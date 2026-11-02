@@ -40,6 +40,7 @@ import {
   OrchestrationV2RunStatus,
   OrchestrationV2RunLaunchEvidence,
   OrchestrationV2RunAttempt,
+  OrchestrationV2ProviderTurn,
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
 import { ProviderOptionSelection, ProviderOptionSelectionValue } from "./model.ts";
@@ -262,6 +263,15 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
           completedAt: Schema.NullOr(IsoDateTime),
         }),
       ),
+      providerTurns: Schema.Array(
+        Schema.Struct({
+          ...OrchestrationV2ProviderTurn.fields,
+          startedAt: Schema.NullOr(IsoDateTime),
+          completedAt: Schema.NullOr(IsoDateTime),
+        }),
+      ),
+      resultMessageId: Schema.NullOr(MessageId),
+      resultTurnItemId: Schema.NullOr(TurnItemId),
       status: OrchestratorMcpTerminalDelegatedTaskStatus,
       startedAt: IsoDateTime,
       completedAt: IsoDateTime,

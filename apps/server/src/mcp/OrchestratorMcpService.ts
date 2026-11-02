@@ -1492,7 +1492,7 @@ const make = Effect.gen(function* () {
         task.childThreadId,
         [
           "runs",
-          ...(includeExecutionEvidence ? ["attempts" as const] : []),
+          ...(includeExecutionEvidence ? ["attempts" as const, "providerTurns" as const] : []),
           "messages",
           "contextTransfers",
           "subagents",
@@ -1528,7 +1528,9 @@ const make = Effect.gen(function* () {
         messageRoles: ["assistant"],
         messageRunIds: resultRunIds,
         turnItemRunIds: resultRunIds,
-        turnItemTypes: ["assistant_message", "error"],
+        ...(includeExecutionEvidence
+          ? {}
+          : { turnItemTypes: ["assistant_message", "error"] as const }),
       })
       .pipe(Effect.mapError(threadManagementFailure));
     const childProjection = {
@@ -1639,9 +1641,26 @@ const make = Effect.gen(function* () {
       const providerThread = childControls.providerThreads.find(
         (thread) => thread.id === activeAttempt?.providerThreadId,
       );
+      const providerTurns = childControls.providerTurns.filter(
+        (turn) => turn.runAttemptId === activeAttempt?.id,
+      );
+      const spawn = childControls.contextTransfers.find(
+        (transfer) =>
+          transfer.type === "subagent_spawn" &&
+          transfer.sourceThreadId === task.threadId &&
+          transfer.sourcePoint.runId === task.runId &&
+          transfer.targetThreadId === task.childThreadId &&
+          transfer.targetRunId === childRun?.id,
+      );
+      const boundTask =
+        childRun?.delegatedTaskId === task.id ||
+        (childRun?.delegatedTaskId === undefined && spawn !== undefined);
+      const runResult =
+        childRun === undefined ? undefined : subagentResultForRun(childProjection, childRun);
+      const inputs = childControls.messages.filter((message) => message.role === "user");
       if (
         childRun === undefined ||
-        childRun.delegatedTaskId !== task.id ||
+        !boundTask ||
         task.runId === null ||
         childRun.launchEvidence === undefined ||
         childRun.startedAt === null ||
@@ -1651,22 +1670,42 @@ const make = Effect.gen(function* () {
         result.workState !== "result_available" ||
         progress.state !== "result_available" ||
         result.hasPendingChildRuns ||
-        childControls.subagents.some(
-          (child) =>
-            child.status !== "completed" &&
-            child.status !== "failed" &&
-            child.status !== "cancelled" &&
-            child.status !== "interrupted",
+        childControls.subagents.length !== 0 ||
+        childControls.providerThreads.some(
+          (thread) => (thread.pendingBackgroundTasks?.length ?? 0) !== 0,
+        ) ||
+        resultRecords.turnItems.some(
+          (item) =>
+            item.status === "pending" || item.status === "running" || item.status === "waiting",
         ) ||
         childControls.runtimeRequests.some((request) => request.status === "pending") ||
         childRun.launchEvidence.taskPrompt !== task.prompt ||
+        childRun.launchEvidence.userMessageId !== childRun.userMessageId ||
+        inputs.length !== 1 ||
+        inputs[0]?.id !== childRun.userMessageId ||
+        inputs[0]?.text !== childRun.launchEvidence.taskPrompt ||
         !modelSelectionsEqual(childRun.launchEvidence.modelSelection, childRun.modelSelection) ||
         activeAttempt?.startedAt == null ||
         activeAttempt.completedAt === null ||
+        attempts.length !== 1 ||
+        activeAttempt.reason !== "initial" ||
+        childRun.launchEvidence.providerStart?.attemptId !== activeAttempt.id ||
         activeAttempt.providerInstanceId !== childRun.providerInstanceId ||
         providerThread === undefined ||
         providerThread.providerInstanceId !== childRun.providerInstanceId ||
         providerThread.driver !== task.driver ||
+        providerTurns.length === 0 ||
+        (activeAttempt.providerTurnId !== null &&
+          !providerTurns.some((turn) => turn.id === activeAttempt.providerTurnId)) ||
+        providerTurns.some(
+          (turn) =>
+            turn.providerThreadId !== activeAttempt.providerThreadId ||
+            turn.nodeId !== activeAttempt.rootNodeId ||
+            turn.startedAt === null ||
+            turn.completedAt === null ||
+            turn.status === "pending" ||
+            turn.status === "running",
+        ) ||
         attempts.some(
           (attempt) =>
             attempt.completedAt === null ||
@@ -1675,11 +1714,12 @@ const make = Effect.gen(function* () {
         ) ||
         derivedResult === null ||
         taskStatusForRun(childRun) !== status ||
-        subagentResultForRun(childProjection, childRun).text !== derivedResult
+        runResult?.text !== derivedResult ||
+        (runResult.messageId === null && runResult.turnItemId === null)
       ) {
         return yield* failure(
           "invalid_request",
-          "Execution evidence requires one settled local run, recorded launch facts, terminal provider attempts, and no pending work.",
+          "Execution evidence requires one unsteered local run and attempt, verified provider start, terminal provider turns, an identifiable result, and no descendants or pending work.",
         );
       }
       const payload = {
@@ -1699,6 +1739,13 @@ const make = Effect.gen(function* () {
           completedAt:
             attempt.completedAt === null ? null : DateTime.formatIso(attempt.completedAt),
         })),
+        providerTurns: providerTurns.map((turn) => ({
+          ...turn,
+          startedAt: turn.startedAt === null ? null : DateTime.formatIso(turn.startedAt),
+          completedAt: turn.completedAt === null ? null : DateTime.formatIso(turn.completedAt),
+        })),
+        resultMessageId: runResult.messageId,
+        resultTurnItemId: runResult.turnItemId,
         status,
         startedAt: DateTime.formatIso(childRun.startedAt),
         completedAt: DateTime.formatIso(childRun.completedAt),

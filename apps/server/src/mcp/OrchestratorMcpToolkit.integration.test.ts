@@ -30,6 +30,15 @@ import { CodexOrchestratorReplayHarness } from "../orchestration-v2/Adapters/Cod
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import * as GitWorkflow from "../git/GitWorkflowService.ts";
+import * as ProviderTurnStartTestkit from "../orchestration-v2/ProviderTurnStartService.testkit.ts";
+import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
+import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
+import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
+import * as TextGeneration from "../textGeneration/TextGeneration.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -193,25 +202,50 @@ const layerUnusedScheduledTaskStub = Layer.succeed(
 
 describe("orchestrator MCP toolkit", () => {
   it.live.each([
+    { label: "fresh-origin", result: queuedFollowupResult, latestSummary: queuedFollowupResult },
     { label: "distinct", result: queuedFollowupResult, latestSummary: queuedFollowupResult },
     { label: "identical", result: delegatedResult, latestSummary: null },
     { label: "emoji", result: "😀", latestSummary: "😀" },
-  ])("reports $label child results", ({ result, latestSummary }) =>
+  ])("reports $label child results", ({ label, result, latestSummary }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const cwd = yield* checkpointWorkspace("delegated-task-status");
+        const freshOrigin = label === "fresh-origin";
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "mcp-origin-proof-" });
+        const childPath = `${directory}/child`;
+        const git = yield* GitVcsDriver.GitVcsDriver;
+        let originCommit = "";
+        if (freshOrigin) {
+          const remote = `${directory}/origin.git`;
+          for (const args of [
+            ["init", "--bare", remote],
+            ["remote", "add", "origin", remote],
+            ["push", "origin", "HEAD:main"],
+          ])
+            yield* git.execute({ operation: "test.origin", cwd, args });
+          originCommit = (yield* git.resolveCommit({ cwd, revision: "HEAD" })).commitSha;
+        }
         const rawTranscript = yield* readDelegatedTaskStatusTranscript(result);
-        const transcript = yield* CodexOrchestratorReplayHarness.decodeTranscript(
-          materializeReplayTranscriptWorkspace(rawTranscript, cwd),
-        );
+        const sharedTranscript = materializeReplayTranscriptWorkspace(rawTranscript, cwd);
+        const childTranscript = materializeReplayTranscriptWorkspace(rawTranscript, childPath);
+        const transcript = yield* CodexOrchestratorReplayHarness.decodeTranscript({
+          ...sharedTranscript,
+          entries: sharedTranscript.entries.map((entry, index) =>
+            freshOrigin && "label" in entry && entry.label?.startsWith("child.")
+              ? childTranscript.entries[index]!
+              : entry,
+          ),
+        });
         const layerOrchestrator = ProviderReplayHarness.layerProviderReplay(
           {
             name: "delegated-task-status/codex",
             transcript,
             commands: [],
-            runtimePolicyOverride: { cwd },
+            ...(freshOrigin ? {} : { runtimePolicyOverride: { cwd } }),
           },
           CodexOrchestratorReplayHarness,
+          { realGit: freshOrigin },
         );
         const layerOrchestration = Layer.merge(
           layerOrchestrator,
@@ -230,7 +264,71 @@ describe("orchestrator MCP toolkit", () => {
             model: codexModel,
           }),
         ]);
-        const layerTest = layerOrchestratorToolkit.pipe(
+        const layerProjects = Layer.mock(ProjectService.ProjectService)({
+          getById: () =>
+            Effect.succeedSome({
+              id: projectId,
+              title: "Example",
+              workspaceRoot: cwd,
+              repositoryIdentity: null,
+              faviconPath: null,
+              defaultModelSelection: codexSelection,
+              defaultThreadEnvMode: null,
+              scripts: [],
+              pinnedAt: null,
+              archivedAt: null,
+              deletedAt: null,
+              createdAt: "2026-10-01T00:00:00.000Z",
+              updatedAt: "2026-10-01T00:00:00.000Z",
+            }),
+        });
+        const layerPreparationGit = Layer.effect(
+          GitWorkflow.GitWorkflowService,
+          Effect.gen(function* () {
+            const workflow = yield* GitWorkflow.GitWorkflowService;
+            return GitWorkflow.GitWorkflowService.of({
+              ...workflow,
+              createWorktree: (input, options) =>
+                git.createWorktree({ ...input, path: childPath }, options),
+            });
+          }),
+        ).pipe(Layer.provide(ProviderTurnStartTestkit.layerRealGit));
+        const layerPreparation = ThreadLaunchService.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              layerOrchestration,
+              layerPreparationGit,
+              layerProjects,
+              layerProviderRegistry,
+              WorktreeSetupTracker.layer,
+              CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+              IdAllocator.layer,
+              ServerSettings.layerTest(),
+              Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({
+                get: () => Effect.succeed(null),
+              }),
+              Layer.mock(TerminalManager.TerminalManager)({}),
+              Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
+                runForThread: () => Effect.succeed({ status: "no-script" }),
+              }),
+              Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+                namedProjectsRoot: directory,
+                isScratchProject: () => Effect.succeed(false),
+              }),
+              Layer.mock(TextGeneration.TextGeneration)({
+                generateBranchName: () => Effect.succeed({ branch: "review-source" }),
+              }),
+            ),
+          ),
+        );
+        const layerTest = (
+          freshOrigin
+            ? McpHttpServer.layerOrchestratorToolkit.pipe(
+                Layer.provide(layerPreparation),
+                Layer.provide(ProviderTurnStartTestkit.layerRealGit),
+              )
+            : layerOrchestratorToolkit
+        ).pipe(
           Layer.provideMerge(McpServer.McpServer.layer),
           Layer.provideMerge(layerOrchestration),
           Layer.provide(
@@ -244,7 +342,7 @@ describe("orchestrator MCP toolkit", () => {
           Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
           Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
           Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
-          Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+          Layer.provide(layerProjects),
           Layer.provideMerge(
             SecretRequests.layer.pipe(
               Layer.provide(layerMemorySecretStore),
@@ -328,6 +426,7 @@ describe("orchestrator MCP toolkit", () => {
             yield* orchestrator.getThreadEventSequence(parentThreadId);
           const delegatedCall = yield* invoke("delegate_task", {
             task: delegatedPrompt,
+            ...(freshOrigin ? { isolation: "worktree", worktreeBaseBranch: "main" } : {}),
             target: {
               providerInstanceId: codexInstanceId,
               model: codexModel,
@@ -381,7 +480,22 @@ describe("orchestrator MCP toolkit", () => {
             taskId: delegated.taskId,
             includeExecutionEvidence: true,
           });
-          expect(evidence.isError).toBe(true);
+          if (freshOrigin) {
+            expect(evidence.isError).not.toBe(true);
+            const exported = yield* decodeDelegateTaskResult(evidence.structuredContent);
+            expect(exported.executionEvidence).toMatchObject({
+              taskId: delegated.taskId,
+              runId: delegated.childRunId,
+              result: delegatedResult,
+              launch: {
+                commitSha: originCommit,
+                worktreePath: childPath,
+                providerStart: { attemptId: expect.any(String) },
+              },
+              resultMessageId: expect.any(String),
+            });
+            expect(exported.executionEvidence?.providerTurns.length).toBeGreaterThan(0);
+          } else expect(evidence.isError).toBe(true);
 
           const delegatedChild = yield* orchestrator.getThreadProjection(
             localChild(delegated.childThreadId),
@@ -701,7 +815,7 @@ describe("orchestrator MCP toolkit", () => {
           expect(capabilities.isError).not.toBe(true);
           expect(messageReads).toHaveLength(messageReadsBeforeCapabilities);
         }).pipe(Effect.provide(layerTest));
-      }),
+      }).pipe(Effect.provide(ProviderTurnStartTestkit.layerRealGit)),
     ),
   );
 });

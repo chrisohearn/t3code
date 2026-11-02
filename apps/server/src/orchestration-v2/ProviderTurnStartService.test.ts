@@ -1042,6 +1042,10 @@ effectIt.effect.each(["clean", "dirty", "head", "cwd", "missing-evidence"])(
       if (scenario === "clean") {
         expect(harness.startRootRun).toHaveBeenCalledOnce();
         expect(harness.inspectCheckout).toHaveBeenCalledWith(evidence.worktreePath);
+        expect(harness.projection().runs.at(-1)?.launchEvidence?.providerStart).toEqual({
+          attemptId: run.activeAttemptId,
+          verifiedAt: expect.any(String),
+        });
       } else {
         expect(harness.open).not.toHaveBeenCalled();
         expect(harness.startRootRun).not.toHaveBeenCalled();

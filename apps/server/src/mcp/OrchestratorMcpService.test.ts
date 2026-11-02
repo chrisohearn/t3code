@@ -321,6 +321,7 @@ describe("OrchestratorMcpService", () => {
       let recordedLaunch = true;
       let extraRun = false;
       let recordedProvider = true;
+      let scenario = "normal";
       const now = DateTime.makeUnsafe("2026-10-01T00:00:00.000Z");
       const selection = {
         instanceId: ProviderInstanceId.make("codex"),
@@ -329,6 +330,7 @@ describe("OrchestratorMcpService", () => {
       };
       const attemptId = RunAttemptId.make("attempt:child");
       const launchEvidence = {
+        providerStart: { attemptId, verifiedAt: DateTime.formatIso(now) },
         recordedAt: DateTime.formatIso(now),
         fetchedAt: DateTime.formatIso(now),
         worktreePath: "/repo/worktree",
@@ -355,7 +357,11 @@ describe("OrchestratorMcpService", () => {
               driver: "codex",
               model: "gpt-5.6-terra",
               status: finished ? "completed" : "running",
-              result: finished ? "done" : null,
+              result: finished
+                ? scenario === "synthetic-result"
+                  ? "Child task completed without an assistant result."
+                  : "done"
+                : null,
               completionDelivery: { state: "pending" },
             },
           ],
@@ -365,12 +371,23 @@ describe("OrchestratorMcpService", () => {
         ordinal: 1,
         status: finished ? ("completed" as const) : ("running" as const),
         delegatedTaskId: taskId,
+        userMessageId:
+          scenario === "changed-message"
+            ? MessageId.make("message:replacement")
+            : launchEvidence.userMessageId,
         modelSelection: selection,
         providerInstanceId: selection.instanceId,
         activeAttemptId: attemptId,
         startedAt: now,
         completedAt: finished ? now : null,
-        ...(recordedLaunch ? { launchEvidence } : {}),
+        ...(recordedLaunch
+          ? {
+              launchEvidence:
+                scenario === "local-only" || scenario === "missing-verification"
+                  ? { ...launchEvidence, providerStart: undefined }
+                  : launchEvidence,
+            }
+          : {}),
       });
       const childProjection = () =>
         ({
@@ -398,32 +415,80 @@ describe("OrchestratorMcpService", () => {
               completedAt: finished ? now : null,
             },
           ],
+          providerTurns:
+            scenario === "local-only" || scenario === "missing-turn"
+              ? []
+              : [
+                  {
+                    id: ProviderTurnId.make("provider-turn:child"),
+                    providerThreadId: ProviderThreadId.make("provider-thread:child"),
+                    runAttemptId: attemptId,
+                    nodeId: NodeId.make("node:child-root"),
+                    nativeTurnRef: null,
+                    ordinal: 1,
+                    status: "completed",
+                    startedAt: now,
+                    completedAt: now,
+                  },
+                ],
           contextTransfers: [],
-          messages: finished
-            ? [
-                {
-                  id: MessageId.make("message:child-result"),
-                  runId: childRun().id,
-                  role: "assistant",
-                  text: "done",
-                  createdAt: now,
-                  updatedAt: now,
-                },
-              ]
-            : [],
-          subagents: [],
+          messages: [
+            {
+              id: launchEvidence.userMessageId,
+              runId: childRun().id,
+              role: "user",
+              text: launchEvidence.taskPrompt,
+            },
+            ...(scenario === "steered"
+              ? [
+                  {
+                    id: MessageId.make("message:steer"),
+                    runId: childRun().id,
+                    role: "user",
+                    text: "Additional instruction",
+                  },
+                ]
+              : []),
+            ...(finished && scenario !== "synthetic-result"
+              ? [
+                  {
+                    id: MessageId.make("message:child-result"),
+                    runId: childRun().id,
+                    role: "assistant",
+                    text: "done",
+                    createdAt: now,
+                    updatedAt: now,
+                  },
+                ]
+              : []),
+          ],
+          subagents: scenario === "descendant" ? [{ status: "completed" }] : [],
           providerThreads: recordedProvider
             ? [
                 {
                   id: ProviderThreadId.make("provider-thread:child"),
                   driver: ProviderDriverKind.make("codex"),
                   providerInstanceId: selection.instanceId,
+                  pendingBackgroundTasks:
+                    scenario === "background-command"
+                      ? [{ kind: "command", taskId: "command:background" }]
+                      : [],
                 },
               ]
             : [],
           runtimeRequests: pendingRequest ? [{ status: "pending" }] : [],
           nodes: [],
-          turnItems: [],
+          turnItems:
+            scenario === "active-item"
+              ? [
+                  {
+                    id: "item:active-command",
+                    runId: childRun().id,
+                    type: "command_execution",
+                    status: "running",
+                  },
+                ]
+              : [],
         }) as unknown as OrchestrationV2ThreadProjection;
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
@@ -501,19 +566,30 @@ describe("OrchestratorMcpService", () => {
         assert.equal(payload.result, "done");
         assert.equal(payload.parentRunId, "run:parent");
         assert.equal(payload.runId, childRun().id);
-        for (const scenario of [
+        for (const failureCase of [
           "missing-launch",
           "pending-request",
           "continuation",
           "missing-provider",
+          "local-only",
+          "changed-message",
+          "background-command",
+          "descendant",
+          "missing-verification",
+          "missing-turn",
+          "synthetic-result",
+          "active-item",
+          "steered",
         ] as const) {
-          recordedLaunch = scenario !== "missing-launch";
-          pendingRequest = scenario === "pending-request";
-          extraRun = scenario === "continuation";
-          recordedProvider = scenario !== "missing-provider";
+          scenario = failureCase;
+          recordedLaunch = failureCase !== "missing-launch";
+          pendingRequest = failureCase === "pending-request";
+          extraRun = failureCase === "continuation";
+          recordedProvider = failureCase !== "missing-provider";
           const error = yield* service.taskStatus(scope, taskId, true).pipe(Effect.flip);
           assert.equal(error.code, "invalid_request");
         }
+        scenario = "normal";
         recordedLaunch = true;
         pendingRequest = false;
         extraRun = false;

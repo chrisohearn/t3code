@@ -8,6 +8,7 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
+  type OrchestrationV2RunLaunchEvidence,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2TurnItem,
   isCompactionCommandMessage,
@@ -714,6 +715,7 @@ export const layer: Layer.Layer<
       }
       const resolvedRuntimePolicy = resolvedPolicy.success;
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
+      let verifiedProviderStart: OrchestrationV2RunLaunchEvidence["providerStart"];
       if (
         run.workspacePreparation?.type === "worktree" &&
         run.workspacePreparation.requireFreshOrigin === true
@@ -749,6 +751,10 @@ export const layer: Layer.Layer<
           });
           return;
         }
+        verifiedProviderStart = {
+          attemptId: attempt.id,
+          verifiedAt: DateTime.formatIso(yield* DateTime.now),
+        };
       }
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
@@ -1454,6 +1460,11 @@ export const layer: Layer.Layer<
       };
       const runningRun: OrchestrationV2Run = {
         ...run,
+        ...(run.launchEvidence !== undefined && verifiedProviderStart !== undefined
+          ? {
+              launchEvidence: { ...run.launchEvidence, providerStart: verifiedProviderStart },
+            }
+          : {}),
         status: "running",
         startedAt: now,
       };

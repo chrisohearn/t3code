@@ -683,6 +683,9 @@ export const OrchestrationV2RunLaunchEvidence = Schema.Struct({
   taskPrompt: Schema.String,
   userMessageId: MessageId,
   modelSelection: ModelSelection,
+  providerStart: Schema.optional(
+    Schema.Struct({ attemptId: RunAttemptId, verifiedAt: IsoDateTime }),
+  ),
 });
 export type OrchestrationV2RunLaunchEvidence = typeof OrchestrationV2RunLaunchEvidence.Type;
 
