@@ -483,7 +483,11 @@ describe("OrchestratorMcpService", () => {
                 },
               ]
             : [],
-          runtimeRequests: pendingRequest ? [{ status: "pending" }] : [],
+          runtimeRequests: pendingRequest
+            ? [{ status: "pending" }]
+            : scenario === "resolved-user-input"
+              ? [{ kind: "user_input", status: "resolved", answers: { approach: ["Revise it"] } }]
+              : [],
           nodes: [],
           turnItems:
             scenario === "active-item"
@@ -576,6 +580,7 @@ describe("OrchestratorMcpService", () => {
         for (const failureCase of [
           "missing-launch",
           "pending-request",
+          "resolved-user-input",
           "continuation",
           "missing-provider",
           "local-only",
@@ -595,6 +600,11 @@ describe("OrchestratorMcpService", () => {
           pendingRequest = failureCase === "pending-request";
           extraRun = failureCase === "continuation";
           recordedProvider = failureCase !== "missing-provider";
+          if (failureCase === "resolved-user-input") {
+            const answered = yield* service.taskStatus(scope, taskId);
+            assert.equal(answered.status, "completed");
+            assert.notProperty(answered, "executionEvidence");
+          }
           const error = yield* service.taskStatus(scope, taskId, true).pipe(Effect.flip);
           assert.equal(error.code, "invalid_request");
         }
