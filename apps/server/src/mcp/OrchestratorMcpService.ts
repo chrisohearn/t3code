@@ -1699,6 +1699,7 @@ const make = Effect.gen(function* () {
           !providerTurns.some((turn) => turn.id === activeAttempt.providerTurnId)) ||
         providerTurns.some(
           (turn) =>
+            turn.nativeTurnRef?.nativeId == null ||
             turn.providerThreadId !== activeAttempt.providerThreadId ||
             turn.nodeId !== activeAttempt.rootNodeId ||
             turn.startedAt === null ||

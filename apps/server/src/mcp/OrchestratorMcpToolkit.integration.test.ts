@@ -202,6 +202,7 @@ const layerUnusedScheduledTaskStub = Layer.succeed(
 
 describe("orchestrator MCP toolkit", () => {
   it.live.each([
+    { label: "local-goal", result: queuedFollowupResult, latestSummary: queuedFollowupResult },
     { label: "fresh-origin", result: queuedFollowupResult, latestSummary: queuedFollowupResult },
     { label: "distinct", result: queuedFollowupResult, latestSummary: queuedFollowupResult },
     { label: "identical", result: delegatedResult, latestSummary: null },
@@ -210,7 +211,8 @@ describe("orchestrator MCP toolkit", () => {
     Effect.scoped(
       Effect.gen(function* () {
         const cwd = yield* checkpointWorkspace("delegated-task-status");
-        const freshOrigin = label === "fresh-origin";
+        const localGoal = label === "local-goal";
+        const freshOrigin = label === "fresh-origin" || localGoal;
         const fs = yield* FileSystem.FileSystem;
         const directory = yield* fs.makeTempDirectoryScoped({ prefix: "mcp-origin-proof-" });
         const childPath = `${directory}/child`;
@@ -227,8 +229,32 @@ describe("orchestrator MCP toolkit", () => {
           originCommit = (yield* git.resolveCommit({ cwd, revision: "HEAD" })).commitSha;
         }
         const rawTranscript = yield* readDelegatedTaskStatusTranscript(result);
-        const sharedTranscript = materializeReplayTranscriptWorkspace(rawTranscript, cwd);
-        const childTranscript = materializeReplayTranscriptWorkspace(rawTranscript, childPath);
+        const goalTranscript = localGoal
+          ? {
+              ...rawTranscript,
+              entries: rawTranscript.entries.flatMap((entry) => {
+                if ("label" in entry && entry.label === "child.original.turn/start") {
+                  if (entry.type === "expect_outbound")
+                    return [
+                      {
+                        ...entry,
+                        frame: {
+                          id: 5,
+                          method: "thread/goal/get",
+                          params: { threadId: "019f1000-0000-7000-8000-000000000003" },
+                        },
+                      },
+                    ];
+                  if (entry.type === "emit_inbound")
+                    return [{ ...entry, frame: { id: 5, result: { goal: null } } }];
+                }
+                if ("label" in entry && entry.label?.startsWith("child.original.")) return [];
+                return [entry];
+              }),
+            }
+          : rawTranscript;
+        const sharedTranscript = materializeReplayTranscriptWorkspace(goalTranscript, cwd);
+        const childTranscript = materializeReplayTranscriptWorkspace(goalTranscript, childPath);
         const transcript = yield* CodexOrchestratorReplayHarness.decodeTranscript({
           ...sharedTranscript,
           entries: sharedTranscript.entries.map((entry, index) =>
@@ -425,7 +451,7 @@ describe("orchestrator MCP toolkit", () => {
           const delegationStartSequence =
             yield* orchestrator.getThreadEventSequence(parentThreadId);
           const delegatedCall = yield* invoke("delegate_task", {
-            task: delegatedPrompt,
+            task: localGoal ? "/goal" : delegatedPrompt,
             ...(freshOrigin ? { isolation: "worktree", worktreeBaseBranch: "main" } : {}),
             target: {
               providerInstanceId: codexInstanceId,
@@ -467,7 +493,7 @@ describe("orchestrator MCP toolkit", () => {
           ).pipe(Effect.orDie);
           expect(delegated).toMatchObject({
             status: "completed",
-            summary: delegatedResult,
+            summary: localGoal ? "No goal is set." : delegatedResult,
             providerInstanceId: codexInstanceId,
             hasPendingChildRuns: false,
             latestTerminalRunId: delegated.childRunId,
@@ -480,6 +506,16 @@ describe("orchestrator MCP toolkit", () => {
             taskId: delegated.taskId,
             includeExecutionEvidence: true,
           });
+          if (localGoal) {
+            const child = yield* orchestrator.getThreadProjection(
+              localChild(delegated.childThreadId),
+            );
+            expect(child.runs[0]?.launchEvidence?.providerStart).toBeDefined();
+            expect(child.providerTurns.length).toBeGreaterThan(0);
+            expect(child.providerTurns.every((turn) => turn.nativeTurnRef === null)).toBe(true);
+            expect(evidence.isError).toBe(true);
+            return;
+          }
           if (freshOrigin) {
             expect(evidence.isError).not.toBe(true);
             const exported = yield* decodeDelegateTaskResult(evidence.structuredContent);

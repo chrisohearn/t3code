@@ -424,7 +424,14 @@ describe("OrchestratorMcpService", () => {
                     providerThreadId: ProviderThreadId.make("provider-thread:child"),
                     runAttemptId: attemptId,
                     nodeId: NodeId.make("node:child-root"),
-                    nativeTurnRef: null,
+                    nativeTurnRef:
+                      scenario === "missing-native-ref"
+                        ? null
+                        : {
+                            driver: ProviderDriverKind.make("codex"),
+                            nativeId: scenario === "missing-native-id" ? null : "native-turn:child",
+                            strength: "strong",
+                          },
                     ordinal: 1,
                     status: "completed",
                     startedAt: now,
@@ -577,6 +584,8 @@ describe("OrchestratorMcpService", () => {
           "descendant",
           "missing-verification",
           "missing-turn",
+          "missing-native-ref",
+          "missing-native-id",
           "synthetic-result",
           "active-item",
           "steered",
