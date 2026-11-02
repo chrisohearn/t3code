@@ -483,11 +483,18 @@ describe("OrchestratorMcpService", () => {
                 },
               ]
             : [],
-          runtimeRequests: pendingRequest
-            ? [{ status: "pending" }]
-            : scenario === "resolved-user-input"
+          runtimeRequests: [
+            ...(pendingRequest ? [{ status: "pending" }] : []),
+            ...(scenario === "resolved-user-input"
               ? [{ kind: "user_input", status: "resolved", answers: { approach: ["Revise it"] } }]
-              : [],
+              : []),
+            ...(scenario === "resolved-command-approval"
+              ? [{ kind: "command", status: "resolved", decision: "accept" }]
+              : []),
+            ...(scenario === "resolved-file-change-approval"
+              ? [{ kind: "file-change", status: "resolved", decision: "decline" }]
+              : []),
+          ],
           nodes: [],
           turnItems:
             scenario === "active-item"
@@ -581,6 +588,8 @@ describe("OrchestratorMcpService", () => {
           "missing-launch",
           "pending-request",
           "resolved-user-input",
+          "resolved-command-approval",
+          "resolved-file-change-approval",
           "continuation",
           "missing-provider",
           "local-only",
@@ -600,7 +609,11 @@ describe("OrchestratorMcpService", () => {
           pendingRequest = failureCase === "pending-request";
           extraRun = failureCase === "continuation";
           recordedProvider = failureCase !== "missing-provider";
-          if (failureCase === "resolved-user-input") {
+          if (
+            failureCase === "resolved-user-input" ||
+            failureCase === "resolved-command-approval" ||
+            failureCase === "resolved-file-change-approval"
+          ) {
             const answered = yield* service.taskStatus(scope, taskId);
             assert.equal(answered.status, "completed");
             assert.notProperty(answered, "executionEvidence");

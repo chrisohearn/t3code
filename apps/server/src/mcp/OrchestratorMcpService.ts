@@ -1678,9 +1678,7 @@ const make = Effect.gen(function* () {
           (item) =>
             item.status === "pending" || item.status === "running" || item.status === "waiting",
         ) ||
-        childControls.runtimeRequests.some(
-          (request) => request.status === "pending" || request.kind === "user_input",
-        ) ||
+        childControls.runtimeRequests.length !== 0 ||
         childRun.launchEvidence.taskPrompt !== task.prompt ||
         childRun.launchEvidence.userMessageId !== childRun.userMessageId ||
         inputs.length !== 1 ||
