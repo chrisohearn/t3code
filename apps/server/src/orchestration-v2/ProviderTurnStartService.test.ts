@@ -848,6 +848,9 @@ function makeLocalCommandHarness(input: {
         runtimeMode: thread.runtimeMode,
       } as never),
   );
+  const inspectCheckout = vi.fn<GitWorkflow.GitWorkflowService["Service"]["inspectCheckout"]>(() =>
+    Effect.succeed({ commitSha: "a".repeat(40), treeSha: "b".repeat(40), clean: true }),
+  );
   const createWorktree = vi.fn<GitWorkflow.GitWorkflowService["Service"]["createWorktree"]>(() =>
     Effect.succeed({} as never),
   );
@@ -902,6 +905,7 @@ function makeLocalCommandHarness(input: {
               pruneWorktrees: () => Effect.void,
               listLocalBranchNames: () => Effect.succeed(["feature/restore"]),
               createWorktree,
+              inspectCheckout,
             })
           : Layer.succeed(GitWorkflow.GitWorkflowService, input.gitWorkflow),
         Layer.mock(ProjectService.ProjectService)({
@@ -960,6 +964,7 @@ function makeLocalCommandHarness(input: {
       projection = next;
     },
     resolveRuntimePolicy,
+    inspectCheckout,
     createWorktree,
     open,
     writeIfRunCurrent,
@@ -985,6 +990,65 @@ function makeLocalCommandHarness(input: {
     }).pipe(Effect.provide(layer)),
   };
 }
+
+effectIt.effect.each(["clean", "dirty", "head", "cwd", "missing-evidence"])(
+  "checks a verified checkout at provider start: %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        worktreePath: "/repo/worktree",
+        previousTurn: { runStatus: "completed", turnStatus: "completed" },
+      });
+      const projection = harness.projection();
+      const run = projection.runs.at(-1)!;
+      const evidence = {
+        recordedAt: DateTime.formatIso(run.requestedAt),
+        fetchedAt: DateTime.formatIso(run.requestedAt),
+        worktreePath: "/repo/worktree",
+        originRef: "refs/remotes/origin/main",
+        commitSha: "a".repeat(40),
+        treeSha: "b".repeat(40),
+        taskPrompt: "Continue",
+        userMessageId: run.userMessageId,
+        modelSelection: run.modelSelection,
+      };
+      harness.setProjection({
+        ...projection,
+        thread:
+          scenario === "cwd" ? { ...projection.thread, worktreePath: "/other" } : projection.thread,
+        runs: projection.runs.map((candidate) =>
+          candidate.id !== run.id
+            ? candidate
+            : {
+                ...candidate,
+                workspacePreparation: {
+                  type: "worktree",
+                  baseRef: "main",
+                  requireFreshOrigin: true,
+                },
+                ...(scenario === "missing-evidence" ? {} : { launchEvidence: evidence }),
+              },
+        ),
+      });
+      harness.inspectCheckout.mockReturnValue(
+        Effect.succeed({
+          commitSha: scenario === "head" ? "c".repeat(40) : evidence.commitSha,
+          treeSha: evidence.treeSha,
+          clean: scenario !== "dirty",
+        }),
+      );
+      yield* harness.start;
+      if (scenario === "clean") {
+        expect(harness.startRootRun).toHaveBeenCalledOnce();
+        expect(harness.inspectCheckout).toHaveBeenCalledWith(evidence.worktreePath);
+      } else {
+        expect(harness.open).not.toHaveBeenCalled();
+        expect(harness.startRootRun).not.toHaveBeenCalled();
+        expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+      }
+    }),
+);
 
 effectIt.effect(
   "recovers the local or pushed thread tip, else the current branch, remote default, or detached HEAD",

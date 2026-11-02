@@ -714,6 +714,42 @@ export const layer: Layer.Layer<
       }
       const resolvedRuntimePolicy = resolvedPolicy.success;
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
+      if (
+        run.workspacePreparation?.type === "worktree" &&
+        run.workspacePreparation.requireFreshOrigin === true
+      ) {
+        const evidence = run.launchEvidence;
+        const cwd = resolvedRuntimePolicy.cwd;
+        const inspected =
+          evidence !== undefined &&
+          cwd === evidence.worktreePath &&
+          modelSelectionsEqual(evidence.modelSelection, run.modelSelection)
+            ? yield* gitWorkflow.inspectCheckout(cwd).pipe(Effect.result)
+            : null;
+        if (
+          evidence === undefined ||
+          inspected === null ||
+          inspected._tag === "Failure" ||
+          !inspected.success.clean ||
+          inspected.success.commitSha !== evidence.commitSha ||
+          inspected.success.treeSha !== evidence.treeSha
+        ) {
+          yield* settleStartFailure({
+            signal: "verified-checkout-mismatch",
+            title: "Verified checkout changed before execution",
+            error:
+              inspected?._tag === "Failure"
+                ? inspected.failure
+                : new ProviderTurnStartError({
+                    runId: run.id,
+                    cause: "The prepared checkout identity changed before provider execution.",
+                  }),
+            message:
+              "The execution checkout no longer matches its recorded origin commit and tree.",
+          });
+          return;
+        }
+      }
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
       );

@@ -63,7 +63,8 @@ import {
   ThreadId,
   isOrchestrationV2WorkActive,
 } from "@t3tools/contracts";
-import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
+import { getProviderOptionCurrentValue, modelSelectionsEqual } from "@t3tools/shared/model";
+import { stableStringify } from "@t3tools/shared/relaySigning";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import {
@@ -159,6 +160,7 @@ export interface OrchestratorMcpServiceShape {
   readonly taskStatus: (
     scope: McpInvocationScope,
     taskId: NodeId,
+    includeExecutionEvidence?: boolean,
   ) => Effect.Effect<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure>;
   readonly cancelTask: (
     scope: McpInvocationScope,
@@ -1461,6 +1463,7 @@ const make = Effect.gen(function* () {
     waitTimedOut = false,
     acknowledgeTerminal = false,
     acknowledgementOperation = "task-status-acknowledge",
+    includeExecutionEvidence = false,
   ): Effect.fn.Return<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure> {
     yield* requireCapability(scope);
     const parentProjection = yield* loadTaskParent(scope.thread.threadId, taskId);
@@ -1477,6 +1480,11 @@ const make = Effect.gen(function* () {
       );
     }
     if (task.childThreadId === null) {
+      if (includeExecutionEvidence)
+        return yield* failure(
+          "invalid_request",
+          "Execution evidence is available only from the local task's owning host.",
+        );
       return yield* readRemoteTask(scope, task, waitTimedOut, acknowledgeTerminal);
     }
     const childControls = yield* threadManagement
@@ -1484,6 +1492,7 @@ const make = Effect.gen(function* () {
         task.childThreadId,
         [
           "runs",
+          ...(includeExecutionEvidence ? ["attempts" as const] : []),
           "messages",
           "contextTransfers",
           "subagents",
@@ -1623,9 +1632,89 @@ const make = Effect.gen(function* () {
           : pendingTaskApproval(childControls, task.id, childRun),
       waitTimedOut,
     } satisfies OrchestratorMcpDelegateTaskResult;
+    let executionEvidence: OrchestratorMcpDelegateTaskResult["executionEvidence"];
+    if (includeExecutionEvidence) {
+      const attempts = childControls.attempts.filter((attempt) => attempt.runId === childRun?.id);
+      const activeAttempt = attempts.find((attempt) => attempt.id === childRun?.activeAttemptId);
+      const providerThread = childControls.providerThreads.find(
+        (thread) => thread.id === activeAttempt?.providerThreadId,
+      );
+      if (
+        childRun === undefined ||
+        childRun.delegatedTaskId !== task.id ||
+        task.runId === null ||
+        childRun.launchEvidence === undefined ||
+        childRun.startedAt === null ||
+        childRun.completedAt === null ||
+        childControls.runs.length !== 1 ||
+        !isTerminalTaskStatus(status) ||
+        result.workState !== "result_available" ||
+        progress.state !== "result_available" ||
+        result.hasPendingChildRuns ||
+        childControls.subagents.some(
+          (child) =>
+            child.status !== "completed" &&
+            child.status !== "failed" &&
+            child.status !== "cancelled" &&
+            child.status !== "interrupted",
+        ) ||
+        childControls.runtimeRequests.some((request) => request.status === "pending") ||
+        childRun.launchEvidence.taskPrompt !== task.prompt ||
+        !modelSelectionsEqual(childRun.launchEvidence.modelSelection, childRun.modelSelection) ||
+        activeAttempt?.startedAt == null ||
+        activeAttempt.completedAt === null ||
+        activeAttempt.providerInstanceId !== childRun.providerInstanceId ||
+        providerThread === undefined ||
+        providerThread.providerInstanceId !== childRun.providerInstanceId ||
+        providerThread.driver !== task.driver ||
+        attempts.some(
+          (attempt) =>
+            attempt.completedAt === null ||
+            attempt.status === "pending" ||
+            attempt.status === "running",
+        ) ||
+        derivedResult === null ||
+        taskStatusForRun(childRun) !== status ||
+        subagentResultForRun(childProjection, childRun).text !== derivedResult
+      ) {
+        return yield* failure(
+          "invalid_request",
+          "Execution evidence requires one settled local run, recorded launch facts, terminal provider attempts, and no pending work.",
+        );
+      }
+      const payload = {
+        version: 1 as const,
+        environmentId: scope.environmentId,
+        parentThreadId: scope.thread.threadId,
+        parentRunId: task.runId,
+        projectId: childControls.thread.projectId,
+        providerDriver: providerThread.driver,
+        taskId,
+        childThreadId: task.childThreadId,
+        runId: childRun.id,
+        launch: childRun.launchEvidence,
+        attempts: attempts.map((attempt) => ({
+          ...attempt,
+          startedAt: attempt.startedAt === null ? null : DateTime.formatIso(attempt.startedAt),
+          completedAt:
+            attempt.completedAt === null ? null : DateTime.formatIso(attempt.completedAt),
+        })),
+        status,
+        startedAt: DateTime.formatIso(childRun.startedAt),
+        completedAt: DateTime.formatIso(childRun.completedAt),
+        result: derivedResult,
+      };
+      const digest = yield* crypto
+        .digest("SHA-256", new TextEncoder().encode(stableStringify(payload)))
+        .pipe(Effect.orDie);
+      executionEvidence = {
+        ...payload,
+        sha256: Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+      };
+    }
     const response: OrchestratorMcpDelegateTaskResult =
       endsTaskWait(result) || task.completionDelivery?.state === "disposed"
-        ? result
+        ? { ...result, ...(executionEvidence === undefined ? {} : { executionEvidence }) }
         : { ...result, next: ORCHESTRATOR_MCP_RUNNING_TASK_NEXT };
     if (
       acknowledgeTerminal &&
@@ -2313,6 +2402,11 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
+      if (input.worktreeBaseBranch !== undefined && input.isolation !== "worktree")
+        return yield* failure(
+          "invalid_request",
+          "worktreeBaseBranch requires isolation 'worktree'.",
+        );
       const environmentId =
         input.target === undefined
           ? undefined
@@ -2378,32 +2472,41 @@ const make = Effect.gen(function* () {
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
-        const base = yield* gitDriver
-          .resolveCommit({
-            cwd: parent.thread.worktreePath ?? project.workspaceRoot,
-            revision: "HEAD",
-          })
-          .pipe(
-            Effect.mapError(() =>
-              failure("invalid_request", "Unable to resolve the parent checkout commit."),
-            ),
-          );
-        // Launch preparation creates the worktree from the project root, so a
-        // parent checkout in another repository (such as a Git folder inside
-        // Scratch) would hand it a commit it cannot find.
-        if (parent.thread.worktreePath !== null) {
-          yield* gitDriver
-            .resolveCommit({ cwd: project.workspaceRoot, revision: base.commitSha })
+        if (input.worktreeBaseBranch !== undefined) {
+          workspaceStrategy = {
+            type: "worktree",
+            baseRef: input.worktreeBaseBranch,
+            startFromOrigin: true,
+            requireFreshOrigin: true,
+          };
+        } else {
+          const base = yield* gitDriver
+            .resolveCommit({
+              cwd: parent.thread.worktreePath ?? project.workspaceRoot,
+              revision: "HEAD",
+            })
             .pipe(
               Effect.mapError(() =>
-                failure(
-                  "invalid_request",
-                  `Isolation "worktree" creates the child checkout in project "${project.title}" (${project.workspaceRoot}), which does not contain the parent checkout's commit. Use isolation "shared" to work in the parent's checkout.`,
-                ),
+                failure("invalid_request", "Unable to resolve the parent checkout commit."),
               ),
             );
+          // Launch preparation creates the worktree from the project root, so a
+          // parent checkout in another repository (such as a Git folder inside
+          // Scratch) would hand it a commit it cannot find.
+          if (parent.thread.worktreePath !== null) {
+            yield* gitDriver
+              .resolveCommit({ cwd: project.workspaceRoot, revision: base.commitSha })
+              .pipe(
+                Effect.mapError(() =>
+                  failure(
+                    "invalid_request",
+                    `Isolation "worktree" creates the child checkout in project "${project.title}" (${project.workspaceRoot}), which does not contain the parent checkout's commit. Use isolation "shared" to work in the parent's checkout.`,
+                  ),
+                ),
+              );
+          }
+          workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
         }
-        workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
@@ -2511,9 +2614,20 @@ const make = Effect.gen(function* () {
         );
       return yield* readTask(scope, taskId, Option.isNone(waited), true);
     }),
-    taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
+    taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (
+      callerScope,
+      taskId,
+      includeExecutionEvidence = false,
+    ) {
       const scope = yield* requireThreadScope(callerScope, "task_status");
-      return yield* readTask(scope, taskId, false, true);
+      return yield* readTask(
+        scope,
+        taskId,
+        false,
+        true,
+        "task-status-acknowledge",
+        includeExecutionEvidence,
+      );
     }),
     cancelTask: Effect.fn("OrchestratorMcpService.cancelTask")(function* (callerScope, input) {
       const scope = yield* requireThreadScope(callerScope, "task_cancel");

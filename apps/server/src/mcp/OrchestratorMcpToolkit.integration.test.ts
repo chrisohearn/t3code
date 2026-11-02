@@ -377,6 +377,11 @@ describe("orchestrator MCP toolkit", () => {
             latestTerminalResultContextTransferId: null,
           });
           expect(delegated.resultContextTransferId).not.toBeNull();
+          const evidence = yield* invoke("task_status", {
+            taskId: delegated.taskId,
+            includeExecutionEvidence: true,
+          });
+          expect(evidence.isError).toBe(true);
 
           const delegatedChild = yield* orchestrator.getThreadProjection(
             localChild(delegated.childThreadId),
