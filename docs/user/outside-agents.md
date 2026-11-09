@@ -50,7 +50,7 @@ Then choose what the agent may do. **Auto** is selected by default, or the
 closest lower mode allowed by your organization’s policy:
 
 - **Read only** lets the agent read projects and threads and see
-  the available providers and models. It cannot change anything.
+  the available providers and models. It cannot change projects or threads.
 - **Supervised** through **Full access** also let it start, message and stop
   threads in every project. A thread it starts or steers cannot run with more
   permissions than the mode you chose.
@@ -87,6 +87,22 @@ Add the environment as a custom MCP app in ChatGPT's apps settings:
 3. Choose **OAuth** for authentication. ChatGPT discovers the rest; you do not
    need a client ID or secret.
 4. Create the app, then approve the sign-in page that opens.
+
+### Monitor thread updates
+
+Clients that support MCP Events can monitor a specific thread for run results,
+pending decisions, failures, and provider resource release. Ask the client what
+to monitor after approving its OAuth sign-in. Read-only access is sufficient.
+
+Notifications contain identifiers, native status, and a link to the source thread.
+Read that thread for the full result or decision. A finished run or helper does
+not establish that the requested work has been accepted.
+
+Subscriptions last one day by default and the client can refresh them. Updates
+can replay after a server restart, although older history may no longer be
+available. After signing in again, explicitly subscribe through the new connection
+to resume monitoring. Ask the client to stop monitoring, or revoke its sign-in in
+**Settings → Sharing & access** to stop all of that connection's subscriptions.
 
 ## Other agents and bots
 
