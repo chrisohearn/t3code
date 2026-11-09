@@ -1,7 +1,6 @@
 import "vite-plus/test/config";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- tsdown needs the asset path when it reads this config.
 import * as NodePath from "node:path";
-// @effect-diagnostics-next-line nodeBuiltinImport:off -- resolve the SEA-only bundler alias.
 import * as NodeURL from "node:url";
 import { defineConfig, mergeConfig } from "vite-plus";
 
