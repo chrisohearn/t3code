@@ -120,7 +120,10 @@ not establish that the requested work has been accepted.
 
 Subscriptions last one day by default and the client can refresh them. Updates
 can replay after a server restart, although older history may no longer be
-available. After signing in again, explicitly subscribe through the new connection
+available. Delivery stops after eight failed attempts or a permanent callback
+failure. Once the callback is working again, explicitly resubscribe to reactivate
+delivery from the acknowledged cursor. Refreshing an active subscription does not
+reset its retry budget. After signing in again, subscribe through the new connection
 to resume monitoring. Ask the client to stop monitoring, or revoke its sign-in in
 **Settings → Sharing & access** to stop all of that connection's subscriptions.
 

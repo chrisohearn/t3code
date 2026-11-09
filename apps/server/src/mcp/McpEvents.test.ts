@@ -300,7 +300,7 @@ it.effect.each([
   { status: 413, attempts: 1 },
   { status: 503, attempts: 8 },
 ])(
-  "bounds delivery attempts for $status and refuses to grant a perpetual TTL",
+  "bounds delivery attempts for $status until an explicit verified reactivation",
   ({ status, attempts }) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -312,6 +312,7 @@ it.effect.each([
         f.responses.set("event-0", status);
         yield* f.append([thread]);
         yield* f.service.drain();
+        if (status === 503) yield* f.call(f.service.subscribe(input));
         for (const delay of [1, 2, 4, 8, 16, 32, 64]) {
           yield* TestClock.adjust(`${delay} seconds`);
           yield* f.service.drain();
@@ -322,6 +323,22 @@ it.effect.each([
         expect(new Set(f.sent.map((delivery) => delivery.id)).size).toBe(1);
         expect(new Set(f.sent.map((delivery) => delivery.body)).size).toBe(1);
         expect((yield* f.subscriptions.get(sub.id))?.active).toBe(0);
+        // Recovery requires a new authenticated subscribe; automatic retries stay stopped.
+        f.responses.delete("event-0");
+        yield* f.service.drain();
+        expect(f.sent).toHaveLength(attempts);
+        const resumed = yield* f.call(f.service.subscribe(input));
+        expect(resumed.id).toBe(sub.id);
+        expect(resumed.cursor).toBe("0");
+        yield* f.service.drain();
+        expect(f.sent).toHaveLength(attempts + 1);
+        expect(f.sent.at(-1)?.id).toBe("event-0");
+        expect((yield* f.subscriptions.get(sub.id))?.ackCursor).toBeGreaterThan(0);
+        expect(yield* f.deliveries.count(sub.id)).toBe(0);
+        const { cursor: _cursor, ...refresh } = input;
+        yield* f.call(f.service.subscribe(refresh));
+        yield* f.service.drain();
+        expect(f.sent).toHaveLength(attempts + 1);
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );

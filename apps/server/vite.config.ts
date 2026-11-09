@@ -1,6 +1,8 @@
 import "vite-plus/test/config";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- tsdown needs the asset path when it reads this config.
 import * as NodePath from "node:path";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- resolve the SEA-only bundler alias.
+import * as NodeURL from "node:url";
 import { defineConfig, mergeConfig } from "vite-plus";
 
 import baseConfig from "../../vite.config.ts";
@@ -88,6 +90,10 @@ export default mergeConfig(
       },
     },
     pack: {
+      // SEA cannot load file-backed ESM imports; retain Undici as a runtime CJS external.
+      ...(packExecutable
+        ? { alias: { undici: NodeURL.fileURLToPath(import.meta.resolve("./src/seaUndici.cjs")) } }
+        : {}),
       // SEA embeds one entry; expose the history worker as a hidden subcommand.
       entry: packBootstrap
         ? ["src/bin.ts"]
@@ -117,9 +123,11 @@ export default mergeConfig(
         : {}),
       deps: {
         // alwaysBundle=false has no opinion; neverBundle must retain transitive native acceleration.
-        alwaysBundle: shouldBundleCliDependency,
+        alwaysBundle: (id: string) =>
+          packExecutable && id === "undici" ? true : shouldBundleCliDependency(id),
         neverBundle: (id: string) =>
-          (packBootstrap && id === "./binMain.ts") || isExternalCliDependency(id),
+          (packBootstrap && id === "./binMain.ts") ||
+          (!(packExecutable && id === "undici") && isExternalCliDependency(id)),
         onlyBundle: false,
       },
       banner: {

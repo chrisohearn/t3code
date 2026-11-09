@@ -6,6 +6,9 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { loadConfigFromFile } from "vite-plus";
+import { build } from "vite-plus/pack";
+import { vi } from "vite-plus/test";
 
 import { findEsmImportsOfExternalPackages } from "./cli-executable-imports.ts";
 
@@ -28,6 +31,59 @@ const PackageManifest = Schema.Struct({
 type PackageManifest = typeof PackageManifest.Type;
 
 const decodeManifest = Schema.decodeUnknownSync(Schema.fromJsonString(PackageManifest));
+
+it("packs Effect's Undici consumers for SEA without a file-backed ESM dependency", async () => {
+  const serverDir = NodeURL.fileURLToPath(new URL("../../apps/server/", import.meta.url));
+  const entry = `${serverDir}sea-undici-regression.ts`;
+  vi.stubEnv("T3CODE_PACK_EXE", "bundle");
+  vi.stubEnv("T3CODE_PACK_EXE_TARGET", "linux-x64");
+  vi.stubEnv("T3CODE_CLI_ASSET_DIR", serverDir);
+  try {
+    const loaded = await loadConfigFromFile(
+      { command: "build", mode: "production" },
+      `${serverDir}vite.config.ts`,
+      serverDir,
+    );
+    const pack = loaded?.config.pack;
+    if (!pack || Array.isArray(pack)) throw new Error("Expected the server's pack configuration");
+    const chunks: string[] = [];
+    await build({
+      ...pack,
+      config: false,
+      cwd: serverDir,
+      entry,
+      write: false,
+      clean: false,
+      dts: false,
+      exports: false,
+      report: false,
+      logLevel: "silent",
+      plugins: [
+        {
+          name: "sea-undici-regression",
+          resolveId: (id) => (id === entry ? entry : undefined),
+          load: (id) =>
+            id === entry
+              ? 'export { Agent, FormData, getGlobalDispatcher } from "@effect/platform-node/Undici"; export { layerUndiciNoDispatcher } from "@effect/platform-node/NodeHttpClient";'
+              : undefined,
+          generateBundle(_options, bundle) {
+            for (const output of Object.values(bundle))
+              if (output.type === "chunk") chunks.push(output.code);
+          },
+        },
+      ],
+    });
+    assert.strictEqual(chunks.length, 1);
+    const source = chunks.join("\n");
+    assert.deepStrictEqual(findEsmImportsOfExternalPackages(source), []);
+    assert.match(source, /createRequire\(process\.execPath\)\("undici"\)/);
+    for (const name of ["Agent", "FormData", "getGlobalDispatcher", "layerUndiciNoDispatcher"])
+      assert.include(source, name);
+    assert.strictEqual(isRuntimeExternalCliDependency("undici"), true);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
 
 describe("shouldBundleCliDependency", () => {
   it("leaves native addons and their dlopen wrappers external", () => {

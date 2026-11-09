@@ -60,6 +60,13 @@ const make = Effect.gen(function* () {
       sql
         .withTransaction(
           Effect.gen(function* () {
+            // Only an explicitly verified reactivation starts another bounded retry window.
+            // A routine refresh of an active subscription must not replenish its attempts.
+            yield* sql`UPDATE mcp_event_deliveries SET attempts = 0, next_attempt_at = ${input.now}
+      WHERE subscription_id = ${input.id} AND acknowledged = 0 AND EXISTS (
+        SELECT 1 FROM mcp_event_subscriptions
+        WHERE id = ${input.id} AND principal = ${input.principal} AND active = 0
+      )`;
             yield* sql`
       INSERT INTO mcp_event_subscriptions (id, principal, name, thread_id, callback_url, source_url, secret, previous_secret,
         rotation_until, expires_at, active, scan_cursor, ack_cursor, truncated)
