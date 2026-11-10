@@ -2,7 +2,6 @@ import * as NodeDnsPromises from "node:dns/promises";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- The callback adapter must pin DNS without changing TLS hostname verification.
 import * as NodeHttps from "node:https";
 import * as NodeNet from "node:net";
-// @effect-diagnostics-next-line nodeBuiltinImport:off -- Reject callbacks to the server's own network interfaces.
 import * as NodeOS from "node:os";
 import { isPublicFaviconHost, normalizeHostname } from "@t3tools/shared/hostClassification";
 import * as Clock from "effect/Clock";
