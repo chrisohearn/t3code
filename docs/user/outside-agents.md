@@ -75,7 +75,7 @@ selected by default, or the closest lower mode allowed by your organization’s
 policy. Approving without a code starts at **Read only**:
 
 - **Read only** lets the agent read projects and threads and see
-  the available providers and models. It cannot change anything.
+  the available providers and models. It cannot change projects or threads.
 - **Supervised** through **Full access** also let it start, message and stop
   threads in every project. A thread it starts or steers cannot run with more
   permissions than the mode you chose.
@@ -112,6 +112,45 @@ Add the environment as a custom MCP app in ChatGPT's apps settings:
 3. Choose **OAuth** for authentication. ChatGPT discovers the rest; you do not
    need a client ID or secret.
 4. Create the app, then approve the sign-in page that opens.
+
+### Monitor thread updates
+
+Clients that support MCP Events can monitor a specific thread for run results,
+pending decisions, failures, and provider resource release. Ask the client what
+to monitor after approving its OAuth sign-in. Read-only access is sufficient.
+
+Notifications contain identifiers, native status, and a link to the source thread.
+Read that thread for the full result or decision. A finished run or helper does
+not establish that the requested work has been accepted.
+
+Subscriptions last one day by default and the client can refresh them. Updates
+can replay after a server restart, although older history may no longer be
+available. Delivery stops after eight failed attempts or a permanent callback
+failure. Once the callback is working again, explicitly resubscribe to reactivate
+delivery from the acknowledged cursor. Refreshing an active subscription does not
+reset its retry budget. After signing in again, subscribe through the new connection
+to resume monitoring. Explicitly stopping monitoring removes its delivery backlog. A later cursorless
+subscription starts at current events; provide a saved cursor to request replay.
+
+For direct protocol clients, the T3 extension `events/subscriptions/list` lists
+this sign-in's subscriptions: event/thread, active/stopped/expired status, expiry,
+acknowledged cursor and callback **origin**. It never returns signing secrets or
+callback paths/queries. Revoke one with `events/unsubscribe` and `{ "id": "<subscription-id>" }`;
+the standard name/arguments/delivery form also works. Other sign-ins cannot list or
+revoke these subscriptions. Each sign-in can retain up to 512 subscriptions, with
+4096 total on the server; stopped subscriptions count until explicitly removed.
+Transport state belonging to expired or revoked sign-ins is reclaimed when new
+subscriptions are saved. A new sign-in still needs an explicit subscription and a
+saved consumed cursor to replay; subscriptions never transfer between sign-ins.
+
+Callback verification fails fast when busy: up to 16 challenges per sign-in and
+64 globally can be pending. Each sign-in can attempt 512 challenges per minute,
+with 2048 globally. Failed challenges count too; retry later using the same
+subscription inputs. These limits apply to callback verification, not T3 threads
+or model execution. Callback addresses belonging to the server itself are refused.
+
+Ask the client to stop monitoring, or revoke its sign-in in
+**Settings → Sharing & access** to stop all of that connection's subscriptions.
 
 ## Other agents and bots
 

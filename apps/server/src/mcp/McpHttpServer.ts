@@ -42,6 +42,13 @@ import {
 } from "../telemetry/ProviderDimensions.ts";
 import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as McpEvents from "./McpEvents.ts";
+import * as McpEventsProtocol from "./McpEventsProtocol.ts";
+import * as McpEventsWebhook from "./McpEventsWebhook.ts";
+import * as McpEventSubscriptions from "../persistence/McpEventSubscriptions.ts";
+import * as McpEventDeliveries from "../persistence/McpEventDeliveries.ts";
+import * as AuthSessions from "../persistence/AuthSessions.ts";
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
@@ -1227,14 +1234,20 @@ export const layerInProcessMcpServer = McpServer.middleware<{
 ).pipe(Layer.provideMerge(McpServer.McpServer.layer));
 
 export const layerMcpTransport = <RA, RE, RR>(registrations: Layer.Layer<RA, RE, RR>) =>
-  McpServer.layerHttp({
-    name: "T3 Code",
-    version: packageJson.version,
-    path: "/mcp",
-    protocols: [McpProtocol.v2025_06_18],
-    allowSessionTermination: true,
-    registrations,
-  }).pipe(Layer.provide(layerMcpAuthMiddleware));
+  Layer.unwrap(
+    Effect.serviceOption(McpEvents.McpEvents).pipe(
+      Effect.map((events) =>
+        McpServer.layerHttp({
+          name: "T3 Code",
+          version: packageJson.version,
+          path: "/mcp",
+          protocols: [Option.isSome(events) ? McpEventsProtocol.protocol : McpProtocol.v2025_06_18],
+          allowSessionTermination: true,
+          registrations,
+        }).pipe(Layer.provide(layerMcpAuthMiddleware)),
+      ),
+    ),
+  );
 
 /** Every tool the T3 MCP server advertises. AgentContextBudget.test.ts measures this set. */
 export const layerTools = Layer.mergeAll(
@@ -1251,4 +1264,18 @@ export const layerTools = Layer.mergeAll(
   layerHtmlToolkit,
 );
 
-export const layer = layerMcpTransport(layerTools);
+const layerEvents = McpEvents.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      McpEventSubscriptions.layer,
+      McpEventDeliveries.layer,
+      AuthSessions.layer,
+      OrchestrationEventStore.layer,
+    ),
+  ),
+  Layer.provide(McpEventsWebhook.layer.pipe(Layer.provide(McpEventsWebhook.layerNetwork))),
+);
+
+export const layer = Layer.merge(layerMcpTransport(layerTools), McpEvents.layerDeliveryWorker).pipe(
+  Layer.provide(layerEvents),
+);
