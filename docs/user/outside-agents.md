@@ -139,6 +139,15 @@ callback paths/queries. Revoke one with `events/unsubscribe` and `{ "id": "<subs
 the standard name/arguments/delivery form also works. Other sign-ins cannot list or
 revoke these subscriptions. Each sign-in can retain up to 512 subscriptions, with
 4096 total on the server; stopped subscriptions count until explicitly removed.
+Transport state belonging to expired or revoked sign-ins is reclaimed when new
+subscriptions are saved. A new sign-in still needs an explicit subscription and a
+saved consumed cursor to replay; subscriptions never transfer between sign-ins.
+
+Callback verification fails fast when busy: up to 16 challenges per sign-in and
+64 globally can be pending. Each sign-in can attempt 512 challenges per minute,
+with 2048 globally. Failed challenges count too; retry later using the same
+subscription inputs. These limits apply to callback verification, not T3 threads
+or model execution. Callback addresses belonging to the server itself are refused.
 
 Ask the client to stop monitoring, or revoke its sign-in in
 **Settings → Sharing & access** to stop all of that connection's subscriptions.

@@ -782,3 +782,44 @@ it.effect(
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );
+
+it.effect.each(["revoked", "expired"] as const)(
+  "reclaims unreachable %s-principal transport slots without removing live receipts",
+  (state) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const input = inputFor(ThreadId.make("reclaim"));
+        const own = yield* f.call(f.service.subscribe(input));
+        yield* f.append([input.arguments.threadId]);
+        f.responses.set("event-0", 503);
+        yield* f.service.drain();
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n < 4095)
+      INSERT INTO mcp_event_subscriptions SELECT id || '-dead-' || n, ${f.other}, name, thread_id,
+        callback_url || '/' || n, source_url, secret, previous_secret, rotation_until, expires_at,
+        1, scan_cursor, ack_cursor, truncated FROM mcp_event_subscriptions CROSS JOIN numbers WHERE id = ${own.id}`;
+        yield* sql`INSERT INTO mcp_event_deliveries (subscription_id, event_id, sequence, body) VALUES (${own.id + "-dead-1"}, 'dead-event', 1, '{}')`;
+        if (state === "revoked")
+          yield* f.sessions.revoke({ sessionId: f.other, revokedAt: DateTime.makeUnsafe(0) });
+        else
+          yield* sql`UPDATE auth_sessions SET expires_at = '1970-01-01T00:00:00.000Z' WHERE session_id = ${f.other}`;
+        yield* f.call(
+          f.service.subscribe({
+            ...input,
+            delivery: { ...input.delivery, url: "https://new.example.com/events" },
+          }),
+        );
+        expect(
+          (yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM mcp_event_subscriptions`)[0]
+            ?.count,
+        ).toBe(2);
+        expect(yield* f.deliveries.count(own.id + "-dead-1")).toBe(0);
+        expect(yield* f.deliveries.count(own.id)).toBe(1);
+        expect((yield* f.subscriptions.get(own.id))?.active).toBe(1);
+        expect((yield* f.call(f.service.subscribe(input), f.other).pipe(Effect.flip)).reason).toBe(
+          "access_denied",
+        );
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);

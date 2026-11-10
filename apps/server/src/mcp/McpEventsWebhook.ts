@@ -2,6 +2,8 @@ import * as NodeDnsPromises from "node:dns/promises";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- The callback adapter must pin DNS without changing TLS hostname verification.
 import * as NodeHttps from "node:https";
 import * as NodeNet from "node:net";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Reject callbacks to the server's own network interfaces.
+import * as NodeOS from "node:os";
 import { isPublicFaviconHost, normalizeHostname } from "@t3tools/shared/hostClassification";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -32,6 +34,8 @@ export class CallbackError extends Schema.TaggedError<CallbackError>()("McpEvent
     "payload_too_large",
     "challenge_failed",
     "access_denied",
+    "verification_busy",
+    "verification_rate_limited",
   ]),
 }) {
   override get message() {
@@ -52,6 +56,7 @@ interface CallbackResponse {
 export class CallbackNetwork extends Context.Service<
   CallbackNetwork,
   {
+    readonly localAddresses: Effect.Effect<ReadonlyArray<Address>, CallbackError>;
     readonly resolve: (hostname: string) => Effect.Effect<ReadonlyArray<Address>, CallbackError>;
     readonly post: (input: {
       readonly url: URL;
@@ -63,6 +68,16 @@ export class CallbackNetwork extends Context.Service<
 >()("t3/mcp/McpEventsWebhook/CallbackNetwork") {}
 
 export const layerNetwork = Layer.succeed(CallbackNetwork, {
+  localAddresses: Effect.try({
+    try: () =>
+      Object.values(NodeOS.networkInterfaces()).flatMap((entries) =>
+        (entries ?? []).map((entry) => ({
+          address: entry.address,
+          family: entry.family === "IPv6" ? 6 : 4,
+        })),
+      ),
+    catch: () => new CallbackError({ reason: "network" }),
+  }),
   resolve: Effect.fn("McpEventsWebhook.resolve")((hostname: string) =>
     Effect.tryPromise({
       try: () => NodeDnsPromises.lookup(hostname, { all: true, verbatim: true }),
@@ -183,6 +198,43 @@ const make = Effect.gen(function* () {
   const digest = yield* Digest.Digest;
   const random = yield* SecureRandom.SecureRandom;
   const verified = new Map<string, number>();
+  const pending = new Set<string>();
+  const principals = new Map<string, { active: number; remaining: number; refillAt: number }>();
+  let remaining = 2048;
+  let refillAt = 0;
+  const acquireVerification = Effect.fn("McpEventsWebhook.acquireVerification")(function* (
+    key: string,
+    principal: string,
+  ) {
+    const now = yield* Clock.currentTimeMillis;
+    for (const [id, bucket] of principals)
+      if (bucket.active === 0 && bucket.refillAt <= now) principals.delete(id);
+    if (pending.has(key) || pending.size >= 64)
+      return yield* new CallbackError({ reason: "verification_busy" });
+    if (refillAt <= now) {
+      remaining = 2048;
+      refillAt = now + 60_000;
+    }
+    let bucket = principals.get(principal);
+    if (bucket === undefined) {
+      if (principals.size >= 4096)
+        return yield* new CallbackError({ reason: "verification_rate_limited" });
+      bucket = { active: 0, remaining: 512, refillAt: now + 60_000 };
+      principals.set(principal, bucket);
+    } else if (bucket.refillAt <= now) {
+      bucket.remaining = 512;
+      bucket.refillAt = now + 60_000;
+    }
+    if (bucket.active >= 16) return yield* new CallbackError({ reason: "verification_busy" });
+    if (bucket.remaining <= 0 || remaining <= 0)
+      return yield* new CallbackError({ reason: "verification_rate_limited" });
+    // Fail fast instead of queuing unbounded handlers behind callback sockets.
+    pending.add(key);
+    bucket.active++;
+    bucket.remaining--;
+    remaining--;
+    return bucket;
+  });
 
   const send = Effect.fn("McpEventsWebhook.send")(function* (
     input: Parameters<McpEventsWebhook["Service"]["send"]>[0],
@@ -191,12 +243,16 @@ const make = Effect.gen(function* () {
     if (Buffer.byteLength(input.body, "utf8") > 256 * 1024)
       return yield* new CallbackError({ reason: "payload_too_large" });
     const addresses = yield* network.resolve(normalizeHostname(url.hostname));
+    const own = new NodeNet.BlockList();
+    for (const entry of yield* network.localAddresses)
+      own.addAddress(entry.address, entry.family === 6 ? "ipv6" : "ipv4");
     if (
       addresses.length === 0 ||
       addresses.some(
         ({ address, family }) =>
           NodeNet.isIP(address) !== family ||
           !isPublicFaviconHost(address) ||
+          own.check(address, family === 6 ? "ipv6" : "ipv4") ||
           (family === 6 && !/^[23]/i.test(address)),
       )
     )
@@ -249,26 +305,37 @@ const make = Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       for (const [cached, expiry] of verified) if (expiry <= now) verified.delete(cached);
       if ((verified.get(key) ?? 0) > now) return;
-      const challenge = Buffer.from(yield* random.randomBytes(32)).toString("base64url");
-      const id = `verification_${Buffer.from(yield* random.randomBytes(24)).toString("base64url")}`;
-      const body = yield* encodeJson({ type: "verification", challenge }).pipe(
-        Effect.mapError(() => new CallbackError({ reason: "challenge_failed" })),
+      yield* Effect.acquireUseRelease(
+        acquireVerification(key, input.principal),
+        () =>
+          Effect.gen(function* () {
+            const challenge = Buffer.from(yield* random.randomBytes(32)).toString("base64url");
+            const id = `verification_${Buffer.from(yield* random.randomBytes(24)).toString("base64url")}`;
+            const body = yield* encodeJson({ type: "verification", challenge }).pipe(
+              Effect.mapError(() => new CallbackError({ reason: "challenge_failed" })),
+            );
+            const response = yield* send({ ...input, url: url.href, id, body });
+            const echoed = yield* decodeChallenge(response.body).pipe(
+              Effect.mapError(() => new CallbackError({ reason: "challenge_failed" })),
+            );
+            if (
+              response.status < 200 ||
+              response.status >= 300 ||
+              (yield* Clock.currentTimeMillis) - now > 30_000 ||
+              !(yield* constantTimeEquals(challenge, echoed.challenge).pipe(
+                Effect.provideService(Digest.Digest, digest),
+              ))
+            )
+              return yield* new CallbackError({ reason: "challenge_failed" });
+            if (verified.size >= 1024) verified.delete(verified.keys().next().value!);
+            verified.set(key, now + 300_000);
+          }),
+        (bucket) =>
+          Effect.sync(() => {
+            bucket.active--;
+            pending.delete(key);
+          }),
       );
-      const response = yield* send({ ...input, url: url.href, id, body });
-      const echoed = yield* decodeChallenge(response.body).pipe(
-        Effect.mapError(() => new CallbackError({ reason: "challenge_failed" })),
-      );
-      if (
-        response.status < 200 ||
-        response.status >= 300 ||
-        (yield* Clock.currentTimeMillis) - now > 30_000 ||
-        !(yield* constantTimeEquals(challenge, echoed.challenge).pipe(
-          Effect.provideService(Digest.Digest, digest),
-        ))
-      )
-        return yield* new CallbackError({ reason: "challenge_failed" });
-      if (verified.size >= 1024) verified.delete(verified.keys().next().value!);
-      verified.set(key, now + 300_000);
     }),
   });
 });

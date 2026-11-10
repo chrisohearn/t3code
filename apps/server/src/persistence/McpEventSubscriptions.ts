@@ -1,5 +1,6 @@
 import { McpEventName, McpEventsError, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
@@ -78,6 +79,11 @@ const make = Effect.gen(function* () {
       sql
         .withTransaction(
           Effect.gen(function* () {
+            // A dead auth principal cannot unsubscribe; its transport state must not hold capacity forever.
+            yield* sql`DELETE FROM mcp_event_subscriptions WHERE principal IN (
+              SELECT session_id FROM auth_sessions
+              WHERE revoked_at IS NOT NULL OR expires_at <= ${DateTime.formatIso(DateTime.makeUnsafe(input.now))}
+            )`;
             // Bound retained storage as well as live delivery. Check and activate in
             // this transaction, so distinct identities cannot race for the last slot.
             const [counts] = yield* sql<{
