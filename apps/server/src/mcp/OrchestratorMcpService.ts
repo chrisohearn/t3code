@@ -199,6 +199,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadReadInput,
   ) => Effect.Effect<OrchestratorMcpThreadReadResult, OrchestratorMcpFailure>;
+  readonly inspectThread: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpThreadReadInput,
+  ) => Effect.Effect<OrchestratorMcpThreadReadResult, OrchestratorMcpFailure>;
   readonly sendToThread: (
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadSendInput,
@@ -1049,29 +1053,24 @@ const make = Effect.gen(function* () {
           ),
         );
 
-  const loadProjection = (threadId: ThreadId, includeUserMessages = true) =>
-    threadManagement
-      .getThreadRecords(
-        threadId,
-        [
-          "runs",
-          "messages",
-          "providerThreads",
-          "providerTurns",
-          "runtimeRequests",
-          "contextTransfers",
-          "turnItems",
-        ],
-        { turnItemTypes: [], messageRoles: includeUserMessages ? ["user"] : [] },
-      )
-      .pipe(
-        Effect.mapError((error) =>
-          failure(
-            "orchestration_error",
-            `Unable to read thread ${threadId}: ${errorMessage(error)}`,
-          ),
-        ),
-      );
+  const loadProjection = (threadId: ThreadId, includeUserMessages = true, storedOnly = false) =>
+    threadManagement[storedOnly ? "getStoredThreadRecords" : "getThreadRecords"](
+      threadId,
+      [
+        "runs",
+        "messages",
+        "providerThreads",
+        "providerTurns",
+        "runtimeRequests",
+        "contextTransfers",
+        "turnItems",
+      ],
+      { turnItemTypes: [], messageRoles: includeUserMessages ? ["user"] : [] },
+    ).pipe(
+      Effect.mapError((error) =>
+        failure("orchestration_error", `Unable to read thread ${threadId}: ${errorMessage(error)}`),
+      ),
+    );
 
   // A dispatcher thread holds thousands of tasks, each with its full prompt; read only the ones named.
   const loadTasks = (threadId: ThreadId, taskIds: ReadonlyArray<NodeId>) =>
@@ -1121,6 +1120,7 @@ const make = Effect.gen(function* () {
 
   const loadCaller = Effect.fn("OrchestratorMcpService.loadCaller")(function* (
     scope: McpInvocationScope,
+    storedOnly = false,
   ) {
     yield* requireCapability(scope);
     if (scope.thread === undefined) {
@@ -1130,7 +1130,7 @@ const make = Effect.gen(function* () {
       } as const;
     }
     // No loadCaller consumer reads the caller's own prompts.
-    const parent = yield* loadProjection(scope.thread.threadId, false);
+    const parent = yield* loadProjection(scope.thread.threadId, false, storedOnly);
     return {
       parent,
       limits: {
@@ -1245,8 +1245,9 @@ const make = Effect.gen(function* () {
   const loadReadableThread = Effect.fn("OrchestratorMcpService.loadReadableThread")(function* (
     scope: McpInvocationScope,
     threadId: ThreadId,
+    storedOnly = false,
   ) {
-    const { parent } = yield* loadCaller(scope);
+    const { parent } = yield* loadCaller(scope, storedOnly);
     const shell = yield* threadManagement
       .getThreadShell(threadId)
       .pipe(Effect.mapError(threadManagementFailure));
@@ -1259,16 +1260,15 @@ const make = Effect.gen(function* () {
     }
     const input = { projectId: shell.projectId, threadId };
     // Transfers are needed only to acknowledge a caller's child-task result.
+    const readProjectRecords = storedOnly
+      ? threadManagement.getStoredProjectThreadRecords
+      : threadManagement.getProjectThreadRecords;
     const records =
       parent === undefined
-        ? threadManagement
-            .getProjectThreadRecords(input, ["runs", "runtimeRequests"])
-            .pipe(Effect.map((target) => ({ ...target, contextTransfers: [] })))
-        : threadManagement.getProjectThreadRecords(input, [
-            "runs",
-            "runtimeRequests",
-            "contextTransfers",
-          ]);
+        ? readProjectRecords(input, ["runs", "runtimeRequests"]).pipe(
+            Effect.map((target) => ({ ...target, contextTransfers: [] })),
+          )
+        : readProjectRecords(input, ["runs", "runtimeRequests", "contextTransfers"]);
     const target = yield* records.pipe(Effect.mapError(threadManagementFailure));
     return { parent, target, shell } as const;
   });
@@ -2098,6 +2098,127 @@ const make = Effect.gen(function* () {
       yield* resolveInteractionMode(limits.interactionMode, modes.interactionMode);
     }
     return task;
+  });
+
+  // The public operations own tracing; only the consuming reader enters task delivery.
+  const readThreadContent = Effect.fnUntraced(function* (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpThreadReadInput,
+    acknowledgeResults: boolean,
+  ) {
+    const storedOnly = !acknowledgeResults;
+    const { parent, target, shell } = yield* loadReadableThread(scope, input.threadId, storedOnly);
+    const view = input.view ?? "messages";
+    const afterPosition = input.afterPosition ?? -1;
+    const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
+    const maxChars = input.maxCharsPerItem ?? DEFAULT_THREAD_ITEM_MAX_CHARS;
+    const timeline = yield* threadManagement[
+      storedOnly ? "getStoredTimelinePage" : "getTimelinePage"
+    ](input.threadId, {
+      afterPosition,
+      limit,
+      view,
+      ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
+    }).pipe(Effect.mapError(threadManagementFailure));
+    const page = timeline.items;
+    const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
+    for (const row of page) {
+      if (row.item.type !== "user_message" && row.item.type !== "assistant_message") continue;
+      const ids = messageIdsByThread.get(row.sourceThreadId) ?? [];
+      ids.push(row.item.messageId);
+      messageIdsByThread.set(row.sourceThreadId, ids);
+    }
+    const sourceMessages = yield* Effect.forEach(
+      [...messageIdsByThread],
+      ([threadId, messageIds]) =>
+        threadManagement[storedOnly ? "getStoredThreadRecords" : "getThreadRecords"](
+          threadId,
+          ["messages"],
+          { messageIds },
+        ).pipe(
+          Effect.map((records) => [threadId, records.messages] as const),
+          Effect.mapError(threadManagementFailure),
+        ),
+      { concurrency: 1 },
+    );
+    const messagesByThreadId = new Map(sourceMessages);
+    const returnedRunIds = new Set(
+      page.filter((row) => row.sourceThreadId === target.thread.id).map((row) => row.item.runId),
+    );
+    const tasks =
+      !acknowledgeResults || parent === undefined
+        ? []
+        : directAppOwnedChildTasks(
+            {
+              thread: parent.thread,
+              subagents: yield* loadTasks(
+                parent.thread.id,
+                directChildTaskIds(target, returnedRunIds),
+              ),
+            },
+            target,
+            returnedRunIds,
+          );
+    if (
+      parent !== undefined &&
+      scope.thread !== undefined &&
+      tasks.length > 0 &&
+      (input.textOffset ?? 0) === 0
+    ) {
+      for (const task of tasks) {
+        const transfer = taskResultTransfer(parent, target, task);
+        const resultRunId = transfer?.sourcePoint.runId ?? delegatedTaskRun(target, task)?.id;
+        const resultRunIds = resultRunId === undefined ? [] : [resultRunId];
+        const resultRecords = yield* threadManagement
+          .getThreadRecords(target.thread.id, ["messages", "turnItems"], {
+            messageRoles: ["assistant"],
+            messageRunIds: resultRunIds,
+            turnItemRunIds: resultRunIds,
+            turnItemTypes: ["assistant_message", "error"],
+          })
+          .pipe(Effect.mapError(threadManagementFailure));
+        if (
+          pageIncludesTerminalTaskResult({
+            parent,
+            page,
+            task,
+            target: { ...target, ...resultRecords },
+            maxChars,
+          })
+        ) {
+          yield* readTask(
+            scope as McpThreadInvocationScope,
+            task.id,
+            false,
+            true,
+            "thread-read-acknowledge",
+          );
+        }
+      }
+    }
+    return {
+      thread: threadDetail(
+        scope,
+        target,
+        timeline.totalItems,
+        shell,
+        yield* Clock.currentTimeMillis,
+      ),
+      recentRuns: target.runs
+        .toSorted((left, right) => right.ordinal - left.ordinal)
+        .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
+        .map(threadRun),
+      items: page.map((row) =>
+        timelineItem({
+          row,
+          maxChars,
+          messagesByThreadId,
+          ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
+        }),
+      ),
+      nextPosition: page.at(-1)?.position ?? null,
+      hasMore: timeline.hasMore,
+    } satisfies OrchestratorMcpThreadReadResult;
   });
 
   return OrchestratorMcpService.of({
@@ -3115,116 +3236,12 @@ const make = Effect.gen(function* () {
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
     }),
-    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, input) {
-      const { parent, target, shell } = yield* loadReadableThread(scope, input.threadId);
-      const view = input.view ?? "messages";
-      const afterPosition = input.afterPosition ?? -1;
-      const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
-      const maxChars = input.maxCharsPerItem ?? DEFAULT_THREAD_ITEM_MAX_CHARS;
-      const timeline = yield* threadManagement
-        .getTimelinePage(input.threadId, {
-          afterPosition,
-          limit,
-          view,
-          ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
-        })
-        .pipe(Effect.mapError(threadManagementFailure));
-      const page = timeline.items;
-      const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
-      for (const row of page) {
-        if (row.item.type !== "user_message" && row.item.type !== "assistant_message") continue;
-        const ids = messageIdsByThread.get(row.sourceThreadId) ?? [];
-        ids.push(row.item.messageId);
-        messageIdsByThread.set(row.sourceThreadId, ids);
-      }
-      const sourceMessages = yield* Effect.forEach(
-        [...messageIdsByThread],
-        ([threadId, messageIds]) =>
-          threadManagement.getThreadRecords(threadId, ["messages"], { messageIds }).pipe(
-            Effect.map((records) => [threadId, records.messages] as const),
-            Effect.mapError(threadManagementFailure),
-          ),
-        { concurrency: 1 },
-      );
-      const messagesByThreadId = new Map(sourceMessages);
-      const returnedRunIds = new Set(
-        page.filter((row) => row.sourceThreadId === target.thread.id).map((row) => row.item.runId),
-      );
-      const tasks =
-        parent === undefined
-          ? []
-          : directAppOwnedChildTasks(
-              {
-                thread: parent.thread,
-                subagents: yield* loadTasks(
-                  parent.thread.id,
-                  directChildTaskIds(target, returnedRunIds),
-                ),
-              },
-              target,
-              returnedRunIds,
-            );
-      if (
-        parent !== undefined &&
-        scope.thread !== undefined &&
-        tasks.length > 0 &&
-        (input.textOffset ?? 0) === 0
-      ) {
-        for (const task of tasks) {
-          const transfer = taskResultTransfer(parent, target, task);
-          const resultRunId = transfer?.sourcePoint.runId ?? delegatedTaskRun(target, task)?.id;
-          const resultRunIds = resultRunId === undefined ? [] : [resultRunId];
-          const resultRecords = yield* threadManagement
-            .getThreadRecords(target.thread.id, ["messages", "turnItems"], {
-              messageRoles: ["assistant"],
-              messageRunIds: resultRunIds,
-              turnItemRunIds: resultRunIds,
-              turnItemTypes: ["assistant_message", "error"],
-            })
-            .pipe(Effect.mapError(threadManagementFailure));
-          if (
-            pageIncludesTerminalTaskResult({
-              parent,
-              page,
-              task,
-              target: { ...target, ...resultRecords },
-              maxChars,
-            })
-          ) {
-            yield* readTask(
-              scope as McpThreadInvocationScope,
-              task.id,
-              false,
-              true,
-              "thread-read-acknowledge",
-            );
-          }
-        }
-      }
-      return {
-        thread: threadDetail(
-          scope,
-          target,
-          timeline.totalItems,
-          shell,
-          yield* Clock.currentTimeMillis,
-        ),
-        recentRuns: target.runs
-          .toSorted((left, right) => right.ordinal - left.ordinal)
-          .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
-          .map(threadRun),
-        items: page.map((row) =>
-          timelineItem({
-            row,
-            maxChars,
-            messagesByThreadId,
-            ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
-          }),
-        ),
-        nextPosition: page.at(-1)?.position ?? null,
-        hasMore: timeline.hasMore,
-      } satisfies OrchestratorMcpThreadReadResult;
-    }),
+    readThread: Effect.fn("OrchestratorMcpService.readThread")((scope, input) =>
+      readThreadContent(scope, input, true),
+    ),
+    inspectThread: Effect.fn("OrchestratorMcpService.inspectThread")((scope, input) =>
+      readThreadContent(scope, input, false),
+    ),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
       const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
       yield* assertLiveCallerForOtherThread(scope, parent, target);

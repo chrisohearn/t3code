@@ -37,6 +37,7 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 
 it("stamps authoritative provenance on commands that create threads or messages", () => {
   const command: OrchestrationV2Command = {
@@ -78,6 +79,66 @@ it("stamps authoritative provenance on commands that create threads or messages"
 
 const layerReceiptsTest = CommandReceiptStore.layer.pipe(
   Layer.provide(SqlitePersistence.layerMemory),
+);
+
+it.effect(
+  "stored readers never hydrate transcripts and retain the consuming reader's project/deletion checks",
+  () => {
+    const threadId = ThreadId.make("thread:stored-inspection");
+    const projectId = ProjectId.make("project:stored-inspection");
+    let imported = 0;
+    let deletedAt: DateTime.Utc | null = null;
+    const projection = () =>
+      ({
+        thread: { id: threadId, projectId, deletedAt },
+      }) as unknown as OrchestrationV2ThreadProjection;
+    const layer = ThreadManagementService.layerWithLegacyImporter.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          layerReceiptsTest,
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadRecords: () => Effect.succeed(projection()),
+            getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
+          }),
+          Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+            ensureTranscript: () =>
+              Effect.sync(() => {
+                imported++;
+                return { importedThreadCount: 1, importedMessageCount: 1 };
+              }),
+          }),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      const service = yield* ThreadManagementService.ThreadManagementService;
+      const before = JSON.stringify(projection());
+      yield* service.getStoredThreadRecords(threadId, []);
+      yield* service.getStoredProjectThreadRecords({ projectId, threadId }, []);
+      yield* service.getStoredTimelinePage(threadId, {
+        afterPosition: -1,
+        limit: 1,
+        view: "messages",
+      });
+      expect(imported).toBe(0);
+      expect(JSON.stringify(projection())).toBe(before);
+      for (const read of [service.getStoredProjectThreadRecords, service.getProjectThreadRecords]) {
+        const foreign = yield* read(
+          { threadId, projectId: ProjectId.make("project:foreign") },
+          [],
+        ).pipe(Effect.flip);
+        expect(foreign._tag).toBe("ThreadManagementThreadNotFoundError");
+        deletedAt = DateTime.makeUnsafe("2026-01-01T00:00:00Z");
+        const deleted = yield* read({ threadId, projectId }, []).pipe(Effect.flip);
+        expect(deleted._tag).toBe("ThreadManagementThreadNotFoundError");
+        deletedAt = null;
+      }
+      // Only the consuming reader still invokes the lazy importer.
+      expect(imported).toBe(2);
+    }).pipe(Effect.provide(layer));
+  },
 );
 
 const layerDispatchChokepointTest =

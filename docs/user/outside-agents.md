@@ -92,6 +92,28 @@ Any agent that supports remote MCP servers over HTTP with OAuth can connect. Giv
 it the MCP URL and choose OAuth, and the agent finds the sign-in settings itself.
 Agents without OAuth support cannot connect.
 
+## Inspect without consuming results
+
+Use `t3_thread_inspect` for audits and structural result inspection. It returns the
+same thread summary, recent runs, native timeline identities and text pages as
+`t3_thread_read`, under the same authorization and visibility checks. It never
+acknowledges child-result delivery, settles work, updates receipt cursors, imports legacy transcripts or starts
+work. Legacy transcripts not already imported are absent from the stored view;
+inspection does not hydrate missing history. The existing `t3_thread_read` remains a consuming reader: reading a complete
+child result can mark that result delivered.
+
+For example, call `t3_thread_inspect` with `{ "threadId": "<authorized-thread-id>",
+"view": "messages", "limit": 10, "maxCharsPerItem": 2000, "runLimit": 1 }`.
+Continue with `afterPosition` set to the returned `nextPosition` while `hasMore` is
+true. For truncated text, use its `itemId` and `nextTextOffset` as `textOffset`.
+All of these inspection pages remain non-consuming. Inspection grants no access
+beyond the caller's existing scope and does not establish human approval.
+
+The tool must be present in the connected server's advertised tools. Source or a
+merged PR alone does not make it callable: release and install the compatible
+server build, then refresh the existing MCP app's metadata in the caller. Keep
+normal consuming reads available for callers that intend delivery acknowledgement.
+
 ## Scripts on the host
 
 On the machine that runs the environment, `t3 thread` uses the same tools

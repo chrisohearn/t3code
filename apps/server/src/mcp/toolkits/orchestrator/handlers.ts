@@ -159,6 +159,13 @@ const handlers = {
       return yield* service.readThread(scope, input);
     }),
   ),
+  t3_thread_inspect: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      return yield* service.inspectThread(scope, input);
+    }),
+  ),
   t3_thread_update: McpToolAccess.writesThreads(
     (input) => [input.threadId],
     (input) =>

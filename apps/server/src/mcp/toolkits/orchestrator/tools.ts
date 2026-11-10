@@ -249,6 +249,21 @@ const ThreadReadTool = Tool.make("t3_thread_read", {
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true);
 
+const ThreadInspectTool = Tool.make("t3_thread_inspect", {
+  description:
+    "Inspect a thread without acknowledging child-result delivery or changing thread, task, settlement or receipt state. Uses the same visibility checks and result shape as t3_thread_read. `messages` (default): user and assistant messages and plans. `activity`: all timeline items. Keep reads small; page with `afterPosition=nextPosition`. Cut-off text: `itemId` with `textOffset=nextTextOffset`. In your reply, name it as its `link` verbatim.",
+  parameters: OrchestratorMcpThreadReadInput,
+  success: OrchestratorMcpThreadReadResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Inspect a T3 thread without consuming results")
+  .annotate(Tool.Strict, true)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
 const ThreadUpdateTool = Tool.make("t3_thread_update", {
   description:
     "Rename a thread (`action:'rename'` with `title`) or regenerate its title. Omit `threadId` for this thread. Workspace and branch cannot change here.",
@@ -361,6 +376,7 @@ export const OrchestratorToolkit = Toolkit.make(
   CreateThreadsTool,
   ThreadListTool,
   ThreadReadTool,
+  ThreadInspectTool,
   ThreadUpdateTool,
   ThreadSendTool,
   ThreadWaitTool,

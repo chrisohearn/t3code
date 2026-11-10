@@ -375,12 +375,15 @@ export interface ThreadManagementServiceShape {
   >;
   readonly getThreadHistoryPage: Orchestrator.OrchestratorV2["Service"]["getThreadHistoryPage"];
   readonly getTimelinePage: Orchestrator.OrchestratorV2["Service"]["getTimelinePage"];
+  /** Stored projection only: never imports legacy transcripts. */
+  readonly getStoredTimelinePage: Orchestrator.OrchestratorV2["Service"]["getTimelinePage"];
   readonly getMessageCount: Orchestrator.OrchestratorV2["Service"]["getMessageCount"];
   readonly getTurnItem: (input: {
     readonly threadId: ThreadId;
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
   readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
+  readonly getStoredThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, Orchestrator.OrchestratorV2Error>;
@@ -402,6 +405,7 @@ export interface ThreadManagementServiceShape {
     ProjectionRecords<K>,
     ThreadManagementProjectionLoadError | ThreadManagementThreadNotFoundError
   >;
+  readonly getStoredProjectThreadRecords: ThreadManagementServiceShape["getProjectThreadRecords"];
   readonly getShellSnapshot: (
     options?: Pick<
       ShellSnapshotOptions,
@@ -752,13 +756,12 @@ const make = Effect.gen(function* () {
       Effect.andThen(orchestrator.dispatch(command)),
     );
 
-  const getProjectThreadRecords: ThreadManagementServiceShape["getProjectThreadRecords"] = (
+  const getStoredProjectThreadRecords: ThreadManagementServiceShape["getProjectThreadRecords"] = (
     input,
     fields,
     filter,
   ) =>
-    ensureProjectionTranscript(input.threadId).pipe(
-      Effect.andThen(orchestrator.getThreadRecords(input.threadId, fields, filter)),
+    orchestrator.getThreadRecords(input.threadId, fields, filter).pipe(
       Effect.mapError(
         (cause) =>
           new ThreadManagementProjectionLoadError({
@@ -776,6 +779,23 @@ const make = Effect.gen(function* () {
             threadId: input.threadId,
           }),
       ),
+    );
+
+  const getProjectThreadRecords: ThreadManagementServiceShape["getProjectThreadRecords"] = (
+    input,
+    fields,
+    filter,
+  ) =>
+    ensureProjectionTranscript(input.threadId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ThreadManagementProjectionLoadError({
+            projectId: input.projectId,
+            threadId: input.threadId,
+            cause,
+          }),
+      ),
+      Effect.andThen(getStoredProjectThreadRecords(input, fields, filter)),
     );
 
   const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = (input) =>
@@ -1519,6 +1539,9 @@ const make = Effect.gen(function* () {
     getThreadTranscript,
     getThreadSnapshotWindow,
     getProjectThreadRecords,
+    getStoredProjectThreadRecords,
+    getStoredThreadRecords: orchestrator.getThreadRecords,
+    getStoredTimelinePage: orchestrator.getTimelinePage,
     getShellSnapshot: orchestrator.getShellSnapshot,
     listActiveSubagentThreadIds: orchestrator.listActiveSubagentThreadIds,
     countThreads: orchestrator.countThreads,
