@@ -210,3 +210,6 @@ Architecture and its constraints: `docs/internals/overview.md`. Glossary: `docs/
 ## Additional tips
 
 - Security is important, but should not be over-indexed on, especially for dev mode/maintainer-only features.
+
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+Exercise this ownership within established authorization, preserving more-specific user decisions, product boundaries, and required source, review, release, and safety controls.
