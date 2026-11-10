@@ -26,12 +26,33 @@ export const McpEventSubscribe = Schema.Struct({
   ttlMs: Schema.optionalKey(Schema.NullOr(Schema.Int.check(Schema.isGreaterThan(0)))),
 });
 export type McpEventSubscribe = typeof McpEventSubscribe.Type;
-export const McpEventUnsubscribe = Schema.Struct({
+export const McpEventSubscriptionIdentity = Schema.Struct({
   name: McpEventName,
   arguments: McpEventArguments,
   delivery: McpEventDelivery,
 });
+export const McpEventUnsubscribeById = Schema.Struct({
+  id: Schema.String.check(Schema.isMaxLength(128)),
+});
+export const McpEventUnsubscribe = Schema.Union([
+  McpEventSubscriptionIdentity,
+  McpEventUnsubscribeById,
+]);
 export type McpEventUnsubscribe = typeof McpEventUnsubscribe.Type;
+export const McpEventSubscriptionsResult = Schema.Struct({
+  subscriptions: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      name: McpEventName,
+      arguments: McpEventArguments,
+      callbackOrigin: Schema.String,
+      status: Schema.Literals(["active", "stopped", "expired"]),
+      expiresAt: Schema.String,
+      cursor: Schema.String,
+    }),
+  ),
+});
+export type McpEventSubscriptionsResult = typeof McpEventSubscriptionsResult.Type;
 
 export const McpEventSubscriptionResult = Schema.Struct({
   id: Schema.String,

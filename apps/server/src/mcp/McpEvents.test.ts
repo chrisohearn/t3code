@@ -8,6 +8,7 @@ import {
   ThreadId,
   mcpClientScopes,
   type McpEventSubscribe,
+  McpEventsError,
   NodeId,
   ProviderInstanceId,
   ProviderDriverKind,
@@ -66,6 +67,7 @@ const fixture = Effect.gen(function* () {
     yield* Queue.unbounded<Parameters<Webhook.McpEventsWebhook["Service"]["send"]>[0]>();
   const verify: Array<Parameters<Webhook.McpEventsWebhook["Service"]["verify"]>[0]> = [];
   const responses = new Map<string, number>();
+  let verificationWork: Effect.Effect<void> = Effect.void;
   const layer = McpEvents.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -79,7 +81,7 @@ const fixture = Effect.gen(function* () {
           verify: (input) =>
             Effect.sync(() => {
               verify.push(input);
-            }),
+            }).pipe(Effect.andThen(Effect.suspend(() => verificationWork))),
           send: (input) =>
             Effect.sync(() => {
               sent.push(input);
@@ -157,6 +159,9 @@ const fixture = Effect.gen(function* () {
     delivered,
     verify,
     responses,
+    setVerificationWork: (work: Effect.Effect<void>) => {
+      verificationWork = work;
+    },
     deleted,
   };
 });
@@ -277,7 +282,7 @@ it.effect(
         yield* f.call(f.service.unsubscribe(input), f.other);
         yield* f.call(f.service.unsubscribe(input), f.other);
         expect((yield* f.subscriptions.get(own.id))?.active).toBe(1);
-        expect((yield* f.subscriptions.get(other.id))?.active).toBe(0);
+        expect(yield* f.subscriptions.get(other.id)).toBeUndefined();
         yield* f.call(f.service.subscribe(input), f.other);
         yield* f.sessions.revoke({ sessionId: f.other, revokedAt: DateTime.makeUnsafe(0) });
         yield* f.append([thread]);
@@ -632,6 +637,148 @@ it.effect(
         });
         expect(f.sent[0]!.body).not.toContain("PRIVATE REQUEST");
         expect(yield* f.store.latestApplicationSequence).toBe(2);
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["principal", "global"] as const)(
+  "enforces the %s cap on reactivation, retained rows and concurrent creation",
+  (scope) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const input = inputFor(ThreadId.make("capacity"));
+        const sub = yield* f.call(f.service.subscribe(input));
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        const capacity = scope === "principal" ? 512 : 4096;
+        const principal = scope === "principal" ? f.principal : f.other;
+        // Seed the boundary directly; no synthetic threads or network work.
+        yield* sql`WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n < ${capacity})
+      INSERT INTO mcp_event_subscriptions
+      SELECT id || '-' || n, ${principal}, name, thread_id, callback_url || '/' || n, source_url,
+        secret, previous_secret, rotation_until, expires_at, 1, scan_cursor, ack_cursor, truncated
+      FROM mcp_event_subscriptions CROSS JOIN numbers WHERE id = ${sub.id}`;
+        yield* sql`UPDATE mcp_event_subscriptions SET active = 0 WHERE id = ${sub.id}`;
+        expect((yield* f.call(f.service.subscribe(input)).pipe(Effect.flip)).reason).toBe(
+          "subscription_limit",
+        );
+        // A stopped row still occupies bounded durable storage; new URLs cannot accumulate tombstones.
+        yield* sql`UPDATE mcp_event_subscriptions SET active = 0`;
+        const fresh = {
+          ...input,
+          delivery: { ...input.delivery, url: "https://new.example.com/events" },
+        };
+        expect((yield* f.call(f.service.subscribe(fresh)).pipe(Effect.flip)).reason).toBe(
+          "subscription_limit",
+        );
+        // Exactly one remaining slot, with distinct identities racing to claim it.
+        yield* sql`DELETE FROM mcp_event_subscriptions WHERE id IN (SELECT id FROM mcp_event_subscriptions LIMIT 2)`;
+        const results = yield* Effect.forEach(
+          [
+            fresh,
+            { ...fresh, delivery: { ...fresh.delivery, url: "https://other.example.com/events" } },
+          ],
+          (i) => f.call(f.service.subscribe(i)).pipe(Effect.result),
+          { concurrency: "unbounded" },
+        );
+        expect(results.filter((r) => r._tag === "Success")).toHaveLength(1);
+        expect(
+          (yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM mcp_event_subscriptions`)[0]
+            ?.count,
+        ).toBe(capacity);
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect(
+  "lists only the current principal's secret-free subscriptions and revokes one by ID",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const input = inputFor(ThreadId.make("managed"));
+        const own = yield* f.call(f.service.subscribe(input));
+        yield* f.call(f.service.subscribe(input), f.other);
+        const listed = yield* f.call(f.service.listSubscriptions());
+        expect(listed.subscriptions).toEqual([
+          {
+            id: own.id,
+            name: input.name,
+            arguments: input.arguments,
+            callbackOrigin: "https://callbacks.example.com",
+            status: "active",
+            expiresAt: "1970-01-02T00:00:00.000Z",
+            cursor: "0",
+          },
+        ]);
+        expect(encode(listed)).not.toContain(Redacted.value(secret));
+        expect(encode(listed)).not.toContain(input.delivery.url);
+        yield* f.call(f.service.unsubscribe({ id: own.id }), f.other);
+        expect(yield* f.subscriptions.get(own.id)).toBeDefined();
+        yield* f.append([input.arguments.threadId]);
+        f.responses.set("event-0", 503);
+        yield* f.service.drain();
+        expect(yield* f.deliveries.count(own.id)).toBe(1);
+        yield* f.call(f.service.unsubscribe({ id: own.id }));
+        yield* f.call(f.service.unsubscribe({ id: own.id }));
+        expect(yield* f.subscriptions.get(own.id)).toBeUndefined();
+        expect(yield* f.deliveries.count(own.id)).toBe(0);
+        const { cursor: _cursor, ...cursorless } = input;
+        const restarted = yield* f.call(f.service.subscribe(cursorless));
+        expect(restarted.cursor).toBe("1");
+        yield* f.service.drain();
+        expect(f.sent).toHaveLength(2); // one send for each principal before unsubscribe, none replayed
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("keeps the scoped worker recoverable beyond eight separated stream failures", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const attempts = yield* Queue.unbounded<number>();
+      let count = 0;
+      yield* Layer.build(
+        McpEvents.layerDeliveryWorker.pipe(
+          Layer.provide(
+            Layer.mock(McpEvents.McpEvents)({
+              run: () =>
+                Effect.suspend(() =>
+                  Queue.offer(attempts, ++count).pipe(
+                    Effect.andThen(
+                      count <= 9
+                        ? Effect.fail(new McpEventsError({ code: -32603, reason: "storage" }))
+                        : Effect.never,
+                    ),
+                  ),
+                ),
+            }),
+          ),
+        ),
+      );
+      for (let i = 1; i <= 9; i++) {
+        expect(yield* Queue.take(attempts)).toBe(i);
+        yield* TestClock.adjust("5 seconds");
+      }
+      expect(yield* Queue.take(attempts)).toBe(10);
+    }),
+  ),
+);
+
+it.effect(
+  "does not rewind a cursorless refresh when delivery acknowledges during verification",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const input = inputFor(ThreadId.make("refresh-race"));
+        const sub = yield* f.call(f.service.subscribe(input));
+        yield* f.append([input.arguments.threadId]);
+        f.setVerificationWork(f.service.drain().pipe(Effect.orDie));
+        const { cursor: _cursor, ...refresh } = input;
+        expect((yield* f.call(f.service.subscribe(refresh))).cursor).toBe("1");
+        expect((yield* f.subscriptions.get(sub.id))?.ackCursor).toBe(1);
+        yield* f.service.drain();
+        expect(f.sent).toHaveLength(1);
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );

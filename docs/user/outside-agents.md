@@ -129,7 +129,18 @@ available. Delivery stops after eight failed attempts or a permanent callback
 failure. Once the callback is working again, explicitly resubscribe to reactivate
 delivery from the acknowledged cursor. Refreshing an active subscription does not
 reset its retry budget. After signing in again, subscribe through the new connection
-to resume monitoring. Ask the client to stop monitoring, or revoke its sign-in in
+to resume monitoring. Explicitly stopping monitoring removes its delivery backlog. A later cursorless
+subscription starts at current events; provide a saved cursor to request replay.
+
+For direct protocol clients, the T3 extension `events/subscriptions/list` lists
+this sign-in's subscriptions: event/thread, active/stopped/expired status, expiry,
+acknowledged cursor and callback **origin**. It never returns signing secrets or
+callback paths/queries. Revoke one with `events/unsubscribe` and `{ "id": "<subscription-id>" }`;
+the standard name/arguments/delivery form also works. Other sign-ins cannot list or
+revoke these subscriptions. Each sign-in can retain up to 512 subscriptions, with
+4096 total on the server; stopped subscriptions count until explicitly removed.
+
+Ask the client to stop monitoring, or revoke its sign-in in
 **Settings → Sharing & access** to stop all of that connection's subscriptions.
 
 ## Other agents and bots

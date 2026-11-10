@@ -1,6 +1,6 @@
 import { NodeHttpServer } from "@effect/platform-node";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, McpEventsError } from "@t3tools/contracts";
+import { EnvironmentId, McpEventsError, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
@@ -41,6 +41,20 @@ it.effect(
                 Effect.fail(new McpEventsError({ code: -32015, reason: "challenge_failed" })),
               ),
             ),
+          listSubscriptions: () =>
+            Effect.succeed({
+              subscriptions: [
+                {
+                  id: "fixture-sub",
+                  name: "thread.run.result",
+                  arguments: { threadId: ThreadId.make("fixture-thread") },
+                  callbackOrigin: "https://callbacks.example.com",
+                  status: "active",
+                  expiresAt: "2026-11-10T00:00:00.000Z",
+                  cursor: "1",
+                },
+              ],
+            }),
           unsubscribe: () => Effect.succeed({}),
         });
         const toolkit = Toolkit.make(
@@ -115,6 +129,7 @@ it.effect(
               capabilities?: { events?: object };
               tools?: ReadonlyArray<unknown>;
               events?: ReadonlyArray<unknown>;
+              subscriptions?: ReadonlyArray<unknown>;
               structuredContent?: unknown;
             };
             error?: { code: number; data?: { reason: string } };
@@ -137,11 +152,33 @@ it.effect(
           result: { capabilities: { events: {}, tools: { listChanged: true } } },
         });
         const list = yield* post(
-          { jsonrpc: "2.0", id: 2, method: "events/list", params: {} },
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "events/list",
+            params: { _meta: { progressToken: "fixture" } },
+          },
           session,
         );
         expect(decode(yield* list.text).result?.events).toEqual([]);
         expect(principals).toEqual(["fixture-session"]);
+        const subscriptions = yield* post(
+          { jsonrpc: "2.0", id: 21, method: "events/subscriptions/list", params: { _meta: {} } },
+          session,
+        );
+        expect(decode(yield* subscriptions.text).result?.subscriptions).toMatchObject([
+          { id: "fixture-sub", callbackOrigin: "https://callbacks.example.com" },
+        ]);
+        const revoked = yield* post(
+          {
+            jsonrpc: "2.0",
+            id: 22,
+            method: "events/unsubscribe",
+            params: { id: "fixture-sub", _meta: {} },
+          },
+          session,
+        );
+        expect(decode(yield* revoked.text).result).toEqual({});
         const tools = yield* post(
           { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} },
           session,
@@ -164,7 +201,12 @@ it.effect(
           delivery: { mode: "webhook", url: "https://callbacks.example.com/events", secret },
         };
         const failed = yield* post(
-          { jsonrpc: "2.0", id: 4, method: "events/subscribe", params },
+          {
+            jsonrpc: "2.0",
+            id: 4,
+            method: "events/subscribe",
+            params: { ...params, _meta: { progressToken: "fixture" } },
+          },
           session,
         );
         const body = yield* failed.text;

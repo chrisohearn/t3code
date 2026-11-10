@@ -7,6 +7,7 @@ import {
   McpEventData,
   McpEventsError,
   type McpEventSubscribe,
+  type McpEventSubscriptionsResult,
   type McpEventUnsubscribe,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadShell,
@@ -122,6 +123,11 @@ export class McpEvents extends Context.Service<
       McpEventsError,
       Invocation.McpInvocationContext
     >;
+    readonly listSubscriptions: () => Effect.Effect<
+      McpEventSubscriptionsResult,
+      McpEventsError,
+      Invocation.McpInvocationContext
+    >;
     readonly subscribe: (input: McpEventSubscribe) => Effect.Effect<
       {
         readonly id: string;
@@ -209,7 +215,10 @@ const make = Effect.gen(function* () {
     return shell;
   });
   const identity = Effect.fn("McpEvents.identity")(
-    function* (principal: string, input: McpEventUnsubscribe) {
+    function* (
+      principal: string,
+      input: McpEventSubscribe | Exclude<McpEventUnsubscribe, { readonly id: string }>,
+    ) {
       const url = yield* Webhook.callbackUrl(input.delivery.url);
       const canonical = yield* encodeJson([
         principal,
@@ -354,18 +363,33 @@ const make = Effect.gen(function* () {
         })),
       };
     }),
+    listSubscriptions: Effect.fn("McpEvents.listSubscriptions")(function* () {
+      const { principal } = yield* caller();
+      const now = yield* Clock.currentTimeMillis;
+      const own = yield* subscriptions.forPrincipal(principal.sessionId);
+      return {
+        subscriptions: own.map((sub) => ({
+          id: sub.id,
+          name: sub.name,
+          arguments: { threadId: sub.threadId },
+          // Callback paths and queries may be credentials. Management needs only the destination origin.
+          callbackOrigin: new URL(sub.url).origin,
+          status:
+            sub.expiresAt <= now
+              ? ("expired" as const)
+              : sub.active === 1
+                ? ("active" as const)
+                : ("stopped" as const),
+          expiresAt: DateTime.formatIso(DateTime.makeUnsafe(sub.expiresAt)),
+          cursor: String(sub.ackCursor),
+        })),
+      };
+    }),
     subscribe: Effect.fn("McpEvents.subscribe")(function* (input) {
       const { scope, principal } = yield* caller();
       yield* resource(input.arguments.threadId);
       const { id, url } = yield* identity(principal.sessionId, input);
       const existing = yield* subscriptions.get(id);
-      const active = yield* subscriptions.active(yield* Clock.currentTimeMillis);
-      if (
-        existing === undefined &&
-        (active.length >= 4096 ||
-          active.filter((sub) => sub.principal === principal.sessionId).length >= 512)
-      )
-        return yield* new McpEventsError({ code: -32000, reason: "subscription_limit" });
       const floor = yield* events.prunedThroughSequence.pipe(Effect.mapError(() => invalid()));
       const latest = Math.max(
         floor,
@@ -412,9 +436,17 @@ const make = Effect.gen(function* () {
             principal.expiresAt.epochMilliseconds,
             now + Math.min(7 * 86400_000, Math.max(60_000, input.ttlMs ?? 86400_000)),
           );
+          // A cursorless refresh must use the acknowledgement after verification:
+          // delivery may have advanced while the callback challenge was in flight.
+          const currentFloor = yield* events.prunedThroughSequence.pipe(Effect.mapError(storage));
+          const currentLatest = Math.max(
+            currentFloor,
+            yield* events.latestApplicationSequence.pipe(Effect.mapError(storage)),
+          );
+          const selected = input.cursor == null ? (current?.ackCursor ?? currentLatest) : requested;
           const cursor = Math.min(
-            current?.ackCursor ?? Math.max(floor, requested),
-            Math.max(floor, requested),
+            current?.ackCursor ?? Math.max(currentFloor, selected),
+            Math.max(currentFloor, selected),
           );
           yield* subscriptions.save({
             id,
@@ -430,22 +462,24 @@ const make = Effect.gen(function* () {
             scanCursor:
               current !== undefined && cursor === current.ackCursor ? current.scanCursor : cursor,
             ackCursor: cursor,
-            truncated: requested < floor || existing?.truncated === 1 ? 1 : 0,
+            truncated: selected < currentFloor || current?.truncated === 1 ? 1 : 0,
           });
           yield* Queue.offer(wake, undefined);
           return {
             id,
             refreshBefore: DateTime.formatIso(DateTime.makeUnsafe(expiresAt)),
             cursor: String(cursor),
-            truncated: requested < floor || existing?.truncated === 1,
+            truncated: selected < currentFloor || current?.truncated === 1,
           };
         }),
       );
     }),
     unsubscribe: Effect.fn("McpEvents.unsubscribe")(function* (input) {
       const { principal } = yield* caller();
-      const { id } = yield* identity(principal.sessionId, input);
-      yield* withSubscription(id, subscriptions.stop(id, principal.sessionId));
+      const id = "id" in input ? input.id : (yield* identity(principal.sessionId, input)).id;
+      // Explicit unsubscribe forgets the transport backlog. Recovery after a
+      // delivery failure still uses stop(), retaining the acknowledged cursor.
+      yield* withSubscription(id, subscriptions.remove(id, principal.sessionId));
       yield* Queue.offer(wake, undefined);
       return {};
     }),
@@ -499,10 +533,10 @@ export const layerDeliveryWorker = Layer.effectDiscard(
   McpEvents.pipe(
     Effect.flatMap((events) =>
       events.run().pipe(
-        Effect.retry({ schedule: Schedule.exponential("1 second"), times: 7 }),
         Effect.tapError((error) =>
-          Effect.logWarning("MCP Events delivery stopped.", { reason: error.reason }),
+          Effect.logWarning("MCP Events delivery worker restarting.", { reason: error.reason }),
         ),
+        Effect.retry({ schedule: Schedule.spaced("5 seconds") }),
         Effect.forkScoped,
       ),
     ),

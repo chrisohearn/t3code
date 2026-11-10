@@ -1,8 +1,10 @@
 // @effect-diagnostics anyUnknownInErrorContext:off -- The public MCP adapter interface erases the base handler's error and service types.
 import {
   McpEventSubscribe,
-  McpEventUnsubscribe,
+  McpEventSubscriptionIdentity,
+  McpEventUnsubscribeById,
   McpEventSubscriptionResult,
+  McpEventSubscriptionsResult,
   type McpEventsError,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -21,18 +23,29 @@ const protocolFailure = Schema.Struct({
 });
 const eventRpcs = RpcGroup.make(
   Rpc.make("events/list", {
-    payload: Schema.Struct({ cursor: Schema.optionalKey(Schema.String) }),
+    payload: Schema.Struct({
+      ...McpSchema.RequestMeta.fields,
+      cursor: Schema.optionalKey(Schema.String),
+    }),
     success: Schema.Struct({ events: Schema.Array(Schema.Unknown) }),
     error: protocolFailure,
   }),
   Rpc.make("events/subscribe", {
-    payload: McpEventSubscribe,
+    payload: Schema.Struct({ ...McpSchema.RequestMeta.fields, ...McpEventSubscribe.fields }),
     success: McpEventSubscriptionResult,
     error: protocolFailure,
   }),
   Rpc.make("events/unsubscribe", {
-    payload: McpEventUnsubscribe,
+    payload: Schema.Union([
+      Schema.Struct({ ...McpSchema.RequestMeta.fields, ...McpEventSubscriptionIdentity.fields }),
+      Schema.Struct({ ...McpSchema.RequestMeta.fields, ...McpEventUnsubscribeById.fields }),
+    ]),
     success: Schema.Struct({}),
+    error: protocolFailure,
+  }),
+  Rpc.make("events/subscriptions/list", {
+    payload: McpSchema.RequestMeta,
+    success: McpEventSubscriptionsResult,
     error: protocolFailure,
   }),
 ).middleware(McpSchema.McpServerClientMiddleware);
@@ -111,6 +124,8 @@ export const protocol: McpProtocol.ProtocolAdapter<
       yield* target.install(McpProtocol.v2025_06_18, eventRpcs, {
         "events/list": () => events.list().pipe(Effect.mapError(protocolError)),
         "events/subscribe": (input) => events.subscribe(input).pipe(Effect.mapError(protocolError)),
+        "events/subscriptions/list": () =>
+          events.listSubscriptions().pipe(Effect.mapError(protocolError)),
         "events/unsubscribe": (input) =>
           events.unsubscribe(input).pipe(Effect.mapError(protocolError)),
       });

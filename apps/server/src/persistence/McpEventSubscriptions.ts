@@ -6,6 +6,8 @@ import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+const isMcpEventsError = Schema.is(McpEventsError);
+
 const SubscriptionRow = Schema.Struct({
   id: Schema.String,
   principal: Schema.String,
@@ -29,6 +31,10 @@ export class McpEventSubscriptions extends Context.Service<
   {
     readonly get: (id: string) => Effect.Effect<Subscription | undefined, McpEventsError>;
     readonly active: (now: number) => Effect.Effect<ReadonlyArray<Subscription>, McpEventsError>;
+    readonly forPrincipal: (
+      principal: string,
+    ) => Effect.Effect<ReadonlyArray<Subscription>, McpEventsError>;
+    readonly remove: (id: string, principal: string) => Effect.Effect<void, McpEventsError>;
     readonly save: (
       input: Omit<Subscription, "previousSecret" | "rotationUntil"> & { readonly now: number },
     ) => Effect.Effect<void, McpEventsError>;
@@ -56,10 +62,44 @@ const make = Effect.gen(function* () {
         Effect.mapError(() => new McpEventsError({ code: -32603, reason: "storage" })),
       ),
     ),
+    forPrincipal: Effect.fn("McpEventSubscriptions.forPrincipal")((principal) =>
+      sql`${select} WHERE principal = ${principal} ORDER BY id`.pipe(
+        Effect.flatMap(decode),
+        Effect.mapError(() => new McpEventsError({ code: -32603, reason: "storage" })),
+      ),
+    ),
+    remove: Effect.fn("McpEventSubscriptions.remove")((id, principal) =>
+      sql`DELETE FROM mcp_event_subscriptions WHERE id = ${id} AND principal = ${principal}`.pipe(
+        Effect.asVoid,
+        Effect.mapError(() => new McpEventsError({ code: -32603, reason: "storage" })),
+      ),
+    ),
     save: Effect.fn("McpEventSubscriptions.save")((input) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
+            // Bound retained storage as well as live delivery. Check and activate in
+            // this transaction, so distinct identities cannot race for the last slot.
+            const [counts] = yield* sql<{
+              total: number;
+              own: number;
+              active: number;
+              ownActive: number;
+            }>`
+              SELECT COUNT(*) AS total,
+                COALESCE(SUM(principal = ${input.principal}), 0) AS own,
+                COALESCE(SUM(active = 1 AND expires_at > ${input.now}), 0) AS active,
+                COALESCE(SUM(principal = ${input.principal} AND active = 1 AND expires_at > ${input.now}), 0) AS ownActive
+              FROM mcp_event_subscriptions`;
+            const [current] = yield* sql<{ active: number; expiresAt: number }>`
+              SELECT active, expires_at AS "expiresAt" FROM mcp_event_subscriptions
+              WHERE id = ${input.id} AND principal = ${input.principal}`;
+            if (
+              (current === undefined && (counts!.total >= 4096 || counts!.own >= 512)) ||
+              ((current?.active !== 1 || current.expiresAt <= input.now) &&
+                (counts!.active >= 4096 || counts!.ownActive >= 512))
+            )
+              return yield* new McpEventsError({ code: -32000, reason: "subscription_limit" });
             // Only an explicitly verified reactivation starts another bounded retry window.
             // A routine refresh of an active subscription must not replenish its attempts.
             yield* sql`UPDATE mcp_event_deliveries SET attempts = 0, next_attempt_at = ${input.now}
@@ -84,7 +124,13 @@ const make = Effect.gen(function* () {
         WHERE subscription_id = ${input.id} AND CAST(json_extract(body, '$.cursor') AS INTEGER) > ${input.ackCursor}`;
           }),
         )
-        .pipe(Effect.mapError(() => new McpEventsError({ code: -32603, reason: "storage" }))),
+        .pipe(
+          Effect.mapError((error) =>
+            isMcpEventsError(error)
+              ? error
+              : new McpEventsError({ code: -32603, reason: "storage" }),
+          ),
+        ),
     ),
     stop: Effect.fn("McpEventSubscriptions.stop")((id, principal) =>
       sql`
