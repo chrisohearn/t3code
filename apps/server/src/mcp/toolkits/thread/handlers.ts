@@ -19,6 +19,7 @@ import {
   readThread,
   unavailable,
 } from "../../threadAccess.ts";
+import * as ScratchThreadPromotion from "../../../project/ScratchThreadPromotion.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
@@ -335,6 +336,22 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   t3_thread_organize: writesThread((input) =>
     Effect.gen(function* () {
       const { threads, projection, caller } = yield* readThread(input.threadId);
+      if (input.action === "move") {
+        const projectId = yield* required(input.projectId, "projectId");
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const { threadIds } = yield* filing
+          .file({ threadId: projection.thread.id, projectId })
+          .pipe(
+            Effect.mapError(
+              (error) =>
+                new OrchestratorMcpFailure({
+                  code: "orchestration_error",
+                  message: error.message,
+                }),
+            ),
+          );
+        return { moved: true as const, threadIds };
+      }
       const common = { commandId: yield* newCommandId(), threadId: projection.thread.id };
       if (input.action === "settle") {
         return yield* threads

@@ -702,6 +702,23 @@ const layerBase: Layer.Layer<
               new Error(`Command ${input.commandId} produced no orchestration events.`),
             );
           }
+          if (
+            input.commandType === "thread.project.file-scratch" ||
+            input.commandType === "thread.project.adopt-folder"
+          ) {
+            for (const { event } of storedEvents) {
+              if (event.type !== "thread.metadata-updated") continue;
+              const target = yield* projectStore.get(event.payload.projectId);
+              if (Option.isNone(target) || target.value.deletedAt !== null) {
+                return yield* Effect.fail("Cannot update a thread in a missing project.");
+              }
+              // Project assignment and bound tasks commit together, including saves racing a move.
+              yield* sql`
+                UPDATE scheduled_tasks SET project_id = ${event.payload.projectId}
+                WHERE thread_id = ${event.threadId} AND project_id != ${event.payload.projectId}
+              `;
+            }
+          }
           const outcomes = yield* applyStoredEvents(storedEvents);
           yield* effectOutbox.enqueue(input.effects);
           const receipt: CommandReceiptStore.CommandReceiptV2 = {
@@ -791,6 +808,16 @@ const layerBase: Layer.Layer<
             };
             if (!(yield* commandReceipts.insertIfAbsent(reserved))) {
               return { receipt: yield* existingProjectReceipt(input.commandId), event: undefined };
+            }
+            if (input.event.type === "project.deleted") {
+              // A thread may arrive after deletion took its cascade snapshot.
+              const remaining = yield* sql`
+                SELECT 1 FROM orchestration_v2_projection_threads
+                WHERE project_id = ${input.projectId} AND deleted_at IS NULL LIMIT 1
+              `;
+              if (remaining.length > 0) {
+                return yield* Effect.fail("Project gained threads during deletion. Try again.");
+              }
             }
             const event = yield* eventStore.appendProjectEvent(input.event);
             yield* projectStore.apply(event);

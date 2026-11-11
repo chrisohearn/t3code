@@ -654,7 +654,10 @@ export const layer = Layer.effect(
           ${task.prompt},
           ${task.enabled ? 1 : 0},
           ${JSON.stringify(task.schedule)},
-          ${task.projectId},
+          COALESCE((
+            SELECT project_id FROM orchestration_v2_projection_threads
+            WHERE thread_id = ${task.threadId}
+          ), ${task.projectId}),
           ${task.threadId},
           ${scheduledTaskThreadMode(task)},
           ${JSON.stringify(task.workspaceStrategy)},

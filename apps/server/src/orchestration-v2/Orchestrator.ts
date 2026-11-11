@@ -98,6 +98,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import * as ServerConfig from "../config.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import {
   isCheckpointRestoreIsolated,
@@ -584,6 +585,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.pull-request-watch.sync":
     case "thread.pull-request.sync":
     case "thread.title.regeneration.complete":
+    case "thread.project.file-scratch":
     case "thread.project.adopt-folder":
     case "thread.runtime-mode.set":
     case "thread.interaction-mode.set":
@@ -1106,6 +1108,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const commandReceipts = yield* CommandReceiptStoreV2;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
+  const config = yield* ServerConfig.ServerConfig;
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
   const nextTurnItemOrdinal = (
@@ -4626,6 +4629,80 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     });
   });
 
+  const dispatchThreadProjectFileScratch = Effect.fn(
+    "orchestrationV2.dispatch.threadProjectFileScratch",
+  )(function* (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "thread.project.file-scratch" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const reject = (cause: string) =>
+      new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} ${cause}`,
+      });
+    const projection = yield* projectionStore
+      .getThreadRecords(command.threadId, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+      .pipe(
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+        ),
+      );
+    const thread = projection.thread;
+    if (thread.deletedAt !== null) return yield* reject("is deleted.");
+    if (thread.projectId === command.projectId) return yield* reject("is already in that project.");
+    if (threadHasUnfinishedWork(projection)) {
+      return yield* reject("still has work in progress. Finish or stop it first.");
+    }
+    const current = yield* projects.get(thread.projectId).pipe(mapDispatchError(command));
+    const target = yield* projects.get(command.projectId).pipe(mapDispatchError(command));
+    const scratchRoot = path.resolve(config.baseDir, "scratch");
+    if (
+      Option.isNone(target) ||
+      target.value.deletedAt !== null ||
+      target.value.workspaceRoot === scratchRoot
+    ) {
+      return yield* reject(`cannot move to missing project ${command.projectId}.`);
+    }
+    if (
+      Option.isNone(current) ||
+      current.value.deletedAt !== null ||
+      current.value.workspaceRoot !== scratchRoot ||
+      thread.worktreePath === null ||
+      path.dirname(thread.worktreePath) !== scratchRoot
+    ) {
+      return yield* reject("is not a No project thread with its own folder.");
+    }
+    if (target.value.workspaceRoot === thread.worktreePath) {
+      return yield* reject("works in the target project's root. Promote it instead.");
+    }
+    const snapshot = yield* projectionStore
+      .getShellSnapshot({ familyOf: thread.id })
+      .pipe(mapDispatchError(command));
+    if (
+      thread.lineage.parentThreadId !== null ||
+      [...snapshot.threads, ...snapshot.archivedThreads].some(
+        (child) => child.lineage.parentThreadId === thread.id,
+      )
+    ) {
+      return yield* reject("has a parent or child thread. It cannot be filed separately.");
+    }
+    const now = yield* DateTime.now;
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "thread.metadata-updated",
+      threadId: command.threadId,
+      providerInstanceId: thread.providerInstanceId,
+      occurredAt: now,
+      payload: { ...thread, projectId: command.projectId, updatedAt: now },
+    });
+  });
+
   const refuseAboveDispatchModeLimit = Effect.fn("orchestrationV2.dispatch.refuseAboveModeLimit")(
     function* (
       command: OrchestrationV2ServerCommand,
@@ -4709,7 +4786,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
-    // Only side chat forks lock the source; validate the modes copied here, not an earlier read.
+    // Validate the modes copied here, not an earlier read.
     yield* refuseAboveDispatchModeLimit(command, command.sourceThreadId, sourceProjection.thread);
     if (command.sideChat === true && sourceProjection.thread.deletedAt !== null) {
       return yield* new OrchestratorDispatchError({
@@ -13580,6 +13657,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "provider-session.detach":
         yield* dispatchProviderSessionDetach(command, events, effects);
         break;
+      case "thread.project.file-scratch":
+        yield* dispatchThreadProjectFileScratch(command, events);
+        break;
       case "thread.project.adopt-folder":
         yield* dispatchThreadProjectAdoptFolder(command, events);
         break;
@@ -13908,7 +13988,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // Recheck under the lock; the user may have raised modes since sender preflight.
     const limit = yield* DispatchModeLimit;
     if (limit !== undefined) {
-      // Fork and merge-back sources are unlocked; validate the modes copied by their dispatch.
+      // Merge-back sources are unlocked; validate the modes copied by its dispatch.
       const threadId = commandThreadId(command);
       const shell = yield* projectionStore
         .getThreadShell(threadId)
@@ -14116,14 +14196,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       commandThreadId(command),
       dispatchWithReceiptEffect(command),
     );
-    // A parent's lock comes before its side chats' locks, so a delete cascade and a side chat
-    // fork or command never interleave. A fork from a side chat or onto an existing thread would
-    // invert that order; dispatch rejects both, so they skip the source lock.
-    if (
-      command.type === "thread.fork" &&
-      command.sideChat === true &&
-      command.sourceThreadId !== command.targetThreadId
-    ) {
+    // Lock the fork source so filing cannot split it from a concurrently created child.
+    // Side chats and existing targets skip it to preserve the parent-before-child lock order.
+    if (command.type === "thread.fork" && command.sourceThreadId !== command.targetThreadId) {
       const source = yield* findThread(command.sourceThreadId);
       const target = yield* findThread(command.targetThreadId);
       return yield* source === null || source.lineage.sideChat === true || target !== null
@@ -14659,6 +14734,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 export const layer: Layer.Layer<
   OrchestratorV2,
   never,
+  | ServerConfig.ServerConfig
   | CheckpointServiceV2
   | FileSystem.FileSystem
   | Path.Path

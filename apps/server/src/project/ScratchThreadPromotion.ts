@@ -33,6 +33,13 @@ export class ScratchThreadPromotionError extends Schema.TaggedError<ScratchThrea
 export class ScratchThreadPromotion extends Context.Service<
   ScratchThreadPromotion,
   {
+    readonly file: (input: {
+      readonly threadId: ThreadId;
+      readonly projectId: ProjectId;
+    }) => Effect.Effect<
+      { readonly threadIds: ReadonlyArray<ThreadId> },
+      ScratchThreadPromotionError
+    >;
     /**
      * Turns a No project thread's folder into a project, in place, and moves every
      * thread working in that folder into it. Running it again finishes a partial move.
@@ -128,6 +135,105 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const file: ScratchThreadPromotion["Service"]["file"] = Effect.fn("ScratchThreadPromotion.file")(
+    function* (input) {
+      const thread = yield* threads.getThreadShell(input.threadId).pipe(
+        Effect.mapError(fail("Could not read the thread.")),
+        Effect.filterOrFail(
+          (shell) => shell !== null,
+          () => new ScratchThreadPromotionError({ reason: "Thread not found." }),
+        ),
+      );
+      if (thread.deletedAt !== null) {
+        return yield* new ScratchThreadPromotionError({ reason: "Thread not found." });
+      }
+      const folder = thread.worktreePath;
+      const scratchRoot = Option.getOrUndefined(yield* managedFolders.scratchRoot);
+      const isScratch = yield* managedFolders.isScratchProject(thread.projectId);
+      if (
+        folder === null ||
+        scratchRoot === undefined ||
+        path.dirname(folder) !== scratchRoot ||
+        !(isScratch || thread.projectId === input.projectId)
+      ) {
+        return yield* new ScratchThreadPromotionError({
+          reason: "Only a No project thread with its own folder can be filed into a project.",
+        });
+      }
+      const target = yield* projects
+        .getById(input.projectId)
+        .pipe(Effect.mapError(fail("Could not read the target project.")));
+      if (
+        Option.isNone(target) ||
+        target.value.deletedAt !== null ||
+        (yield* managedFolders.isScratchProject(input.projectId))
+      ) {
+        return yield* new ScratchThreadPromotionError({ reason: "Target project not found." });
+      }
+      if (target.value.workspaceRoot === folder) {
+        return yield* new ScratchThreadPromotionError({
+          reason: "This folder is the target project's root. Promote it instead.",
+        });
+      }
+      const snapshot = yield* Effect.flatten(
+        threads.readShellSnapshot({ worktreePath: folder }),
+      ).pipe(Effect.mapError(fail("Could not read the threads in this folder.")));
+      const all = [...snapshot.threads, ...snapshot.archivedThreads];
+      const moveSet = new Map<ThreadId, OrchestrationV2ThreadShell>();
+      if (isScratch) moveSet.set(thread.id, thread);
+      for (const candidate of all) {
+        if (
+          candidate.worktreePath === folder &&
+          (yield* managedFolders.isScratchProject(candidate.projectId))
+        ) {
+          moveSet.set(candidate.id, candidate);
+        }
+      }
+      for (const candidate of isScratch ? moveSet.values() : [thread, ...moveSet.values()]) {
+        const family = yield* Effect.flatten(
+          threads.readShellSnapshot({ familyOf: candidate.id }),
+        ).pipe(Effect.mapError(fail(`Could not read "${candidate.title}".`)));
+        if (
+          candidate.lineage.parentThreadId !== null ||
+          [...family.threads, ...family.archivedThreads].some(
+            (child) => child.lineage.parentThreadId === candidate.id,
+          )
+        ) {
+          return yield* new ScratchThreadPromotionError({
+            reason: `"${candidate.title}" has a parent or child thread. It cannot be filed separately.`,
+          });
+        }
+        const records = yield* threads
+          .getThreadRecords(candidate.id, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+          .pipe(Effect.mapError(fail(`Could not read "${candidate.title}".`)));
+        if (threadHasUnfinishedWork(records)) {
+          return yield* new ScratchThreadPromotionError({
+            reason: `"${candidate.title}" is still working. Finish or stop it first.`,
+          });
+        }
+      }
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const threadIds = [...moveSet.keys()];
+          yield* scheduledTasks
+            .moveThreadTasks({ threadIds, projectId: input.projectId })
+            .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
+          for (const candidate of moveSet.values()) {
+            yield* threads
+              .dispatch({
+                type: "thread.project.file-scratch",
+                commandId: CommandId.make(`scratch-filing:${yield* randomId}`),
+                threadId: candidate.id,
+                projectId: input.projectId,
+              })
+              .pipe(Effect.mapError(fail(`Could not move "${candidate.title}". Try again.`)));
+          }
+          return { threadIds };
+        }),
+      );
+    },
+  );
+
   const randomId = random.uuidV4();
 
   // bootstrap returns the project that already owns the folder, so retries reuse it.
@@ -153,7 +259,7 @@ const make = Effect.gen(function* () {
       );
   });
 
-  return ScratchThreadPromotion.of({ promote });
+  return ScratchThreadPromotion.of({ promote, file });
 });
 
 export const layer = Layer.effect(ScratchThreadPromotion, make);

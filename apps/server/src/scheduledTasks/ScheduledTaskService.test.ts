@@ -758,6 +758,76 @@ it.effect("refuses saving an enabled task above the policy ceiling", () =>
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
+it.effect.each(["insert", "rebind", "edit"] as const)(
+  "a task %s saving across thread filing follows its project",
+  (operation) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread:filing");
+      const projectId = ProjectId.make("project:scratch");
+      const target = ProjectId.make("project:filed");
+      yield* sql`
+      INSERT INTO orchestration_v2_projection_threads
+        (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode, created_at, updated_at, payload_json)
+      VALUES (${threadId}, ${projectId}, 'Scratch', 'codex', 'full-access', 'default', '', '', '{}')
+    `;
+      const ready = yield* Deferred.make<void>();
+      const proceed = yield* Deferred.make<void>();
+      let pause = false;
+      const layer = ScheduledTaskService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ManagedPolicy.layerTest(),
+            NodeCrypto.layer,
+            Scheduler.layer,
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadShell: () => Effect.succeed(threadShell(projectId)),
+            }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+              namedProjectsRoot: "/projects",
+              isScratchProject: () =>
+                pause
+                  ? Deferred.succeed(ready, undefined).pipe(
+                      Effect.andThen(Deferred.await(proceed)),
+                      Effect.as(true),
+                    )
+                  : Effect.succeed(true),
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+        const input = {
+          id: ScheduledTaskId.make("task:filing"),
+          title: "Bound",
+          prompt: "Check in",
+          enabled: true,
+          schedule: { type: "interval", everyMs: 60_000 },
+          projectId,
+          workspaceStrategy: { type: "worktree", baseRef: "main", startFromOrigin: false },
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        } as const;
+        if (operation !== "insert") {
+          yield* tasks.upsert({ ...input, threadId: operation === "edit" ? threadId : null });
+        }
+        pause = true;
+        const pending = yield* Effect.forkChild(tasks.upsert({ ...input, threadId }));
+        yield* Deferred.await(ready);
+        yield* tasks.moveThreadTasks({ threadIds: [threadId], projectId: target });
+        yield* sql`UPDATE orchestration_v2_projection_threads SET project_id = ${target} WHERE thread_id = ${threadId}`;
+        yield* Deferred.succeed(proceed, undefined);
+        const { task } = yield* Fiber.join(pending);
+        assert.equal(task.threadId, threadId);
+        assert.equal(task.projectId, target);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
 it.effect("checks a task's destination thread only when the destination changes", () =>
   Effect.gen(function* () {
     const project = ProjectId.make("project:test");
