@@ -271,6 +271,13 @@ export class ScheduledTaskService extends Context.Service<
       readonly threadIds: ReadonlyArray<ThreadId>;
       readonly projectId: ProjectId;
     }) => Effect.Effect<void, ScheduledTaskError>;
+    /**
+     * Points tasks bound to these threads at whichever project each thread is in now. One
+     * statement reads the thread's project, so concurrent moves cannot leave a task behind.
+     */
+    readonly syncThreadTaskProjects: (input: {
+      readonly threadIds: ReadonlyArray<ThreadId>;
+    }) => Effect.Effect<void, ScheduledTaskError>;
     /** The dispatched thread, or null if dispatch failed; leaves the task's binding unchanged. */
     readonly runNow: (
       input: ScheduledTaskRunNowInput,
@@ -1576,6 +1583,30 @@ export const layer = Layer.effect(
       if (moved.length > 0) yield* notifyChanged;
     });
 
+    const syncThreadTaskProjects: ScheduledTaskService["Service"]["syncThreadTaskProjects"] =
+      Effect.fn("ScheduledTaskService.syncThreadTaskProjects")(function* (input) {
+        if (input.threadIds.length === 0) return;
+        const moved = yield* sql<{ task_id: ScheduledTaskId }>`
+          UPDATE scheduled_tasks
+          SET project_id = (
+            SELECT thread.project_id FROM orchestration_v2_projection_threads AS thread
+            WHERE thread.thread_id = scheduled_tasks.thread_id
+          )
+          WHERE thread_id IN ${sql.in(input.threadIds)}
+            AND EXISTS (
+              SELECT 1 FROM orchestration_v2_projection_threads AS thread
+              WHERE thread.thread_id = scheduled_tasks.thread_id
+                AND thread.project_id != scheduled_tasks.project_id
+            )
+          RETURNING task_id
+        `.pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not move the thread's schedule tasks.", { cause }),
+          ),
+        );
+        if (moved.length > 0) yield* notifyChanged;
+      });
+
     const runNow: ScheduledTaskService["Service"]["runNow"] = Effect.fn(
       "ScheduledTaskService.runNow",
     )(function* (input: ScheduledTaskRunNowInput) {
@@ -2510,6 +2541,7 @@ export const layer = Layer.effect(
       delete: deleteTask,
       deleteForThread,
       moveThreadTasks,
+      syncThreadTaskProjects,
       runNow,
       rotateWebhookToken,
       listWebhookDeliveries,

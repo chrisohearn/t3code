@@ -322,6 +322,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
       listPage: unused,
       getShell: unused,
       listShells: unused,
+      withProjectLock: (_projectId, effect) => effect,
       getById: () => Effect.succeedSome(project),
     }),
     Effect.provideService(FetchHttpClient.Fetch, fetch),

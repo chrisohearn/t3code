@@ -160,6 +160,11 @@ export class ProjectService extends Context.Service<
     readonly listShells: (options?: {
       readonly projectIds?: ReadonlyArray<ProjectId>;
     }) => Effect.Effect<ReadonlyArray<OrchestrationProjectShell>, ProjectOperationError>;
+    /** Runs an effect while no project command, deletion included, can commit for this project. */
+    readonly withProjectLock: <A, E, R>(
+      projectId: ProjectId,
+      effect: Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E, R>;
   }
 >()("t3/project/ProjectService") {}
 
@@ -615,6 +620,7 @@ export const make = Effect.gen(function* () {
     listPage,
     getShell,
     listShells,
+    withProjectLock: projectLocks.withLock,
   });
 });
 

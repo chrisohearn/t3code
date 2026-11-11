@@ -40,6 +40,15 @@ export class ScratchThreadPromotion extends Context.Service<
     readonly promote: (input: {
       readonly threadId: ThreadId;
     }) => Effect.Effect<{ readonly projectId: ProjectId }, ScratchThreadPromotionError>;
+    /**
+     * Files one idle thread under another existing project; it keeps its folder. Holds the
+     * target project's lock, so the project cannot be deleted while the thread arrives.
+     * Running it again finishes a partial move.
+     */
+    readonly move: (input: {
+      readonly threadId: ThreadId;
+      readonly projectId: ProjectId;
+    }) => Effect.Effect<void, ScratchThreadPromotionError>;
   }
 >()("t3/project/ScratchThreadPromotion") {}
 
@@ -128,6 +137,47 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const move: ScratchThreadPromotion["Service"]["move"] = Effect.fn("ScratchThreadPromotion.move")(
+    function* (input) {
+      yield* projects.withProjectLock(
+        input.projectId,
+        Effect.gen(function* () {
+          const thread = yield* threads.getThreadShell(input.threadId).pipe(
+            Effect.mapError(fail("Could not read the thread.")),
+            Effect.filterOrFail(
+              (shell) => shell !== null,
+              () => new ScratchThreadPromotionError({ reason: "Thread not found." }),
+            ),
+          );
+          if (thread.projectId !== input.projectId) {
+            yield* threads
+              .dispatch({
+                type: "thread.project.move",
+                commandId: CommandId.make(`thread-project-move:${yield* randomId}`),
+                threadId: input.threadId,
+                projectId: input.projectId,
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ScratchThreadPromotionError({
+                      reason:
+                        "cause" in cause && typeof cause.cause === "string"
+                          ? cause.cause
+                          : `Could not move "${thread.title}".`,
+                      cause,
+                    }),
+                ),
+              );
+          }
+          yield* scheduledTasks
+            .syncThreadTaskProjects({ threadIds: [input.threadId] })
+            .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
+        }),
+      );
+    },
+  );
+
   const randomId = random.uuidV4();
 
   // bootstrap returns the project that already owns the folder, so retries reuse it.
@@ -153,7 +203,7 @@ const make = Effect.gen(function* () {
       );
   });
 
-  return ScratchThreadPromotion.of({ promote });
+  return ScratchThreadPromotion.of({ promote, move });
 });
 
 export const layer = Layer.effect(ScratchThreadPromotion, make);

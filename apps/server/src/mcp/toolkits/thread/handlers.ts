@@ -20,6 +20,7 @@ import {
   unavailable,
 } from "../../threadAccess.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
+import * as ScratchThreadPromotion from "../../../project/ScratchThreadPromotion.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { ThreadToolkit } from "./tools.ts";
@@ -366,17 +367,9 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               message: "move requires projectId.",
             });
           }
-          // A thread already there skips the command, so a retry can still finish the task step.
-          const moved =
-            projection.thread.projectId === input.projectId
-              ? undefined
-              : yield* threads
-                  .dispatch({ ...common, type: "thread.project.move", projectId: input.projectId })
-                  .pipe(Effect.mapError(dispatchFailure));
-          // After the move, so a refused move leaves the tasks alone.
-          const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
-          yield* scheduledTasks
-            .moveThreadTasks({ threadIds: [common.threadId], projectId: input.projectId })
+          const promotion = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+          yield* promotion
+            .move({ threadId: common.threadId, projectId: input.projectId })
             .pipe(
               Effect.mapError(
                 (cause) =>
@@ -386,7 +379,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
                   }),
               ),
             );
-          return { sequence: moved?.sequence ?? 0 };
+          return { moved: true as const };
         }
         default:
           command = { ...common, type: `thread.${input.action}` };

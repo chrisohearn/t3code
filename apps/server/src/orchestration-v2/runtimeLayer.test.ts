@@ -7251,6 +7251,59 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
     }),
   );
 
+  it.effect("moves one thread and its bound tasks to an existing project", () =>
+    Effect.gen(function* () {
+      const promotion = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const projects = yield* ProjectService.ProjectService;
+      const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+      const { folder, createThread } = yield* setup("file");
+      const threadId = yield* createThread("main", folder);
+      const projectId = ProjectId.make("promotion-file-repo");
+      yield* projects.create({
+        commandId: CommandId.make("promotion-file-repo-create"),
+        projectId,
+        title: "Repo",
+        workspaceRoot: "/tmp/runtime-layer-promotion-file-repo",
+      });
+      const { task } = yield* tasks.upsert({
+        id: ScheduledTaskId.make("promotion-file-bound"),
+        title: "Bound",
+        prompt: "Check in",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60_000 },
+        projectId: SCRATCH_PROJECT_ID,
+        threadId,
+        workspaceStrategy: { type: "root" },
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const taskProject = Effect.map(
+        tasks.list(),
+        (list) => list.tasks.find((candidate) => candidate.id === task.id)?.projectId,
+      );
+
+      yield* promotion.move({ threadId, projectId });
+      const moved = yield* shellOf(threadId);
+      assert.equal(moved?.projectId, projectId);
+      assert.equal(moved?.worktreePath, folder);
+      assert.equal(yield* taskProject, projectId);
+
+      // Running it again is harmless, and the tasks follow the thread back.
+      yield* promotion.move({ threadId, projectId });
+      yield* promotion.move({ threadId, projectId: SCRATCH_PROJECT_ID });
+      assert.equal((yield* shellOf(threadId))?.projectId, SCRATCH_PROJECT_ID);
+      assert.equal(yield* taskProject, SCRATCH_PROJECT_ID);
+
+      const missing = yield* promotion
+        .move({ threadId, projectId: ProjectId.make("promotion-file-missing") })
+        .pipe(Effect.flip);
+      assert.include(missing.message, "cannot move to missing project");
+    }),
+  );
+
   it.effect("changes nothing while a thread in the folder is busy", () =>
     Effect.gen(function* () {
       const promotion = yield* ScratchThreadPromotion.ScratchThreadPromotion;
