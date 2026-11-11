@@ -310,6 +310,7 @@ export const make = Effect.gen(function* () {
   // A shell merge or close sends no event, and the branch lookup caches an open pull request for
   // a minute, so these threads' next lookup reads the host fresh.
   const shellClosedThreads = new Set<ThreadId>();
+  const failedLookupProjects = new Set<string>();
   const terminals = yield* TerminalManager.TerminalManager;
   const projectScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   // Repeated thread.settled retains settledAt; run the action only once per settlement.
@@ -548,7 +549,24 @@ export const make = Effect.gen(function* () {
       groups.values(),
       (group) =>
         Effect.gen(function* () {
-          const pullRequest = yield* pullRequestFor(group);
+          // A failed lookup may hide an open PR, so these threads are skipped, logged once per project.
+          const pullRequest = yield* pullRequestFor(group).pipe(
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              (cause) =>
+                Effect.gen(function* () {
+                  for (const projectId of new Set(group.map((thread) => thread.projectId))) {
+                    if (failedLookupProjects.has(projectId)) continue;
+                    failedLookupProjects.add(projectId);
+                    yield* Effect.logWarning("automatic thread settlement PR lookup failed", {
+                      projectId,
+                      cause: Cause.pretty(cause),
+                    });
+                  }
+                  return undefined;
+                }),
+            ),
+          );
           if (pullRequest === undefined) return;
           yield* Effect.forEach(group, (thread) => settleThread(thread, pullRequest), {
             discard: true,

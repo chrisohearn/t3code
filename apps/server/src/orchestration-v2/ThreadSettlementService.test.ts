@@ -28,6 +28,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as PubSub from "effect/PubSub";
@@ -819,6 +820,37 @@ const settledEvent = (thread: OrchestrationV2AppThread): OrchestrationV2DomainEv
 });
 
 describe("ThreadSettlementServiceV2 worker", () => {
+  it.effect("logs a failed PR lookup once per project across sweeps without settling it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const logs: Array<unknown> = [];
+        const threads = ["first", "second"].map((id) => makeThread(id, { branch: id }));
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot(threads),
+          settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: null },
+          branchPullRequest: () => Effect.die(new Error("remotes unavailable")),
+        });
+        yield* Effect.gen(function* () {
+          const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+          yield* fixture.updateSettings({ sidebarAutoSettleKeepPullRequests: true });
+          yield* Queue.take(fixture.snapshotReads);
+          yield* service.drain;
+          assert.deepEqual(yield* Ref.get(fixture.commands), []);
+          assert.lengthOf(yield* Ref.get(fixture.branchCalls), 4);
+          assert.lengthOf(logs, 1);
+        }).pipe(
+          Effect.provide(fixture.layer),
+          Effect.provide(
+            Logger.layer([Logger.make(({ message }) => logs.push(message))], {
+              mergeWithExisting: false,
+            }),
+          ),
+        );
+      }),
+    ),
+  );
   it.effect("skips settings and PR decisions for recent branchless threads", () =>
     Effect.scoped(
       Effect.gen(function* () {
