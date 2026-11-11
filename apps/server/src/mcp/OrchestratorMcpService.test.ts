@@ -3780,6 +3780,66 @@ describe("OrchestratorMcpService thread lookup", () => {
       }).pipe(Effect.provide(service(shells, sent)));
     });
 
+  it.effect(
+    "reads a capped final reply directly without paging history or acknowledging delivery",
+    () =>
+      Effect.gen(function* () {
+        const sent = yield* Ref.make(0);
+        const runId = RunId.make("result-run");
+        const run = {
+          id: runId,
+          ordinal: 1,
+          status: "completed",
+          activeAttemptId: null,
+          modelSelection: launched.modelSelection,
+          requestedAt: launched.createdAt,
+          startedAt: launched.createdAt,
+          completedAt: launched.updatedAt,
+        } as unknown as OrchestrationV2ThreadProjection["runs"][number];
+        // A later silent run, such as idle compaction, is not the thread's result.
+        const silent = { ...run, id: RunId.make("compaction-run"), ordinal: 2 };
+        const projection = { ...idleThreadProjection(launched), runs: [run, silent] };
+        yield* Effect.gen(function* () {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const result = yield* mcp.threadResult(client, { threadId: launched.id });
+          assert.equal(result.revision, 42);
+          assert.equal(Array.from(result.lastAssistantMessage?.text ?? "").length, 4000);
+          assert.equal(result.lastAssistantMessage?.truncated, true);
+          assert.equal(result.run?.runId, runId);
+          const short = yield* mcp.threadResult(client, {
+            threadId: launched.id,
+            runId,
+            maxChars: 1,
+          });
+          assert.equal(short.lastAssistantMessage?.text, "😀");
+          const missing = yield* mcp
+            .threadResult(client, { threadId: launched.id, runId: RunId.make("wrong-run") })
+            .pipe(Effect.flip);
+          assert.equal(missing.code, "invalid_request");
+        }).pipe(
+          Effect.provide(
+            service([{ ...launched, latestRunId: runId }], sent, {
+              getThreadEventSequence: () => Effect.succeed(42),
+              getProjectThreadRecords: () => Effect.succeed(projection),
+              getThreadRecords: (_id, _fields, filter) => {
+                assert.deepEqual(filter, {
+                  messageRoles: ["assistant"],
+                  messageRunIds: [runId],
+                  latestMessageOnly: true,
+                });
+                return Effect.succeed({
+                  ...projection,
+                  messages: [{ id: MessageId.make("final-reply"), text: "😀".repeat(4001) }],
+                } as unknown as OrchestrationV2ThreadProjection);
+              },
+              getTimelinePage: () => Effect.die("must not page history"),
+              dispatch: () => Effect.die("must not acknowledge delivery"),
+            }),
+          ),
+        );
+      }),
+  );
+
   it.effect("points a bare uuid at the mcp: thread it belongs to", () =>
     Effect.gen(function* () {
       const { read, send, wait, sends } = yield* failuresFor([launched]);

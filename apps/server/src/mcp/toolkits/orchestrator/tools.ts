@@ -28,6 +28,8 @@ import {
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadListInput,
   OrchestratorMcpThreadListResult,
+  OrchestratorMcpThreadResultInput,
+  OrchestratorMcpThreadResult,
   OrchestratorMcpThreadReadInput,
   OrchestratorMcpThreadReadResult,
   OrchestratorMcpThreadSendInput,
@@ -258,6 +260,19 @@ const ThreadReadTool = Tool.make("t3_thread_read", {
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true);
 
+const ThreadResultTool = Tool.make("t3_thread_result", {
+  description:
+    "Read a thread's latest run or `runId`: status, last assistant message (default 4000 chars), pending request ids, PRs and revision. Does not acknowledge a child's result. Use `t3_thread_read` for history.",
+  parameters: OrchestratorMcpThreadResultInput,
+  success: OrchestratorMcpThreadResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
 const ThreadUpdateTool = Tool.make("t3_thread_update", {
   description:
     "Rename a thread (`action:'rename'` with `title`) or regenerate its title. Omit `threadId` for this thread. Workspace and branch cannot change here.",
@@ -370,6 +385,7 @@ export const OrchestratorToolkit = Toolkit.make(
   CreateThreadsTool,
   ThreadListTool,
   ThreadReadTool,
+  ThreadResultTool,
   ThreadUpdateTool,
   ThreadSendTool,
   ThreadWaitTool,

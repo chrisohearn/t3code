@@ -275,6 +275,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
     });
   const layerBoxThreads = Layer.mock(ThreadManagement.ThreadManagementService)({
     getThreadShell: shellOf,
+    getThreadEventSequence: () => Effect.succeed(0),
     getProjectThreadRecords: (input) => projectionOf(input.threadId),
     getThreadRecords: (threadId) => projectionOf(threadId),
     waitForThread: (input) =>

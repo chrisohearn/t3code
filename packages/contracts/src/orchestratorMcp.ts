@@ -507,6 +507,26 @@ export const OrchestratorMcpThreadReadResult = Schema.Struct({
 });
 export type OrchestratorMcpThreadReadResult = typeof OrchestratorMcpThreadReadResult.Type;
 
+export const OrchestratorMcpThreadResultInput = Schema.Struct({
+  environmentId: OrchestratorMcpEnvironmentTarget,
+  threadId: ThreadId,
+  runId: Schema.optional(RunId),
+  maxChars: Schema.optional(clampedPositiveInt(50_000)),
+});
+export type OrchestratorMcpThreadResultInput = typeof OrchestratorMcpThreadResultInput.Type;
+export const OrchestratorMcpThreadResult = Schema.Struct({
+  threadId: ThreadId,
+  status: OrchestratorMcpThreadStatus,
+  run: Schema.NullOr(OrchestratorMcpThreadRun),
+  lastAssistantMessage: Schema.NullOr(
+    Schema.Struct({ messageId: MessageId, text: Schema.String, truncated: Schema.Boolean }),
+  ),
+  pendingRequestIds: Schema.Array(RuntimeRequestId),
+  pullRequests: Schema.Array(OrchestratorMcpThreadPullRequest),
+  revision: NonNegativeInt,
+});
+export type OrchestratorMcpThreadResult = typeof OrchestratorMcpThreadResult.Type;
+
 export const OrchestratorMcpThreadSendInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,

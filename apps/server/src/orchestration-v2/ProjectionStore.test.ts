@@ -3256,6 +3256,9 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       ]) {
         assert.deepEqual(yield* readMessageIds(filter), [lastMessageId, firstMessageId]);
       }
+      assert.deepEqual(yield* readMessageIds({ messageRoles: ["user"], latestMessageOnly: true }), [
+        lastMessageId,
+      ]);
       assert.deepEqual(yield* readMessageIds({ messageIds: [] }), []);
       assert.deepEqual(yield* readMessageIds({ messageIds: [firstMessageId] }), [firstMessageId]);
       yield* sql`

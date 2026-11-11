@@ -43,6 +43,8 @@ import {
   type OrchestratorMcpThreadListInput,
   type OrchestratorMcpThreadListItem,
   type OrchestratorMcpThreadListResult,
+  type OrchestratorMcpThreadResultInput,
+  type OrchestratorMcpThreadResult,
   type OrchestratorMcpThreadReadInput,
   type OrchestratorMcpThreadReadResult,
   type OrchestratorMcpThreadRun,
@@ -202,6 +204,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadListInput,
   ) => Effect.Effect<OrchestratorMcpThreadListResult, OrchestratorMcpFailure>;
+  readonly threadResult: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpThreadResultInput,
+  ) => Effect.Effect<OrchestratorMcpThreadResult, OrchestratorMcpFailure>;
   readonly readThread: (
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadReadInput,
@@ -1264,6 +1270,9 @@ const make = Effect.gen(function* () {
         `Thread ${threadId} is no longer available.`,
       );
     }
+    const revision = yield* threadManagement
+      .getThreadEventSequence(threadId)
+      .pipe(Effect.mapError(threadManagementFailure));
     const input = { projectId: shell.projectId, threadId };
     // Transfers are needed only to acknowledge a caller's child-task result.
     const records =
@@ -1278,7 +1287,7 @@ const make = Effect.gen(function* () {
             "contextTransfers",
           ]);
     const target = yield* records.pipe(Effect.mapError(threadManagementFailure));
-    return { parent, target, shell } as const;
+    return { parent, target, shell, revision } as const;
   });
 
   const loadProviders = providerRegistry.getProviders;
@@ -3010,6 +3019,45 @@ const make = Effect.gen(function* () {
         nextCursor,
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
+    }),
+    threadResult: Effect.fn("OrchestratorMcpService.threadResult")(function* (scope, input) {
+      const { target, shell, revision } = yield* loadReadableThread(scope, input.threadId);
+      // The shell's latest run skips silent maintenance runs such as idle compaction.
+      const runId = input.runId ?? shell.latestRunId;
+      const run = runId === null ? undefined : target.runs.find((run) => run.id === runId);
+      if (input.runId !== undefined && run === undefined)
+        return yield* failure("invalid_request", "The run was not found in this thread.");
+      const records =
+        run === undefined
+          ? undefined
+          : yield* threadManagement
+              .getThreadRecords(input.threadId, ["messages"], {
+                messageRoles: ["assistant"],
+                messageRunIds: [run.id],
+                latestMessageOnly: true,
+              })
+              .pipe(Effect.mapError(threadManagementFailure));
+      const message = records?.messages[0];
+      const chars = Array.from(message?.text ?? "");
+      const maxChars = input.maxChars ?? 4000;
+      return {
+        threadId: input.threadId,
+        status: shell.activityRunStatus ?? shell.status,
+        run: run === undefined ? null : threadRun(target, run),
+        lastAssistantMessage:
+          message === undefined
+            ? null
+            : {
+                messageId: message.id,
+                text: chars.slice(0, maxChars).join(""),
+                truncated: chars.length > maxChars,
+              },
+        pendingRequestIds: target.runtimeRequests
+          .filter((request) => request.status === "pending")
+          .map((request) => request.id),
+        pullRequests: threadPullRequests(shell.pullRequests),
+        revision,
+      };
     }),
     readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, input) {
       const { parent, target, shell } = yield* loadReadableThread(scope, input.threadId);
