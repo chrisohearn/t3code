@@ -1,3 +1,4 @@
+import { McpThreadNotify, McpThreadNotifyResult } from "./mcpEvents.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
@@ -535,6 +536,7 @@ export const OrchestratorMcpThreadResult = Schema.Struct({
 export type OrchestratorMcpThreadResult = typeof OrchestratorMcpThreadResult.Type;
 
 export const OrchestratorMcpThreadSendInput = Schema.Struct({
+  notify: Schema.optional(McpThreadNotify),
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
@@ -550,6 +552,7 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;
 
 export const OrchestratorMcpThreadSendResult = Schema.Struct({
+  notify: Schema.optional(McpThreadNotifyResult),
   threadId: ThreadId,
   link: Schema.optional(Schema.String),
   messageId: MessageId,

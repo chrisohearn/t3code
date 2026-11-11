@@ -89,3 +89,17 @@ export class McpEventsError extends Schema.TaggedError<McpEventsError>()("McpEve
     return "The MCP Events request could not be completed.";
   }
 }
+
+export const McpThreadNotify = Schema.Struct({
+  events: Schema.optional(
+    Schema.Array(McpEventName).check(Schema.isMinLength(1), Schema.isMaxLength(4)),
+  ),
+});
+export type McpThreadNotify = typeof McpThreadNotify.Type;
+export const McpThreadNotifyResult = Schema.Struct({
+  status: Schema.Literals(["subscribed", "unavailable", "failed"]),
+  subscriptionIds: Schema.Array(Schema.String),
+  refreshBefore: Schema.optional(Schema.String),
+  reason: Schema.optional(Schema.String),
+});
+export type McpThreadNotifyResult = typeof McpThreadNotifyResult.Type;

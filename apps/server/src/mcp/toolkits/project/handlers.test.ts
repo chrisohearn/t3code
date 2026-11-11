@@ -442,11 +442,14 @@ it.effect("a launch retried with the same clientRequestId replays the first one"
           title: "Fix",
           projectId,
           message: "Fix the bug",
+          notify: {},
           ...(clientRequestId === undefined ? {} : { clientRequestId }),
         })
         .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
 
-    yield* launch("fix-1");
+    expect((yield* launch("fix-1")).at(-1)?.result).toMatchObject({
+      notify: { status: "unavailable", reason: "events_unavailable" },
+    });
     yield* launch("fix-1");
     yield* launch("fix-2");
     yield* launch(undefined);

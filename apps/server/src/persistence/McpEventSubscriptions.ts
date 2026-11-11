@@ -87,6 +87,10 @@ const make = Effect.gen(function* () {
               SELECT session_id FROM auth_sessions
               WHERE revoked_at IS NOT NULL OR expires_at <= ${DateTime.formatIso(DateTime.makeUnsafe(input.now))}
             )`;
+            // An expired row stays a day, then frees its slot; the one being resubscribed is kept,
+            // since an explicit resubscribe resumes from its acknowledged cursor.
+            yield* sql`DELETE FROM mcp_event_subscriptions
+              WHERE id <> ${input.id} AND expires_at <= ${input.now - 86_400_000}`;
             // Bound retained storage as well as live delivery. Check and activate in
             // this transaction, so distinct identities cannot race for the last slot.
             const [counts] = yield* sql<{

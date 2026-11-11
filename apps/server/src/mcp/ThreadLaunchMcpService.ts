@@ -1,3 +1,5 @@
+import * as ThreadNotifications from "./ThreadNotifications.ts";
+import { McpThreadNotify, McpThreadNotifyResult } from "@t3tools/contracts";
 import {
   CommandId,
   MessageId,
@@ -52,6 +54,7 @@ import {
 const isAboveCeilingError = Schema.is(OrchestratorRuntimeModeAboveCeilingError);
 
 export const launchInput = Schema.Struct({
+  notify: Schema.optional(McpThreadNotify),
   environmentId: OrchestratorMcpEnvironmentTarget,
   projectId: Schema.optional(ProjectId),
   scratch: Schema.optional(
@@ -80,6 +83,7 @@ export const launchInput = Schema.Struct({
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
 });
 export const launchResult = Schema.Struct({
+  notify: Schema.optional(McpThreadNotifyResult),
   threadId: ThreadId,
   link: Schema.optional(Schema.String),
   projectId: ProjectId,
@@ -298,6 +302,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           )?.supportedRuntimeModes,
         });
       }
+      const notification = yield* ThreadNotifications.prepare(input.notify);
       const result = yield* ThreadMessageIntake.launchThread({
         commandId,
         threadId,
@@ -362,7 +367,9 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           .pipe(Effect.ignore({ log: true }));
       }
       const run = result.projection.runs.find((run) => run.userMessageId === messageId);
+      const notify = yield* ThreadNotifications.finish(notification, thread.id);
       return {
+        ...(notify === undefined ? {} : { notify }),
         threadId: thread.id,
         link: McpInvocationContext.threadLinkFor(scope, thread.id, thread.title),
         projectId: thread.projectId,

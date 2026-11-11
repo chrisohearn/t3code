@@ -1,3 +1,5 @@
+import * as Invocation from "./McpInvocationContext.ts";
+import * as ThreadNotifications from "./ThreadNotifications.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import {
   CommandId,
@@ -3236,6 +3238,9 @@ const make = Effect.gen(function* () {
         requestKey: key,
         operation: "thread-send",
       });
+      const notification = yield* ThreadNotifications.prepare(input.notify).pipe(
+        Effect.provideService(Invocation.McpInvocationContext, scope),
+      );
       const result = yield* threadManagement
         .sendToThread({
           projectId: target.thread.projectId,
@@ -3264,7 +3269,11 @@ const make = Effect.gen(function* () {
                 ),
           ),
         );
+      const notify = yield* ThreadNotifications.finish(notification, input.threadId).pipe(
+        Effect.provideService(Invocation.McpInvocationContext, scope),
+      );
       return {
+        ...(notify === undefined ? {} : { notify }),
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,

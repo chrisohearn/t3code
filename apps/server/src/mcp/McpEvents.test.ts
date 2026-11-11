@@ -1,7 +1,10 @@
+import * as ThreadNotifications from "./ThreadNotifications.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "@effect/vitest";
 import {
+  MessageId,
+  RunId,
   AuthSessionId,
   EnvironmentId,
   EventId,
@@ -23,6 +26,7 @@ import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import * as Clock from "effect/Clock";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -167,6 +171,104 @@ const fixture = Effect.gen(function* () {
     deleted,
   };
 });
+
+it.effect(
+  "notify delivers an immediately completed run from the cursor captured before launch or send",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const source = ThreadId.make("source");
+        const invoke = <A, E, R>(
+          effect: Effect.Effect<A, E, R | Invocation.McpInvocationContext | McpEvents.McpEvents>,
+        ) =>
+          effect.pipe(
+            Effect.provideService(McpEvents.McpEvents, f.service),
+            Effect.provideService(Invocation.McpInvocationContext, f.scope()),
+          );
+        expect(
+          yield* invoke(
+            ThreadNotifications.finish(yield* invoke(ThreadNotifications.prepare({})), source),
+          ),
+        ).toMatchObject({ status: "unavailable", reason: "no_active_subscription" });
+        yield* f.call(f.service.subscribe(inputFor(source)));
+        let sendSubscriptions: ReadonlyArray<string> = [];
+        for (const operation of ["launch", "send", "send-again"]) {
+          const threadId = ThreadId.make(
+            `immediate-${operation.startsWith("send") ? "send" : "launch"}`,
+          );
+          // A lapsed subscription is replaced at the new cursor, not resumed to replay old runs.
+          if (operation === "send-again")
+            for (const id of sendSubscriptions)
+              yield* f.subscriptions.stop(id, f.scope().client!.sessionId);
+          const prepared = yield* invoke(ThreadNotifications.prepare({}));
+          const now = DateTime.makeUnsafe(1);
+          yield* f.store.appendAgentEvents({
+            events: [
+              {
+                id: EventId.make(`immediate-${operation}`),
+                threadId,
+                occurredAt: now,
+                type: "run.updated",
+                payload: {
+                  id: RunId.make(`run-${operation}`),
+                  threadId,
+                  ordinal: 1,
+                  providerInstanceId: ProviderInstanceId.make("replay"),
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("replay"),
+                    model: "fixture",
+                  },
+                  providerThreadId: null,
+                  userMessageId: MessageId.make(`message-${operation}`),
+                  rootNodeId: null,
+                  activeAttemptId: null,
+                  status: "completed",
+                  requestedAt: now,
+                  startedAt: now,
+                  completedAt: now,
+                  checkpointId: null,
+                  contextHandoffId: null,
+                },
+              },
+            ],
+          });
+          const notified = yield* invoke(ThreadNotifications.finish(prepared, threadId));
+          expect(notified).toMatchObject({
+            status: "subscribed",
+            subscriptionIds: expect.any(Array),
+            refreshBefore: expect.any(String),
+          });
+          if (operation === "send") sendSubscriptions = notified!.subscriptionIds;
+          yield* f.service.drain();
+          const delivered = f.sent.find((delivery) => delivery.id === `immediate-${operation}`);
+          expect(delivered).toBeDefined();
+          expect(json(delivered!.body)).toMatchObject({
+            name: "thread.run.result",
+            data: { threadId, state: "completed" },
+          });
+        }
+        expect(f.sent.filter((delivery) => delivery.id === "immediate-send")).toHaveLength(1);
+        // A notify near its source's expiry still gets a full day, not the source's remainder.
+        yield* TestClock.adjust("23 hours");
+        const late = yield* invoke(
+          ThreadNotifications.finish(
+            yield* invoke(ThreadNotifications.prepare({})),
+            ThreadId.make("late"),
+          ),
+        );
+        expect(late).toMatchObject({
+          refreshBefore: DateTime.formatIso(
+            DateTime.makeUnsafe((yield* Clock.currentTimeMillis) + 86_400_000),
+          ),
+        });
+        expect(yield* f.call(f.service.prepareNotify({}), f.other)).toMatchObject({
+          status: "unavailable",
+          reason: "no_active_subscription",
+        });
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
 
 it.effect(
   "follows committed source events in the scoped delivery worker without an idle polling clock",
@@ -700,6 +802,19 @@ it.effect.each(["principal", "global"] as const)(
           (yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM mcp_event_subscriptions`)[0]
             ?.count,
         ).toBe(capacity);
+        // Rows expired over a day, any principal's, free their slots instead of locking clients out.
+        yield* sql`UPDATE mcp_event_subscriptions SET expires_at = 0`;
+        yield* TestClock.adjust("2 days");
+        const later = {
+          ...fresh,
+          delivery: { ...fresh.delivery, url: "https://later.example.com/events" },
+        };
+        yield* f.call(f.service.subscribe(later));
+        expect(
+          (yield* sql<{
+            count: number;
+          }>`SELECT COUNT(*) AS count FROM mcp_event_subscriptions`)[0]?.count,
+        ).toBe(1);
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );

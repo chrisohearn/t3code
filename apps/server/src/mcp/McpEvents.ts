@@ -1,5 +1,7 @@
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import {
+  type McpThreadNotify,
+  type McpThreadNotifyResult,
   AuthOrchestrationReadScope,
   AuthSessionId,
   McpEventName,
@@ -108,9 +110,27 @@ export const observeEvent = (
   };
 };
 
+export interface PreparedThreadNotify {
+  readonly principal: string;
+  readonly subscriptionId: string;
+  readonly cursor: string;
+  readonly events: ReadonlyArray<McpEventName>;
+}
+
 export class McpEvents extends Context.Service<
   McpEvents,
   {
+    readonly prepareNotify: (
+      input: McpThreadNotify,
+    ) => Effect.Effect<
+      PreparedThreadNotify | McpThreadNotifyResult,
+      McpEventsError,
+      Invocation.McpInvocationContext
+    >;
+    readonly notifyThread: (
+      prepared: PreparedThreadNotify,
+      threadId: ThreadId,
+    ) => Effect.Effect<McpThreadNotifyResult, McpEventsError, Invocation.McpInvocationContext>;
     readonly bridgeStatus: () => Effect.Effect<
       {
         readonly daysUntilSessionExpires: number;
@@ -394,7 +414,175 @@ const make = Effect.gen(function* () {
     };
   });
 
+  const subscribe = Effect.fn("McpEvents.subscribe")(function* (input: McpEventSubscribe) {
+    const { scope, principal } = yield* caller();
+    yield* resource(input.arguments.threadId);
+    const { id, url } = yield* identity(principal.sessionId, input);
+    const existing = yield* subscriptions.get(id);
+    const floor = yield* events.prunedThroughSequence.pipe(Effect.mapError(() => invalid()));
+    const latest = Math.max(
+      floor,
+      yield* events.latestApplicationSequence.pipe(Effect.mapError(() => invalid())),
+    );
+    const requested = input.cursor == null ? (existing?.ackCursor ?? latest) : Number(input.cursor);
+    if (
+      !Number.isSafeInteger(requested) ||
+      requested < 0 ||
+      requested > latest ||
+      (input.cursor != null && !/^(0|[1-9][0-9]*)$/.test(input.cursor)) ||
+      (existing !== undefined && requested > existing.ackCursor)
+    )
+      return yield* invalid();
+    yield* webhook
+      .verify({
+        principal: principal.sessionId,
+        subscriptionId: id,
+        url,
+        secret: input.delivery.secret,
+        authorize: activePrincipal(principal.sessionId).pipe(
+          Effect.andThen(resource(input.arguments.threadId)),
+          Effect.asVoid,
+          Effect.mapError(
+            (error) =>
+              new Webhook.CallbackError({
+                reason: error.reason === "access_denied" ? "access_denied" : "network",
+              }),
+          ),
+        ),
+      })
+      .pipe(Effect.mapError((error) => new McpEventsError({ code: -32015, reason: error.reason })));
+    return yield* withSubscription(
+      id,
+      Effect.gen(function* () {
+        yield* caller();
+        yield* resource(input.arguments.threadId);
+        const current = yield* subscriptions.get(id);
+        const now = yield* Clock.currentTimeMillis;
+        const expiresAt = Math.min(
+          principal.expiresAt.epochMilliseconds,
+          now + Math.min(7 * 86400_000, Math.max(60_000, input.ttlMs ?? 86400_000)),
+        );
+        // A cursorless refresh must use the acknowledgement after verification:
+        // delivery may have advanced while the callback challenge was in flight.
+        const currentFloor = yield* events.prunedThroughSequence.pipe(Effect.mapError(storage));
+        const currentLatest = Math.max(
+          currentFloor,
+          yield* events.latestApplicationSequence.pipe(Effect.mapError(storage)),
+        );
+        const selected = input.cursor == null ? (current?.ackCursor ?? currentLatest) : requested;
+        const cursor = Math.min(
+          current?.ackCursor ?? Math.max(currentFloor, selected),
+          Math.max(currentFloor, selected),
+        );
+        yield* subscriptions.save({
+          id,
+          principal: principal.sessionId,
+          name: input.name,
+          threadId: input.arguments.threadId,
+          url,
+          sourceUrl: Invocation.threadLinkFor(scope, input.arguments.threadId),
+          secret: input.delivery.secret,
+          active: 1,
+          now,
+          expiresAt,
+          scanCursor:
+            current !== undefined && cursor === current.ackCursor ? current.scanCursor : cursor,
+          ackCursor: cursor,
+          truncated: selected < currentFloor || current?.truncated === 1 ? 1 : 0,
+        });
+        yield* Queue.offer(wake, undefined);
+        return {
+          id,
+          refreshBefore: DateTime.formatIso(DateTime.makeUnsafe(expiresAt)),
+          cursor: String(cursor),
+          truncated: selected < currentFloor || current?.truncated === 1,
+        };
+      }),
+    );
+  });
+
   return McpEvents.of({
+    prepareNotify: Effect.fn("McpEvents.prepareNotify")(function* (input) {
+      const scope = yield* Invocation.McpInvocationContext;
+      if (scope.client === undefined || scope.thread !== undefined || scope.client.linked === true)
+        return {
+          status: "unavailable" as const,
+          subscriptionIds: [],
+          reason: "outside_client_required",
+        };
+      const { principal } = yield* caller();
+      const now = yield* Clock.currentTimeMillis;
+      const source = (yield* subscriptions.forPrincipal(principal.sessionId)).find(
+        (sub) => sub.active === 1 && sub.expiresAt > now,
+      );
+      if (source === undefined)
+        return {
+          status: "unavailable" as const,
+          subscriptionIds: [],
+          reason: "no_active_subscription",
+        };
+      const cursor = String(yield* events.latestApplicationSequence.pipe(Effect.mapError(storage)));
+      return {
+        principal: principal.sessionId,
+        subscriptionId: source.id,
+        cursor,
+        events: input.events ?? ["thread.run.result", "thread.needs-decision", "thread.blocker"],
+      };
+    }),
+    notifyThread: Effect.fn("McpEvents.notifyThread")(function* (prepared, threadId) {
+      const { principal } = yield* caller();
+      if (principal.sessionId !== prepared.principal) return yield* refused();
+      const source = yield* subscriptions.get(prepared.subscriptionId);
+      const now = yield* Clock.currentTimeMillis;
+      if (
+        source === undefined ||
+        source.principal !== principal.sessionId ||
+        source.active !== 1 ||
+        source.expiresAt <= now
+      )
+        return {
+          status: "unavailable" as const,
+          subscriptionIds: [],
+          reason: "no_active_subscription",
+        };
+      const subscriptionIds: Array<string> = [];
+      let refreshBefore: string | undefined;
+      for (const name of new Set(prepared.events)) {
+        const delivery = { mode: "webhook" as const, url: source.url, secret: source.secret };
+        const existingId = (yield* identity(principal.sessionId, {
+          name,
+          arguments: { threadId },
+          delivery,
+        })).id;
+        let existing = yield* subscriptions.get(existingId);
+        // A lapsed subscription would resume at its old cursor and replay old runs.
+        if (existing !== undefined && (existing.active !== 1 || existing.expiresAt <= now)) {
+          yield* withSubscription(
+            existingId,
+            subscriptions.remove(existingId, principal.sessionId),
+          );
+          existing = undefined;
+        }
+        const result = yield* subscribe({
+          name,
+          arguments: { threadId },
+          cursor: existing === undefined ? prepared.cursor : null,
+          delivery,
+          // Each active subscription scans the event log, so one made for a run lapses within a day.
+          // Not the source's own expiry: it may be an earlier notify subscription near its end.
+          ttlMs: 86_400_000,
+        }).pipe(Effect.result);
+        if (result._tag === "Failure")
+          return { status: "failed" as const, subscriptionIds, reason: result.failure.reason };
+        subscriptionIds.push(result.success.id);
+        refreshBefore = result.success.refreshBefore;
+      }
+      return {
+        status: "subscribed" as const,
+        subscriptionIds,
+        ...(refreshBefore === undefined ? {} : { refreshBefore }),
+      };
+    }),
     bridgeStatus: Effect.fn("McpEvents.bridgeStatus")(function* () {
       const { principal } = yield* caller();
       const now = yield* Clock.currentTimeMillis;
@@ -425,95 +613,7 @@ const make = Effect.gen(function* () {
       };
     }),
     listSubscriptions,
-    subscribe: Effect.fn("McpEvents.subscribe")(function* (input) {
-      const { scope, principal } = yield* caller();
-      yield* resource(input.arguments.threadId);
-      const { id, url } = yield* identity(principal.sessionId, input);
-      const existing = yield* subscriptions.get(id);
-      const floor = yield* events.prunedThroughSequence.pipe(Effect.mapError(() => invalid()));
-      const latest = Math.max(
-        floor,
-        yield* events.latestApplicationSequence.pipe(Effect.mapError(() => invalid())),
-      );
-      const requested =
-        input.cursor == null ? (existing?.ackCursor ?? latest) : Number(input.cursor);
-      if (
-        !Number.isSafeInteger(requested) ||
-        requested < 0 ||
-        requested > latest ||
-        (input.cursor != null && !/^(0|[1-9][0-9]*)$/.test(input.cursor)) ||
-        (existing !== undefined && requested > existing.ackCursor)
-      )
-        return yield* invalid();
-      yield* webhook
-        .verify({
-          principal: principal.sessionId,
-          subscriptionId: id,
-          url,
-          secret: input.delivery.secret,
-          authorize: activePrincipal(principal.sessionId).pipe(
-            Effect.andThen(resource(input.arguments.threadId)),
-            Effect.asVoid,
-            Effect.mapError(
-              (error) =>
-                new Webhook.CallbackError({
-                  reason: error.reason === "access_denied" ? "access_denied" : "network",
-                }),
-            ),
-          ),
-        })
-        .pipe(
-          Effect.mapError((error) => new McpEventsError({ code: -32015, reason: error.reason })),
-        );
-      return yield* withSubscription(
-        id,
-        Effect.gen(function* () {
-          yield* caller();
-          yield* resource(input.arguments.threadId);
-          const current = yield* subscriptions.get(id);
-          const now = yield* Clock.currentTimeMillis;
-          const expiresAt = Math.min(
-            principal.expiresAt.epochMilliseconds,
-            now + Math.min(7 * 86400_000, Math.max(60_000, input.ttlMs ?? 86400_000)),
-          );
-          // A cursorless refresh must use the acknowledgement after verification:
-          // delivery may have advanced while the callback challenge was in flight.
-          const currentFloor = yield* events.prunedThroughSequence.pipe(Effect.mapError(storage));
-          const currentLatest = Math.max(
-            currentFloor,
-            yield* events.latestApplicationSequence.pipe(Effect.mapError(storage)),
-          );
-          const selected = input.cursor == null ? (current?.ackCursor ?? currentLatest) : requested;
-          const cursor = Math.min(
-            current?.ackCursor ?? Math.max(currentFloor, selected),
-            Math.max(currentFloor, selected),
-          );
-          yield* subscriptions.save({
-            id,
-            principal: principal.sessionId,
-            name: input.name,
-            threadId: input.arguments.threadId,
-            url,
-            sourceUrl: Invocation.threadLinkFor(scope, input.arguments.threadId),
-            secret: input.delivery.secret,
-            active: 1,
-            now,
-            expiresAt,
-            scanCursor:
-              current !== undefined && cursor === current.ackCursor ? current.scanCursor : cursor,
-            ackCursor: cursor,
-            truncated: selected < currentFloor || current?.truncated === 1 ? 1 : 0,
-          });
-          yield* Queue.offer(wake, undefined);
-          return {
-            id,
-            refreshBefore: DateTime.formatIso(DateTime.makeUnsafe(expiresAt)),
-            cursor: String(cursor),
-            truncated: selected < currentFloor || current?.truncated === 1,
-          };
-        }),
-      );
-    }),
+    subscribe,
     unsubscribe: Effect.fn("McpEvents.unsubscribe")(function* (input) {
       const { principal } = yield* caller();
       const id = "id" in input ? input.id : (yield* identity(principal.sessionId, input)).id;
