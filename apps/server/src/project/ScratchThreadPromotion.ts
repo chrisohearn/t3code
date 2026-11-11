@@ -1,3 +1,4 @@
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import {
   CommandId,
   type OrchestrationV2ThreadShell,
@@ -137,78 +138,101 @@ const make = Effect.gen(function* () {
     );
   });
 
+  // Moves of one thread family run one at a time, so two targets cannot split it.
+  const familyLocks = yield* KeyedLock.make<ThreadId>();
+
   const move: ScratchThreadPromotion["Service"]["move"] = Effect.fn("ScratchThreadPromotion.move")(
     function* (input) {
-      yield* projects.withProjectLock(
-        input.projectId,
-        Effect.gen(function* () {
-          const thread = yield* threads.getThreadShell(input.threadId).pipe(
-            Effect.mapError(fail("Could not read the thread.")),
-            Effect.filterOrFail(
-              (shell) => shell !== null,
-              () => new ScratchThreadPromotionError({ reason: "Thread not found." }),
-            ),
-          );
-          // A subagent or side chat stays listed under its parent, whatever its project says.
-          if (thread.lineage.parentThreadId !== null) {
-            return yield* new ScratchThreadPromotionError({
-              reason: "This thread belongs to another thread. Move that thread instead.",
-            });
-          }
-          // Threads sharing the folder (its subagents and side chats) move with it. A thread in
-          // its project's root has no folder of its own, so it moves alone.
-          const moveSet = new Map<ThreadId, OrchestrationV2ThreadShell>([[thread.id, thread]]);
-          if (thread.worktreePath !== null) {
-            const snapshot = yield* Effect.flatten(
-              threads.readShellSnapshot({ worktreePath: thread.worktreePath }),
-            ).pipe(Effect.mapError(fail("Could not read the threads in this folder.")));
-            for (const candidate of [...snapshot.threads, ...snapshot.archivedThreads]) {
-              if (candidate.lineage.rootThreadId === thread.lineage.rootThreadId) {
-                moveSet.set(candidate.id, candidate);
-              }
-            }
-          }
-          const pending = [...moveSet.values()].filter(
-            (candidate) => candidate.projectId !== input.projectId,
-          );
-          for (const candidate of pending) {
-            const records = yield* threads
-              .getThreadRecords(candidate.id, ["runs", "runtimeRequests"], { turnItemTypes: [] })
-              .pipe(Effect.mapError(fail(`Could not read "${candidate.title}".`)));
-            if (threadHasUnfinishedWork(records)) {
-              return yield* new ScratchThreadPromotionError({
-                reason: `"${candidate.title}" is still working. Finish or stop it first.`,
-              });
-            }
-          }
-          for (const candidate of pending) {
-            yield* threads
-              .dispatch({
-                type: "thread.project.move",
-                commandId: CommandId.make(`thread-project-move:${yield* randomId}`),
-                threadId: candidate.id,
-                projectId: input.projectId,
-              })
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ScratchThreadPromotionError({
-                      reason:
-                        "cause" in cause && typeof cause.cause === "string"
-                          ? cause.cause
-                          : `Could not move "${candidate.title}".`,
-                      cause,
-                    }),
-                ),
-              );
-          }
-          yield* scheduledTasks
-            .syncThreadTaskProjects({ threadIds: [...moveSet.keys()] })
-            .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
-        }),
+      const requested = yield* threads.getThreadShell(input.threadId).pipe(
+        Effect.mapError(fail("Could not read the thread.")),
+        Effect.filterOrFail(
+          (shell) => shell !== null,
+          () => new ScratchThreadPromotionError({ reason: "Thread not found." }),
+        ),
+      );
+      yield* familyLocks.withLock(
+        requested.lineage.rootThreadId,
+        projects.withProjectLock(
+          input.projectId,
+          moveFamily({ threadId: input.threadId, projectId: input.projectId }),
+        ),
       );
     },
   );
+
+  const moveFamily = Effect.fn("ScratchThreadPromotion.moveFamily")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly projectId: ProjectId;
+  }) {
+    // Read again under the locks: an earlier move may have just finished.
+    const thread = yield* threads.getThreadShell(input.threadId).pipe(
+      Effect.mapError(fail("Could not read the thread.")),
+      Effect.filterOrFail(
+        (shell) => shell !== null,
+        () => new ScratchThreadPromotionError({ reason: "Thread not found." }),
+      ),
+    );
+    // A subagent or side chat stays listed under its parent, whatever its project says.
+    if (thread.lineage.parentThreadId !== null) {
+      return yield* new ScratchThreadPromotionError({
+        reason: "This thread belongs to another thread. Move that thread instead.",
+      });
+    }
+    // The folder is how the thread's subagents and side chats are found. A thread working
+    // in its project's root shares that folder with unrelated threads, so it cannot move.
+    const folder = thread.worktreePath;
+    if (folder === null) {
+      return yield* new ScratchThreadPromotionError({
+        reason: "Only a thread with its own folder can move to another project.",
+      });
+    }
+    const moveSet = new Map<ThreadId, OrchestrationV2ThreadShell>([[thread.id, thread]]);
+    const snapshot = yield* Effect.flatten(
+      threads.readShellSnapshot({ worktreePath: folder }),
+    ).pipe(Effect.mapError(fail("Could not read the threads in this folder.")));
+    for (const candidate of [...snapshot.threads, ...snapshot.archivedThreads]) {
+      if (candidate.lineage.rootThreadId === thread.lineage.rootThreadId) {
+        moveSet.set(candidate.id, candidate);
+      }
+    }
+    const pending = [...moveSet.values()].filter(
+      (candidate) => candidate.projectId !== input.projectId,
+    );
+    for (const candidate of pending) {
+      const records = yield* threads
+        .getThreadRecords(candidate.id, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+        .pipe(Effect.mapError(fail(`Could not read "${candidate.title}".`)));
+      if (threadHasUnfinishedWork(records)) {
+        return yield* new ScratchThreadPromotionError({
+          reason: `"${candidate.title}" is still working. Finish or stop it first.`,
+        });
+      }
+    }
+    for (const candidate of pending) {
+      yield* threads
+        .dispatch({
+          type: "thread.project.move",
+          commandId: CommandId.make(`thread-project-move:${yield* randomId}`),
+          threadId: candidate.id,
+          projectId: input.projectId,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ScratchThreadPromotionError({
+                reason:
+                  "cause" in cause && typeof cause.cause === "string"
+                    ? cause.cause
+                    : `Could not move "${candidate.title}".`,
+                cause,
+              }),
+          ),
+        );
+    }
+    yield* scheduledTasks
+      .syncThreadTaskProjects({ threadIds: [...moveSet.keys()] })
+      .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
+  });
 
   const randomId = random.uuidV4();
 

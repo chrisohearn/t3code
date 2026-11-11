@@ -7302,6 +7302,31 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
         .pipe(Effect.flip);
       assert.include(missing.message, "cannot move to missing project");
 
+      // A thread working in its project's root has no folder of its own to keep.
+      const orchestratorForRoot = yield* Orchestrator.OrchestratorV2;
+      const rootThreadId = ThreadId.make("promotion-file-root");
+      yield* orchestratorForRoot.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("promotion-file-root-create"),
+        threadId: rootThreadId,
+        projectId: SCRATCH_PROJECT_ID,
+        title: "file root",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      const rootless = yield* promotion
+        .move({ threadId: rootThreadId, projectId })
+        .pipe(Effect.flip);
+      assert.equal(
+        rootless.message,
+        "Only a thread with its own folder can move to another project.",
+      );
+
       // A side chat is refused on its own and moves with its parent.
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const sideChatId = ThreadId.make("promotion-file-side-chat");

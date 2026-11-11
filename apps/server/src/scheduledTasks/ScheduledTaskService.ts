@@ -687,7 +687,19 @@ export const layer = Layer.effect(
           prompt = excluded.prompt,
           enabled = excluded.enabled,
           schedule_json = excluded.schedule_json,
-          project_id = excluded.project_id,
+          -- A save that keeps its thread binding follows that thread's project, so an edit that
+          -- loaded the task before the thread moved cannot put the stale project back.
+          project_id = CASE
+            WHEN excluded.thread_id IS NOT NULL AND excluded.thread_id = scheduled_tasks.thread_id
+              THEN COALESCE(
+                (
+                  SELECT thread.project_id FROM orchestration_v2_projection_threads AS thread
+                  WHERE thread.thread_id = scheduled_tasks.thread_id
+                ),
+                excluded.project_id
+              )
+            ELSE excluded.project_id
+          END,
           -- A first run may bind the thread while this save is in flight; only a
           -- switch to new threads unbinds.
           thread_id = CASE
