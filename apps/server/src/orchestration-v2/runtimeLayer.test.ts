@@ -8,6 +8,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
+import { McpSchema, McpServer } from "effect/ai";
 import {
   type ApplicationStoredEvent,
   CheckpointId,
@@ -15,6 +16,7 @@ import {
   CommandId,
   ContextTransferId,
   EventId,
+  EnvironmentId,
   MessageId,
   NodeId,
   RuntimeRequestId,
@@ -56,6 +58,9 @@ import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as McpHttpServer from "../mcp/McpHttpServer.ts";
+import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import * as ThreadSearch from "./ThreadSearch.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
@@ -7190,7 +7195,11 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
         workspaceRoot: SCRATCH_ROOT,
       });
     }
-    const createThread = (suffix: string, worktreePath: string) =>
+    const createThread = (
+      suffix: string,
+      worktreePath: string,
+      runtimeMode: "auto" | "full-access" = "full-access",
+    ) =>
       orchestrator
         .dispatch({
           type: "thread.create",
@@ -7201,7 +7210,7 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
           projectId: SCRATCH_PROJECT_ID,
           title: `${name} ${suffix}`,
           modelSelection,
-          runtimeMode: "full-access",
+          runtimeMode,
           interactionMode: "default",
           branch: null,
           worktreePath,
@@ -7286,6 +7295,132 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
           .file({ threadId, projectId: (yield* createTarget("other")).id })
           .pipe(Effect.flip);
         assert.include(regular.message, "Only a No project thread");
+      }),
+  );
+
+  it.effect("a rejected filing leaves its scheduled tasks in scratch", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+      const { folder, createThread } = yield* setup("file-rejected-task");
+      const threadId = yield* createThread("main", folder);
+      const target = yield* createTarget("rejected-task");
+      const { task } = yield* tasks.upsert({
+        id: ScheduledTaskId.make("filing-rejected-task"),
+        title: "Bound",
+        prompt: "Check in",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60_000 },
+        projectId: SCRATCH_PROJECT_ID,
+        threadId,
+        workspaceStrategy: { type: "root" },
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      });
+      const dispatch = threads.dispatch;
+      const spy = vi.spyOn(threads, "dispatch").mockImplementation((command) =>
+        command.type === "thread.project.file-scratch"
+          ? Effect.fail(
+              new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "Rejected filing",
+              }),
+            )
+          : dispatch(command),
+      );
+      try {
+        yield* filing.file({ threadId, projectId: target.id }).pipe(Effect.flip);
+        assert.equal((yield* shellOf(threadId))?.projectId, SCRATCH_PROJECT_ID);
+        assert.equal(
+          (yield* tasks.list()).tasks.find((row) => row.id === task.id)?.projectId,
+          SCRATCH_PROJECT_ID,
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    }),
+  );
+
+  it.effect.each(["folder-mate", "family"] as const)(
+    "a linked caller cannot file an unauthorized %s and moves nothing",
+    (relationship) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`file-linked-${relationship}`);
+        const ownedId = ThreadId.make(`filing-linked-owned-${relationship}`);
+        const foreignId = yield* createThread("foreign", folder, "auto");
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${ownedId}`),
+          threadId: ownedId,
+          projectId: SCRATCH_PROJECT_ID,
+          title: "Link owned",
+          modelSelection,
+          runtimeMode: "auto",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: folder,
+          createdBy: "user",
+          creationSource: "web",
+          linkOrigin: { sessionId: "filing-link", label: "Filing link", access: "auto" },
+          ...(relationship === "family"
+            ? {
+                lineage: {
+                  rootThreadId: foreignId,
+                  parentThreadId: foreignId,
+                  relationshipToParent: "subagent" as const,
+                },
+              }
+            : {}),
+        });
+        const target = yield* createTarget(`linked-${relationship}`);
+        const result = yield* McpServer.McpServer.pipe(
+          Effect.flatMap((server) =>
+            server.callTool({
+              name: "t3_thread_organize",
+              arguments: { action: "move", threadId: ownedId, projectId: target.id },
+            }),
+          ),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("filing-environment"),
+            requestNamespace: "filing-link",
+            thread: undefined,
+            client: {
+              sessionId: "filing-link",
+              label: "Filing link",
+              access: "auto",
+              linked: true,
+            },
+            capabilities: new Set(["orchestration"] as const),
+            issuedAt: 0,
+          }),
+          Effect.provideService(McpSchema.McpServerClient, {
+            clientId: 1,
+            protocolVersion: "2025-06-18",
+            clientCapabilities: {},
+            clientInfo: { name: "filing-test", version: "1" },
+            initializePayload: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: "filing-test", version: "1" },
+            },
+            getClient: Effect.die("unused"),
+          }),
+          Effect.provide(
+            McpHttpServer.layerThreadToolkit.pipe(
+              Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+              Layer.provide(NodeCrypto.layer),
+              Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
+            ),
+          ),
+        );
+        assert.isTrue(result.isError);
+        assert.include(JSON.stringify(result.content), "capability_denied");
+        for (const id of [ownedId, foreignId])
+          assert.equal((yield* shellOf(id))?.projectId, SCRATCH_PROJECT_ID);
       }),
   );
 
@@ -7716,27 +7851,40 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
   );
 
   it.effect.each(["delete", "file"] as const)(
-    "rejects a %s that loses the project-deletion race",
-    (paused) =>
+    "serializes target deletion with the whole family when %s wins the lock",
+    (first) =>
       Effect.gen(function* () {
         const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
         const projects = yield* ProjectService.ProjectService;
         const eventSink = yield* EventSink.EventSinkV2;
-        const { folder, createThread } = yield* setup(`race-${paused}`);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`batch-race-${first}`);
         const threadId = yield* createThread("main", folder);
-        const target = yield* createTarget(`race-${paused}`);
+        const childId = ThreadId.make(`filing-delete-child-${first}`);
+        yield* orchestrator.dispatch({
+          type: "thread.fork",
+          commandId: CommandId.make(`fork:${childId}`),
+          sourceThreadId: threadId,
+          targetThreadId: childId,
+          sourcePoint: { type: "latest_stable" },
+          sideChat: true,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const target = yield* createTarget(`batch-race-${first}`);
         const ready = yield* Deferred.make<void>();
         const proceed = yield* Deferred.make<void>();
+        const competing = yield* Deferred.make<void>();
         const commitProject = eventSink.commitProjectCommand;
         const commitThread = eventSink.commitCommand;
         const deleteTarget = projects.delete({
-          commandId: CommandId.make(`race-delete-${paused}`),
+          commandId: CommandId.make(`batch-delete-${first}`),
           projectId: target.id,
           force: true,
         });
         const file = filing.file({ threadId, projectId: target.id });
         const spy =
-          paused === "delete"
+          first === "delete"
             ? vi
                 .spyOn(eventSink, "commitProjectCommand")
                 .mockImplementation((input) =>
@@ -7747,40 +7895,59 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
                       )
                     : commitProject(input),
                 )
-            : vi
-                .spyOn(eventSink, "commitCommand")
-                .mockImplementation((input) =>
-                  input.commandType === "thread.project.file-scratch" && input.threadId === threadId
-                    ? Deferred.succeed(ready, undefined).pipe(
-                        Effect.andThen(Deferred.await(proceed)),
-                        Effect.andThen(commitThread(input)),
-                      )
-                    : commitThread(input),
-                );
+            : vi.spyOn(eventSink, "commitCommand").mockImplementation((input) =>
+                Effect.gen(function* () {
+                  const result = yield* commitThread(input);
+                  if (
+                    input.commandType === "thread.project.file-scratch" &&
+                    input.threadId === threadId
+                  ) {
+                    yield* Deferred.succeed(ready, undefined);
+                    yield* Deferred.await(proceed);
+                  }
+                  return result;
+                }),
+              );
         try {
           const pending = yield* Effect.forkChild(
             Effect.gen(function* () {
-              if (paused === "delete") yield* deleteTarget;
+              if (first === "delete") yield* deleteTarget;
               else yield* file;
             }).pipe(Effect.result),
           );
           yield* Deferred.await(ready);
-          if (paused === "delete") yield* file;
-          else yield* deleteTarget;
-          yield* Deferred.succeed(proceed, undefined);
-          assert.equal((yield* Fiber.join(pending))._tag, "Failure");
-          assert.equal(
-            (yield* shellOf(threadId))?.projectId,
-            paused === "delete" ? target.id : SCRATCH_PROJECT_ID,
+          const competitor = yield* Effect.forkChild(
+            Deferred.succeed(competing, undefined).pipe(
+              Effect.andThen(
+                Effect.gen(function* () {
+                  if (first === "delete") yield* file;
+                  else yield* deleteTarget;
+                }),
+              ),
+              Effect.result,
+            ),
           );
-          assert.equal(Option.isSome(yield* projects.getById(target.id)), paused === "delete");
+          yield* Deferred.await(competing);
+          yield* TestClock.adjust(0);
+          yield* Deferred.succeed(proceed, undefined);
+          assert.equal((yield* Fiber.join(pending))._tag, "Success");
+          assert.equal(
+            (yield* Fiber.join(competitor))._tag,
+            first === "delete" ? "Failure" : "Success",
+          );
+          for (const id of [threadId, childId]) {
+            const { thread } = yield* orchestrator.getThreadProjection(id);
+            assert.equal(thread.projectId, first === "delete" ? SCRATCH_PROJECT_ID : target.id);
+            assert.equal(thread.deletedAt !== null, first === "file");
+          }
         } finally {
+          yield* Deferred.succeed(proceed, undefined);
           spy.mockRestore();
         }
       }),
   );
 
-  it.effect("moves a task created after task migration but before thread assignment", () =>
+  it.effect("publishes the final task state for tasks created before thread assignment", () =>
     Effect.gen(function* () {
       const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
       const eventSink = yield* EventSink.EventSinkV2;
@@ -7817,8 +7984,21 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
           runtimeMode: "full-access",
           interactionMode: "default",
         });
+        const subscribed = yield* Deferred.make<void>();
+        const updated = yield* Deferred.make<void>();
+        yield* tasks.subscribeList().pipe(
+          Stream.runForEach(({ tasks: rows }) => {
+            const row = rows.find((candidate) => candidate.id === task.id);
+            return row?.projectId === target.id
+              ? Deferred.succeed(updated, undefined)
+              : Deferred.succeed(subscribed, undefined);
+          }),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(subscribed);
         yield* Deferred.succeed(proceed, undefined);
         yield* Fiber.join(pending);
+        yield* Deferred.await(updated);
         const saved = (yield* tasks.list()).tasks.find((candidate) => candidate.id === task.id);
         assert.equal(saved?.projectId, target.id);
         assert.equal(saved?.threadId, threadId);

@@ -56,6 +56,7 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as DueHint from "../scheduling/DueHint.ts";
+import * as ScheduledTaskChanges from "./ScheduledTaskChanges.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
 import {
@@ -491,8 +492,7 @@ export const layer = Layer.effect(
       ReadonlyMap<ScheduledTaskId, ReadonlyArray<number>>
     >(new Map());
     const activeRuns = yield* Ref.make<ReadonlySet<ScheduledTaskId>>(new Set());
-    // Notifications re-emit the full list; slow subscribers need only the newest dirty signal.
-    const changesPubSub = yield* PubSub.sliding<void>(1);
+    const changesPubSub = yield* ScheduledTaskChanges.ScheduledTaskChanges;
     const dueTasks = DueHint.make();
     const pendingWebhooks = DueHint.make();
     // Every scheduled_tasks write that can change next_run_at, enabled or run state notifies.
@@ -2520,4 +2520,4 @@ export const layer = Layer.effect(
       triggerWebhook,
     });
   }),
-);
+).pipe(Layer.provide(ScheduledTaskChanges.layer));

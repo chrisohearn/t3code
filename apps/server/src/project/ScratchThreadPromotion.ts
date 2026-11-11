@@ -33,12 +33,16 @@ export class ScratchThreadPromotionError extends Schema.TaggedError<ScratchThrea
 export class ScratchThreadPromotion extends Context.Service<
   ScratchThreadPromotion,
   {
-    readonly file: (input: {
-      readonly threadId: ThreadId;
-      readonly projectId: ProjectId;
-    }) => Effect.Effect<
+    readonly file: <E = never, R = never>(
+      input: {
+        readonly threadId: ThreadId;
+        readonly projectId: ProjectId;
+      },
+      authorize?: (threadId: ThreadId) => Effect.Effect<void, E, R>,
+    ) => Effect.Effect<
       { readonly threadIds: ReadonlyArray<ThreadId> },
-      ScratchThreadPromotionError
+      ScratchThreadPromotionError | E,
+      R
     >;
     /**
      * Turns a No project thread's folder into a project, in place, and moves every
@@ -136,7 +140,10 @@ const make = Effect.gen(function* () {
   });
 
   const file: ScratchThreadPromotion["Service"]["file"] = Effect.fn("ScratchThreadPromotion.file")(
-    function* (input) {
+    function* <E = never, R = never>(
+      input: { readonly threadId: ThreadId; readonly projectId: ProjectId },
+      authorize?: (threadId: ThreadId) => Effect.Effect<void, E, R>,
+    ) {
       const thread = yield* threads.getThreadShell(input.threadId).pipe(
         Effect.mapError(fail("Could not read the thread.")),
         Effect.filterOrFail(
@@ -208,6 +215,7 @@ const make = Effect.gen(function* () {
         }
         const moveSet = new Map<ThreadId, OrchestrationV2ThreadShell>();
         for (const member of members.values()) {
+          if (authorize !== undefined) yield* authorize(member.id);
           const records = yield* threads
             .getThreadRecords(member.id, ["runs", "runtimeRequests"], { turnItemTypes: [] })
             .pipe(Effect.mapError(fail(`Could not read "${member.title}".`)));
@@ -241,12 +249,6 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const moved = new Set<ThreadId>();
           while (moveSet.length > 0) {
-            yield* scheduledTasks
-              .moveThreadTasks({
-                threadIds: moveSet.map((member) => member.id),
-                projectId: input.projectId,
-              })
-              .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
             for (const candidate of moveSet) {
               yield* threads
                 .dispatch({
@@ -265,6 +267,7 @@ const make = Effect.gen(function* () {
         }),
       );
     },
+    (effect, input) => projects.withProjectLock(input.projectId, effect),
   );
 
   const randomId = random.uuidV4();

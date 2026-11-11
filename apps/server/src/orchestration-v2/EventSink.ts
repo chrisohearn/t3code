@@ -30,6 +30,7 @@ import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventS
 import { projectStoredEventForWire } from "./WireProjection.ts";
 import { makeRunOutcomeRecorder, type RunOutcome } from "./RunMetrics.ts";
 
+import * as ScheduledTaskChanges from "../scheduledTasks/ScheduledTaskChanges.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventStore from "./EventStore.ts";
@@ -242,6 +243,7 @@ const layerBase: Layer.Layer<
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const scheduledTaskChanges = yield* ScheduledTaskChanges.ScheduledTaskChanges;
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -678,7 +680,12 @@ const layerBase: Layer.Layer<
           });
           if (!reserved) {
             const existing = yield* existingCommandResult(input.commandId);
-            return { ...existing, committed: false as const, cancelledEffectIds: [] };
+            return {
+              ...existing,
+              committed: false as const,
+              cancelledEffectIds: [],
+              tasksChanged: false,
+            };
           }
 
           const runId = input.updateDelegatedCompletionOnlyRunId;
@@ -702,6 +709,7 @@ const layerBase: Layer.Layer<
               new Error(`Command ${input.commandId} produced no orchestration events.`),
             );
           }
+          let tasksChanged = false;
           if (
             input.commandType === "thread.project.file-scratch" ||
             input.commandType === "thread.project.adopt-folder"
@@ -713,10 +721,12 @@ const layerBase: Layer.Layer<
                 return yield* Effect.fail("Cannot update a thread in a missing project.");
               }
               // Project assignment and bound tasks commit together, including saves racing a move.
-              yield* sql`
+              const moved = yield* sql`
                 UPDATE scheduled_tasks SET project_id = ${event.payload.projectId}
                 WHERE thread_id = ${event.threadId} AND project_id != ${event.payload.projectId}
+                RETURNING task_id
               `;
+              tasksChanged ||= moved.length > 0;
             }
           }
           const outcomes = yield* applyStoredEvents(storedEvents);
@@ -738,10 +748,18 @@ const layerBase: Layer.Layer<
                   threadId: input.threadId,
                   ...input.cancelUnsettledEffects,
                 });
-          return { receipt, storedEvents, outcomes, committed: true as const, cancelledEffectIds };
+          return {
+            receipt,
+            storedEvents,
+            outcomes,
+            committed: true as const,
+            cancelledEffectIds,
+            tasksChanged,
+          };
         }),
         (result) =>
           Effect.gen(function* () {
+            if (result.tasksChanged) yield* PubSub.publish(scheduledTaskChanges, undefined);
             yield* effectOutbox.signalCancellations(result.cancelledEffectIds);
             if (result.committed && input.effects.length > 0) {
               yield* effectOutbox.notifyAvailable(input.effects.length);
@@ -1143,7 +1161,7 @@ const layerBase: Layer.Layer<
         ),
     } satisfies EventSinkV2Shape);
   }),
-);
+).pipe(Layer.provide(ScheduledTaskChanges.layer));
 
 /** Share the worker's outbox instance: enqueue wakeups are in-memory. */
 export const layerFromStores = layerBase;
