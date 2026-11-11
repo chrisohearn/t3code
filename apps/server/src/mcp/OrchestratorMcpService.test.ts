@@ -1,3 +1,4 @@
+import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -71,9 +72,14 @@ import { resolveRuntimeMode } from "./delegatedTaskModes.ts";
 import type { ProjectionRecordFilter } from "../orchestration-v2/ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+const layerClientThreads = Layer.mock(McpClientThreads.McpClientThreads)({
+  record: () => Effect.void,
+  list: () => Effect.succeed([]),
+});
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(layerClientThreads),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -3052,6 +3058,7 @@ describe("OrchestratorMcpService provider resolution", () => {
       modes?: Ref.Ref<ReadonlyArray<ScheduledTaskUpsertInput["threadMode"]>>,
     ) =>
       OrchestratorMcpService.layer.pipe(
+        Layer.provide(layerClientThreads),
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)(git)),
         Layer.provide(
@@ -3982,7 +3989,18 @@ describe("OrchestratorMcpService thread list", () => {
       ],
     },
   ];
-  const service = layerOrchestratorService.pipe(
+  const service = OrchestratorMcpService.layer.pipe(
+    Layer.provide(
+      Layer.mock(McpClientThreads.McpClientThreads)({
+        list: () =>
+          Effect.succeed([
+            { threadId: shells[0]!.id, sessionId: "thread-list", clientLabel: "Shared client" },
+            { threadId: shells[2]!.id, sessionId: "other-session", clientLabel: "Shared client" },
+          ]),
+      }),
+    ),
+    Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+    Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
     Layer.provide(
       Layer.mergeAll(
         NodeServices.layer,
@@ -4017,6 +4035,18 @@ describe("OrchestratorMcpService thread list", () => {
         snoozed: true,
       });
       assert.equal(listed.projectId, null);
+      assert.equal(listed.threads[0]?.launchedBy, "Shared client");
+      assert.equal(listed.threads[0]?.pendingRequestCount, 0);
+      const mine = yield* mcp.listThreads(client, { allProjects: true, launchedByMe: true });
+      assert.deepEqual(
+        mine.threads.map((thread) => thread.threadId),
+        [shells[0]!.id],
+      );
+      const linked = { ...client, client: { ...client.client!, linked: true } };
+      const refused = yield* mcp
+        .listThreads(linked, { allProjects: true, launchedByMe: true })
+        .pipe(Effect.flip);
+      assert.equal(refused.code, "invalid_request");
       assert.deepStrictEqual(
         listed.threads.map((thread) => [thread.threadId, thread.projectId]),
         [

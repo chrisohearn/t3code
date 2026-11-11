@@ -1,3 +1,4 @@
+import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import {
   CommandId,
   type RunId,
@@ -836,6 +837,8 @@ function listItemFromShell(
 ): OrchestratorMcpThreadListItem {
   return {
     threadId: shell.id,
+    launchedBy: null,
+    pendingRequestCount: shell.pendingRuntimeRequest === null ? 0 : 1,
     projectId: shell.projectId,
     title: shell.title,
     link: threadLinkFor(scope, shell.id, shell.title),
@@ -1061,6 +1064,7 @@ function timelineItem(input: {
 }
 
 const make = Effect.gen(function* () {
+  const clientThreads = yield* McpClientThreads.McpClientThreads;
   const random = yield* SecureRandom.SecureRandom;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
@@ -2995,7 +2999,26 @@ const make = Effect.gen(function* () {
           ? null
           : new Set(input.statuses);
       const titleContains = input.titleContains?.toLocaleLowerCase();
+      // Launches forwarded from a linked environment are not recorded here, so refuse rather than list none.
+      if (
+        input.launchedByMe === true &&
+        (scope.client === undefined || scope.client.linked === true)
+      )
+        return yield* failure(
+          "invalid_request",
+          "launchedByMe works only for an outside MCP sign-in on its own environment, not through a linked environment.",
+        );
+      const sessionId = scope.client?.sessionId;
+      const mine =
+        input.launchedByMe === true && sessionId !== undefined
+          ? new Set(
+              (yield* clientThreads.list({ sessionId }))
+                .filter((row) => row.sessionId === sessionId)
+                .map((row) => row.threadId),
+            )
+          : null;
       const filtered = projectThreads
+        .filter((thread) => mine === null || mine.has(thread.id))
         .filter((thread) => statuses === null || statuses.has(listedThreadStatus(thread)))
         .filter(
           (thread) =>
@@ -3012,10 +3035,35 @@ const make = Effect.gen(function* () {
       const limit = input.limit ?? DEFAULT_THREAD_LIST_LIMIT;
       const page = filtered.slice(cursor, cursor + limit);
       const nextCursor = cursor + page.length < filtered.length ? cursor + page.length : null;
+      const provenance = new Map(
+        (yield* clientThreads.list({ threadIds: page.map((shell) => shell.id) })).map((row) => [
+          row.threadId,
+          row,
+        ]),
+      );
       return {
         projectId,
         currentThreadId: parent?.thread.id ?? null,
-        threads: page.map((shell) => listItemFromShell(scope, shell, nowMs)),
+        threads: yield* Effect.forEach(
+          page,
+          (shell) =>
+            Effect.gen(function* () {
+              const records =
+                shell.pendingRuntimeRequest === null
+                  ? undefined
+                  : yield* threadManagement
+                      .getThreadRecords(shell.id, ["runtimeRequests"], {
+                        runtimeRequestStatuses: ["pending"],
+                      })
+                      .pipe(Effect.mapError(threadManagementFailure));
+              return {
+                ...listItemFromShell(scope, shell, nowMs),
+                pendingRequestCount: records?.runtimeRequests.length ?? 0,
+                launchedBy: provenance.get(shell.id)?.clientLabel ?? null,
+              };
+            }),
+          { concurrency: 8 },
+        ),
         nextCursor,
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
@@ -3391,6 +3439,7 @@ const make = Effect.gen(function* () {
 export const layer: Layer.Layer<
   OrchestratorMcpService,
   never,
+  | McpClientThreads.McpClientThreads
   | SecureRandom.SecureRandom
   | ThreadManagementService.ThreadManagementService
   | ThreadLaunchService.ThreadLaunchService

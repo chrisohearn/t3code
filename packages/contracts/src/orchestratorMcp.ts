@@ -339,6 +339,7 @@ export const OrchestratorMcpThreadListInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
   projectId: OrchestratorMcpProjectTarget,
   allProjects: Schema.optional(Schema.Boolean),
+  launchedByMe: Schema.optional(Schema.Boolean),
   statuses: Schema.optional(
     Schema.Array(OrchestratorMcpThreadStatus).check(Schema.isMaxLength(10)),
   ),
@@ -361,6 +362,9 @@ export const OrchestratorMcpThreadPullRequest = Schema.Struct({
 export type OrchestratorMcpThreadPullRequest = typeof OrchestratorMcpThreadPullRequest.Type;
 
 export const OrchestratorMcpThreadListItem = Schema.Struct({
+  // Optional: a linked environment on an older build omits them.
+  launchedBy: Schema.optional(Schema.NullOr(Schema.String)),
+  pendingRequestCount: Schema.optional(NonNegativeInt),
   threadId: ThreadId,
   projectId: ProjectId,
   title: Schema.String,

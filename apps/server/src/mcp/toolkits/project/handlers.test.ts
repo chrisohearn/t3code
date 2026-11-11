@@ -1,3 +1,5 @@
+import * as McpClientThreads from "../../../persistence/McpClientThreads.ts";
+import * as ThreadLaunchMcp from "../../ThreadLaunchMcpService.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import { expect, it } from "@effect/vitest";
 import {
@@ -70,7 +72,16 @@ const clientLaunchHarness = (input: {
   const projectDefaults: { model: ModelSelection | null } = {
     model: input.overrideModel === undefined ? modelSelection : null,
   };
+  const provenance: Array<{ threadId: ThreadId; sessionId: string; clientLabel: string }> = [];
   const layerDependencies = Layer.mergeAll(
+    ThreadLaunchMcp.layer,
+    Layer.mock(McpClientThreads.McpClientThreads)({
+      record: (row) =>
+        Effect.sync(() => {
+          provenance.push(row);
+        }),
+      list: () => Effect.succeed(provenance),
+    }),
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed(input.providers ?? []),
     }),
@@ -178,7 +189,13 @@ const clientLaunchHarness = (input: {
     ),
     Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
-  return { projectId, modelSelection, projectDefaults, dependencies: layerDependencies };
+  return {
+    projectId,
+    modelSelection,
+    projectDefaults,
+    provenance,
+    dependencies: layerDependencies,
+  };
 };
 
 it.effect(
@@ -410,7 +427,7 @@ it.effect("a launch with a model its provider does not advertise creates no thre
 it.effect("a launch retried with the same clientRequestId replays the first one", () =>
   Effect.gen(function* () {
     const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
-    const { projectId, dependencies } = clientLaunchHarness({
+    const { projectId, dependencies, provenance } = clientLaunchHarness({
       runtimeModeCeiling: "auto",
       launched,
     });
@@ -434,6 +451,11 @@ it.effect("a launch retried with the same clientRequestId replays the first one"
     yield* launch("fix-2");
     yield* launch(undefined);
     yield* launch(undefined);
+    expect(provenance).toContainEqual({
+      threadId: launched[0]!.threadId,
+      sessionId: "session-1",
+      clientLabel: "Claude Code",
+    });
     const ids = launched.map((input) => [input.commandId, input.threadId]);
     // The same key sends the same command and thread ids, which the launch
     // service replays instead of starting a second thread.

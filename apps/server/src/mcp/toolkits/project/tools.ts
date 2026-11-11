@@ -1,20 +1,12 @@
-import { McpAttachmentInput } from "../attachment/input.ts";
+import * as ThreadLaunchMcp from "../../ThreadLaunchMcpService.ts";
+import * as McpClientThreads from "../../../persistence/McpClientThreads.ts";
+
 import {
   NonNegativeInt,
-  ModelSelection,
-  TrimmedNonEmptyString,
-  ThreadId,
-  RunId,
-  OrchestrationV2DelegatedFrom,
-  OrchestrationV2RunStatus,
-  OrchestrationV2ThreadLaunchWorkspaceStrategy,
-  RuntimeMode,
-  ProviderInteractionMode,
   Project,
   ProjectCreatePayload,
   ProjectUpdatePayload,
   ProjectId,
-  OrchestratorMcpClientRequestId,
   OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpFailure,
   SourceControlCloneRepositoryInput,
@@ -125,45 +117,12 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
   ...shared,
   description:
     "Create one new top-level thread, bound to its workspace before the agent starts. Task in `message`. Omit `projectId`, model and modes to inherit yours (outside a thread, pass `projectId` or `scratch`); modes cannot exceed yours. After an error or lost reply, retry with the same `clientRequestId`. Follow it with `t3_thread_read` or `t3_thread_wait`. Mention it with its `link`.",
-  parameters: Schema.Struct({
-    environmentId: OrchestratorMcpEnvironmentTarget,
-    projectId: Schema.optional(ProjectId),
-    scratch: Schema.optional(
-      Schema.Boolean.annotate({
-        description:
-          "No project: a new Scratch folder. Not with `projectId` or `workspaceStrategy`.",
-      }),
-    ),
-    title: TrimmedNonEmptyString,
-    modelSelection: Schema.optional(ModelSelection),
-    runtimeMode: Schema.optional(RuntimeMode),
-    interactionMode: Schema.optional(ProviderInteractionMode),
-    workspaceStrategy: Schema.optional(
-      OrchestrationV2ThreadLaunchWorkspaceStrategy.annotate({
-        description:
-          "'worktree': new checkout from `baseRef`. Honor a requested base. Otherwise, independent work uses the default branch as `remote/branch` (e.g. `origin/main`) with `startFromOrigin: true`; with no remote, use the local default branch. Required unpublished commits and dependent or stacked work use their local base with `startFromOrigin: false`. 'existing_worktree': bind `worktreePath`, a project worktree. 'root': project checkout, the default, not your worktree. Uncommitted edits are not copied.",
-      }),
-    ),
-    message: Schema.optional(
-      Schema.String.check(Schema.isMaxLength(120000)).annotate({
-        description: "First prompt. Omit it and `attachments` for idle.",
-      }),
-    ),
-    attachments: Schema.optional(Schema.Array(McpAttachmentInput).check(Schema.isMaxLength(8))),
-    clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
-    /** Set by a linked environment launching its agent's delegated task here; ignored otherwise. */
-    delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
-  }),
-  success: Schema.Struct({
-    threadId: ThreadId,
-    link: Schema.optional(Schema.String),
-    projectId: ProjectId,
-    modelSelection: ModelSelection,
-    runId: Schema.NullOr(RunId),
-    status: Schema.NullOr(OrchestrationV2RunStatus),
-  }),
+  parameters: ThreadLaunchMcp.launchInput,
+  success: ThreadLaunchMcp.launchResult,
   dependencies: [
     ...shared.dependencies,
+    ThreadLaunchMcp.ThreadLaunchMcpService,
+    McpClientThreads.McpClientThreads,
     ThreadLaunchService.ThreadLaunchService,
     ManagedProjectFolders.ManagedProjectFolders,
     GitVcsDriver.GitVcsDriver,

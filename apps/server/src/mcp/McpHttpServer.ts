@@ -1,3 +1,5 @@
+import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
+import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
 import { LedgerToolkit } from "./toolkits/ledger/tools.ts";
 import * as LedgerHandlers from "./toolkits/ledger/handlers.ts";
@@ -1239,7 +1241,10 @@ const layerEnvironmentToolkit = toolkitRegistration(
   EnvironmentHandlers.layer,
 ).pipe(Layer.provide(ThreadCommandExecutor.layer));
 
-export const layerProjectRegistration = toolkitRegistration(ProjectToolkit, ProjectHandlers.layer);
+export const layerProjectRegistration = toolkitRegistration(
+  ProjectToolkit,
+  ProjectHandlers.layer,
+).pipe(Layer.provide(ThreadLaunchMcp.layer));
 
 export const layerAttachmentToolkit = toolkitRegistration(
   AttachmentToolkit,
@@ -1372,4 +1377,4 @@ export const layerToolSearch = Layer.mergeAll(
 export const layer = Layer.merge(
   layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch)),
   McpEvents.layerDeliveryWorker,
-).pipe(Layer.provide(layerEvents), Layer.provide(WorkLedger.layer));
+).pipe(Layer.provide(layerEvents), Layer.provide(WorkLedger.layer), Layer.provide(McpClientThreads.layer));
