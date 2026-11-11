@@ -69,6 +69,9 @@ const sourcemapEnv = process.env.T3CODE_WEB_SOURCEMAP?.trim().toLowerCase();
 // is about 2 s of each build, and nothing in that mode reads it.
 const builtDev = process.env.T3CODE_BUILT_DEV === "1";
 
+// Vitest sets VITEST before it loads this config.
+const isVitest = process.env.VITEST !== undefined;
+
 const bundledDevEnv = process.env.T3CODE_BUNDLED_DEV?.trim().toLowerCase();
 const bundledDev = bundledDevEnv === "1" || bundledDevEnv === "true";
 
@@ -341,9 +344,9 @@ export default defineConfig(() => {
       allowedHosts,
       // Warm the module graph before first request to avoid serial import transforms over tailnet.
       // Bundled dev ignores this; warmBundledDevPlugin handles it there.
-      warmup: {
-        clientFiles: ["./src/main.tsx"],
-      },
+      // Not under Vitest: warming main.tsx starts a Tailwind scanner per web test project, even
+      // for server-only runs, and Tailwind's native scanner can segfault with more than one.
+      ...(isVitest ? {} : { warmup: { clientFiles: ["./src/main.tsx"] } }),
       ...(devProxyTarget
         ? {
             // Share prefixes with the backend catch-all so the proxy and 404 lists cannot drift.
