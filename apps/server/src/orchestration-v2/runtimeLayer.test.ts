@@ -7363,163 +7363,356 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
     }),
   );
 
-  it.effect("finishes a partial filing from the already filed thread", () =>
-    Effect.gen(function* () {
-      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const { folder, createThread } = yield* setup("file-partial");
-      const movedId = yield* createThread("moved", folder);
-      const leftId = yield* createThread("left", folder);
-      const target = yield* createTarget("partial");
-      yield* orchestrator.dispatch({
-        type: "thread.project.file-scratch",
-        commandId: CommandId.make("file-partial-first"),
-        threadId: movedId,
-        projectId: target.id,
-      });
-      assert.deepEqual(yield* filing.file({ threadId: movedId, projectId: target.id }), {
-        threadIds: [leftId],
-      });
-      assert.equal((yield* shellOf(leftId))?.projectId, target.id);
-      assert.equal((yield* shellOf(leftId))?.worktreePath, folder);
-    }),
-  );
-
-  it.effect("refuses filing either side of a nested thread family", () =>
-    Effect.gen(function* () {
-      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const { folder, createThread } = yield* setup("file-family");
-      const parentId = yield* createThread("parent", folder);
-      const childId = ThreadId.make("filing-child");
-      const target = yield* createTarget("family");
-      yield* orchestrator.dispatch({
-        type: "thread.fork",
-        commandId: CommandId.make("file-fork"),
-        sourceThreadId: parentId,
-        targetThreadId: childId,
-        sourcePoint: { type: "latest_stable" },
-        sideChat: true,
-        createdBy: "user",
-        creationSource: "web",
-      });
-      yield* orchestrator.dispatch({
-        type: "thread.metadata.update",
-        commandId: CommandId.make("filing-child-folder"),
-        threadId: childId,
-        worktreePath: `${yield* scratchRoot}/child-folder`,
-      });
-      for (const threadId of [parentId, childId]) {
-        assert.include(
-          (yield* filing.file({ threadId, projectId: target.id }).pipe(Effect.flip)).message,
-          "parent or child thread",
-        );
-        const error = yield* orchestrator
-          .dispatch({
-            type: "thread.project.file-scratch",
-            commandId: CommandId.make(`file-family-${threadId}`),
-            threadId,
-            projectId: target.id,
-          })
-          .pipe(Effect.flip);
-        assert.include(String(error.cause), "parent or child thread");
-        assert.equal((yield* shellOf(threadId))?.projectId, SCRATCH_PROJECT_ID);
-      }
-    }),
-  );
-
-  it.effect("a concurrent fork waits for filing and inherits the filed project", () =>
-    Effect.gen(function* () {
-      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const eventSink = yield* EventSink.EventSinkV2;
-      const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
-      const { folder, createThread } = yield* setup("file-fork-race");
-      const threadId = yield* createThread("main", folder);
-      const target = yield* createTarget("fork-race");
-      const childId = ThreadId.make("filing-concurrent-fork");
-      yield* orchestrator.dispatch({
-        type: "message.dispatch",
-        createdBy: "user",
-        creationSource: "web",
-        commandId: CommandId.make("filing-fork-source-run"),
-        threadId,
-        messageId: MessageId.make("filing-fork-source-run"),
-        text: "Prior work",
-        attachments: [],
-        modelSelection,
-        dispatchMode: { type: "start_immediately" },
-      });
-      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0];
-      assert.isDefined(run);
-      const now = yield* DateTime.now;
-      yield* eventSink.write({
-        events: [
-          {
-            id: EventId.make("filing-fork-source-completed"),
-            type: "run.updated",
-            threadId,
-            runId: run.id,
-            occurredAt: now,
-            payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+  const createSubagent = Effect.fn(function* (parentId: ThreadId, suffix: string) {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const parent = (yield* orchestrator.getThreadProjection(parentId)).thread;
+    const id = ThreadId.make(`${parentId}:${suffix}`);
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(`${id}:created`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: yield* DateTime.now,
+          payload: {
+            ...parent,
+            id,
+            title: suffix,
+            lineage: {
+              parentThreadId: parentId,
+              rootThreadId: parent.lineage.rootThreadId,
+              relationshipToParent: "subagent",
+            },
           },
-        ],
-      });
-      const ready = yield* Deferred.make<void>();
-      const proceed = yield* Deferred.make<void>();
-      const queued = yield* Deferred.make<void>();
-      const commit = eventSink.commitCommand;
-      const withLock = executor.withLock;
-      const commitSpy = vi
-        .spyOn(eventSink, "commitCommand")
-        .mockImplementation((input) =>
-          input.commandType === "thread.project.file-scratch" && input.threadId === threadId
-            ? Deferred.succeed(ready, undefined).pipe(
-                Effect.andThen(Deferred.await(proceed)),
-                Effect.andThen(commit(input)),
-              )
-            : commit(input),
+        },
+      ],
+    });
+    return id;
+  });
+
+  it.effect.each(["root", "child"] as const)(
+    "files a subagent family when naming its %s",
+    (named) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`file-family-${named}`);
+        const rootId = yield* createThread("root", folder);
+        const childId = yield* createSubagent(rootId, "child");
+        const grandchildId = yield* createSubagent(childId, "grandchild");
+        const archivedId = yield* createSubagent(rootId, "archived");
+        const deletedId = yield* createSubagent(rootId, "deleted");
+        const mateId = yield* createThread("folder-mate", folder);
+        yield* orchestrator.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make(`${archivedId}:archive`),
+          threadId: archivedId,
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.delete",
+          commandId: CommandId.make(`${deletedId}:delete`),
+          threadId: deletedId,
+        });
+        const target = yield* createTarget(`family-${named}`);
+        const result = yield* filing.file({
+          threadId: named === "root" ? rootId : childId,
+          projectId: target.id,
+        });
+        assert.sameMembers(
+          [...result.threadIds],
+          [rootId, childId, grandchildId, archivedId, mateId],
         );
-      try {
-        const pending = yield* Effect.forkChild(filing.file({ threadId, projectId: target.id }));
-        yield* Deferred.await(ready);
-        const observeLock: ThreadCommandExecutor.ThreadCommandExecutor["Service"]["withLock"] = (
-          id,
-          effect,
-        ) =>
-          id === threadId
-            ? Deferred.succeed(queued, undefined).pipe(Effect.andThen(withLock(id, effect)))
-            : withLock(id, effect);
-        const lockSpy = vi.spyOn(executor, "withLock").mockImplementation(observeLock);
-        try {
-          const fork = yield* Effect.forkChild(
-            orchestrator.dispatch({
+        assert.isBelow(result.threadIds.indexOf(rootId), result.threadIds.indexOf(childId));
+        assert.isBelow(result.threadIds.indexOf(childId), result.threadIds.indexOf(grandchildId));
+        for (const id of result.threadIds) {
+          assert.equal((yield* shellOf(id))?.projectId, target.id);
+          assert.equal((yield* shellOf(id))?.worktreePath, folder);
+        }
+        assert.deepEqual(yield* filing.file({ threadId: childId, projectId: target.id }), {
+          threadIds: [],
+        });
+      }),
+  );
+
+  it.effect.each(["root", "child"] as const)(
+    "finishes a partial family filing from its filed %s",
+    (first) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`file-partial-${first}`);
+        const rootId = yield* createThread("root", folder);
+        const childId = yield* createSubagent(rootId, "child");
+        const movedId = first === "root" ? rootId : childId;
+        const leftId = first === "root" ? childId : rootId;
+        const target = yield* createTarget(`partial-${first}`);
+        yield* orchestrator.dispatch({
+          type: "thread.project.file-scratch",
+          commandId: CommandId.make(`file-partial-first-${first}`),
+          threadId: movedId,
+          projectId: target.id,
+        });
+        assert.deepEqual(yield* filing.file({ threadId: movedId, projectId: target.id }), {
+          threadIds: [leftId],
+        });
+        assert.equal((yield* shellOf(leftId))?.projectId, target.id);
+        assert.equal((yield* shellOf(leftId))?.worktreePath, folder);
+      }),
+  );
+
+  it.effect.each(["folder", "project", "busy"] as const)(
+    "refuses a family with a conflicting %s before moving anything",
+    (conflict) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`file-family-refuse-${conflict}`);
+        const parentId = yield* createThread("parent", folder);
+        const childId = ThreadId.make(`filing-child-${conflict}`);
+        const target = yield* createTarget(`family-refuse-${conflict}`);
+        yield* orchestrator.dispatch({
+          type: "thread.fork",
+          commandId: CommandId.make(`file-fork-${conflict}`),
+          sourceThreadId: parentId,
+          targetThreadId: childId,
+          sourcePoint: { type: "latest_stable" },
+          sideChat: true,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const mateId = yield* createThread("folder-mate", folder);
+        if (conflict === "busy") {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("file-family-busy"),
+            threadId: childId,
+            messageId: MessageId.make("file-family-busy"),
+            text: "Working",
+            attachments: [],
+            modelSelection,
+            dispatchMode: { type: "start_immediately" },
+          });
+        } else {
+          const projection = (yield* orchestrator.getThreadProjection(childId)).thread;
+          yield* (yield* EventSink.EventSinkV2).write({
+            events: [
+              {
+                id: EventId.make(`file-family-conflict-${conflict}`),
+                type: "thread.metadata-updated",
+                threadId: childId,
+                occurredAt: yield* DateTime.now,
+                payload: {
+                  ...projection,
+                  ...(conflict === "folder"
+                    ? { worktreePath: `${yield* scratchRoot}/child-folder` }
+                    : { projectId: (yield* createTarget("third-project")).id }),
+                },
+              },
+            ],
+          });
+        }
+        for (const threadId of [parentId, childId]) {
+          const outside = conflict === "project" && threadId === childId;
+          assert.include(
+            (yield* filing.file({ threadId, projectId: target.id }).pipe(Effect.flip)).message,
+            outside
+              ? "Only a No project thread"
+              : conflict === "busy"
+                ? "still working"
+                : "family member",
+          );
+          if (conflict === "busy" && threadId === parentId) continue;
+          const error = yield* orchestrator
+            .dispatch({
+              type: "thread.project.file-scratch",
+              commandId: CommandId.make(`file-family-${conflict}-${threadId}`),
+              threadId,
+              projectId: target.id,
+            })
+            .pipe(Effect.flip);
+          assert.include(
+            String(error.cause),
+            outside
+              ? "not a No project thread"
+              : conflict === "busy"
+                ? "work in progress"
+                : "family member",
+          );
+        }
+        for (const id of [parentId, mateId]) {
+          assert.equal((yield* shellOf(id))?.projectId, SCRATCH_PROJECT_ID);
+        }
+      }),
+  );
+
+  it.effect("files a child forked after the family snapshot before returning", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { folder, createThread } = yield* setup("file-late-child");
+      const threadId = yield* createThread("root", folder);
+      const childId = ThreadId.make("filing-late-child");
+      const target = yield* createTarget("late-child");
+      const dispatch = threads.dispatch;
+      let forked = false;
+      const spy = vi.spyOn(threads, "dispatch").mockImplementation((command) =>
+        Effect.gen(function* () {
+          if (command.type === "thread.project.file-scratch" && !forked) {
+            forked = true;
+            yield* orchestrator.dispatch({
               type: "thread.fork",
-              commandId: CommandId.make("filing-concurrent-fork"),
+              commandId: CommandId.make("filing-late-child"),
               sourceThreadId: threadId,
               targetThreadId: childId,
-              sourcePoint: { type: "run", runId: run.id },
+              sourcePoint: { type: "latest_stable" },
+              sideChat: true,
               createdBy: "user",
               creationSource: "web",
-            }),
-          );
-          yield* Effect.raceFirst(
-            Deferred.await(queued),
-            Fiber.join(fork).pipe(Effect.andThen(Effect.die("Fork bypassed the source lock."))),
-          );
-          yield* Deferred.succeed(proceed, undefined);
-          yield* Fiber.join(pending);
-          yield* Fiber.join(fork);
-          assert.equal((yield* shellOf(threadId))?.projectId, target.id);
-          assert.equal((yield* shellOf(childId))?.projectId, target.id);
-        } finally {
-          lockSpy.mockRestore();
-        }
+            });
+          }
+          return yield* dispatch(command);
+        }),
+      );
+      try {
+        assert.sameMembers(
+          [...(yield* filing.file({ threadId, projectId: target.id })).threadIds],
+          [threadId, childId],
+        );
+        assert.equal((yield* shellOf(childId))?.projectId, target.id);
       } finally {
-        yield* Deferred.succeed(proceed, undefined);
-        commitSpy.mockRestore();
+        spy.mockRestore();
       }
     }),
+  );
+
+  it.effect.each(["root", "side-chat"] as const)(
+    "a concurrent fork from a %s waits for filing and inherits the filed project",
+    (source) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const { folder, createThread } = yield* setup(`file-fork-race-${source}`);
+        const rootId = yield* createThread("main", folder);
+        const threadId = source === "root" ? rootId : ThreadId.make("filing-side-chat-source");
+        if (source === "side-chat") {
+          yield* orchestrator.dispatch({
+            type: "thread.fork",
+            commandId: CommandId.make("filing-side-chat-source"),
+            sourceThreadId: rootId,
+            targetThreadId: threadId,
+            sourcePoint: { type: "latest_stable" },
+            sideChat: true,
+            createdBy: "user",
+            creationSource: "web",
+          });
+        }
+        const target = yield* createTarget(`fork-race-${source}`);
+        const childId = ThreadId.make(`filing-concurrent-fork-${source}`);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`filing-fork-source-run-${source}`),
+          threadId,
+          messageId: MessageId.make(`filing-fork-source-run-${source}`),
+          text: "Prior work",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0];
+        assert.isDefined(run);
+        const now = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`filing-fork-source-completed-${source}`),
+              type: "run.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+            },
+          ],
+        });
+        const delegation = yield* orchestrator
+          .dispatch({
+            type: "delegated_task.request",
+            commandId: CommandId.make(`filing-settled-parent-delegate-${source}`),
+            parentThreadId: threadId,
+            parentRunId: run.id,
+            parentNodeId: run.rootNodeId!,
+            task: "Too late",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            completionWake: "always",
+            createdBy: "agent",
+            creationSource: "mcp",
+          })
+          .pipe(Effect.flip);
+        assert.include(String(delegation.cause), "is not active");
+        const ready = yield* Deferred.make<void>();
+        const proceed = yield* Deferred.make<void>();
+        const queued = yield* Deferred.make<void>();
+        const commit = eventSink.commitCommand;
+        const withLock = executor.withLock;
+        const commitSpy = vi
+          .spyOn(eventSink, "commitCommand")
+          .mockImplementation((input) =>
+            input.commandType === "thread.project.file-scratch" && input.threadId === threadId
+              ? Deferred.succeed(ready, undefined).pipe(
+                  Effect.andThen(Deferred.await(proceed)),
+                  Effect.andThen(commit(input)),
+                )
+              : commit(input),
+          );
+        try {
+          const pending = yield* Effect.forkChild(filing.file({ threadId, projectId: target.id }));
+          yield* Deferred.await(ready);
+          const observeLock: ThreadCommandExecutor.ThreadCommandExecutor["Service"]["withLock"] = (
+            id,
+            effect,
+          ) =>
+            id === threadId
+              ? Deferred.succeed(queued, undefined).pipe(Effect.andThen(withLock(id, effect)))
+              : withLock(id, effect);
+          const lockSpy = vi.spyOn(executor, "withLock").mockImplementation(observeLock);
+          try {
+            const fork = yield* Effect.forkChild(
+              orchestrator.dispatch({
+                type: "thread.fork",
+                commandId: CommandId.make(`filing-concurrent-fork-${source}`),
+                sourceThreadId: threadId,
+                targetThreadId: childId,
+                sourcePoint: { type: "run", runId: run.id },
+                createdBy: "user",
+                creationSource: "web",
+              }),
+            );
+            yield* Effect.raceFirst(
+              Deferred.await(queued),
+              Fiber.join(fork).pipe(Effect.andThen(Effect.die("Fork bypassed the source lock."))),
+            );
+            yield* Deferred.succeed(proceed, undefined);
+            yield* Fiber.join(pending);
+            yield* Fiber.join(fork);
+            assert.equal((yield* shellOf(threadId))?.projectId, target.id);
+            assert.equal((yield* shellOf(childId))?.projectId, target.id);
+          } finally {
+            lockSpy.mockRestore();
+          }
+        } finally {
+          yield* Deferred.succeed(proceed, undefined);
+          commitSpy.mockRestore();
+        }
+      }),
   );
 
   it.effect.each(["delete", "file"] as const)(

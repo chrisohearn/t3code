@@ -175,60 +175,93 @@ const make = Effect.gen(function* () {
           reason: "This folder is the target project's root. Promote it instead.",
         });
       }
-      const snapshot = yield* Effect.flatten(
-        threads.readShellSnapshot({ worktreePath: folder }),
-      ).pipe(Effect.mapError(fail("Could not read the threads in this folder.")));
-      const all = [...snapshot.threads, ...snapshot.archivedThreads];
-      const moveSet = new Map<ThreadId, OrchestrationV2ThreadShell>();
-      if (isScratch) moveSet.set(thread.id, thread);
-      for (const candidate of all) {
-        if (
-          candidate.worktreePath === folder &&
-          (yield* managedFolders.isScratchProject(candidate.projectId))
-        ) {
-          moveSet.set(candidate.id, candidate);
-        }
-      }
-      for (const candidate of isScratch ? moveSet.values() : [thread, ...moveSet.values()]) {
-        const family = yield* Effect.flatten(
-          threads.readShellSnapshot({ familyOf: candidate.id }),
-        ).pipe(Effect.mapError(fail(`Could not read "${candidate.title}".`)));
-        if (
-          candidate.lineage.parentThreadId !== null ||
-          [...family.threads, ...family.archivedThreads].some(
-            (child) => child.lineage.parentThreadId === candidate.id,
+      const collectMoveSet = Effect.fn("ScratchThreadPromotion.collectFilingFamily")(function* () {
+        const snapshot = yield* Effect.flatten(
+          threads.readShellSnapshot({ worktreePath: folder }),
+        ).pipe(Effect.mapError(fail("Could not read the threads in this folder.")));
+        const members = new Map<ThreadId, OrchestrationV2ThreadShell>();
+        const families = new Set<ThreadId>();
+        for (const candidate of [...snapshot.threads, ...snapshot.archivedThreads]) {
+          if (
+            candidate.id !== input.threadId &&
+            !(yield* managedFolders.isScratchProject(candidate.projectId))
           )
-        ) {
-          return yield* new ScratchThreadPromotionError({
-            reason: `"${candidate.title}" has a parent or child thread. It cannot be filed separately.`,
-          });
+            continue;
+          const rootId = candidate.lineage.rootThreadId;
+          if (families.has(rootId)) continue;
+          families.add(rootId);
+          const family = yield* Effect.flatten(
+            threads.readShellSnapshot({ familyOf: candidate.id }),
+          ).pipe(Effect.mapError(fail(`Could not read "${candidate.title}".`)));
+          for (const member of [...family.threads, ...family.archivedThreads]) {
+            if (
+              member.worktreePath !== folder ||
+              (member.projectId !== input.projectId &&
+                !(yield* managedFolders.isScratchProject(member.projectId)))
+            ) {
+              return yield* new ScratchThreadPromotionError({
+                reason: `"${candidate.title}" has a family member in another folder or project.`,
+              });
+            }
+            members.set(member.id, member);
+          }
         }
-        const records = yield* threads
-          .getThreadRecords(candidate.id, ["runs", "runtimeRequests"], { turnItemTypes: [] })
-          .pipe(Effect.mapError(fail(`Could not read "${candidate.title}".`)));
-        if (threadHasUnfinishedWork(records)) {
-          return yield* new ScratchThreadPromotionError({
-            reason: `"${candidate.title}" is still working. Finish or stop it first.`,
-          });
+        const moveSet = new Map<ThreadId, OrchestrationV2ThreadShell>();
+        for (const member of members.values()) {
+          const records = yield* threads
+            .getThreadRecords(member.id, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+            .pipe(Effect.mapError(fail(`Could not read "${member.title}".`)));
+          if (threadHasUnfinishedWork(records)) {
+            return yield* new ScratchThreadPromotionError({
+              reason: `"${member.title}" is still working. Finish or stop it first.`,
+            });
+          }
+          if (yield* managedFolders.isScratchProject(member.projectId)) {
+            moveSet.set(member.id, member);
+          }
         }
-      }
+        const depth = (member: OrchestrationV2ThreadShell) => {
+          let parentId = member.lineage.parentThreadId;
+          let count = 0;
+          while (parentId !== null) {
+            const parent = members.get(parentId);
+            if (parent === undefined) break;
+            count++;
+            parentId = parent.lineage.parentThreadId;
+          }
+          return count;
+        };
+        // Move ancestors first so new children inherit the target as early as possible.
+        return [...moveSet.values()].toSorted(
+          (a, b) => depth(a) - depth(b) || a.id.localeCompare(b.id),
+        );
+      });
+      let moveSet = yield* collectMoveSet();
       return yield* Effect.uninterruptible(
         Effect.gen(function* () {
-          const threadIds = [...moveSet.keys()];
-          yield* scheduledTasks
-            .moveThreadTasks({ threadIds, projectId: input.projectId })
-            .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
-          for (const candidate of moveSet.values()) {
-            yield* threads
-              .dispatch({
-                type: "thread.project.file-scratch",
-                commandId: CommandId.make(`scratch-filing:${yield* randomId}`),
-                threadId: candidate.id,
+          const moved = new Set<ThreadId>();
+          while (moveSet.length > 0) {
+            yield* scheduledTasks
+              .moveThreadTasks({
+                threadIds: moveSet.map((member) => member.id),
                 projectId: input.projectId,
               })
-              .pipe(Effect.mapError(fail(`Could not move "${candidate.title}". Try again.`)));
+              .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
+            for (const candidate of moveSet) {
+              yield* threads
+                .dispatch({
+                  type: "thread.project.file-scratch",
+                  commandId: CommandId.make(`scratch-filing:${yield* randomId}`),
+                  threadId: candidate.id,
+                  projectId: input.projectId,
+                })
+                .pipe(Effect.mapError(fail(`Could not move "${candidate.title}". Try again.`)));
+              moved.add(candidate.id);
+            }
+            // A fork can commit before its source moves, after the initial family snapshot.
+            moveSet = yield* collectMoveSet();
           }
-          return { threadIds };
+          return { threadIds: [...moved] };
         }),
       );
     },

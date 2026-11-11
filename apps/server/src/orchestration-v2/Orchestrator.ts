@@ -4683,12 +4683,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       .getShellSnapshot({ familyOf: thread.id })
       .pipe(mapDispatchError(command));
     if (
-      thread.lineage.parentThreadId !== null ||
       [...snapshot.threads, ...snapshot.archivedThreads].some(
-        (child) => child.lineage.parentThreadId === thread.id,
+        (member) =>
+          member.worktreePath !== thread.worktreePath ||
+          (member.projectId !== thread.projectId && member.projectId !== command.projectId),
       )
     ) {
-      return yield* reject("has a parent or child thread. It cannot be filed separately.");
+      return yield* reject("has a family member in another folder or project.");
     }
     const now = yield* DateTime.now;
     yield* emit(
@@ -14197,13 +14198,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       dispatchWithReceiptEffect(command),
     );
     // Lock the fork source so filing cannot split it from a concurrently created child.
-    // Side chats and existing targets skip it to preserve the parent-before-child lock order.
+    // Side chats take their parent first; existing targets keep the original lock order.
     if (command.type === "thread.fork" && command.sourceThreadId !== command.targetThreadId) {
       const source = yield* findThread(command.sourceThreadId);
       const target = yield* findThread(command.targetThreadId);
-      return yield* source === null || source.lineage.sideChat === true || target !== null
-        ? dispatch
-        : threadDispatch.withLock(command.sourceThreadId, dispatch);
+      if (source === null || target !== null) return yield* dispatch;
+      const fork = threadDispatch.withLock(command.sourceThreadId, dispatch);
+      return yield* source.lineage.sideChat === true && source.lineage.parentThreadId !== null
+        ? threadDispatch.withLock(source.lineage.parentThreadId, fork)
+        : fork;
     }
     if (command.type === "thread.delete")
       return yield* threadDispatch.withLock(
