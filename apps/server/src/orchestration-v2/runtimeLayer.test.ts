@@ -7549,7 +7549,11 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
           title: projectId,
           workspaceRoot,
         });
-      const createThread = (threadId: ThreadId, worktreePath: string | null) =>
+      const createThread = (
+        threadId: ThreadId,
+        worktreePath: string | null,
+        branch: string | null = null,
+      ) =>
         orchestrator.dispatch({
           type: "thread.create",
           createdBy: "user",
@@ -7561,7 +7565,7 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
           modelSelection,
           runtimeMode: "full-access",
           interactionMode: "default",
-          branch: null,
+          branch,
           worktreePath,
         });
       const move = (threadId: ThreadId, projectId: ProjectId, suffix: string) =>
@@ -7606,6 +7610,13 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
         `Thread ${busyThreadId} still has work in progress. Finish or stop it first.`,
       );
       assert.equal((yield* shellOf(busyThreadId))?.projectId, scratchProjectId);
+      const branchThreadId = ThreadId.make("runtime-layer-move-branch");
+      yield* createThread(branchThreadId, "/tmp/runtime-layer-move-worktree", "feature/x");
+      const onBranch = yield* move(branchThreadId, repoProjectId, "branch").pipe(Effect.flip);
+      assert.equal(
+        onBranch.cause,
+        `Thread ${branchThreadId} works on a git branch of its current project and cannot move.`,
+      );
 
       // The folder is kept, so the thread's cwd does not change with its project.
       yield* move(idleThreadId, repoProjectId, "repo");

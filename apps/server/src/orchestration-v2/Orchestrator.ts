@@ -4650,6 +4650,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (thread.projectId === command.projectId) {
         return yield* reject(`is already in project ${command.projectId}.`);
       }
+      // A branch means a git worktree of the current project. Under another project, worktree
+      // repair and storage cleanup would run that project's git against it.
+      if (thread.branch !== null) {
+        return yield* reject("works on a git branch of its current project and cannot move.");
+      }
       if (threadHasUnfinishedWork(projection)) {
         return yield* reject("still has work in progress. Finish or stop it first.");
       }
