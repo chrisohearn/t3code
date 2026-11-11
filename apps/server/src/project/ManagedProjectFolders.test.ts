@@ -286,6 +286,12 @@ it.effect("leaves threads in other projects alone", () =>
       assert.deepEqual(yield* fileSystem.readDirectory(yield* requireRoot), []);
       assert.isTrue(yield* scratch.isScratchProject(scratchId));
       assert.isFalse(yield* scratch.isScratchProject(other.id));
+      yield* projects.delete({
+        commandId: CommandId.make("command:delete-scratch"),
+        projectId: scratchId,
+      });
+      assert.isFalse(yield* scratch.isScratchProject(scratchId));
+      assert.isTrue(yield* scratch.isScratchProject(scratchId, { includeDeleted: true }));
     }),
   ),
 );

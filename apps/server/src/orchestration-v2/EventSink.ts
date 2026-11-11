@@ -370,14 +370,33 @@ const layerBase: Layer.Layer<
       return Effect.forEach(
         events,
         (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
-          event.type === "turn-item.updated"
-            ? turnItemPositions
-                .normalize(
-                  event.payload,
-                  event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
-                )
-                .pipe(Effect.map((payload) => ({ ...event, payload })))
-            : Effect.succeed(event),
+          Effect.gen(function* () {
+            if (event.type === "turn-item.updated") {
+              const payload = yield* turnItemPositions.normalize(
+                event.payload,
+                event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
+              );
+              return { ...event, payload };
+            }
+            if (
+              event.type === "thread.created" &&
+              event.payload.creationSource === "provider" &&
+              event.payload.lineage.relationshipToParent === "subagent" &&
+              event.payload.lineage.parentThreadId !== null
+            ) {
+              const parent = yield* projectionStore
+                .getThread(event.payload.lineage.parentThreadId)
+                .pipe(
+                  Effect.catchTags({
+                    ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
+                  }),
+                );
+              if (parent !== null && parent.worktreePath === event.payload.worktreePath) {
+                return { ...event, payload: { ...event.payload, projectId: parent.projectId } };
+              }
+            }
+            return event;
+          }),
         { concurrency: 1 },
       );
     };

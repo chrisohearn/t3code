@@ -614,6 +614,7 @@ export const layer = Layer.effect(
     const saveTask = (
       task: ScheduledTask,
       requireExisting: boolean,
+      preserveThreadBinding: boolean,
       /** The schedule this save read, when it left the schedule unchanged. */
       keptSchedule: ScheduledTask["schedule"] | null,
       webhook: {
@@ -621,8 +622,12 @@ export const layer = Layer.effect(
         readonly secret: string | null;
         readonly secretChanged: boolean;
       },
-    ) =>
-      sql<{ task_id: string }>`
+    ) => {
+      const destinationThread = sql`COALESCE(${task.threadId}, (
+        SELECT thread_id FROM scheduled_tasks
+        WHERE task_id = ${task.id} AND ${preserveThreadBinding ? 1 : 0} = 1
+      ))`;
+      return sql<{ task_id: string }>`
         INSERT INTO scheduled_tasks (
           task_id,
           title,
@@ -656,9 +661,9 @@ export const layer = Layer.effect(
           ${JSON.stringify(task.schedule)},
           COALESCE((
             SELECT project_id FROM orchestration_v2_projection_threads
-            WHERE thread_id = ${task.threadId}
+            WHERE thread_id = ${destinationThread}
           ), ${task.projectId}),
-          ${task.threadId},
+          ${destinationThread},
           ${scheduledTaskThreadMode(task)},
           ${JSON.stringify(task.workspaceStrategy)},
           ${JSON.stringify(task.modelSelection)},
@@ -684,13 +689,7 @@ export const layer = Layer.effect(
           enabled = excluded.enabled,
           schedule_json = excluded.schedule_json,
           project_id = excluded.project_id,
-          -- A first run may bind the thread while this save is in flight; only a
-          -- switch to new threads unbinds.
-          thread_id = CASE
-            WHEN excluded.thread_mode = 'new_thread' THEN NULL
-            WHEN excluded.project_id != scheduled_tasks.project_id THEN excluded.thread_id
-            ELSE COALESCE(excluded.thread_id, scheduled_tasks.thread_id)
-          END,
+          thread_id = excluded.thread_id,
           thread_mode = excluded.thread_mode,
           workspace_strategy_json = excluded.workspace_strategy_json,
           model_selection_json = excluded.model_selection_json,
@@ -731,6 +730,7 @@ export const layer = Layer.effect(
             : taskError("Schedule task not found.", { taskId: task.id }),
         ),
       );
+    };
 
     const deleteRow = (id: ScheduledTaskId) =>
       sql
@@ -835,7 +835,12 @@ export const layer = Layer.effect(
     const bindThread = Effect.fn("ScheduledTaskService.bindThread")(
       function* (task: ScheduledTask, threadId: ThreadId) {
         yield* sql`
-          UPDATE scheduled_tasks SET thread_id = ${threadId}
+          UPDATE scheduled_tasks
+          SET thread_id = ${threadId},
+              project_id = COALESCE((
+                SELECT project_id FROM orchestration_v2_projection_threads
+                WHERE thread_id = ${threadId}
+              ), project_id)
           WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
             AND project_id = ${task.projectId}
             AND thread_id IS NULL AND thread_mode != 'new_thread'
@@ -1312,15 +1317,32 @@ export const layer = Layer.effect(
       const existingTask = yield* findTask(id);
       const threadMode = resolveThreadMode(input, existingTask);
       const keptThreadId = input.threadId ?? existingTask?.threadId ?? null;
+      const boundThread =
+        existingTask?.threadId != null &&
+        keptThreadId === existingTask.threadId &&
+        existingTask.projectId !== input.projectId &&
+        (yield* managedFolders.isScratchProject(input.projectId, { includeDeleted: true }))
+          ? yield* threadManagement
+              .getThreadShell(existingTask.threadId)
+              .pipe(
+                Effect.mapError((cause) =>
+                  taskError("Could not read the destination thread.", { taskId: id, cause }),
+                ),
+              )
+          : null;
+      const projectId =
+        boundThread !== null && boundThread.projectId === existingTask?.projectId
+          ? boundThread.projectId
+          : input.projectId;
       // A bound thread belongs to its project, so moving the task leaves it for a new one.
       const movedOffThread =
         existingTask !== null &&
-        existingTask.projectId !== input.projectId &&
+        existingTask.projectId !== projectId &&
         keptThreadId === existingTask.threadId;
       const threadId = threadMode === "new_thread" || movedOffThread ? null : keptThreadId;
       // An unchanged destination is not rechecked, so a task on an archived thread stays editable.
       if (threadId !== null && threadId !== existingTask?.threadId) {
-        yield* requireDestinationThread(threadId, input.projectId, id);
+        yield* requireDestinationThread(threadId, projectId, id);
       }
       // Refused on save rather than at run time; a disabled task can still be saved, so one
       // stored above the ceiling can be turned off before its mode is lowered. A task bound to a
@@ -1379,7 +1401,7 @@ export const layer = Layer.effect(
                 signature?.secretRef === undefined
                   ? undefined
                   : yield* secretRequests
-                      .consume({ ref: signature.secretRef, projectId: input.projectId })
+                      .consume({ ref: signature.secretRef, projectId })
                       .pipe(
                         Effect.catch((error) =>
                           replay
@@ -1403,7 +1425,7 @@ export const layer = Layer.effect(
           : { token: null, secret: null, secretChanged: true };
       const workspaceStrategy: ScheduledTask["workspaceStrategy"] =
         input.workspaceStrategy.type === "worktree" &&
-        (yield* managedFolders.isScratchProject(input.projectId))
+        (yield* managedFolders.isScratchProject(projectId))
           ? { type: "root" }
           : input.workspaceStrategy;
       const scheduleUnchanged =
@@ -1418,7 +1440,7 @@ export const layer = Layer.effect(
         prompt: input.prompt,
         enabled: input.enabled,
         schedule,
-        projectId: input.projectId,
+        projectId,
         threadId,
         threadMode,
         workspaceStrategy,
@@ -1440,6 +1462,7 @@ export const layer = Layer.effect(
       yield* saveTask(
         task,
         input.requireExisting === true,
+        threadMode !== "new_thread" && !movedOffThread,
         scheduleUnchanged ? existingTask.schedule : null,
         webhook,
       );

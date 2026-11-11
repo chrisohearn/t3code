@@ -574,6 +574,68 @@ it.effect("a fresh-session task launches one thread, then starts each later run 
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
+it.effect("a first run binding after filing follows the thread's committed project", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const projectId = ProjectId.make("project:scratch");
+    const target = ProjectId.make("project:filed");
+    const threadId = ThreadId.make("thread:filed-before-binding");
+    let scratchDeleted = false;
+    const layer = ScheduledTaskService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ManagedPolicy.layerTest(),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+            launch: () =>
+              sql`
+                INSERT INTO orchestration_v2_projection_threads
+                  (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode, created_at, updated_at, payload_json)
+                VALUES (${threadId}, ${target}, 'Filed', 'codex', 'full-access', 'default', '', '', '{}')
+              `.pipe(Effect.orDie, Effect.as({ threadId, resumed: false } as never)),
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: () => Effect.succeed(threadShell(target)),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: "/projects",
+            isScratchProject: (id, options) =>
+              Effect.succeed(
+                id === projectId && (!scratchDeleted || options?.includeDeleted === true),
+              ),
+          }),
+          NodeCrypto.layer,
+          Scheduler.layer,
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+      const { task } = yield* tasks.upsert({
+        id: ScheduledTaskId.make("task:filed-before-binding"),
+        title: "Bound",
+        prompt: "Check in",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60_000 },
+        projectId,
+        threadMode: "continue",
+        workspaceStrategy: { type: "root" },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      });
+      yield* tasks.runNow({ id: task.id });
+      const saved = (yield* tasks.list()).tasks.find((candidate) => candidate.id === task.id);
+      assert.equal(saved?.threadId, threadId);
+      assert.equal(saved?.projectId, target);
+      scratchDeleted = true;
+      const stale = yield* tasks.upsert({ ...task, title: "Edited after source deletion" });
+      assert.equal(stale.task.threadId, threadId);
+      assert.equal(stale.task.projectId, target);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
 it.effect("a first run whose thread was deleted before it bound removes the task", () =>
   Effect.gen(function* () {
     const layer = ScheduledTaskService.layer.pipe(
@@ -758,7 +820,7 @@ it.effect("refuses saving an enabled task above the policy ceiling", () =>
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
-it.effect.each(["insert", "rebind", "edit"] as const)(
+it.effect.each(["insert", "rebind", "edit", "first-run"] as const)(
   "a task %s saving across thread filing follows its project",
   (operation) =>
     Effect.gen(function* () {
@@ -802,6 +864,7 @@ it.effect.each(["insert", "rebind", "edit"] as const)(
         const tasks = yield* ScheduledTaskService.ScheduledTaskService;
         const input = {
           id: ScheduledTaskId.make("task:filing"),
+          ...(operation === "first-run" ? { threadMode: "continue" as const } : {}),
           title: "Bound",
           prompt: "Check in",
           enabled: true,
@@ -816,10 +879,15 @@ it.effect.each(["insert", "rebind", "edit"] as const)(
           yield* tasks.upsert({ ...input, threadId: operation === "edit" ? threadId : null });
         }
         pause = true;
-        const pending = yield* Effect.forkChild(tasks.upsert({ ...input, threadId }));
+        const pending = yield* Effect.forkChild(
+          tasks.upsert({ ...input, threadId: operation === "first-run" ? null : threadId }),
+        );
         yield* Deferred.await(ready);
         yield* tasks.moveThreadTasks({ threadIds: [threadId], projectId: target });
         yield* sql`UPDATE orchestration_v2_projection_threads SET project_id = ${target} WHERE thread_id = ${threadId}`;
+        if (operation === "first-run") {
+          yield* sql`UPDATE scheduled_tasks SET project_id = ${target}, thread_id = ${threadId} WHERE task_id = ${input.id}`;
+        }
         yield* Deferred.succeed(proceed, undefined);
         const { task } = yield* Fiber.join(pending);
         assert.equal(task.threadId, threadId);

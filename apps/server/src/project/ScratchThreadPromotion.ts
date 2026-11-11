@@ -65,9 +65,25 @@ const make = Effect.gen(function* () {
   const fail = (reason: string) => (cause: unknown) =>
     new ScratchThreadPromotionError({ reason, cause });
 
-  const promote: ScratchThreadPromotion["Service"]["promote"] = Effect.fn(
-    "ScratchThreadPromotion.promote",
-  )(function* (input) {
+  const withScratchProjectLocks = Effect.fn("ScratchThreadPromotion.withScratchProjectLocks")(
+    function* <A, E, R>(projectId: ProjectId, effect: Effect.Effect<A, E, R>) {
+      const root = yield* managedFolders.scratchRoot;
+      const scratch = Option.isSome(root)
+        ? yield* projects
+            .getByWorkspaceRoot(root.value)
+            .pipe(Effect.mapError(fail("Could not read the scratch project.")))
+        : Option.none();
+      const projectIds = new Set([projectId]);
+      if (Option.isSome(scratch)) projectIds.add(scratch.value.id);
+      return yield* [...projectIds]
+        .toSorted()
+        .reduceRight((locked, id) => projects.withProjectLock(id, locked), effect);
+    },
+  );
+
+  const preparePromotion = Effect.fn("ScratchThreadPromotion.preparePromotion")(function* (input: {
+    readonly threadId: ThreadId;
+  }) {
     const thread = yield* threads.getThreadShell(input.threadId).pipe(
       Effect.mapError(fail("Could not read the thread.")),
       Effect.filterOrFail(
@@ -117,24 +133,37 @@ const make = Effect.gen(function* () {
       }
     }
 
-    return yield* Effect.uninterruptible(
+    return { thread, folder, moveSet };
+  });
+
+  const promote: ScratchThreadPromotion["Service"]["promote"] = Effect.fn(
+    "ScratchThreadPromotion.promote",
+  )(function* (input) {
+    const prepared = yield* preparePromotion(input);
+    const projectId = yield* createProject(prepared.thread.title, prepared.folder);
+    return yield* withScratchProjectLocks(
+      projectId,
       Effect.gen(function* () {
-        const projectId = yield* createProject(thread.title, folder);
-        yield* scheduledTasks
-          .moveThreadTasks({ threadIds: [...moveSet.keys()], projectId })
-          .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
-        for (const candidate of moveSet.values()) {
-          const commandId = CommandId.make(`scratch-promotion:${yield* randomId}`);
-          yield* threads
-            .dispatch({
-              type: "thread.project.adopt-folder",
-              commandId,
-              threadId: candidate.id,
-              projectId,
-            })
-            .pipe(Effect.mapError(fail(`Could not move "${candidate.title}". Try again.`)));
-        }
-        return { projectId };
+        const { moveSet } = yield* preparePromotion(input);
+        return yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            for (const candidate of moveSet.values()) {
+              const commandId = CommandId.make(`scratch-promotion:${yield* randomId}`);
+              yield* threads
+                .dispatch({
+                  type: "thread.project.adopt-folder",
+                  commandId,
+                  threadId: candidate.id,
+                  projectId,
+                })
+                .pipe(Effect.mapError(fail(`Could not move "${candidate.title}". Try again.`)));
+            }
+            yield* scheduledTasks
+              .moveThreadTasks({ threadIds: [...moveSet.keys()], projectId })
+              .pipe(Effect.mapError(fail("Could not move the thread's scheduled tasks.")));
+            return { projectId };
+          }),
+        );
       }),
     );
   });
@@ -267,7 +296,7 @@ const make = Effect.gen(function* () {
         }),
       );
     },
-    (effect, input) => projects.withProjectLock(input.projectId, effect),
+    (effect, input) => withScratchProjectLocks(input.projectId, effect),
   );
 
   const randomId = random.uuidV4();
