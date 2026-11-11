@@ -842,11 +842,12 @@ describe("ThreadSettlementServiceV2 worker", () => {
           assert.lengthOf(logs, 1);
         }).pipe(
           Effect.provide(
-            Layer.merge(
-              fixture.layer,
-              Logger.layer([Logger.make(({ message }) => logs.push(message))], {
-                mergeWithExisting: false,
-              }),
+            fixture.layer.pipe(
+              Layer.provideMerge(
+                Logger.layer([Logger.make(({ message }) => logs.push(message))], {
+                  mergeWithExisting: false,
+                }),
+              ),
             ),
           ),
         );

@@ -129,6 +129,52 @@ Add the environment as a custom MCP app in ChatGPT's apps settings:
    need a client ID or secret.
 4. Create the app, then approve the sign-in page that opens.
 
+### Check results and decisions
+
+Use `t3_thread_result` for a thread's latest run, or pass `runId` for a specific
+run. It returns status, the last assistant reply, pending request IDs, linked
+pull requests, and a revision. Replies default to 4,000 characters. Increase
+`maxChars` up to 50,000 when `truncated` is true. This read does not acknowledge
+a delegated child's result.
+
+For history, use `t3_thread_read`. Save its `revision` and pass it as
+`sinceRevision` on the next read. An unchanged thread returns an empty first
+page; reads with `afterPosition` or `itemId` still return items.
+`t3_pending_request` lists questions and approvals with a `kind` field. MCP can
+answer user-input questions, but approval responses still require the app.
+
+`t3_thread_list` includes `launchedBy` and `pendingRequestCount`. Pass
+`launchedByMe: true` to find threads launched through this sign-in session.
+After signing in again, the new session has a separate launch history. The
+filter works on the environment you signed in to, not through a linked one.
+
+`t3_thread_wait` returns when a run ends, asks a question, or raises an
+approval during the wait. An approval that was already pending does not end a
+new wait, because approvals are answered in the app.
+Pass either `threadId` or `threadIds` to wait for the first ready thread.
+A specific `runId` works with a single thread. Prefer event notifications for
+ongoing monitoring.
+
+### Track work across agents
+
+Use `ledger_upsert` with a stable `key` to create or update a work item. New
+items need `title`, `ownerKind` (`jarvis`, `vision`, `t3`, or `human`), and
+`ownerName`. Later calls can update individual fields. Omit a field to keep it,
+or pass `null` to clear a nullable field. Read-only sign-ins can query the
+ledger. Writing requires operate access and also works for agents inside T3.
+
+Use `status` to track `open`, `blocked`, `waiting_on_human`, `done`, or
+`cancelled` work. Record a blocker, next action, approval context, links, and an
+optional owning thread. An `approvalNote` records context and grants no approval.
+`ledger_query` filters by `status`, `ownerKind`, `ownerName`, or `updatedSince`, which is inclusive, so skip rows you have already seen.
+It returns up to 25 rows by default, ordered by key. Pass `nextCursor` as
+`cursor` for the next page, or set `limit` up to 100.
+
+Use `bridge_status` to check this sign-in's remaining lifetime, subscription
+state, last successful webhook delivery, and exhausted retries. Tool call,
+error, and response byte counters reset when the server restarts. Delivery
+counters survive restarts. Callback secrets are never returned.
+
 ### Monitor thread updates
 
 Clients that support MCP Events can monitor a specific thread for run results,
@@ -146,7 +192,23 @@ failure. Once the callback is working again, explicitly resubscribe to reactivat
 delivery from the acknowledged cursor. Refreshing an active subscription does not
 reset its retry budget. After signing in again, subscribe through the new connection
 to resume monitoring. Explicitly stopping monitoring removes its delivery backlog. A later cursorless
-subscription starts at current events; provide a saved cursor to request replay.
+subscription starts at current events; provide a saved cursor to request replay. A plain
+subscription made after a run ends does not replay that run's completion event.
+Check the thread once after subscribing to catch a result that arrived earlier.
+
+To monitor a new launch or send, include `notify: {}` in `t3_thread_launch` or
+`t3_thread_send`. T3 reuses this sign-in's most recently refreshed active
+subscription's callback and secret. It captures the event cursor before starting
+the run, so even an immediate completion is covered. The default events are
+`thread.run.result`, `thread.needs-decision`, and `thread.blocker`. Set
+`notify.events` to choose a subset. The response's `notify` field reports
+`subscribed`, `unavailable`, or `failed`, with subscription IDs and a reason when
+needed. Without an active subscription, the launch or send still succeeds and
+reports `no_active_subscription`. Check this field and read the thread once if
+notification setup fails. These subscriptions last up to a day, or less if the
+sign-in expires sooner, and `refreshBefore` gives the time. Another launch or
+send with `notify` renews them. A lapsed one restarts at the new run instead of
+replaying older events. Subscriptions are deleted a day after they expire.
 
 For direct protocol clients, the T3 extension `events/subscriptions/list` lists
 this sign-in's subscriptions: event/thread, active/stopped/expired status, expiry,

@@ -4006,6 +4006,10 @@ describe("OrchestratorMcpService thread list", () => {
         NodeServices.layer,
         NodeCrypto.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () =>
+            Effect.succeed({
+              runtimeRequests: [{ status: "pending" }, { status: "pending" }],
+            } as unknown as OrchestrationV2ThreadProjection),
           listProjectThreads: (input) =>
             Effect.succeed(
               shells.filter(
