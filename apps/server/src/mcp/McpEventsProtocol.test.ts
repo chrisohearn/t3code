@@ -148,9 +148,13 @@ it.effect(
         const response = yield* post(init);
         expect(response.status).toBe(200);
         const session = response.headers["mcp-session-id"]!;
-        expect(decode(yield* response.text)).toMatchObject({
+        const initialized = decode(yield* response.text);
+        expect(initialized).toMatchObject({
           result: { capabilities: { events: {}, tools: { listChanged: true } } },
         });
+        // Strict clients (Claude Code) reject `instructions: null`; an unset value must be absent.
+        expect(initialized.result).not.toHaveProperty("instructions");
+        expect(initialized.result).not.toHaveProperty("_meta");
         const list = yield* post(
           {
             jsonrpc: "2.0",

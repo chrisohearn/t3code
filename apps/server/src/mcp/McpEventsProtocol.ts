@@ -55,8 +55,9 @@ const Initialize = McpSchema.Initialize.setSuccess(
     protocolVersion: Schema.String,
     capabilities: Schema.Record(Schema.String, Schema.Unknown),
     serverInfo: McpSchema.Implementation,
-    instructions: Schema.optional(Schema.String),
-    _meta: Schema.optional(Schema.Unknown),
+    // McpSchema.optional drops an unset key; Schema.optional would encode it as null.
+    instructions: McpSchema.optional(Schema.String),
+    _meta: McpSchema.optional(Schema.Unknown),
   }),
 ).middleware(McpSchema.McpServerClientMiddleware);
 
