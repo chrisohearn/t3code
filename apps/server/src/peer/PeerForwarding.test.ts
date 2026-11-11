@@ -485,6 +485,13 @@ it.effect("keeps a forwarded wait short and its retries scoped to the caller", (
         [PeerForwarding.FORWARDED_WAIT_CHUNK_MS, boxRun],
         [PeerForwarding.FORWARDED_WAIT_CHUNK_MS, boxRun],
       ]);
+      // The several-thread form reaches the linked environment too.
+      const waitedMany = yield* a.call("thread:laptop-full", "t3_thread_wait", {
+        environmentId: box.environmentId,
+        threadIds: [boxThread],
+        timeoutMs: 600_000,
+      });
+      expect(waitedMany.structuredContent).toMatchObject({ threadId: boxThread, timedOut: false });
 
       const send = (caller: string, clientRequestId: string) =>
         a.call(caller, "t3_thread_send", {

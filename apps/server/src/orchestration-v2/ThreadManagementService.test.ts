@@ -199,6 +199,82 @@ it.effect(
   },
 );
 
+it.effect("waitForThread wakes on a pending question or approval only when asked", () =>
+  Effect.gen(function* () {
+    for (const kind of ["user_input", "command"]) {
+      const projectId = ProjectId.make("wait-project");
+      const threadId = ThreadId.make(`wait-${kind}`);
+      const runId = RunId.make(`wait-run-${kind}`);
+      const subscribed = yield* Deferred.make<void>();
+      const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+      let waiting = false;
+      const run = () => ({ id: runId, ordinal: 1, status: waiting ? "waiting" : "running" });
+      const layer = ThreadManagementService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+            ServerSettings.layerTest(),
+            layerReceiptsTest,
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              getThreadEventSequence: () => Effect.succeed(0),
+              getThreadRecords: () =>
+                Effect.sync(
+                  () =>
+                    ({
+                      thread: { id: threadId, projectId, deletedAt: null },
+                      runs: [run()],
+                      runtimeRequests: waiting
+                        ? [{ id: `request-${kind}`, kind, status: "pending" }]
+                        : [],
+                    }) as unknown as OrchestrationV2ThreadProjection,
+                ),
+              streamStoredEventsFrom: (input) =>
+                input?.eventType === "runtime-request.updated"
+                  ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                      Stream.drain,
+                      Stream.concat(Stream.fromQueue(events)),
+                    )
+                  : Stream.never,
+            }),
+          ),
+        ),
+      );
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(layer),
+      );
+      const fiber = yield* service
+        .waitForThread({ projectId, threadId, timeoutMs: 60_000, returnOnWaiting: true })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(subscribed);
+      waiting = true;
+      yield* Queue.offer(events, {
+        sequence: 1,
+        event: { type: "runtime-request.updated", threadId, payload: { kind, status: "pending" } },
+      } as unknown as OrchestrationV2StoredEvent);
+      expect(yield* Fiber.join(fiber)).toMatchObject({
+        threadId,
+        timedOut: false,
+        run: { status: "waiting" },
+      });
+      // A question can be answered, so a new wait returns at once; an approval cannot, so a new
+      // wait on one already pending keeps waiting rather than spinning the caller.
+      const again = yield* service
+        .waitForThread({ projectId, threadId, timeoutMs: 60_000, returnOnWaiting: true })
+        .pipe(Effect.forkChild);
+      // Peer delegation re-waits at once on a non-terminal result, so the default keeps waiting.
+      const plain = yield* service
+        .waitForThread({ projectId, threadId, timeoutMs: 60_000, untilDelegatedWorkSettled: true })
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust(Duration.millis(60_000));
+      expect(yield* Fiber.join(again)).toMatchObject({
+        timedOut: kind === "command",
+        run: { status: "waiting" },
+      });
+      expect(yield* Fiber.join(plain)).toMatchObject({ timedOut: true });
+    }
+  }),
+);
+
 it.effect("waitForThread follows a restart continuation instead of the cut run", () =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("project:thread-management:wait-restart");

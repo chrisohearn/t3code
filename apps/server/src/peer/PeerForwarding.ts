@@ -196,7 +196,9 @@ const make = Effect.gen(function* () {
         OrchestratorMcpThreadWaitResult,
         environmentId,
         {
-          threadId: input.threadId,
+          ...(input.threadIds === undefined
+            ? { threadId: input.threadId }
+            : { threadIds: input.threadIds }),
           ...(runId === undefined ? {} : { runId }),
           timeoutMs: chunk,
           ...(input.untilDelegatedWorkSettled === undefined
@@ -207,7 +209,7 @@ const make = Effect.gen(function* () {
       remaining -= chunk;
       if (!result.timedOut || remaining <= 0) return result;
       // Later pieces wait for the run the first one picked, not a newer one.
-      runId = result.runId ?? undefined;
+      if (input.threadIds === undefined) runId = result.runId ?? undefined;
     }
   });
 

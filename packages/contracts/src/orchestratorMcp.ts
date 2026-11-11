@@ -558,7 +558,10 @@ export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendRe
 
 export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
-  threadId: ThreadId,
+  threadId: Schema.optional(ThreadId),
+  threadIds: Schema.optional(
+    Schema.Array(ThreadId).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
+  ),
   runId: Schema.optional(RunId),
   timeoutMs: Schema.optional(Schema.Finite),
   untilDelegatedWorkSettled: Schema.optional(

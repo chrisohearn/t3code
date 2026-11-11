@@ -3227,19 +3227,41 @@ const make = Effect.gen(function* () {
       } satisfies OrchestratorMcpThreadSendResult;
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {
-      const { parent, target } = yield* loadScopedThread(scope, input.threadId, []);
-      const result = yield* threadManagement
-        .waitForThread({
-          projectId: target.thread.projectId,
-          threadId: input.threadId,
-          ...(input.runId === undefined ? {} : { runId: input.runId }),
-          timeoutMs: Math.min(
-            MAX_WAIT_TIMEOUT_MS,
-            Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
-          ),
-          ...(input.untilDelegatedWorkSettled === true ? { untilDelegatedWorkSettled: true } : {}),
-        })
-        .pipe(Effect.mapError(threadManagementFailure));
+      const ids = input.threadIds ?? (input.threadId === undefined ? [] : [input.threadId]);
+      if (
+        ids.length === 0 ||
+        (input.threadIds !== undefined &&
+          (input.threadId !== undefined || input.runId !== undefined))
+      ) {
+        return yield* failure(
+          "invalid_request",
+          "Use threadId (and optional runId), or threadIds without runId.",
+        );
+      }
+      const targets = yield* Effect.forEach([...new Set(ids)], (threadId) =>
+        loadScopedThread(scope, threadId, []).pipe(
+          Effect.map((context) => ({ ...context, threadId })),
+        ),
+      );
+      const waits = targets.map(({ target, threadId }) =>
+        threadManagement
+          .waitForThread({
+            projectId: target.thread.projectId,
+            threadId,
+            ...(input.runId === undefined ? {} : { runId: input.runId }),
+            timeoutMs: Math.min(
+              MAX_WAIT_TIMEOUT_MS,
+              Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
+            ),
+            // Peer delegation follows with untilDelegatedWorkSettled and re-waits at once on any non-terminal result.
+            ...(input.untilDelegatedWorkSettled === true
+              ? { untilDelegatedWorkSettled: true }
+              : { returnOnWaiting: true }),
+          })
+          .pipe(Effect.mapError(threadManagementFailure)),
+      );
+      const result = yield* Effect.raceAll(waits);
+      const { parent } = targets.find((target) => target.threadId === result.threadId)!;
       const status = result.run === null ? "idle" : runOutcome(result.run);
       const taskId = result.run?.delegatedTaskId;
       const ownedTask =
@@ -3252,19 +3274,19 @@ const make = Effect.gen(function* () {
             task.id === taskId &&
             task.origin === "app_owned" &&
             task.threadId === parent.thread.id &&
-            task.childThreadId === input.threadId &&
+            task.childThreadId === result.threadId &&
             task.completionDelivery?.state !== "disposed",
         );
       // A child waiting on a question or approval needs an answer, not a wake.
       const childRequests = ownedTask
         ? (yield* threadManagement
-            .getThreadRecords(input.threadId, ["runtimeRequests"])
+            .getThreadRecords(result.threadId, ["runtimeRequests"])
             .pipe(Effect.mapError(threadManagementFailure))).runtimeRequests
         : [];
       const wakesCaller =
         ownedTask && !childRequests.some((request) => request.status === "pending");
       return {
-        threadId: input.threadId,
+        threadId: result.threadId,
         runId: result.run?.id ?? null,
         status,
         timedOut: result.timedOut,

@@ -3891,6 +3891,34 @@ describe("OrchestratorMcpService thread lookup", () => {
     }),
   );
 
+  it.effect("waits for the first ready thread and validates every requested thread", () =>
+    Effect.gen(function* () {
+      const sent = yield* Ref.make(0);
+      const second = { ...launched, id: ThreadId.make("second-wait-thread") };
+      yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const result = yield* mcp.waitForThread(client, { threadIds: [launched.id, second.id] });
+        assert.equal(result.threadId, second.id);
+        assert.equal(result.timedOut, false);
+        const denied = yield* mcp
+          .waitForThread(client, { threadIds: [second.id, bareId] })
+          .pipe(Effect.flip);
+        assert.equal(denied.code, "thread_not_found");
+      }).pipe(
+        Effect.provide(
+          service([launched, second], sent, {
+            getProjectThreadRecords: ({ threadId }) =>
+              Effect.succeed(idleThreadProjection(threadId === second.id ? second : launched)),
+            waitForThread: ({ threadId }) =>
+              threadId === launched.id
+                ? Effect.never
+                : Effect.succeed({ threadId, run: null, timedOut: false }),
+          }),
+        ),
+      );
+    }),
+  );
+
   it.effect("waits on the caller's own thread without a separate shell lookup", () =>
     Effect.gen(function* () {
       const sent = yield* Ref.make(0);

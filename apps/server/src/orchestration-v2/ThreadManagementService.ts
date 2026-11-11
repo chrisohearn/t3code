@@ -176,6 +176,8 @@ export interface ThreadManagementWaitInput {
    * completion delivery will wake it again, as a delegated task's result does.
    */
   readonly untilDelegatedWorkSettled?: boolean;
+  /** Also return once the run waits on a pending question or approval. */
+  readonly returnOnWaiting?: boolean;
 }
 
 export interface ThreadManagementWaitResult {
@@ -932,6 +934,17 @@ const make = Effect.gen(function* () {
         threadId: input.threadId,
         cause,
       });
+    // An approval cannot be answered over MCP, so only one raised during this wait ends it;
+    // otherwise a caller waiting again would return at once, every time. Read before the event
+    // cursor, so an approval raised in between is new and its event still replays.
+    const startingApprovals =
+      input.returnOnWaiting === true
+        ? new Set(
+            (yield* getProjectThreadRecords(input, ["runtimeRequests"])).runtimeRequests
+              .filter((request) => request.status === "pending" && request.kind !== "user_input")
+              .map((request) => request.id),
+          )
+        : undefined;
     // Taken before the first read, so a run update between that read and
     // the subscription below still replays.
     const afterSequence = yield* orchestrator
@@ -992,6 +1005,18 @@ const make = Effect.gen(function* () {
       runs: ReadonlyArray<OrchestrationV2Run>,
     ) {
       const current = yield* outcome(runs);
+      if (current.run.status === "waiting" && startingApprovals !== undefined) {
+        const records = yield* getProjectThreadRecords(input, ["runtimeRequests"]);
+        if (
+          records.runtimeRequests.some(
+            (request) =>
+              request.status === "pending" &&
+              (request.kind === "user_input" || !startingApprovals.has(request.id)),
+          )
+        ) {
+          return { ...current, settled: true, resultRun: undefined };
+        }
+      }
       if (!current.settled || !untilDelegatedWorkSettled) {
         return { ...current, resultRun: undefined };
       }
@@ -1015,6 +1040,7 @@ const make = Effect.gen(function* () {
           [
             "run.updated",
             "thread.deleted",
+            ...(startingApprovals === undefined ? [] : (["runtime-request.updated"] as const)),
             // What delegated work reads besides runs: tasks and their
             // deliveries, and a provider thread's background tasks.
             ...(untilDelegatedWorkSettled
