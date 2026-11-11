@@ -158,6 +158,21 @@ it.effect("an answered question reports already answered instead of not found", 
           Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
           Effect.provideService(McpSchema.McpServerClient, client),
         );
+    const listed = yield* server
+      .callTool({ name: "t3_pending_request", arguments: { action: "list" } })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(listed.structuredContent).toMatchObject({
+      requests: [
+        { requestId: "pending-approval", kind: "approval" },
+        { requestId: "pending-question", kind: "user_input" },
+      ],
+    });
+    expect(declaredFailure(yield* respond("pending-approval"))).toMatchObject({
+      code: "invalid_request",
+    });
     expect(declaredFailure(yield* respond(requestId))).toMatchObject({
       code: "invalid_request",
       message: "The user-input request was already answered.",
@@ -190,6 +205,19 @@ it.effect("an answered question reports already answered instead of not found", 
                     resolvedAt: shell.updatedAt,
                     answers: { size: "large" },
                   },
+                  ...(["command", "user_input"] as const).map((kind) => ({
+                    id: RuntimeRequestId.make(
+                      kind === "command" ? "pending-approval" : "pending-question",
+                    ),
+                    nodeId: NodeId.make("root"),
+                    providerTurnId: null,
+                    nativeRequestRef: null,
+                    kind,
+                    status: "pending" as const,
+                    responseCapability: { type: "message" as const },
+                    createdAt: shell.createdAt,
+                    resolvedAt: null,
+                  })),
                 ],
                 turnItems: [
                   {
