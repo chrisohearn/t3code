@@ -31,7 +31,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
-    "Pin, snooze, settle, archive, or mark a thread unread. Omit `threadId` for this thread. `snooze` needs `snoozedUntil`. Settling this thread applies at turn end. A failed turn or queued message leaves it active.",
+    "Pin, snooze, settle, archive, mark a thread unread, or move it to another project. Omit `threadId` for this thread. `snooze` needs `snoozedUntil`. `move` needs `projectId`; the thread keeps its folder and must be idle. Settling this thread applies at turn end. A failed turn or queued message leaves it active.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
@@ -45,8 +45,10 @@ const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
       "archive",
       "unarchive",
       "mark_unread",
+      "move",
     ]),
     snoozedUntil: Schema.optional(IsoDateTime),
+    projectId: Schema.optional(ProjectId),
   }),
   success: Schema.Union([
     OrchestrationV2DispatchCommandResult,
@@ -57,6 +59,7 @@ const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   dependencies: [
     McpInvocationContext.McpInvocationContext,
     ThreadManagementService.ThreadManagementService,
+    ScheduledTaskService.ScheduledTaskService,
     SecureRandom.SecureRandom,
   ],
 })

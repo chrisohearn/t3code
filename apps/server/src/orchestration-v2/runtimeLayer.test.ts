@@ -7534,6 +7534,100 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
       assert.equal(stayed?.projectId, scratchProjectId);
     }),
   );
+
+  it.effect("moves a thread to another project without changing its folder", () =>
+    Effect.gen(function* () {
+      const projects = yield* ProjectService.ProjectService;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const scratchProjectId = ProjectId.make("runtime-layer-move-scratch");
+      const repoProjectId = ProjectId.make("runtime-layer-move-repo");
+      const folder = "/tmp/runtime-layer-move-scratch/2026-01-01-notes-a1b2c3d4";
+      const createProject = (projectId: ProjectId, workspaceRoot: string) =>
+        projects.create({
+          commandId: CommandId.make(`${projectId}-create`),
+          projectId,
+          title: projectId,
+          workspaceRoot,
+        });
+      const createThread = (threadId: ThreadId, worktreePath: string | null) =>
+        orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}-create`),
+          threadId,
+          projectId: scratchProjectId,
+          title: "Scratch work",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath,
+        });
+      const move = (threadId: ThreadId, projectId: ProjectId, suffix: string) =>
+        orchestrator.dispatch({
+          type: "thread.project.move",
+          commandId: CommandId.make(`${threadId}-move-${suffix}`),
+          threadId,
+          projectId,
+        });
+      const shellOf = (threadId: ThreadId) =>
+        orchestrator
+          .getShellSnapshot()
+          .pipe(Effect.map((shell) => shell.threads.find((thread) => thread.id === threadId)));
+      yield* createProject(scratchProjectId, "/tmp/runtime-layer-move-scratch");
+      yield* createProject(repoProjectId, "/tmp/runtime-layer-move-repo");
+      const idleThreadId = ThreadId.make("runtime-layer-move-idle");
+      const rootThreadId = ThreadId.make("runtime-layer-move-root");
+      const busyThreadId = ThreadId.make("runtime-layer-move-busy");
+      yield* createThread(idleThreadId, folder);
+      yield* createThread(rootThreadId, null);
+      yield* createThread(busyThreadId, folder);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-move-busy-message"),
+        threadId: busyThreadId,
+        messageId: MessageId.make("runtime-layer-move-busy-message"),
+        text: "Keep this run active.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+
+      const missing = yield* move(idleThreadId, ProjectId.make("missing"), "missing").pipe(
+        Effect.flip,
+      );
+      assert.equal(missing.cause, `Thread ${idleThreadId} cannot move to missing project missing.`);
+      const busy = yield* move(busyThreadId, repoProjectId, "busy").pipe(Effect.flip);
+      assert.equal(
+        busy.cause,
+        `Thread ${busyThreadId} still has work in progress. Finish or stop it first.`,
+      );
+      assert.equal((yield* shellOf(busyThreadId))?.projectId, scratchProjectId);
+
+      // The folder is kept, so the thread's cwd does not change with its project.
+      yield* move(idleThreadId, repoProjectId, "repo");
+      const moved = yield* shellOf(idleThreadId);
+      assert.equal(moved?.projectId, repoProjectId);
+      assert.equal(moved?.worktreePath, folder);
+
+      // A thread that ran in its old project's root is pinned to that root.
+      yield* move(rootThreadId, repoProjectId, "repo");
+      const pinned = yield* shellOf(rootThreadId);
+      assert.equal(pinned?.projectId, repoProjectId);
+      assert.equal(pinned?.worktreePath, "/tmp/runtime-layer-move-scratch");
+
+      // A repeat is refused, and moving back restores the original shape.
+      const repeat = yield* move(idleThreadId, repoProjectId, "repeat").pipe(Effect.flip);
+      assert.equal(repeat.cause, `Thread ${idleThreadId} is already in project ${repoProjectId}.`);
+      yield* move(rootThreadId, scratchProjectId, "back");
+      const back = yield* shellOf(rootThreadId);
+      assert.equal(back?.projectId, scratchProjectId);
+      assert.isNull(back?.worktreePath);
+    }),
+  );
 });
 
 it.layer(layerSharedApplicationDataPlaneTest)("visited projection", (it) => {

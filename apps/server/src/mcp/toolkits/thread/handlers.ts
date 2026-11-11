@@ -359,6 +359,35 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         case "mark_unread":
           command = { ...common, type: "thread.mark-unread" };
           break;
+        case "move": {
+          if (input.projectId === undefined) {
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "move requires projectId.",
+            });
+          }
+          // A thread already there skips the command, so a retry can still finish the task step.
+          const moved =
+            projection.thread.projectId === input.projectId
+              ? undefined
+              : yield* threads
+                  .dispatch({ ...common, type: "thread.project.move", projectId: input.projectId })
+                  .pipe(Effect.mapError(dispatchFailure));
+          // After the move, so a refused move leaves the tasks alone.
+          const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
+          yield* scheduledTasks
+            .moveThreadTasks({ threadIds: [common.threadId], projectId: input.projectId })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestratorMcpFailure({
+                    code: "orchestration_error",
+                    message: cause.message,
+                  }),
+              ),
+            );
+          return { sequence: moved?.sequence ?? 0 };
+        }
         default:
           command = { ...common, type: `thread.${input.action}` };
       }

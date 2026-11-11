@@ -3444,6 +3444,13 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     projectId: ProjectId,
   }),
+  /** Files a thread under another existing project. It keeps working in the folder it already uses. */
+  Schema.Struct({
+    type: Schema.Literal("thread.project.move"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    projectId: ProjectId,
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request-watch.sync"),
     commandId: CommandId,
