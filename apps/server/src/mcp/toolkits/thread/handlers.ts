@@ -367,18 +367,23 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               message: "move requires projectId.",
             });
           }
+          // The caller's own run keeps its thread busy, so a self-move could never be accepted.
+          if (caller?.id === projection.thread.id) {
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "A thread cannot move itself while it runs. Move it from another thread.",
+            });
+          }
           const promotion = yield* ScratchThreadPromotion.ScratchThreadPromotion;
-          yield* promotion
-            .move({ threadId: common.threadId, projectId: input.projectId })
-            .pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestratorMcpFailure({
-                    code: "orchestration_error",
-                    message: cause.message,
-                  }),
-              ),
-            );
+          yield* promotion.move({ threadId: common.threadId, projectId: input.projectId }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestratorMcpFailure({
+                  code: "orchestration_error",
+                  message: cause.message,
+                }),
+            ),
+          );
           return { moved: true as const };
         }
         default:

@@ -7301,6 +7301,28 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
         .move({ threadId, projectId: ProjectId.make("promotion-file-missing") })
         .pipe(Effect.flip);
       assert.include(missing.message, "cannot move to missing project");
+
+      // A side chat is refused on its own and moves with its parent.
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sideChatId = ThreadId.make("promotion-file-side-chat");
+      yield* orchestrator.dispatch({
+        type: "thread.fork",
+        commandId: CommandId.make("promotion-file-side-chat-fork"),
+        sourceThreadId: threadId,
+        targetThreadId: sideChatId,
+        sourcePoint: { type: "latest_stable" },
+        sideChat: true,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const nested = yield* promotion.move({ threadId: sideChatId, projectId }).pipe(Effect.flip);
+      assert.equal(
+        nested.message,
+        "This thread belongs to another thread. Move that thread instead.",
+      );
+      yield* promotion.move({ threadId, projectId });
+      assert.equal((yield* shellOf(threadId))?.projectId, projectId);
+      assert.equal((yield* shellOf(sideChatId))?.projectId, projectId);
     }),
   );
 

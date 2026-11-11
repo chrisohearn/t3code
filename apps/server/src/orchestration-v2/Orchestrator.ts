@@ -4639,7 +4639,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Thread ${command.threadId} ${cause}`,
         });
       const projection = yield* projectionStore
-        .getThreadRecords(command.threadId, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+        .getThreadRecords(command.threadId, ["runs", "runtimeRequests", "providerThreads"], {
+          turnItemTypes: [],
+        })
         .pipe(
           Effect.mapError(
             (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
@@ -4657,6 +4659,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       if (threadHasUnfinishedWork(projection)) {
         return yield* reject("still has work in progress. Finish or stop it first.");
+      }
+      // A finished run can leave provider background work (a command, a native subagent) alive.
+      if (
+        projection.providerThreads.some(
+          (providerThread) => (providerThread.pendingBackgroundTasks?.length ?? 0) > 0,
+        )
+      ) {
+        return yield* reject("still has background work running. Wait for it or stop it first.");
       }
       const current = yield* projects.get(thread.projectId).pipe(mapDispatchError(command));
       const target = yield* projects.get(command.projectId).pipe(mapDispatchError(command));
