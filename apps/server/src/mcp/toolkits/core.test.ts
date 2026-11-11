@@ -1038,6 +1038,30 @@ it.effect("discovers workflow stop targets and requires orchestration capability
     expect(read.isError).toBe(false);
     const result = yield* decodeThreadReadResult(read.structuredContent);
     expect(result.items[0]?.subagentId).toBe(subagentId);
+    expect(result.revision).toBe(7);
+    const unchanged = yield* server
+      .callTool({ name: "t3_thread_read", arguments: { threadId, sinceRevision: 7 } })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(unchanged.structuredContent).toMatchObject({
+      revision: 7,
+      items: [],
+      hasMore: false,
+      nextPosition: null,
+    });
+    // A page past the first is still read, so a caller paging with a stored revision gets items.
+    const paged = yield* server
+      .callTool({
+        name: "t3_thread_read",
+        arguments: { threadId, view: "activity", sinceRevision: 7, afterPosition: 0 },
+      })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect((yield* decodeThreadReadResult(paged.structuredContent)).items).toHaveLength(1);
     const call = (invocation: McpInvocationContext.McpInvocationScope) =>
       server
         .callTool({

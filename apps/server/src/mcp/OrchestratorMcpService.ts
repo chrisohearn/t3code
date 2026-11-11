@@ -3060,19 +3060,24 @@ const make = Effect.gen(function* () {
       };
     }),
     readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, input) {
-      const { parent, target, shell } = yield* loadReadableThread(scope, input.threadId);
+      const { parent, target, shell, revision } = yield* loadReadableThread(scope, input.threadId);
       const view = input.view ?? "messages";
       const afterPosition = input.afterPosition ?? -1;
       const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
       const maxChars = input.maxCharsPerItem ?? DEFAULT_THREAD_ITEM_MAX_CHARS;
-      const timeline = yield* threadManagement
-        .getTimelinePage(input.threadId, {
-          afterPosition,
-          limit,
-          view,
-          ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
-        })
-        .pipe(Effect.mapError(threadManagementFailure));
+      const timeline =
+        input.sinceRevision === revision &&
+        input.afterPosition === undefined &&
+        input.itemId === undefined
+          ? { items: [], totalItems: shell.itemCount, hasMore: false }
+          : yield* threadManagement
+              .getTimelinePage(input.threadId, {
+                afterPosition,
+                limit,
+                view,
+                ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
+              })
+              .pipe(Effect.mapError(threadManagementFailure));
       const page = timeline.items;
       const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
       for (const row of page) {
@@ -3146,6 +3151,7 @@ const make = Effect.gen(function* () {
         }
       }
       return {
+        revision,
         thread: threadDetail(
           scope,
           target,

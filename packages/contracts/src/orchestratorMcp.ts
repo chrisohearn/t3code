@@ -412,6 +412,7 @@ const clampedPositiveInt = (maximum: number) =>
   );
 
 export const OrchestratorMcpThreadReadInput = Schema.Struct({
+  sinceRevision: Schema.optional(NonNegativeInt),
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,
   itemId: Schema.optional(TurnItemId),
@@ -499,6 +500,8 @@ export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
 export type OrchestratorMcpThreadTimelineItem = typeof OrchestratorMcpThreadTimelineItem.Type;
 
 export const OrchestratorMcpThreadReadResult = Schema.Struct({
+  // Optional: a linked environment on an older build omits it.
+  revision: Schema.optional(NonNegativeInt),
   thread: OrchestratorMcpThreadDetail,
   recentRuns: Schema.Array(OrchestratorMcpThreadRun),
   items: Schema.Array(OrchestratorMcpThreadTimelineItem),
