@@ -1,3 +1,6 @@
+import * as WorkLedger from "../persistence/WorkLedger.ts";
+import { LedgerToolkit } from "./toolkits/ledger/tools.ts";
+import * as LedgerHandlers from "./toolkits/ledger/handlers.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -1217,6 +1220,8 @@ export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorHandlers.layer,
 ).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
 
+export const layerLedgerToolkit = toolkitRegistration(LedgerToolkit, LedgerHandlers.layer);
+
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
@@ -1298,6 +1303,7 @@ export const layerMcpTransport = <RA, RE, RR>(registrations: Layer.Layer<RA, RE,
 
 /** Every tool the T3 MCP server advertises. AgentContextBudget.test.ts measures this set. */
 export const layerTools = Layer.mergeAll(
+  layerLedgerToolkit,
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,
@@ -1366,4 +1372,4 @@ export const layerToolSearch = Layer.mergeAll(
 export const layer = Layer.merge(
   layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch)),
   McpEvents.layerDeliveryWorker,
-).pipe(Layer.provide(layerEvents));
+).pipe(Layer.provide(layerEvents), Layer.provide(WorkLedger.layer));

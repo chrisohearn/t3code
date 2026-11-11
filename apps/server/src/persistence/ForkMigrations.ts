@@ -3,11 +3,15 @@ import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import ForkMigration0001 from "./ForkMigrations/001_McpEvents.ts";
+import ForkMigration0002 from "./ForkMigrations/002_WorkLedger.ts";
 
 // Fork-only migrations, recorded in their own table so upstream keeps every id in
 // effect_sql_migrations. They run after all upstream migrations. Add new ones here, never in
 // Migrations.ts, and never rename one: the repair below finds old rows by name. See FORK.md.
-const forkMigrationEntries = [[1, "McpEvents", ForkMigration0001]] as const;
+const forkMigrationEntries = [
+  [1, "McpEvents", ForkMigration0001],
+  [2, "WorkLedger", ForkMigration0002],
+] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
 

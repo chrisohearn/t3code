@@ -841,11 +841,13 @@ describe("ThreadSettlementServiceV2 worker", () => {
           assert.lengthOf(yield* Ref.get(fixture.branchCalls), 4);
           assert.lengthOf(logs, 1);
         }).pipe(
-          Effect.provide(fixture.layer),
           Effect.provide(
-            Logger.layer([Logger.make(({ message }) => logs.push(message))], {
-              mergeWithExisting: false,
-            }),
+            Layer.merge(
+              fixture.layer,
+              Logger.layer([Logger.make(({ message }) => logs.push(message))], {
+                mergeWithExisting: false,
+              }),
+            ),
           ),
         );
       }),

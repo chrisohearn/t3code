@@ -1,3 +1,5 @@
+import * as WorkLedger from "../../persistence/WorkLedger.ts";
+import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as AssetSigner from "../../assets/AssetSigner.ts";
 import * as DocumentText from "../../provider/DocumentText.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -114,6 +116,57 @@ const client = McpSchema.McpServerClient.of({
   },
   getClient: Effect.die("unused"),
 });
+
+it.effect(
+  "ledger permits outside and thread callers to read but requires operate access to write",
+  () =>
+    Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const call = (
+        name: string,
+        args: object,
+        invocation: McpInvocationContext.McpInvocationScope,
+      ) =>
+        server
+          .callTool({ name, arguments: args })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+      const outside = {
+        ...scope,
+        thread: undefined,
+        client: { sessionId: "ledger-session", label: "Jarvis", access: "read-only" as const },
+      };
+      const item = { key: "ledger-task", title: "Task", ownerKind: "jarvis", ownerName: "chief" };
+      expect(declaredFailure(yield* call("ledger_upsert", item, outside))).toMatchObject({
+        code: "capability_denied",
+      });
+      expect(
+        (yield* call("ledger_upsert", item, {
+          ...outside,
+          client: { ...outside.client, access: "full-access" },
+        })).isError,
+      ).toBe(false);
+      expect((yield* call("ledger_query", {}, outside)).structuredContent).toMatchObject({
+        items: [{ ...item, updatedBy: "ledger-session" }],
+      });
+      expect(
+        (yield* call("ledger_upsert", { key: item.key, status: "done" }, scope)).structuredContent,
+      ).toMatchObject({ status: "done", updatedBy: threadId });
+      expect(
+        declaredFailure(yield* call("ledger_query", {}, { ...outside, capabilities: new Set() })),
+      ).toMatchObject({ code: "capability_denied" });
+    }).pipe(
+      Effect.provide(
+        McpHttpServer.layerLedgerToolkit.pipe(
+          Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+          Layer.provide(WorkLedger.layer.pipe(Layer.provide(Sqlite.layerMemory))),
+        ),
+      ),
+    ),
+);
 
 it.effect("checks capability through the production registration", () =>
   Effect.gen(function* () {
