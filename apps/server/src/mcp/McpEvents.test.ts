@@ -1,3 +1,4 @@
+import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "@effect/vitest";
 import {
@@ -43,6 +44,7 @@ const replacement = Redacted.make(`whsec_${Buffer.alloc(32, 8).toString("base64"
 const json = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const database = Layer.mergeAll(
+  BridgeStatus.layer,
   AuthSessions.layer,
   Subscriptions.layer,
   Deliveries.layer,
@@ -327,6 +329,12 @@ it.effect.each([
         expect(f.sent).toHaveLength(attempts);
         expect(new Set(f.sent.map((delivery) => delivery.id)).size).toBe(1);
         expect(new Set(f.sent.map((delivery) => delivery.body)).size).toBe(1);
+        expect((yield* f.call(f.service.bridgeStatus())).deliveriesExhaustedRetries).toBe(
+          status === 503 ? 1 : 0,
+        );
+        expect((yield* f.call(f.service.bridgeStatus(), f.other)).deliveriesExhaustedRetries).toBe(
+          0,
+        );
         expect((yield* f.subscriptions.get(sub.id))?.active).toBe(0);
         // Recovery requires a new authenticated subscribe; automatic retries stay stopped.
         f.responses.delete("event-0");
@@ -340,6 +348,12 @@ it.effect.each([
         expect(f.sent.at(-1)?.id).toBe("event-0");
         expect((yield* f.subscriptions.get(sub.id))?.ackCursor).toBeGreaterThan(0);
         expect(yield* f.deliveries.count(sub.id)).toBe(0);
+        expect(
+          (yield* f.call(f.service.bridgeStatus())).lastSuccessfulEventDeliveryAt,
+        ).not.toBeNull();
+        expect(
+          (yield* f.call(f.service.bridgeStatus(), f.other)).lastSuccessfulEventDeliveryAt,
+        ).toBeNull();
         const { cursor: _cursor, ...refresh } = input;
         yield* f.call(f.service.subscribe(refresh));
         yield* f.service.drain();

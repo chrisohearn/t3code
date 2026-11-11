@@ -1,3 +1,4 @@
+import * as McpBridgeMetrics from "../McpBridgeMetrics.ts";
 import * as McpClientThreads from "../../persistence/McpClientThreads.ts";
 import * as WorkLedger from "../../persistence/WorkLedger.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
@@ -128,6 +129,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
+      const metrics = yield* McpBridgeMetrics.McpBridgeMetrics;
       const call = (
         name: string,
         args: object,
@@ -163,10 +165,22 @@ it.effect(
       expect(
         declaredFailure(yield* call("ledger_query", {}, { ...outside, capabilities: new Set() })),
       ).toMatchObject({ code: "capability_denied" });
+      expect(yield* metrics.read("ledger-session")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            tool: "ledger_upsert",
+            calls: 2,
+            errors: 1,
+            responseBytes: expect.any(Number),
+          }),
+        ]),
+      );
+      expect(yield* metrics.read("another-session")).toEqual([]);
     }).pipe(
       Effect.provide(
         McpHttpServer.layerLedgerToolkit.pipe(
           Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provideMerge(McpBridgeMetrics.layer),
           Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
           Layer.provide(WorkLedger.layer.pipe(Layer.provide(Sqlite.layerMemory))),
         ),

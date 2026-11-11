@@ -1,3 +1,5 @@
+import * as McpEvents from "../mcp/McpEvents.ts";
+import * as McpBridgeMetrics from "../mcp/McpBridgeMetrics.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -51,6 +53,8 @@ import budget from "./agentContextBudget.json" with { type: "json" };
 
 // Registration only stores tool definitions, so the handlers' services are never called.
 const toolHandlerServices = Layer.mergeAll(
+  Layer.mock(McpEvents.McpEvents)({}),
+  Layer.mock(McpBridgeMetrics.McpBridgeMetrics)({}),
   Layer.mock(McpClientThreads.McpClientThreads)({}),
   Layer.mock(WorkLedger.WorkLedger)({}),
   Layer.mock(AssetSigner)({}),

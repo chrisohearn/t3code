@@ -1,3 +1,4 @@
+import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import {
   AuthOrchestrationReadScope,
   AuthSessionId,
@@ -110,6 +111,16 @@ export const observeEvent = (
 export class McpEvents extends Context.Service<
   McpEvents,
   {
+    readonly bridgeStatus: () => Effect.Effect<
+      {
+        readonly daysUntilSessionExpires: number;
+        readonly subscriptions: McpEventSubscriptionsResult["subscriptions"];
+        readonly lastSuccessfulEventDeliveryAt: string | null;
+        readonly deliveriesExhaustedRetries: number;
+      },
+      McpEventsError,
+      Invocation.McpInvocationContext
+    >;
     readonly list: () => Effect.Effect<
       {
         readonly events: ReadonlyArray<{
@@ -147,6 +158,7 @@ export class McpEvents extends Context.Service<
 >()("t3/mcp/McpEvents") {}
 
 const make = Effect.gen(function* () {
+  const bridge = yield* BridgeStatus.McpBridgeStatus;
   const sessions = yield* AuthSessions.AuthSessionRepository;
   const subscriptions = yield* Subscriptions.McpEventSubscriptions;
   const deliveries = yield* Deliveries.McpEventDeliveries;
@@ -278,7 +290,10 @@ const make = Effect.gen(function* () {
     const sub = yield* subscriptions.get(delivery.subscriptionId);
     if (sub === undefined) return;
     yield* authorizeDelivery(sub);
-    if (delivery.attempts >= 8) return yield* subscriptions.stop(sub.id, sub.principal);
+    if (delivery.attempts >= 8) {
+      yield* subscriptions.stop(sub.id, sub.principal);
+      return yield* bridge.exhausted(sub.principal);
+    }
     const now = yield* Clock.currentTimeMillis;
     yield* deliveries.begin(delivery, now);
     const status = yield* webhook
@@ -307,12 +322,18 @@ const make = Effect.gen(function* () {
             Effect.succeed(error.reason === "access_denied" ? 410 : 0),
         }),
       );
-    if (status >= 200 && status < 300) return yield* deliveries.acknowledge(delivery);
+    if (status >= 200 && status < 300) {
+      yield* deliveries.acknowledge(delivery);
+      return yield* bridge.delivered(sub.principal, yield* Clock.currentTimeMillis);
+    }
     if (
       (status > 0 && status < 500 && ![408, 425, 429].includes(status)) ||
       delivery.attempts + 1 >= 8
-    )
-      return yield* subscriptions.stop(sub.id, sub.principal);
+    ) {
+      yield* subscriptions.stop(sub.id, sub.principal);
+      if (delivery.attempts + 1 >= 8) yield* bridge.exhausted(sub.principal);
+      return;
+    }
     yield* deliveries.retry(
       delivery,
       (yield* Clock.currentTimeMillis) + Math.min(300_000, 1000 * 2 ** delivery.attempts),
@@ -350,7 +371,47 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const listSubscriptions = Effect.fn("McpEvents.listSubscriptions")(function* () {
+    const { principal } = yield* caller();
+    const now = yield* Clock.currentTimeMillis;
+    const own = yield* subscriptions.forPrincipal(principal.sessionId);
+    return {
+      subscriptions: own.map((sub) => ({
+        id: sub.id,
+        name: sub.name,
+        arguments: { threadId: sub.threadId },
+        // Callback paths and queries may be credentials. Management needs only the destination origin.
+        callbackOrigin: new URL(sub.url).origin,
+        status:
+          sub.expiresAt <= now
+            ? ("expired" as const)
+            : sub.active === 1
+              ? ("active" as const)
+              : ("stopped" as const),
+        expiresAt: DateTime.formatIso(DateTime.makeUnsafe(sub.expiresAt)),
+        cursor: String(sub.ackCursor),
+      })),
+    };
+  });
+
   return McpEvents.of({
+    bridgeStatus: Effect.fn("McpEvents.bridgeStatus")(function* () {
+      const { principal } = yield* caller();
+      const now = yield* Clock.currentTimeMillis;
+      const status = yield* bridge.read(principal.sessionId);
+      return {
+        daysUntilSessionExpires: Math.max(
+          0,
+          (principal.expiresAt.epochMilliseconds - now) / 86400_000,
+        ),
+        subscriptions: (yield* listSubscriptions()).subscriptions,
+        lastSuccessfulEventDeliveryAt:
+          status.lastSuccessAt === null
+            ? null
+            : DateTime.formatIso(DateTime.makeUnsafe(status.lastSuccessAt)),
+        deliveriesExhaustedRetries: status.exhaustedRetries,
+      };
+    }),
     list: Effect.fn("McpEvents.list")(function* () {
       yield* caller();
       return {
@@ -363,28 +424,7 @@ const make = Effect.gen(function* () {
         })),
       };
     }),
-    listSubscriptions: Effect.fn("McpEvents.listSubscriptions")(function* () {
-      const { principal } = yield* caller();
-      const now = yield* Clock.currentTimeMillis;
-      const own = yield* subscriptions.forPrincipal(principal.sessionId);
-      return {
-        subscriptions: own.map((sub) => ({
-          id: sub.id,
-          name: sub.name,
-          arguments: { threadId: sub.threadId },
-          // Callback paths and queries may be credentials. Management needs only the destination origin.
-          callbackOrigin: new URL(sub.url).origin,
-          status:
-            sub.expiresAt <= now
-              ? ("expired" as const)
-              : sub.active === 1
-                ? ("active" as const)
-                : ("stopped" as const),
-          expiresAt: DateTime.formatIso(DateTime.makeUnsafe(sub.expiresAt)),
-          cursor: String(sub.ackCursor),
-        })),
-      };
-    }),
+    listSubscriptions,
     subscribe: Effect.fn("McpEvents.subscribe")(function* (input) {
       const { scope, principal } = yield* caller();
       yield* resource(input.arguments.threadId);
