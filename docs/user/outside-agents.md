@@ -171,7 +171,8 @@ It returns up to 25 rows by default, ordered by key. Pass `nextCursor` as
 `cursor` for the next page, or set `limit` up to 100.
 
 Use `bridge_status` to check this sign-in's remaining lifetime, subscription
-state, last successful webhook delivery, and exhausted retries. Tool call,
+state, tunnel reachability, service start time, last successful webhook delivery,
+and exhausted retries. Tool call,
 error, and response byte counters reset when the server restarts. Delivery
 counters survive restarts. Callback secrets are never returned.
 
@@ -187,7 +188,8 @@ not establish that the requested work has been accepted.
 
 Subscriptions last one day by default and the client can refresh them. Updates
 can replay after a server restart, although older history may no longer be
-available. Delivery stops after eight failed attempts or a permanent callback
+available. When T3 Connect is enabled, T3 holds startup notifications until its
+public address is reachable, for up to three minutes, so clients can call back. Delivery stops after eight failed attempts or a permanent callback
 failure. Once the callback is working again, explicitly resubscribe to reactivate
 delivery from the acknowledged cursor. Refreshing an active subscription does not
 reset its retry budget. After signing in again, subscribe through the new connection
