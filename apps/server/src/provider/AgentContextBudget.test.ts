@@ -1,3 +1,4 @@
+import * as Sqlite from "../persistence/Sqlite.ts";
 import * as McpEvents from "../mcp/McpEvents.ts";
 import * as McpBridgeMetrics from "../mcp/McpBridgeMetrics.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
@@ -120,6 +121,7 @@ const codexAdditionalContext = () =>
 
 const layerAdvertisedTools = McpHttpServer.layerTools.pipe(
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+  Layer.provide(Sqlite.layerMemory),
   Layer.provide(toolHandlerServices),
 );
 

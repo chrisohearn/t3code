@@ -75,6 +75,7 @@ import * as AttachmentHandlers from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import * as ThreadHandlers from "./toolkits/thread/handlers.ts";
 import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
+import * as PendingApproval from "./PendingApprovalMcpService.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import * as OrchestratorHandlers from "./toolkits/orchestrator/handlers.ts";
@@ -1260,7 +1261,9 @@ export const layerOrchestratorToolkit = toolkitRegistration(
 
 export const layerLedgerToolkit = toolkitRegistration(LedgerToolkit, LedgerHandlers.layer);
 
-export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
+export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer).pipe(
+  Layer.provide(PendingApproval.layer),
+);
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,

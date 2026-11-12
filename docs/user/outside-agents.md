@@ -140,8 +140,18 @@ a delegated child's result.
 For history, use `t3_thread_read`. Save its `revision` and pass it as
 `sinceRevision` on the next read. An unchanged thread returns an empty first
 page; reads with `afterPosition` or `itemId` still return items.
-`t3_pending_request` lists questions and approvals with a `kind` field. MCP can
-answer user-input questions, but approval responses still require the app.
+`t3_pending_request` lists questions and approvals with a `kind` field. Read an
+approval by its `requestId` before answering. An outside sign-in approved for
+**Full access** can answer on any thread with `action: "respond"` and
+`decision: "accept"` to allow once, or `decision: "decline"` to deny. Other
+sign-ins and agents running inside T3 threads cannot answer approvals over MCP.
+Standing grants and permission-mode changes stay in the app.
+
+Every answer records the session, client label, thread, request, requested action,
+decision, and time. An optional `note` records the caller's statement of what the
+user said. The thread timeline identifies the MCP client that answered. A
+full-access caller can read the records with `t3_approval_log`; use `threadId`
+to filter and `cursor` and `limit` to page through them.
 
 `t3_thread_list` includes `launchedBy` and `pendingRequestCount`. Pass
 `launchedByMe: true` to find threads launched through this sign-in session.
@@ -151,7 +161,7 @@ filter works on the environment you signed in to, not through a linked one.
 
 `t3_thread_wait` returns when a run ends, asks a question, or raises an
 approval during the wait. An approval that was already pending does not end a
-new wait, because approvals are answered in the app.
+new wait. Use `t3_pending_request` to inspect existing pending approvals.
 Pass either `threadId` or `threadIds` to wait for the first ready thread.
 A specific `runId` works with a single thread. Prefer event notifications for
 ongoing monitoring.

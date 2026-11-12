@@ -133,6 +133,20 @@ export interface McpInvocationScope {
   readonly linkedEnvironments?: boolean;
 }
 
+export const assertOutsideApprovalCaller = (scope: McpInvocationScope) =>
+  scope.thread === undefined &&
+  scope.client?.access === "full-access" &&
+  scope.capabilities.has("orchestration") &&
+  clientModeCeiling(scope.client).runtimeMode === "full-access" &&
+  clientModeCeiling(scope.client).interactionMode === "default"
+    ? Effect.void
+    : Effect.fail(
+        new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message: "Only an outside full-access sign-in may answer approvals over MCP.",
+        }),
+      );
+
 /**
  * T3 Code renders `t3-thread://` links as thread chips. Other MCP clients cannot open them, so
  * they get the hosted link Copy thread copies, which opens the thread in either app or a browser.

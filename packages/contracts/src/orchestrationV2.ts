@@ -1215,6 +1215,22 @@ export function latestProviderTurnForAttempt<
   return latest;
 }
 
+export const OrchestrationV2McpApprovalAnswer = Schema.Struct({
+  sessionId: Schema.String,
+  clientLabel: Schema.String,
+  threadId: ThreadId,
+  requestId: RuntimeRequestId,
+  requested: Schema.Struct({
+    requestKind: ProviderRequestKind,
+    prompt: Schema.optional(Schema.String),
+    reason: Schema.optional(Schema.String),
+    appName: Schema.optional(Schema.String),
+  }),
+  decision: Schema.Literals(["accept", "decline"]),
+  answeredAt: IsoDateTime,
+  note: Schema.optional(Schema.String),
+});
+
 export const OrchestrationV2RuntimeRequest = Schema.Struct({
   id: RuntimeRequestId,
   nodeId: NodeId,
@@ -1239,6 +1255,7 @@ export const OrchestrationV2RuntimeRequest = Schema.Struct({
   decision: Schema.optional(ProviderApprovalDecision),
   feedback: Schema.optional(Schema.String),
   answers: Schema.optional(ProviderUserInputAnswers),
+  mcpApprovalAnswer: Schema.optional(OrchestrationV2McpApprovalAnswer),
 });
 export type OrchestrationV2RuntimeRequest = typeof OrchestrationV2RuntimeRequest.Type;
 

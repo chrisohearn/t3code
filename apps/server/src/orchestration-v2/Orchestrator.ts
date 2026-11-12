@@ -123,6 +123,7 @@ import {
   visibleDeltaRunOrdinals,
 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
+import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import {
   cancelledBeforeStart,
   continuationFailedBeforePrompt,
@@ -10202,6 +10203,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
 
       const approvalTurnItem = context.item;
+      const mcpAnswer = yield* Effect.serviceOption(McpApprovalAnswerContext);
+      if (
+        Option.isSome(mcpAnswer) &&
+        (approvalTurnItem?.type !== "approval_request" ||
+          (command.decision !== "accept" && command.decision !== "decline") ||
+          command.answers !== undefined ||
+          command.feedback !== undefined ||
+          (approvalTurnItem.options !== undefined &&
+            !approvalTurnItem.options.some((option) => option.decision === command.decision)))
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "MCP may only allow once or deny a pending approval with that option.",
+        });
+      }
       const resolvedNodeStatus =
         command.decision === "decline" || command.decision === "cancel"
           ? ("cancelled" as const)
@@ -10280,9 +10297,60 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.decision === undefined ? {} : { decision: command.decision }),
         ...(command.feedback === undefined ? {} : { feedback: command.feedback }),
         ...(answers === undefined ? {} : { answers }),
+        ...(Option.isNone(mcpAnswer) ||
+        approvalTurnItem?.type !== "approval_request" ||
+        (command.decision !== "accept" && command.decision !== "decline")
+          ? {}
+          : {
+              mcpApprovalAnswer: {
+                ...mcpAnswer.value,
+                threadId: command.threadId,
+                requestId: command.requestId,
+                requested: {
+                  requestKind: approvalTurnItem.requestKind,
+                  ...(approvalTurnItem.prompt === undefined
+                    ? {}
+                    : { prompt: approvalTurnItem.prompt }),
+                  ...(approvalTurnItem.reason === undefined
+                    ? {}
+                    : { reason: approvalTurnItem.reason }),
+                  ...(approvalTurnItem.appName === undefined
+                    ? {}
+                    : { appName: approvalTurnItem.appName }),
+                },
+                decision: command.decision,
+                answeredAt: DateTime.formatIso(now),
+              },
+            }),
       };
       const emitEvent = emit(events, command);
       const requestNode = context.node;
+      if (
+        resolvedRequest.mcpApprovalAnswer !== undefined &&
+        approvalTurnItem?.type === "approval_request"
+      ) {
+        const answer = resolvedRequest.mcpApprovalAnswer;
+        yield* emitEvent({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          occurredAt: now,
+          ...(approvalTurnItem.runId === null ? {} : { runId: approvalTurnItem.runId }),
+          payload: {
+            ...approvalTurnItem,
+            id: TurnItemId.make(`mcp-approval:${command.requestId}`),
+            type: "system_notice",
+            ordinal: yield* projectionStore
+              .getNextTurnItemOrdinal(command.threadId)
+              .pipe(mapDispatchError(command)),
+            status: "completed",
+            title: null,
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            message: `MCP client "${answer.clientLabel}" ${answer.decision === "accept" ? "allowed once" : "denied"} approval ${command.requestId}.${answer.note === undefined ? "" : ` Caller note: ${answer.note}`}`,
+          },
+        });
+      }
       if (command.feedback !== undefined) {
         const messageId = MessageId.make(`approval-feedback:${command.requestId}`);
         // Record the reply for every client without dispatching a prompt to the parent agent.

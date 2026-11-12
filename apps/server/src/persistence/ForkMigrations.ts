@@ -8,6 +8,7 @@ import ForkMigration0003 from "./ForkMigrations/003_McpClientThreads.ts";
 import ForkMigration0004 from "./ForkMigrations/004_McpBridgeStatus.ts";
 import ForkMigration0005 from "./ForkMigrations/005_McpOAuthRenewal.ts";
 import ForkMigration0006 from "./ForkMigrations/006_McpSubscriptionRenewal.ts";
+import ForkMigration0007 from "./ForkMigrations/007_McpApprovalAnswers.ts";
 
 // Fork-only migrations, recorded in their own table so upstream keeps every id in
 // effect_sql_migrations. They run after all upstream migrations. Add new ones here, never in
@@ -19,6 +20,7 @@ const forkMigrationEntries = [
   [4, "McpBridgeStatus", ForkMigration0004],
   [5, "McpOAuthRenewal", ForkMigration0005],
   [6, "McpSubscriptionRenewal", ForkMigration0006],
+  [7, "McpApprovalAnswers", ForkMigration0007],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
