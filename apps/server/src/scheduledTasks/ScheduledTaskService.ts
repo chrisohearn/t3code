@@ -1,6 +1,9 @@
 import {
   CommandId,
   MessageId,
+  type OrchestrationV2Run,
+  OrchestrationV2RunStatus,
+  type RunId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   type ProjectId,
   ScheduledTask,
@@ -15,6 +18,7 @@ import {
   type ScheduledTaskListWebhookDeliveriesInput,
   type ScheduledTaskListWebhookDeliveriesResult,
   type ScheduledTaskRotateWebhookTokenInput,
+  type ScheduledTaskRunStatus,
   type ScheduledTaskWebhookDeliveryOutcome,
   type ScheduledTaskWebhookFilter,
   type ScheduledTaskListResult,
@@ -59,7 +63,7 @@ import * as DueHint from "../scheduling/DueHint.ts";
 import * as ScheduledTaskChanges from "./ScheduledTaskChanges.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
-import { hasGitEntry } from "../mcp/gitEntryProbe.ts";
+import { findGitEntry } from "../mcp/gitEntryProbe.ts";
 import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
 import {
   redactHeaders,
@@ -235,9 +239,10 @@ interface ScheduledTaskRow {
   readonly webhook_secret: string | null;
 }
 
-interface StartedRunRow {
+interface LastRunRow {
   readonly task_id: string;
   readonly last_run_at: string;
+  readonly last_run_status: string;
   readonly last_run_webhook_delivery_id: string | null;
 }
 
@@ -322,6 +327,12 @@ const UNSUCCESSFUL_RUN_ERRORS = {
   cancelled: "The run was cancelled.",
   rolled_back: "The run was rolled back.",
 } as const;
+type RunOutcome = { readonly status: "succeeded" | "failed"; readonly error: string | null };
+const THREAD_DELETED_OUTCOME: RunOutcome = {
+  status: "failed",
+  error: "The run's thread was deleted before the run finished.",
+};
+const isRunStatus = Schema.is(OrchestrationV2RunStatus);
 const localNow = DateTime.withCurrentZoneLocal(DateTime.nowInCurrentZone);
 
 function nextRunAt(
@@ -487,10 +498,22 @@ export const layer = Layer.effect(
       webhookPolicyOrganization === undefined
         ? undefined
         : managedPolicyDeniedMessage(webhookPolicyOrganization, "webhook tasks");
-    const withPolicy = (task: ScheduledTask): ScheduledTask =>
-      webhookPolicyBlock !== undefined && task.schedule.type === "webhook"
-        ? { ...task, blockedByPolicy: webhookPolicyBlock }
-        : task;
+    // Accepted runs whose outcome is pending, by task, with the run's start time. Kept out of the
+    // table so stored statuses stay ones every client and older build can decode.
+    const pendingRuns = yield* Ref.make<ReadonlyMap<ScheduledTaskId, string>>(new Map());
+    const present = (
+      task: ScheduledTask,
+      pending: ReadonlyMap<ScheduledTaskId, string>,
+    ): ScheduledTask => {
+      const since = pending.get(task.id);
+      return {
+        ...task,
+        ...(since !== undefined && since === task.lastRunAt ? { runInProgressSince: since } : {}),
+        ...(webhookPolicyBlock !== undefined && task.schedule.type === "webhook"
+          ? { blockedByPolicy: webhookPolicyBlock }
+          : {}),
+      };
+    };
     const webhookPermits = yield* Ref.make<ReadonlyMap<ScheduledTaskId, Semaphore.Semaphore>>(
       new Map(),
     );
@@ -552,9 +575,10 @@ export const layer = Layer.effect(
     const listRows = Effect.fn("ScheduledTaskService.listRows")(function* () {
       const rows = yield* selectAllRows();
       const origin = yield* readWebhookOrigin;
+      const pending = yield* Ref.get(pendingRuns);
       return yield* Effect.forEach(
         rows,
-        (row) => decodeRow(row, origin).pipe(Effect.map(withPolicy)),
+        (row) => decodeRow(row, origin).pipe(Effect.map((task) => present(task, pending))),
         { concurrency: 1 },
       );
     });
@@ -597,7 +621,7 @@ export const layer = Layer.effect(
       );
       const row = rows[0];
       if (row === undefined) return null;
-      return withPolicy(yield* decodeRow(row, yield* readWebhookOrigin));
+      return present(yield* decodeRow(row, yield* readWebhookOrigin), yield* Ref.get(pendingRuns));
     });
 
     const findWebhookCredentials = (id: ScheduledTaskId) =>
@@ -784,7 +808,7 @@ export const layer = Layer.effect(
       readonly id: ScheduledTaskId;
       readonly completedAtIso: string;
       readonly nextRunAtIso: string | null;
-      readonly status: "started" | "failed";
+      readonly status: Exclude<ScheduledTaskRunStatus, "running">;
       readonly error: string | null;
       readonly startedAtIso: string;
     }) =>
@@ -887,58 +911,58 @@ export const layer = Layer.effect(
       ),
     );
 
-    const recordRunOutcome = (
+    const setPendingRun = (taskId: ScheduledTaskId, startedAtIso: string) =>
+      Ref.update(pendingRuns, (pending) => new Map(pending).set(taskId, startedAtIso));
+    const clearPendingRun = (taskId: ScheduledTaskId, startedAtIso?: string) =>
+      Ref.modify(pendingRuns, (pending) => {
+        const current = pending.get(taskId);
+        if (current === undefined || (startedAtIso !== undefined && current !== startedAtIso))
+          return [false, pending] as const;
+        const next = new Map(pending);
+        next.delete(taskId);
+        return [true, next] as const;
+      });
+
+    // Only while the run is still the pending one, so a missed-run failure recorded meanwhile stands.
+    const recordRunOutcome = Effect.fn("ScheduledTaskService.recordRunOutcome")(function* (
       taskId: ScheduledTaskId,
       startedAtIso: string,
-      status: "succeeded" | "failed",
-      error: string | null,
-    ) =>
-      sql`
+      outcome: RunOutcome,
+    ) {
+      if ((yield* Ref.get(pendingRuns)).get(taskId) !== startedAtIso) return;
+      yield* sql`
         UPDATE scheduled_tasks
-        SET last_run_status = ${status}, last_run_error = ${error}
-        WHERE task_id = ${taskId} AND last_run_at = ${startedAtIso} AND last_run_status = 'started'
-        RETURNING task_id
-      `.pipe(Effect.flatMap((rows) => (rows.length > 0 ? notifyChanged : Effect.void)));
+        SET last_run_status = ${outcome.status}, last_run_error = ${outcome.error}
+        WHERE task_id = ${taskId} AND last_run_at = ${startedAtIso}
+          AND last_run_status <> 'running'
+      `;
+    });
 
-    // A dispatch is recorded as started once the message is accepted; workspace preparation
-    // or the provider can still fail the run after that, so follow it to its outcome.
-    const followRunOutcome = Effect.fn("ScheduledTaskService.followRunOutcome")(
-      function* (
-        taskId: ScheduledTaskId,
-        startedAtIso: string,
-        threadId: ThreadId,
-        messageId: MessageId,
-      ) {
+    // Null while the run is still active after the wait.
+    const resolveRunOutcome = Effect.fn("ScheduledTaskService.resolveRunOutcome")(
+      function* (threadId: ThreadId, messageId: MessageId) {
         const shell = yield* threadManagement.getThreadShell(threadId);
-        if (shell === null) {
-          return yield* recordRunOutcome(
-            taskId,
-            startedAtIso,
-            "failed",
-            "The run's thread was deleted before the run finished.",
-          );
-        }
+        if (shell === null || shell.deletedAt != null) return THREAD_DELETED_OUTCOME;
         const thread = { projectId: shell.projectId, threadId };
         const { runs, messages } = yield* threadManagement.getProjectThreadRecords(thread, [
           "runs",
           "messages",
         ]);
-        let runId =
+        let runId: RunId | null =
           runs.find((run) => run.userMessageId === messageId)?.id ??
           messages.find((message) => message.id === messageId)?.runId ??
           null;
+        if (runId === null) return { status: "failed", error: "The run never started." } as const;
         // A queued message promoted to a steer cancels its run and joins the active one.
-        for (let hops = 0; runId !== null && hops < 3; hops++) {
-          const { run } = yield* threadManagement.waitForThread({
-            ...thread,
-            runId,
-            timeoutMs: RUN_OUTCOME_WAIT_MS,
-          });
-          // Still active after the wait: the run has not finished, so it stays started.
-          if (run === null || !ThreadManagementService.isTerminalRunStatus(run.status)) return;
-          if (run.status === "completed") {
-            return yield* recordRunOutcome(taskId, startedAtIso, "succeeded", null);
-          }
+        for (let hops = 0; hops < 3; hops++) {
+          const { run }: { readonly run: OrchestrationV2Run | null } =
+            yield* threadManagement.waitForThread({
+              ...thread,
+              runId,
+              timeoutMs: RUN_OUTCOME_WAIT_MS,
+            });
+          if (run === null || !ThreadManagementService.isTerminalRunStatus(run.status)) return null;
+          if (run.status === "completed") return { status: "succeeded", error: null } as const;
           const { turnItems, messages: current } = yield* threadManagement.getProjectThreadRecords(
             thread,
             ["turnItems", "messages"],
@@ -946,59 +970,83 @@ export const layer = Layer.effect(
           const joined = current.find((message) => message.id === messageId)?.runId ?? null;
           // waitForThread answers with a restart's continuation, so compare against both ids.
           if (
-            run.status === "cancelled" &&
-            joined !== null &&
-            joined !== runId &&
-            joined !== run.id
+            run.status !== "cancelled" ||
+            joined === null ||
+            joined === runId ||
+            joined === run.id
           ) {
-            runId = joined;
-            continue;
+            const error =
+              latestRootProviderFailure(run, turnItems)?.message ??
+              UNSUCCESSFUL_RUN_ERRORS[run.status];
+            return { status: "failed", error } as const;
           }
-          const error =
-            latestRootProviderFailure(run, turnItems)?.message ??
-            UNSUCCESSFUL_RUN_ERRORS[run.status];
-          return yield* recordRunOutcome(taskId, startedAtIso, "failed", error);
+          runId = joined;
         }
-        yield* recordRunOutcome(
-          taskId,
-          startedAtIso,
-          "failed",
-          runId === null ? "The run never started." : "The run was cancelled.",
-        );
+        return { status: "failed", error: UNSUCCESSFUL_RUN_ERRORS.cancelled } as const;
       },
-      (effect, taskId) =>
-        effect.pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("Could not record scheduled run outcome", { taskId, cause }),
-          ),
-        ),
+      Effect.catchTags({
+        ThreadManagementThreadNotFoundError: () => Effect.succeed(THREAD_DELETED_OUTCOME),
+        ThreadManagementRunNotFoundError: () =>
+          Effect.succeed({
+            status: "failed",
+            error: "The run was removed before it finished.",
+          } as const),
+      }),
     );
 
-    // The message id is derived from the run's start time and trigger (see runTask's fireKey),
-    // so a restart can find a started run again and keep following it.
-    const resumeStartedRun = Effect.fn("ScheduledTaskService.resumeStartedRun")(function* (
-      row: StartedRunRow,
+    // The caller marks the run pending first. Any other failure leaves the stored status as it was.
+    const followRunOutcome = (
+      taskId: ScheduledTaskId,
+      startedAtIso: string,
+      threadId: ThreadId,
+      messageId: MessageId,
+    ) =>
+      resolveRunOutcome(threadId, messageId).pipe(
+        Effect.flatMap((outcome) =>
+          outcome === null ? Effect.void : recordRunOutcome(taskId, startedAtIso, outcome),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Could not record scheduled run outcome", { taskId, cause }),
+        ),
+        // Notifies even when a newer run replaced this one, so every follower's end is observable.
+        Effect.ensuring(clearPendingRun(taskId, startedAtIso).pipe(Effect.andThen(notifyChanged))),
+      );
+
+    // The stored row holds no trace of a pending run, so after a restart each task's latest run is
+    // found again from its message id (see runTask's fireKey) and followed when its outcome is not
+    // recorded yet. A row whose message is gone is left as it is.
+    const resumeRunOutcome = Effect.fn("ScheduledTaskService.resumeRunOutcome")(function* (
+      row: LastRunRow,
     ) {
-      const taskId = ScheduledTaskId.make(row.task_id);
       const startedMs = Date.parse(row.last_run_at);
       const fireKeys =
         row.last_run_webhook_delivery_id !== null
           ? [`${row.task_id}:webhook:${row.last_run_webhook_delivery_id}`]
           : [`${row.task_id}:${startedMs}:scheduled`, `${row.task_id}:${startedMs}:manual`];
-      const messageIds = fireKeys.map((key) => `scheduled-task-message:${key}`);
-      const [found] = yield* sql<{ message_id: string; thread_id: string }>`
-        SELECT message_id, thread_id FROM orchestration_v2_projection_messages
-        WHERE ${sql.in("message_id", messageIds)}
+      const [found] = yield* sql<{
+        message_id: string;
+        thread_id: string;
+        run_status: string | null;
+      }>`
+        SELECT m.message_id, m.thread_id, r.status AS run_status
+        FROM orchestration_v2_projection_messages m
+        LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = m.run_id
+        WHERE ${sql.in(
+          "m.message_id",
+          fireKeys.map((key) => `scheduled-task-message:${key}`),
+        )}
         LIMIT 1
       `.pipe(NodeSqliteClient.readOnly);
-      if (found === undefined) {
-        return yield* recordRunOutcome(
-          taskId,
-          row.last_run_at,
-          "failed",
-          "The run's thread was deleted before the run finished.",
-        );
+      if (found === undefined) return;
+      if (
+        isRunStatus(found.run_status) &&
+        ThreadManagementService.isTerminalRunStatus(found.run_status)
+      ) {
+        const recorded = found.run_status === "completed" ? "succeeded" : "failed";
+        if (row.last_run_status === recorded) return;
       }
+      const taskId = ScheduledTaskId.make(row.task_id);
+      yield* setPendingRun(taskId, row.last_run_at);
       yield* followRunOutcome(
         taskId,
         row.last_run_at,
@@ -1022,9 +1070,13 @@ export const layer = Layer.effect(
         const [project] = yield* sql<{ workspace_root: string }>`
           SELECT workspace_root FROM projection_projects WHERE project_id = ${task.projectId}
         `.pipe(NodeSqliteClient.readOnly);
-        if (project === undefined || !(yield* hasGitEntry(project.workspace_root))) return;
+        if (project === undefined) return;
+        const gitEntry = yield* findGitEntry(project.workspace_root);
+        if (gitEntry === null) return;
         return yield* taskError(
-          `${project.workspace_root} is now a Git repository, but this task was saved to run directly in that folder because it was not one. Update the task (any change through schedule_task re-checks the folder) or choose a workspace in Settings.`,
+          gitEntry.inParent
+            ? `${project.workspace_root} is now inside the Git repository at ${gitEntry.folder} (${gitEntry.path}), but this task was saved to run directly in that folder because it was not in one. Updating the task through schedule_task would run it in a worktree of ${gitEntry.folder}; if that is not intended, choose a workspace in Settings.`
+            : `${project.workspace_root} is now a Git repository (${gitEntry.path}), but this task was saved to run directly in that folder because it was not one. Update the task (any change through schedule_task re-checks the folder) or choose a workspace in Settings.`,
           { taskId: task.id },
         );
       },
@@ -1209,8 +1261,13 @@ export const layer = Layer.effect(
         const runSucceeded = result._tag === "Success";
         if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
         const completedAt = yield* localNow;
-        const lastRunStatus = runSucceeded ? ("started" as const) : ("failed" as const);
-        const lastRunError = runSucceeded ? null : errorMessage(result.cause);
+        // An accepted run keeps the previous run's status until its own outcome is known.
+        const lastRunStatus = !runSucceeded
+          ? ("failed" as const)
+          : active.lastRunStatus === "running"
+            ? ("never" as const)
+            : active.lastRunStatus;
+        const lastRunError = runSucceeded ? active.lastRunError : errorMessage(result.cause);
         const threadId = runSucceeded ? result.value : null;
         // One transaction, so an edit cannot land between reading the schedule and
         // writing the next run computed from it. The origin is read first: it reads
@@ -1275,14 +1332,20 @@ export const layer = Layer.effect(
                   ),
             ),
           );
+        const following = written && threadId !== null;
+        if (following) yield* setPendingRun(active.id, startedAtIso);
         if (written) yield* notifyChanged;
-        if (written && threadId !== null) {
+        if (following) {
           yield* followRunOutcome(active.id, startedAtIso, threadId, messageId).pipe(
             Effect.forkIn(serviceScope),
           );
         }
         // The stored row can belong to a replacement, so report this dispatch separately.
-        return { task: recorded, threadId, dispatchFailed: !runSucceeded };
+        return {
+          task: following ? { ...recorded, runInProgressSince: startedAtIso } : recorded,
+          threadId,
+          dispatchFailed: !runSucceeded,
+        };
       }).pipe(
         Effect.onError((cause) =>
           releaseStuckRun(task, startedAtIso, errorMessage(cause), webhook?.deliveryId),
@@ -1342,7 +1405,10 @@ export const layer = Layer.effect(
           taskError("Could not reschedule missed schedule task run.", { taskId: task.id, cause }),
         ),
       );
-      if (updated.length > 0) yield* notifyChanged;
+      if (updated.length === 0) return;
+      // The recorded miss stands over the outcome of a run still pending from before it.
+      if (runError !== undefined) yield* clearPendingRun(task.id);
+      yield* notifyChanged;
     });
 
     const runDueTasks = Effect.fn("ScheduledTaskService.runDueTasks")(function* () {
@@ -1396,6 +1462,33 @@ export const layer = Layer.effect(
       );
     });
 
+    // Before the running-row recovery below, whose rows never dispatched a message to follow.
+    yield* sql<LastRunRow>`
+      SELECT task_id, last_run_at, last_run_status, last_run_webhook_delivery_id
+      FROM scheduled_tasks
+      WHERE last_run_at IS NOT NULL AND last_run_status <> 'running'
+    `.pipe(
+      NodeSqliteClient.readOnly,
+      Effect.flatMap((rows) =>
+        Effect.forEach(
+          rows,
+          (row) =>
+            resumeRunOutcome(row).pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("Could not resume following a schedule task run", {
+                  taskId: row.task_id,
+                  cause,
+                }),
+              ),
+            ),
+          { discard: true },
+        ),
+      ),
+      Effect.catch((cause) =>
+        Effect.logWarning("Could not resume following schedule task runs", { cause }),
+      ),
+    );
+
     // Recover crash-left running rows that the due-task filter would otherwise skip forever.
     yield* Effect.gen(function* () {
       const rows = yield* selectAllRows();
@@ -1446,32 +1539,6 @@ export const layer = Layer.effect(
     }).pipe(
       Effect.catch((cause) =>
         Effect.logWarning("Could not reset interrupted schedule task runs", { cause }),
-      ),
-    );
-
-    // A run's outcome follower does not survive a restart; pick each started run up again.
-    yield* sql<StartedRunRow>`
-      SELECT task_id, last_run_at, last_run_webhook_delivery_id FROM scheduled_tasks
-      WHERE last_run_status = 'started' AND last_run_at IS NOT NULL
-    `.pipe(
-      NodeSqliteClient.readOnly,
-      Effect.flatMap((rows) =>
-        Effect.forEach(
-          rows,
-          (row) =>
-            resumeStartedRun(row).pipe(
-              Effect.catch((cause) =>
-                Effect.logWarning("Could not resume following a started schedule task run", {
-                  taskId: row.task_id,
-                  cause,
-                }),
-              ),
-            ),
-          { discard: true },
-        ),
-      ),
-      Effect.catch((cause) =>
-        Effect.logWarning("Could not resume following started schedule task runs", { cause }),
       ),
     );
 
@@ -1685,7 +1752,8 @@ export const layer = Layer.effect(
         runtimeMode: input.runtimeMode,
         interactionMode: input.interactionMode,
         createdBy: existingTask?.createdBy ?? input.createdBy ?? "user",
-        creationSource: input.creationSource ?? "web",
+        // Kept on edits: MCP's derived workspaces are rechecked at launch (refuseStaleRootWorkspace).
+        creationSource: existingTask?.creationSource ?? input.creationSource ?? "web",
         createdAt: existingTask?.createdAt ?? iso(now),
         updatedAt: iso(now),
         nextRunAt: scheduleUnchanged

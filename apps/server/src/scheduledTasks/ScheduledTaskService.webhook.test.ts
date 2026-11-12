@@ -1082,7 +1082,7 @@ it.effect("retrying a running window keeps the prompt it was dispatched with", (
         yield* service.triggerWebhook(requestFor(task));
         yield* save("Prompt at dispatch");
         yield* sql`CREATE TRIGGER fail_completion BEFORE UPDATE ON scheduled_tasks
-          WHEN NEW.last_run_status = 'started' BEGIN SELECT RAISE(FAIL, 'completion unavailable'); END`;
+          WHEN OLD.last_run_status = 'running' AND NEW.last_run_status <> 'failed' BEGIN SELECT RAISE(FAIL, 'completion unavailable'); END`;
         yield* TestClock.adjust("10 seconds");
         yield* drainPendingDispatch(workers);
         const launched = yield* Queue.take(launches);
@@ -1408,7 +1408,8 @@ it.effect("start failures release both replay keys and relay claims for redelive
         );
         assert.equal(retry._tag === "accepted" && retry.outcome, "accepted");
         yield* Queue.take(launches);
-        assert.equal((yield* service.list()).tasks[0]!.lastRunStatus, "started");
+        // The retry was accepted; the failed start stays the latest outcome until it finishes.
+        assert.equal((yield* service.list()).tasks[0]!.runCount, 2);
       }),
     { failLaunches: { remaining: 1 } },
   ),
@@ -1528,7 +1529,7 @@ it.effect("keeps replay keys when dispatch succeeds but completion bookkeeping f
         }),
       );
       yield* sql`CREATE TRIGGER fail_completion BEFORE UPDATE ON scheduled_tasks
-      WHEN NEW.last_run_status = 'started' BEGIN SELECT RAISE(FAIL, 'completion unavailable'); END`;
+      WHEN OLD.last_run_status = 'running' AND NEW.last_run_status <> 'failed' BEGIN SELECT RAISE(FAIL, 'completion unavailable'); END`;
       yield* waitForSpan(
         service.triggerWebhook(requestFor(task)),
         "ScheduledTaskService.runWebhookDelivery",
@@ -1920,7 +1921,7 @@ it.effect.each([false, true])(
               requestFor(task, { headers: { group: "old" }, bodyText: '{"value":"old"}' }),
             );
             yield* sql`CREATE TRIGGER fail_old_completion BEFORE UPDATE ON scheduled_tasks
-        WHEN NEW.last_run_status = 'started' BEGIN SELECT RAISE(FAIL, 'completion unavailable'); END`;
+        WHEN OLD.last_run_status = 'running' AND NEW.last_run_status <> 'failed' BEGIN SELECT RAISE(FAIL, 'completion unavailable'); END`;
             yield* TestClock.adjust("10 seconds");
             yield* drainPendingDispatch(workers);
             yield* Queue.take(launches);

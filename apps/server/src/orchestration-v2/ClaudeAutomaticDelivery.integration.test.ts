@@ -326,7 +326,7 @@ it.effect.each(deliveries)(
                 }),
               );
               const ran = yield* service.runNow({ id: task.id });
-              assert.equal(ran.task.lastRunStatus, "started");
+              assert.equal(ran.task.runInProgressSince, ran.task.lastRunAt);
             }).pipe(
               Effect.provide(
                 ScheduledTaskService.layer.pipe(

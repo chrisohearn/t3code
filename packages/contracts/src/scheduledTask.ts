@@ -214,14 +214,7 @@ export const ScheduledTaskUpsertSchedule = Schema.Union([
 ]);
 export type ScheduledTaskUpsertSchedule = typeof ScheduledTaskUpsertSchedule.Type;
 
-/** `running` while the run is being dispatched; `started` once it was accepted and its outcome is pending. */
-export const ScheduledTaskRunStatus = Schema.Literals([
-  "never",
-  "running",
-  "started",
-  "succeeded",
-  "failed",
-]);
+export const ScheduledTaskRunStatus = Schema.Literals(["never", "running", "succeeded", "failed"]);
 export type ScheduledTaskRunStatus = typeof ScheduledTaskRunStatus.Type;
 
 export const ScheduledTaskWebhookEndpoint = Schema.Struct({
@@ -270,8 +263,21 @@ export const ScheduledTask = Schema.Struct({
   webhook: Schema.optional(ScheduledTaskWebhookEndpoint),
   /** Why the task cannot run regardless of `enabled`, such as a managed policy refusing webhooks. */
   blockedByPolicy: Schema.optionalKey(Schema.String),
+  /**
+   * When the run started at `lastRunAt` was accepted and has not finished yet. The `lastRun*` fields
+   * still describe the run before it until it ends. Never stored, so older clients and builds see
+   * only the statuses they know.
+   */
+  runInProgressSince: Schema.optionalKey(IsoDateTime),
 });
 export type ScheduledTask = typeof ScheduledTask.Type;
+
+/** What to show for the latest run: `running` until an accepted run's outcome is known. */
+export function scheduledTaskRunDisplayStatus(
+  task: Pick<ScheduledTask, "lastRunStatus" | "runInProgressSince">,
+): ScheduledTaskRunStatus {
+  return task.runInProgressSince === undefined ? task.lastRunStatus : "running";
+}
 
 export const ScheduledTaskListInput = Schema.Struct({});
 export type ScheduledTaskListInput = typeof ScheduledTaskListInput.Type;
