@@ -11,7 +11,9 @@ import {
   forkHistoryProblems,
   historyAfterForkRepair,
 } from "../persistence/ForkMigrations.ts";
-import { migrationManifest, skippedMigrations } from "../persistence/Migrations.ts";
+import { migrationManifest, skippedV2Migrations } from "../persistence/Migrations.ts";
+
+import { reconciledV2PreviewHistory } from "../persistence/reconcileV2PreviewMigration.ts";
 
 export type ServicePreflightResult =
   | {
@@ -83,8 +85,12 @@ function migrationHistory(
   const recorded = recordedMigrations(databasePath);
   const forkRecorded = recordedMigrations(databasePath, FORK_MIGRATIONS_TABLE);
   if (recorded === null || forkRecorded === null) return null;
+  const reconciled = reconciledV2PreviewHistory(recorded);
+  if (reconciled === null) {
+    return { newer: [], skipped: ["an unexpected V2 preview history"] };
+  }
   // Fork: startup moves fork rows off upstream ids first, so judge the history it leaves.
-  const { upstream, fork } = historyAfterForkRepair(recorded, forkRecorded, migrationManifest);
+  const { upstream, fork } = historyAfterForkRepair(reconciled, forkRecorded, migrationManifest);
   return {
     newer: [
       ...upstream
@@ -95,7 +101,7 @@ function migrationHistory(
         .map(({ id, name }) => `fork ${id}_${name}`),
     ],
     skipped: [
-      ...skippedMigrations(upstream),
+      ...skippedV2Migrations(upstream),
       ...forkHistoryProblems(fork).map((problem) => `fork ${problem}`),
     ],
   };

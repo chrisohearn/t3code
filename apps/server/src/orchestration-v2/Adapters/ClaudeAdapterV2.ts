@@ -97,6 +97,7 @@ import {
   TrimmedNonEmptyString,
   defaultInstanceIdForDriver,
   isCompactionCommandMessage,
+  parseGoalCommand,
   type MessageId,
   type ModelSelection,
   type OrchestrationV2ConversationMessage,
@@ -244,6 +245,9 @@ import {
 } from "@t3tools/provider-core/server/subagentProjection";
 
 export const CLAUDE_PROVIDER = ProviderDriverKind.make("claudeAgent");
+/** The query exited before the turn attached, so the prompt was never offered. */
+export const CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL =
+  "Claude provider query ended before the turn could start.";
 const CLAUDE_AGENT_SDK_QUERY_PROTOCOL = "claude-agent-sdk.query" as const;
 
 interface ClaudeCacheCreation {
@@ -740,6 +744,10 @@ export interface ClaudeAgentSdkQueryRunnerShape {
     ClaudeAgentSdkQueryRunnerError
   >;
   readonly subagentLaunchToolUseId: (
+    input: ClaudeAgentSdkSubagentLookupInput,
+  ) => Effect.Effect<string | null, ClaudeAgentSdkQueryRunnerError>;
+  /** The model a subagent's transcript says it ran on. */
+  readonly subagentModel: (
     input: ClaudeAgentSdkSubagentLookupInput,
   ) => Effect.Effect<string | null, ClaudeAgentSdkQueryRunnerError>;
   readonly assertComplete: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
@@ -1808,6 +1816,27 @@ export const layerQueryRunner: Layer.Layer<
           return toolUseId;
         },
       ),
+      subagentModel: Effect.fn("ClaudeAgentSdkQueryRunner.subagentModel")(function* (
+        input: ClaudeAgentSdkSubagentLookupInput,
+      ) {
+        const messages = yield* Effect.tryPromise({
+          try: () =>
+            getSubagentMessages(
+              input.sessionId,
+              input.agentId,
+              input.dir === null ? {} : { dir: input.dir },
+            ),
+          catch: (cause) => queryRunnerError(cause, "getSubagentMessages"),
+        });
+        return (
+          messages
+            .toReversed()
+            .flatMap((message) =>
+              message.type === "assistant" ? [text(field(message.message, "model"))] : [],
+            )
+            .find((model) => model !== undefined) ?? null
+        );
+      }),
       assertComplete: Effect.void,
     });
   }),
@@ -1838,20 +1867,29 @@ function claudeLiveSelectionFlagSettings(
 
 // A delegated child is its own SDK session, so Claude Code gives it the main-conversation cache
 // TTL. When the user sets Claude's subagentPromptCacheTtl, the child follows it like a native
-// subagent would. An explicit CLAUDE_CODE_PROMPT_CACHE_TTL on the instance still wins.
+// subagent would. A resumed session's first request otherwise goes out before its MCP servers
+// connect, and Claude Code tells the agent they disconnected. Explicit instance values still win.
 export function claudeQueryEnvironment(
   environment: NodeJS.ProcessEnv,
   appThread: Pick<OrchestrationV2AppThread, "lineage">,
   subagentPromptCacheTtl: "5m" | "1h" | undefined,
+  resume = false,
 ): NodeJS.ProcessEnv {
-  if (
-    appThread.lineage.relationshipToParent !== "subagent" ||
-    subagentPromptCacheTtl === undefined ||
-    environment.CLAUDE_CODE_PROMPT_CACHE_TTL !== undefined
-  ) {
+  const promptCacheTtl =
+    appThread.lineage.relationshipToParent === "subagent" &&
+    subagentPromptCacheTtl !== undefined &&
+    environment.CLAUDE_CODE_PROMPT_CACHE_TTL === undefined
+      ? subagentPromptCacheTtl
+      : undefined;
+  const blockingMcpConnect = resume && environment.MCP_CONNECTION_NONBLOCKING === undefined;
+  if (promptCacheTtl === undefined && !blockingMcpConnect) {
     return environment;
   }
-  return { ...environment, CLAUDE_CODE_PROMPT_CACHE_TTL: subagentPromptCacheTtl };
+  return {
+    ...environment,
+    ...(promptCacheTtl === undefined ? {} : { CLAUDE_CODE_PROMPT_CACHE_TTL: promptCacheTtl }),
+    ...(blockingMcpConnect ? { MCP_CONNECTION_NONBLOCKING: "0" } : {}),
+  };
 }
 
 // Claude Code's auto tool search sends every MCP schema in full while they fit under a share of the
@@ -2550,18 +2588,22 @@ export function makeClaudeUserMessage(input: {
   // Keep the whole request before that block; see ClaudeSkillDispatch.
   const dispatch =
     input.skills === undefined ? undefined : planClaudeSkillDispatch(input.text, input.skills);
+  // Claude runs `/goal` only when it opens the prompt, so a goal stays one block.
+  const isGoalCommand = parseGoalCommand({ text: input.text }) !== null;
   return {
     type: "user",
     message: {
       role: "user",
-      content: dispatch
-        ? [
-            ...(dispatch.leadingText === undefined
-              ? []
-              : [{ type: "text" as const, text: dispatch.leadingText }]),
-            { type: "text" as const, text: dispatch.commandText },
-          ]
-        : input.text,
+      content: isGoalCommand
+        ? (dispatch?.leadingText ?? input.text)
+        : dispatch
+          ? [
+              ...(dispatch.leadingText === undefined
+                ? []
+                : [{ type: "text" as const, text: dispatch.leadingText }]),
+              { type: "text" as const, text: dispatch.commandText },
+            ]
+          : input.text,
     },
     parent_tool_use_id: null,
     ...(input.priority === undefined ? {} : { priority: input.priority }),
@@ -3578,7 +3620,15 @@ function claudeCommandOutputText(output: ClaudeNativeToolOutput): string {
   return claudeNativeToolOutputText(output);
 }
 
+// Claude Code prefixes foreground Agent results with a note for the parent model, not the report.
+const CLAUDE_TOOLS_USED_NOTE =
+  /^\s*<tools-used-before-summary>[^<]*<\/tools-used-before-summary>\s*/;
+
 function claudeSubagentResultText(output: ClaudeNativeToolOutput): string {
+  return claudeSubagentRawResultText(output).replace(CLAUDE_TOOLS_USED_NOTE, "");
+}
+
+function claudeSubagentRawResultText(output: ClaudeNativeToolOutput): string {
   const value = claudeNativeToolOutputValue(output);
   const content = Array.isArray(value)
     ? value
@@ -6042,6 +6092,24 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             taskId,
           );
 
+        // Untraced with roster emission: this runs for each streamed roster update.
+        const owedWakeTasksForNativeThread = Effect.fnUntraced(function* (nativeThreadId: string) {
+          const previous = (yield* Ref.get(lastProviderThreadByNativeThread)).get(nativeThreadId);
+          const roster = rosterForNativeThread(
+            yield* Ref.get(pendingBackgroundTasksByNativeThread),
+            nativeThreadId,
+          );
+          const tasks: OrchestrationV2PendingBackgroundTask[] = [];
+          for (const task of previous?.pendingBackgroundTasks ?? []) {
+            if (
+              !roster.has(task.taskId) &&
+              (yield* isKnownOpaqueBackgroundTaskOnNativeThread(nativeThreadId, task.taskId))
+            )
+              tasks.push(task);
+          }
+          return tasks;
+        });
+
         const emitProviderThreadRoster = Effect.fnUntraced(function* (input: {
           readonly nativeThreadId: string;
           readonly providerThread: OrchestrationV2ProviderThread;
@@ -6055,16 +6123,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             yield* Ref.get(awaitedBackgroundTasksByNativeThread),
             input.nativeThreadId,
           );
+          const owedWakeTasks = yield* owedWakeTasksForNativeThread(input.nativeThreadId);
           const now = yield* DateTime.now;
           const providerThread: OrchestrationV2ProviderThread = {
             ...input.providerThread,
             providerSessionId: session.id,
             ...(input.status === undefined ? {} : { status: input.status }),
-            pendingBackgroundTasks: publishedPendingBackgroundTasks(
-              input.nativeThreadId,
-              roster,
-              awaitedTaskIds,
-            ),
+            pendingBackgroundTasks: [
+              ...publishedPendingBackgroundTasks(input.nativeThreadId, roster, awaitedTaskIds),
+              ...owedWakeTasks,
+            ],
             ...(goalsByNativeThread.has(input.nativeThreadId)
               ? { goal: goalsByNativeThread.get(input.nativeThreadId) ?? null }
               : {}),
@@ -6075,6 +6143,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             type: "provider_thread.updated",
             driver: CLAUDE_PROVIDER,
             providerThread,
+            pendingBackgroundWork: owedWakeTasks.length > 0,
           });
         });
 
@@ -6358,7 +6427,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             driver: CLAUDE_PROVIDER,
             nativeItemId: `task:${taskId}:thread-root`,
           }),
-          childThreadId: idAllocator.derive.threadFromProviderThread({
+          childThreadId: idAllocator.derive.subagentThread({
             driver: CLAUDE_PROVIDER,
             nativeThreadId: `${context.input.providerThread.id}:${taskId}`,
           }),
@@ -6601,6 +6670,42 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           });
         });
 
+        // A `context: fork` skill has no Agent call and streams none of its own frames;
+        // only its transcript records the model, written after the fork reports its outcome.
+        const forkedSkillModel = Effect.fnUntraced(function* (
+          context: ActiveClaudeTurnContext,
+          nativeThreadId: string,
+          taskId: string,
+        ) {
+          const registered = (yield* Ref.get(sessionSubagentsByTaskId)).get(taskId);
+          if (
+            registered === undefined ||
+            registered.runToolUseId !== null ||
+            registered.task.model !== null ||
+            registered.task.status === "running"
+          ) {
+            return undefined;
+          }
+          const model = yield* queryRunner
+            .subagentModel({
+              sessionId: nativeThreadId,
+              agentId: taskId,
+              dir: context.input.runtimePolicy.cwd,
+              threadId: context.input.threadId,
+              providerSessionId: input.providerSessionId,
+            })
+            .pipe(
+              Effect.catch(() =>
+                Effect.logWarning("orchestration-v2.claude-subagent-model-lookup-failed", {
+                  taskId,
+                }).pipe(Effect.as(null)),
+              ),
+            );
+          return model === null || model === "<synthetic>"
+            ? undefined
+            : canonicalClaudeSubagentModel(modelCatalog, model);
+        });
+
         // Resume frames reference the launch call, but task_started names SendMessage; recover the mapping from CLI storage.
         const recoverResumedClaudeSubagent = Effect.fnUntraced(function* (resume: {
           readonly context: ActiveClaudeTurnContext;
@@ -6696,7 +6801,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           ...workflow,
           agents: workflow.agents.map((member) => ({
             ...member,
-            childThreadId: idAllocator.derive.threadFromProviderThread({
+            childThreadId: idAllocator.derive.subagentThread({
               driver: CLAUDE_PROVIDER,
               nativeThreadId: `${coordinatorChildThreadId}:agent:${member.index}`,
             }),
@@ -8667,6 +8772,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                         yield* Ref.get(awaitedBackgroundTasksByNativeThread),
                         nativeThreadId,
                       );
+                const owedWakeTasks =
+                  nativeThreadId === null
+                    ? []
+                    : yield* owedWakeTasksForNativeThread(nativeThreadId);
                 // A stopped turn that wrote to the transcript moved past the pinned head.
                 const clearConversationHead =
                   (input.status === "completed" || input.context.nativeMessageCursor !== null) &&
@@ -8705,11 +8814,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     input.context.input.providerThread.firstRunOrdinal ??
                     input.context.input.runOrdinal,
                   lastRunOrdinal: input.context.input.runOrdinal,
-                  pendingBackgroundTasks: publishedPendingBackgroundTasks(
-                    nativeThreadId,
-                    roster,
-                    awaitedTaskIds,
-                  ),
+                  pendingBackgroundTasks: [
+                    ...publishedPendingBackgroundTasks(nativeThreadId, roster, awaitedTaskIds),
+                    ...owedWakeTasks,
+                  ],
                   status: input.status === "completed" ? "active" : "idle",
                   updatedAt: input.completedAt,
                 };
@@ -8718,6 +8826,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   type: "provider_thread.updated" as const,
                   driver: CLAUDE_PROVIDER,
                   providerThread,
+                  pendingBackgroundWork: owedWakeTasks.length > 0,
                 });
               }),
               emitProviderEvent(terminalEvent),
@@ -9237,6 +9346,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ...later,
           ];
           if (!(yield* replaceWakeBuffer(nativeThreadId, buffered, kept, retiredTaskIds))) return;
+          for (const taskId of retiredTaskIds) {
+            yield* clearPendingBackgroundTask(nativeThreadId, taskId);
+            yield* clearTaskIdFromNativeThreadSet(
+              wakeEligibleBackgroundTasksByNativeThread,
+              nativeThreadId,
+              taskId,
+            );
+            yield* clearOpaqueBackgroundTaskReplayTombstone(nativeThreadId, taskId);
+          }
+          yield* endClaudeMonitorTasks((taskId) => retiredTaskIds.has(taskId));
+          const providerThread = (yield* Ref.get(lastProviderThreadByNativeThread)).get(
+            nativeThreadId,
+          );
+          if (providerThread !== undefined)
+            yield* emitProviderThreadRoster({ nativeThreadId, providerThread });
           if (latch.end === undefined) {
             // A lifecycle result closes the root frames before it without opening the wake's turn.
             const sinceLifecycleResult = retired.slice(
@@ -9357,7 +9481,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               : baseThread.status === "idle"
                 ? ("active" as const)
                 : baseThread.status;
-          yield* emitProviderThreadRoster({ nativeThreadId, providerThread: baseThread, status });
+          yield* emitProviderThreadRoster({
+            nativeThreadId,
+            providerThread: baseThread,
+            status,
+          });
         });
 
         const applyBackgroundTaskRosterMessage = Effect.fnUntraced(function* (input: {
@@ -10761,6 +10889,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               next.delete(context.providerTurnId);
               return next;
             });
+            for (const taskId of context.subagentsByTaskId.keys()) {
+              const model = yield* forkedSkillModel(context, liveQuery.nativeThreadId, taskId);
+              const status = (yield* Ref.get(sessionSubagentsByTaskId)).get(taskId)?.task.status;
+              if (
+                model !== undefined &&
+                (status === "completed" || status === "failed" || status === "cancelled")
+              ) {
+                yield* updateClaudeSubagentNode({ context, taskId, model, status });
+              }
+            }
             if (!isClaudeProviderContinuationTurn(context.input)) {
               yield* markAbsorbedWake(liveQuery.nativeThreadId);
             }
@@ -11743,6 +11881,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               turnInput.appThread.lineage.relationshipToParent === "subagent"
                 ? yield* resolveSubagentPromptCacheTtl(turnInput.runtimePolicy.cwd)
                 : undefined,
+              shouldResume,
             ),
             tools: queryPolicy.tools ?? CLAUDE_CODE_PRESET_TOOLS,
             ...(mcpOverrides.allowedTools === undefined
@@ -11963,7 +12102,24 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               });
               return updated;
             });
-            yield* rememberProviderThread(turnInput.providerThread);
+            // A queued turn's snapshot can predate another task's exit.
+            const owedWakeTasks = yield* owedWakeTasksForNativeThread(nativeThreadId);
+            yield* rememberProviderThread(
+              owedWakeTasks.length === 0
+                ? turnInput.providerThread
+                : {
+                    ...turnInput.providerThread,
+                    pendingBackgroundTasks: [
+                      ...(turnInput.providerThread.pendingBackgroundTasks ?? []),
+                      ...owedWakeTasks.filter(
+                        (task) =>
+                          !(turnInput.providerThread.pendingBackgroundTasks ?? []).some(
+                            (current) => current.taskId === task.taskId,
+                          ),
+                      ),
+                    ],
+                  },
+            );
             if (!goalsByNativeThread.has(nativeThreadId)) {
               goalsByNativeThread.set(nativeThreadId, turnInput.providerThread.goal ?? null);
             }
@@ -12070,7 +12226,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 yield* Ref.update(activeTurn, (current) => (current === context ? null : current));
                 return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                   driver: CLAUDE_PROVIDER,
-                  detail: "Claude provider query ended before the turn could start.",
+                  detail: CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL,
                 });
               }
               if (
