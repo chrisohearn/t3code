@@ -4,33 +4,35 @@ Accepted 2026-11-12.
 
 ## Decision
 
-Verify existing `RestartContinuation` during the audit-owned first forced update
-after round-two PRs 23, 24 and 25 are released. Add no drain or updater code.
-The guarded-update proposal remains deferred.
+Verify existing recovery during audit-owned updates. Add no draining or updater code.
 
-## Verification plan
+## Results
 
-Before the update, record version, continuation setting, and each
-active thread's run, provider instance/model, provider turn, pending interactions,
-and queued run/message ids in order.
+Update: 2026-11-12 07:36 UTC, to `0.1.10-preview.20261112.3`.
+Exit zero; serving 07:37:22; Connect HTTP 200 07:37:57; migrations 5/6 applied 07:36:23.
 
-Codex continues its native thread without prompt text unless background work was
-lost; then it receives the restart note. Claude, Cursor, Grok, OpenCode,
-Antigravity and Kiro receive the shared continuation through their adapter. For each active provider, check that an
-eligible interrupted run continues once on the same provider/model and queued
-messages execute once in order. Inactive providers remain unobserved.
+`continueThreadsAfterServerUpdate` was unset; default is true. No pending approval,
+secret or auth requests. Baseline: eight running, 59 queued; all had native references.
 
-Afterward, record the new version, continuation links, resumed and missing runs,
-duplicates, and eligibility exclusions.
-Check interrupted state-changing actions before repeating them. Record actual
-gaps under `r2/restart-gap/*`; keep this item open until results arrive.
+| Provider       | Running | Continued once |
+| -------------- | ------- | -------------- |
+| Claude         | 2       | 2              |
+| Codex Revotech | 4       | 4              |
+| Codex Pro      | 2       | 1              |
 
-## Alternatives
+Seven retained provider instance, model/options and provider thread, with a
+visible restart notice. Code path: native empty input for five Codex continuations;
+shared prompts for both Claude, one including cancelled-background-work notes.
 
-Build new draining and resumption machinery, or assume shared orchestration proves
-every adapter works.
+By 07:47:57, no duplicates; queued-origin runs: 21 completed, two running, 36 queued.
+Later queue completion and ordering remain unverified.
+Cursor, Grok, OpenCode, Antigravity and Kiro were unobserved.
 
-## Why
+Codex Pro's thread auto-settled after run 457's shutdown cancellation, before its
+prepared continuation completed. Audit resumed run 458. Gap:
+`r2/restart-gap/codex-pro-run-not-resumed`, [#42](https://github.com/chrisohearn/t3code/issues/42).
+Restart observation complete; repair open.
 
-Existing recovery already handles restarts. One coordinated observation establishes
-which provider paths need repairs without adding an unverified deployment contract.
+## Alternatives and why
+
+Build new recovery instead. Observation avoids untested changes.

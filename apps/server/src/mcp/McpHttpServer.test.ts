@@ -1,3 +1,4 @@
+import * as RequestLog from "../persistence/McpRequestLog.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
@@ -63,6 +64,7 @@ import { ProjectToolkit } from "./toolkits/project/tools.ts";
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
 const alternateTabId = PreviewTabId.make("tab-mcp-alternate");
+const encodeJsonText = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeJsonText = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const invocation = {
   environmentId,
@@ -89,6 +91,7 @@ const client = McpSchema.McpServerClient.of({
   getClient: Effect.die("unused"),
 });
 const layerTest = McpHttpServer.layerPreviewToolkit.pipe(
+  Layer.provideMerge(RequestLog.layer.pipe(Layer.provide(Sqlite.layerMemory))),
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
   Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
   Layer.provideMerge(PreviewAutomationBroker.layer),
@@ -432,6 +435,7 @@ it.effect.each([
       }).pipe(Effect.forkScoped);
       yield* Deferred.await(connected);
 
+      let expectedBytes = 0;
       for (const call of [1, 2, 3, 4, 5, 6]) {
         const snapshot = yield* server
           .callTool({
@@ -442,6 +446,16 @@ it.effect.each([
             Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
             Effect.provideService(McpSchema.McpServerClient, client),
           );
+        const expectedWire = {
+          ...snapshot,
+          content: snapshot.content.map((item) =>
+            item.type === "image" ? { ...item, data: png } : item,
+          ),
+        };
+        expectedBytes += Buffer.byteLength(yield* encodeJsonText(expectedWire));
+        expect(
+          (yield* (yield* RequestLog.McpRequestLog).usage({}, undefined)).byTool[0]?.responseBytes,
+        ).toBe(expectedBytes);
         const metadata = { ...page, title: `Snapshot ${call}`, screenshot };
         const { accessibilityTree: _tree, ...boundedMetadata } = metadata;
         expect(snapshot.isError).toBe(false);
@@ -1846,4 +1860,44 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       expect(yield* other.listed).toEqual(["delegate_task", "preview_open", "schedule_task"]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each(["capability_denied", "invalid_request"] as const)(
+  "records declared failure code %s without retaining failure text",
+  (code) => {
+    const entries: Array<{ readonly errorClass: string | null }> = [];
+    const toolkit = Toolkit.make(
+      Tool.make("declared_failure", {
+        parameters: Schema.Struct({ value: Schema.optional(Schema.String) }),
+        success: Schema.String,
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        declared_failure: McpToolAccess.reads(() =>
+          Effect.fail(new OrchestratorMcpFailure({ code, message: "private failure details" })),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+      Layer.provide(
+        Layer.mock(RequestLog.McpRequestLog)({
+          record: (entry) =>
+            Effect.sync(() => {
+              entries.push(entry);
+            }),
+        }),
+      ),
+    );
+    return Effect.gen(function* () {
+      const result = yield* callTool("declared_failure", {});
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toBeUndefined();
+      expect(entries.map((entry) => entry.errorClass)).toEqual([code]);
+      expect(JSON.stringify(entries)).not.toContain("private failure details");
+    }).pipe(Effect.provide(layer));
+  },
 );

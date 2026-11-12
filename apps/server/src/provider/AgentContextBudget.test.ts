@@ -2,6 +2,7 @@ import * as Sqlite from "../persistence/Sqlite.ts";
 import * as McpEvents from "../mcp/McpEvents.ts";
 import * as McpBridgeMetrics from "../mcp/McpBridgeMetrics.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
+import * as McpRequestLog from "../persistence/McpRequestLog.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -60,6 +61,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(McpBridgeMetrics.McpBridgeMetrics)({}),
   Layer.mock(McpClientThreads.McpClientThreads)({}),
   Layer.mock(WorkLedger.WorkLedger)({}),
+  Layer.mock(McpRequestLog.McpRequestLog)({}),
   Layer.mock(AssetSigner)({}),
   Layer.mock(DeviceService)({}),
   Layer.mock(DocumentText)({}),

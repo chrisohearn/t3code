@@ -1,3 +1,7 @@
+import * as McpRequestLog from "../../persistence/McpRequestLog.ts";
+import * as BridgeStatusService from "../BridgeStatusService.ts";
+import { BridgeToolkit } from "./bridge/tools.ts";
+import * as BridgeHandlers from "./bridge/handlers.ts";
 import * as McpBridgeMetrics from "../McpBridgeMetrics.ts";
 import * as McpClientThreads from "../../persistence/McpClientThreads.ts";
 import * as WorkLedger from "../../persistence/WorkLedger.ts";
@@ -139,6 +143,7 @@ it.effect(
     Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
       const metrics = yield* McpBridgeMetrics.McpBridgeMetrics;
+      const log = yield* McpRequestLog.McpRequestLog;
       const call = (
         name: string,
         args: object,
@@ -185,9 +190,28 @@ it.effect(
         ]),
       );
       expect(yield* metrics.read("another-session")).toEqual([]);
+      const usage = yield* call("mcp_usage", {}, outside);
+      expect(usage.structuredContent).toMatchObject({
+        byClient: [{ client: "ledger-session", calls: 4, errors: 2 }],
+      });
+      expect((yield* log.usage({}, undefined)).byClient).toEqual(
+        expect.arrayContaining([expect.objectContaining({ client: threadId, calls: 1 })]),
+      );
+      expect(
+        (yield* call(
+          "mcp_usage",
+          {},
+          { ...outside, client: { ...outside.client, sessionId: "unrelated" } },
+        )).structuredContent,
+      ).toMatchObject({ byClient: [], byTool: [] });
     }).pipe(
       Effect.provide(
-        McpHttpServer.layerLedgerToolkit.pipe(
+        Layer.merge(
+          McpHttpServer.layerLedgerToolkit,
+          McpHttpServer.toolkitRegistration(BridgeToolkit, BridgeHandlers.layer),
+        ).pipe(
+          Layer.provide(Layer.mock(BridgeStatusService.BridgeStatusService)({})),
+          Layer.provideMerge(McpRequestLog.layer.pipe(Layer.provide(Sqlite.layerMemory))),
           Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
           Layer.provideMerge(McpBridgeMetrics.layer),
           Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
