@@ -1,3 +1,7 @@
+import * as ConnectReachability from "../cloud/ConnectReachability.ts";
+import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
+import type { EnvironmentConnectReachability } from "@t3tools/contracts";
 import * as ThreadNotifications from "./ThreadNotifications.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -74,9 +78,21 @@ const fixture = Effect.gen(function* () {
   const verify: Array<Parameters<Webhook.McpEventsWebhook["Service"]["verify"]>[0]> = [];
   const responses = new Map<string, number>();
   let verificationWork: Effect.Effect<void> = Effect.void;
+  let tunnel: EnvironmentConnectReachability = {
+    status: "unreachable",
+    checkedAt: "1970-01-01T00:00:00.000Z",
+    cause: "not_linked",
+    reason: "Not linked",
+    hint: null,
+    fix: "Connect",
+  };
   const layer = McpEvents.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.succeed(ConnectReachability.ConnectReachability, {
+          latest: Effect.sync(() => Option.some(tunnel)),
+          check: Effect.sync(() => tunnel),
+        }),
         Layer.mock(ThreadManagement.ThreadManagementService)({
           getThreadShell: (id) => Effect.succeed(deleted.has(id) ? null : liveThreadShell(id)),
         }),
@@ -169,6 +185,9 @@ const fixture = Effect.gen(function* () {
       verificationWork = work;
     },
     deleted,
+    setTunnel: (status: EnvironmentConnectReachability) => {
+      tunnel = status;
+    },
   };
 });
 
@@ -948,6 +967,52 @@ it.effect.each(["revoked", "expired"] as const)(
         expect((yield* f.subscriptions.get(own.id))?.active).toBe(1);
         expect((yield* f.call(f.service.subscribe(input), f.other).pipe(Effect.flip)).reason).toBe(
           "access_denied",
+        );
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["reachable", "deadline"] as const)(
+  "holds startup event deliveries until %s release without consuming retries",
+  (release) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        f.setTunnel({
+          status: "unreachable",
+          checkedAt: "1970-01-01T00:00:00.000Z",
+          cause: "connector_not_ready",
+          reason: "Starting",
+          hint: null,
+          fix: "Wait",
+        });
+        const input = inputFor(ThreadId.make("startup-tunnel"));
+        const sub = yield* f.call(f.service.subscribe(input));
+        yield* f.append([input.arguments.threadId]);
+        const drain = yield* Effect.forkChild(f.service.drain());
+        yield* TestClock.adjust("1 second");
+        expect(f.sent).toHaveLength(0);
+        const pending = yield* f.deliveries.due(yield* Clock.currentTimeMillis);
+        expect(pending).toHaveLength(1);
+        expect(pending[0]?.attempts).toBe(0);
+        if (release === "reachable") {
+          f.setTunnel({
+            status: "reachable",
+            checkedAt: "1970-01-01T00:00:01.000Z",
+            readyConnections: 1,
+            protocol: "quic",
+          });
+          yield* TestClock.adjust("5 seconds");
+        } else {
+          yield* TestClock.adjust("178 seconds");
+          expect(f.sent).toHaveLength(0);
+          yield* TestClock.adjust("1 second");
+        }
+        yield* Fiber.join(drain);
+        expect(f.sent).toHaveLength(1);
+        expect(yield* f.deliveries.count(sub.id)).toBe(0);
+        expect((yield* f.call(f.service.bridgeStatus())).serviceStartedAt).toBe(
+          "1970-01-01T00:00:00.000Z",
         );
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),

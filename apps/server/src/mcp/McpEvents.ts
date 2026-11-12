@@ -1,5 +1,7 @@
+import * as ConnectReachability from "../cloud/ConnectReachability.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import {
+  type EnvironmentConnectReachability,
   type McpThreadNotify,
   type McpThreadNotifyResult,
   AuthOrchestrationReadScope,
@@ -133,6 +135,8 @@ export class McpEvents extends Context.Service<
     ) => Effect.Effect<McpThreadNotifyResult, McpEventsError, Invocation.McpInvocationContext>;
     readonly bridgeStatus: () => Effect.Effect<
       {
+        readonly serviceStartedAt: string;
+        readonly tunnel: EnvironmentConnectReachability | null;
         readonly daysUntilSessionExpires: number;
         readonly subscriptions: McpEventSubscriptionsResult["subscriptions"];
         readonly lastSuccessfulEventDeliveryAt: string | null;
@@ -178,6 +182,26 @@ export class McpEvents extends Context.Service<
 >()("t3/mcp/McpEvents") {}
 
 const make = Effect.gen(function* () {
+  const reachability = yield* ConnectReachability.ConnectReachability;
+  const serviceStartedAt = yield* Clock.currentTimeMillis;
+  let startupHoldReleased = false;
+  const awaitStartupTunnel = Effect.fn("McpEvents.awaitStartupTunnel")(function* () {
+    if (startupHoldReleased) return;
+    const remaining = serviceStartedAt + 180_000 - (yield* Clock.currentTimeMillis);
+    if (remaining > 0) {
+      yield* Effect.gen(function* () {
+        const latest = yield* reachability.latest;
+        const status = Option.getOrNull(latest);
+        if (status?.status === "reachable") return true;
+        const checked = yield* reachability.check;
+        return checked.status === "reachable" || checked.cause === "not_linked";
+      }).pipe(
+        Effect.repeat({ schedule: Schedule.spaced("5 seconds"), until: (ready) => ready }),
+        Effect.timeoutOption(remaining),
+      );
+    }
+    startupHoldReleased = true;
+  });
   const bridge = yield* BridgeStatus.McpBridgeStatus;
   const sessions = yield* AuthSessions.AuthSessionRepository;
   const subscriptions = yield* Subscriptions.McpEventSubscriptions;
@@ -380,6 +404,7 @@ const make = Effect.gen(function* () {
           behind ||= more;
         }
         const due = yield* deliveries.due(yield* Clock.currentTimeMillis);
+        if (due.length > 0) yield* awaitStartupTunnel();
         yield* Effect.forEach(
           due,
           (delivery) =>
@@ -588,6 +613,8 @@ const make = Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const status = yield* bridge.read(principal.sessionId);
       return {
+        serviceStartedAt: DateTime.formatIso(DateTime.makeUnsafe(serviceStartedAt)),
+        tunnel: Option.getOrNull(yield* reachability.latest),
         daysUntilSessionExpires: Math.max(
           0,
           (principal.expiresAt.epochMilliseconds - now) / 86400_000,
