@@ -665,7 +665,9 @@ describe("orchestrator MCP toolkit", () => {
                   runReads.push(query);
                 }
                 if (
-                  /SELECT\s+payload_json\s+FROM orchestration_v2_projection_messages/i.test(query)
+                  /SELECT\s+(?:message\.)?payload_json\s+FROM orchestration_v2_projection_messages/i.test(
+                    query,
+                  )
                 ) {
                   messageReads.push(query);
                 }
