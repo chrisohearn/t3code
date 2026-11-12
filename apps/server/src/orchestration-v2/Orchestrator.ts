@@ -536,10 +536,10 @@ function wakeWorkStartedAt(
 
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
 
-/** Unfinished runs (including queued) or open requests block moving a thread to another project. */
 export function threadHasUnfinishedWork(records: {
   readonly runs: ReadonlyArray<{ readonly status: string }>;
   readonly runtimeRequests: ReadonlyArray<{ readonly status: string }>;
+  readonly subagents: ReadonlyArray<Pick<OrchestrationV2Subagent, "status">>;
 }): boolean {
   return (
     records.runs.some(
@@ -549,7 +549,9 @@ export function threadHasUnfinishedWork(records: {
         run.status !== "cancelled" &&
         run.status !== "interrupted" &&
         run.status !== "rolled_back",
-    ) || records.runtimeRequests.some((request) => request.status === "pending")
+    ) ||
+    records.runtimeRequests.some((request) => request.status === "pending") ||
+    records.subagents.some((subagent) => isOrchestrationV2WorkActive(subagent.status))
   );
 }
 
@@ -4595,7 +4597,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} ${cause}`,
       });
     const projection = yield* projectionStore
-      .getThreadRecords(command.threadId, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+      .getThreadRecords(command.threadId, ["runs", "runtimeRequests", "subagents"], {
+        turnItemTypes: [],
+      })
       .pipe(
         Effect.mapError(
           (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
@@ -4645,7 +4649,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} ${cause}`,
       });
     const projection = yield* projectionStore
-      .getThreadRecords(command.threadId, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+      .getThreadRecords(command.threadId, ["runs", "runtimeRequests", "subagents"], {
+        turnItemTypes: [],
+      })
       .pipe(
         Effect.mapError(
           (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),

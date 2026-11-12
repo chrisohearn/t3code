@@ -7567,6 +7567,103 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
     }),
   );
 
+  it.effect("refuses filing while a linked remote delegated task is running", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const { folder, createThread } = yield* setup("file-remote-delegate");
+      const threadId = yield* createThread("main", folder);
+      const target = yield* createTarget("remote-delegate");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("file-remote-parent-run"),
+        threadId,
+        messageId: MessageId.make("file-remote-parent-run"),
+        text: "Delegate the work to the linked environment",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      const remoteChild = {
+        environmentId: EnvironmentId.make("file-remote-environment"),
+        threadId: ThreadId.make("file-remote-child"),
+        label: "Linked environment",
+      };
+      yield* orchestrator.dispatch({
+        type: "delegated_task.remote.request",
+        commandId: CommandId.make("file-remote-delegate"),
+        parentThreadId: threadId,
+        parentRunId: run.id,
+        parentNodeId: run.rootNodeId!,
+        task: "Finish the work in the linked environment",
+        driver: ProviderDriverKind.make("remote"),
+        modelSelection,
+        remoteChild,
+        completionWake: "always",
+      });
+      const now = yield* DateTime.now;
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("file-remote-parent-completed"),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+          },
+        ],
+      });
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      const task = projection.subagents[0]!;
+      assert.equal(projection.runs[0]?.status, "completed");
+      assert.isEmpty(projection.runtimeRequests);
+      assert.equal(task.status, "running");
+      assert.equal(task.childThreadId, null);
+      assert.deepEqual(task.remoteChild, remoteChild);
+      assert.isNull(yield* orchestrator.getThreadShell(remoteChild.threadId));
+      assert.equal(
+        (yield* filing.file({ threadId, projectId: target.id }).pipe(Effect.flip)).message,
+        '"file-remote-delegate main" is still working. Finish or stop it first.',
+      );
+      assert.equal(
+        (yield* filing.promote({ threadId }).pipe(Effect.flip)).message,
+        '"file-remote-delegate main" is still working. Finish or stop it first.',
+      );
+      const busy = yield* orchestrator
+        .dispatch({
+          type: "thread.project.file-scratch",
+          commandId: CommandId.make("file-remote-busy-direct"),
+          threadId,
+          projectId: target.id,
+        })
+        .pipe(Effect.flip);
+      assert.include(String(busy.cause), "work in progress");
+      assert.equal((yield* shellOf(threadId))?.projectId, SCRATCH_PROJECT_ID);
+      yield* orchestrator.dispatch({
+        type: "delegated_task.remote.complete",
+        commandId: CommandId.make("file-remote-completed"),
+        parentThreadId: threadId,
+        taskId: task.id,
+        status: "completed",
+        result: "The work in the linked environment is finished.",
+        stoppedThere: "ran-out",
+      });
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(threadId)).subagents[0]?.status,
+        "completed",
+      );
+      const result = yield* filing.file({ threadId, projectId: target.id });
+      assert.deepEqual([...result.threadIds], [threadId]);
+      assert.equal((yield* shellOf(threadId))?.projectId, target.id);
+      assert.equal((yield* shellOf(threadId))?.worktreePath, folder);
+    }),
+  );
+
   const createSubagent = Effect.fn(function* (parentId: ThreadId, suffix: string) {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const sink = yield* EventSink.EventSinkV2;

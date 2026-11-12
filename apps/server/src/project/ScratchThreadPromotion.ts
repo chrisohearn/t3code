@@ -124,7 +124,9 @@ const make = Effect.gen(function* () {
 
     for (const candidate of moveSet.values()) {
       const records = yield* threads
-        .getThreadRecords(candidate.id, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+        .getThreadRecords(candidate.id, ["runs", "runtimeRequests", "subagents"], {
+          turnItemTypes: [],
+        })
         .pipe(Effect.mapError(fail(`Could not read "${candidate.title}".`)));
       if (threadHasUnfinishedWork(records)) {
         return yield* new ScratchThreadPromotionError({
@@ -246,7 +248,9 @@ const make = Effect.gen(function* () {
         for (const member of members.values()) {
           if (authorize !== undefined) yield* authorize(member.id);
           const records = yield* threads
-            .getThreadRecords(member.id, ["runs", "runtimeRequests"], { turnItemTypes: [] })
+            .getThreadRecords(member.id, ["runs", "runtimeRequests", "subagents"], {
+              turnItemTypes: [],
+            })
             .pipe(Effect.mapError(fail(`Could not read "${member.title}".`)));
           if (threadHasUnfinishedWork(records)) {
             return yield* new ScratchThreadPromotionError({
