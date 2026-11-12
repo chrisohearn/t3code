@@ -61,7 +61,7 @@ behind=$(git -C "$SOURCE" rev-list --count "origin/$BRANCH..$upstream_sha")
 open_pr=""
 if [[ "$release_only" == 0 ]]; then
   open_pr=$(gh pr list -R "$FORK" --base "$BRANCH" --state open --json number,headRefName \
-    --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] | "\(.number) \(.headRefName)" // empty')
+    --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] // empty | "\(.number) \(.headRefName)"')
 fi
 stamp=$(date -u +%Y%m%d-%H%M)
 wt="$WORKTREES/upstream-sync-$stamp"
