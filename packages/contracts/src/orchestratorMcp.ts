@@ -526,11 +526,11 @@ export const OrchestratorMcpThreadResultInput = Schema.Struct({
 export type OrchestratorMcpThreadResultInput = typeof OrchestratorMcpThreadResultInput.Type;
 const OrchestratorMcpMessageSummary = Schema.Struct({
   messageId: MessageId,
-  role: Schema.Literals(["user", "assistant", "system"]),
+  role: Schema.optional(Schema.Literals(["user", "assistant", "system"])),
   text: Schema.String,
   truncated: Schema.Boolean,
-  createdBy: Schema.NullOr(OrchestrationV2Actor),
-  creationSource: Schema.NullOr(OrchestrationV2CreationSource),
+  createdBy: Schema.optional(Schema.NullOr(OrchestrationV2Actor)),
+  creationSource: Schema.optional(Schema.NullOr(OrchestrationV2CreationSource)),
   senderThreadId: Schema.optional(ThreadId),
   mcpSender: Schema.optional(OrchestrationV2McpSender),
 });
@@ -539,7 +539,7 @@ export const OrchestratorMcpThreadResult = Schema.Struct({
   status: OrchestratorMcpThreadStatus,
   run: Schema.NullOr(OrchestratorMcpThreadRun),
   lastAssistantMessage: Schema.NullOr(OrchestratorMcpMessageSummary),
-  latestMessage: Schema.NullOr(OrchestratorMcpMessageSummary),
+  latestMessage: Schema.optional(Schema.NullOr(OrchestratorMcpMessageSummary)),
   pendingRequestIds: Schema.Array(RuntimeRequestId),
   pullRequests: Schema.Array(OrchestratorMcpThreadPullRequest),
   revision: NonNegativeInt,

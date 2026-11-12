@@ -4,6 +4,7 @@ import {
   MessageId,
   OrchestratorMcpFailure,
 } from "@t3tools/contracts";
+import * as Digest from "effect/crypto/Digest";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as AssetSigner from "../../../assets/AssetSigner.ts";
@@ -45,6 +46,7 @@ const uploadOwner = McpInvocationContext.McpInvocationContext.pipe(
 export const layer = McpToolAccess.toLayer(
   AttachmentToolkit,
   Effect.gen(function* () {
+    const senderDigest = yield* Digest.Digest;
     const assetSigner = yield* AssetSigner.AssetSigner;
     const uploadOwners = new Map<string, { readonly owner: string; readonly issuedAt: number }>();
     return {
@@ -85,7 +87,7 @@ export const layer = McpToolAccess.toLayer(
         (input) => [input.threadId],
         (input) =>
           Effect.gen(function* () {
-            const { caller, projection } = yield* readThread(input.threadId, ["messages"]);
+            const { caller, projection, scope } = yield* readThread(input.threadId, ["messages"]);
             if (projection.thread.archivedAt !== null)
               return yield* new OrchestratorMcpFailure({
                 code: "invalid_request",
@@ -103,6 +105,7 @@ export const layer = McpToolAccess.toLayer(
               commandId,
               messageId,
               ...(caller === undefined ? {} : { senderThreadId: caller.id }),
+              ...(yield* McpInvocationContext.messageSenderFor(scope, senderDigest)),
               text: input.message ?? "",
               attachments,
               mode: "auto",
