@@ -2169,9 +2169,15 @@ const make = Effect.gen(function* () {
             : input.bindToCurrentThread && parent !== undefined
               ? parent.thread.id
               : null;
-        // Reset the workspace only when the binding flips, so unbinding cannot leave runs in the shared checkout.
+        // Reset the workspace when the binding flips, so unbinding cannot leave runs in the shared
+        // checkout. An unbound root it derived is re-derived too: the folder may be a repository now.
         const workspaceStrategy =
-          (threadId === null) === (existing.threadId === null)
+          (threadId === null) === (existing.threadId === null) &&
+          !(
+            threadId === null &&
+            existing.creationSource === "mcp" &&
+            existing.workspaceStrategy.type === "root"
+          )
             ? existing.workspaceStrategy
             : yield* scheduledTaskWorkspaceStrategy(threadId !== null, existing.projectId);
         const upsertInput: ScheduledTaskUpsertInput = {

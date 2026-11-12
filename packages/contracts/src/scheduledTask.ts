@@ -214,7 +214,14 @@ export const ScheduledTaskUpsertSchedule = Schema.Union([
 ]);
 export type ScheduledTaskUpsertSchedule = typeof ScheduledTaskUpsertSchedule.Type;
 
-export const ScheduledTaskRunStatus = Schema.Literals(["never", "running", "succeeded", "failed"]);
+/** `running` while the run is being dispatched; `started` once it was accepted and its outcome is pending. */
+export const ScheduledTaskRunStatus = Schema.Literals([
+  "never",
+  "running",
+  "started",
+  "succeeded",
+  "failed",
+]);
 export type ScheduledTaskRunStatus = typeof ScheduledTaskRunStatus.Type;
 
 export const ScheduledTaskWebhookEndpoint = Schema.Struct({

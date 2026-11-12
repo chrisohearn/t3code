@@ -2,6 +2,7 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as NodeUtil from "node:util";
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, vi } from "@effect/vitest";
 import {
   ProjectId,
@@ -15,9 +16,11 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Fiber from "effect/Fiber";
@@ -419,21 +422,40 @@ it.effect("thread cleanup notifies subscribers and a finishing run cannot recrea
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
+const PREPARATION_FAILURE =
+  "Workspace preparation failed during provision worktree: Git command failed in GitWorkflowService.resolveWorktreeBaseRemote (/home/user/app): Failed to resolve the VCS driver for this Git command.";
+
 it.effect.each([
-  { status: "failed", error: "Weekly usage limit reached" },
-  { status: "interrupted", error: "The run was stopped." },
-  { status: "cancelled", error: "The run was cancelled." },
-] as const)("a run that ends $status after its message was accepted records it", (outcome) =>
+  { name: "ends failed", run: "failed", status: "failed", error: "Weekly usage limit reached" },
+  { name: "ends interrupted", run: "interrupted", status: "failed", error: "The run was stopped." },
+  { name: "ends cancelled", run: "cancelled", status: "failed", error: "The run was cancelled." },
+  { name: "completes", run: "completed", status: "succeeded", error: null },
+  // The Jarvis inbox heartbeat failed this way on its first launch and still read as succeeded.
+  {
+    name: "fails workspace preparation on its first launch",
+    run: "failed",
+    status: "failed",
+    error: PREPARATION_FAILURE,
+    unbound: true,
+  },
+] as const)("a run that $name after its message was accepted records its outcome", (outcome) =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("project:test");
+    const threadId = ThreadId.make("thread:quota");
+    const unbound = "unbound" in outcome;
     const ended = yield* Deferred.make<void>();
     const sent = yield* Ref.make("");
-    const run = { id: "run:2", status: outcome.status, rootNodeId: "node:root" };
+    const run = { id: "run:2", status: outcome.run, rootNodeId: "node:root" };
     const layer = ScheduledTaskService.layer.pipe(
       Layer.provide(
         Layer.mergeAll(
           ManagedPolicy.layerTest(),
-          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+            launch: (input) =>
+              Ref.set(sent, input.initialMessage?.messageId ?? "").pipe(
+                Effect.as({ threadId } as never),
+              ),
+          }),
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             sendToThread: (input) => Ref.set(sent, input.messageId).pipe(Effect.as({} as never)),
             getThreadShell: () => Effect.succeed(threadShell(projectId)),
@@ -453,7 +475,9 @@ it.effect.each([
                         status: "failed",
                         runId: "run:2",
                         nodeId: "node:root",
-                        failure: { message: "Weekly usage limit reached" },
+                        failure: {
+                          message: unbound ? PREPARATION_FAILURE : "Weekly usage limit reached",
+                        },
                       },
                     ],
                   }) as never,
@@ -486,25 +510,175 @@ it.effect.each([
         enabled: true,
         schedule: { type: "interval", everyMs: 60_000 },
         projectId,
-        threadId: ThreadId.make("thread:quota"),
+        threadId: unbound ? null : threadId,
         workspaceStrategy: { type: "root" },
         modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
         runtimeMode: "full-access",
         interactionMode: "default",
       });
-      yield* service.runNow({ id: task.id });
-      const failed = yield* service.subscribeList().pipe(
+      const dispatched = yield* service.runNow({ id: task.id });
+      assert.equal(dispatched.task.lastRunStatus, "started");
+      const settled = yield* service.subscribeList().pipe(
         Stream.map(({ tasks }) => tasks.find((candidate) => candidate.id === task.id)),
-        Stream.filter((current) => current?.lastRunStatus === "failed"),
+        Stream.filter((current) => current?.lastRunStatus === outcome.status),
         Stream.runHead,
         Effect.forkChild,
       );
       yield* Deferred.succeed(ended, undefined);
-      const recorded = Option.getOrUndefined(yield* Fiber.join(failed));
+      const recorded = Option.getOrUndefined(yield* Fiber.join(settled));
       assert.equal(recorded?.lastRunError, outcome.error);
       assert.equal(recorded?.runCount, 1);
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect("a restart picks up each started run and records how it ended", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const startedAt = "2026-11-12T17:44:47.869Z";
+    const threadId = ThreadId.make("thread:resumed");
+    const messageId = `scheduled-task-message:task:resumed:${Date.parse(startedAt)}:scheduled`;
+    for (const id of ["task:resumed", "task:lost"]) {
+      yield* insertRow(sql, { id, next: null, enabled: 1, status: "started" }, startedAt);
+      yield* sql`UPDATE scheduled_tasks SET last_run_at = ${startedAt} WHERE task_id = ${id}`;
+    }
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, role, streaming, created_at, updated_at, payload_json)
+      VALUES (${messageId}, ${threadId}, 'run:1', 'user', 0, ${startedAt}, ${startedAt}, '{}')
+    `;
+    const run = {
+      id: "run:1",
+      status: "failed",
+      rootNodeId: "node:root",
+      userMessageId: messageId,
+    };
+    const layer = ScheduledTaskService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ManagedPolicy.layerTest(),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: () => Effect.succeed(threadShell(ProjectId.make("project:test"))),
+            getProjectThreadRecords: () =>
+              Effect.succeed({
+                runs: [run],
+                messages: [{ id: messageId, runId: run.id }],
+                turnItems: [
+                  {
+                    type: "error",
+                    status: "failed",
+                    runId: run.id,
+                    nodeId: run.rootNodeId,
+                    failure: { message: PREPARATION_FAILURE },
+                  },
+                ],
+              } as never),
+            waitForThread: (input) =>
+              Effect.succeed({ threadId: input.threadId, run, timedOut: false } as never),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: "/projects",
+            isScratchProject: () => Effect.succeed(false),
+          }),
+          NodeCrypto.layer,
+          Scheduler.layer,
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const settled = yield* service.subscribeList().pipe(
+        Stream.map(({ tasks }) => tasks),
+        Stream.filter((tasks) => tasks.every((task) => task.lastRunStatus === "failed")),
+        Stream.runHead,
+      );
+      const errors = Object.fromEntries(
+        Option.getOrThrow(settled).map((task) => [task.id, task.lastRunError]),
+      );
+      assert.deepEqual(errors, {
+        "task:resumed": PREPARATION_FAILURE,
+        "task:lost": "The run's thread was deleted before the run finished.",
+      });
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+// #69: a task MCP saved to run in its folder because the folder was not a repository.
+it.effect.each([
+  { name: "refuses an unbound MCP task", git: true, dispatch: "refused" },
+  { name: "runs a bound task", git: true, bound: true, dispatch: "sent" },
+  { name: "runs a task whose folder was chosen in Settings", git: true, source: "web" },
+  { name: "runs a task in a scratch project", git: true, scratch: true },
+  { name: "runs a task whose folder is still not a repository", git: false },
+] as const)("a saved project-folder workspace in a folder that became a repository $name", (row) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const sql = yield* SqlClient.SqlClient;
+    const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "scheduled-root-" });
+    if (row.git) yield* fileSystem.makeDirectory(path.join(root, ".git"));
+    const projectId = ProjectId.make("project:repo");
+    yield* sql`
+      INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+      VALUES (${projectId}, 'Repo', ${root}, '[]', '', '')
+    `;
+    const dispatched = yield* Ref.make<"launched" | "sent" | "refused">("refused");
+    const layer = ScheduledTaskService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ManagedPolicy.layerTest(),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+            launch: () =>
+              Ref.set(dispatched, "launched").pipe(
+                Effect.as({ threadId: ThreadId.make("thread:launched") } as never),
+              ),
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            sendToThread: () => Ref.set(dispatched, "sent").pipe(Effect.as({} as never)),
+            getThreadShell: () => Effect.succeed(threadShell(projectId)),
+            getProjectThreadRecords: () =>
+              Effect.succeed({ runs: [], messages: [], turnItems: [] } as never),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: "/projects",
+            isScratchProject: () => Effect.succeed("scratch" in row),
+          }),
+          NodeCrypto.layer,
+          Scheduler.layer,
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const { task } = yield* service.upsert({
+        id: ScheduledTaskId.make("task:repo"),
+        title: "Nightly notes",
+        prompt: "Update the notes",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60_000 },
+        projectId,
+        threadId: "bound" in row ? ThreadId.make("thread:bound") : null,
+        workspaceStrategy: { type: "root" },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "source" in row ? row.source : "mcp",
+      });
+      const result = yield* service.runNow({ id: task.id });
+      assert.equal(yield* Ref.get(dispatched), "dispatch" in row ? row.dispatch : "launched");
+      if ("dispatch" in row && row.dispatch === "refused") {
+        assert.equal(result.task.lastRunStatus, "failed");
+        assert.include(result.task.lastRunError, `${root} is now a Git repository`);
+        assert.equal(result.task.runCount, 1);
+      } else {
+        assert.equal(result.task.lastRunStatus, "started");
+      }
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(Layer.merge(SqlitePersistence.layerMemory, NodeServices.layer))),
 );
 
 it.effect("a bound run follows its thread when promotion moves it mid-send", () =>
