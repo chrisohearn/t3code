@@ -3047,6 +3047,191 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const message = stopped.turnItems.find((item) => item.type === "user_message");
       assert.isDefined(notice);
       assert.isAbove(notice!.ordinal, message!.ordinal);
+
+      const childId = ThreadId.make("mode-runless-child");
+      const childProviderId = ProviderThreadId.make("mode-runless-provider");
+      const childNodeId = NodeId.make("mode-runless-node");
+      const childNode = {
+        ...stopped.nodes[0]!,
+        id: childNodeId,
+        threadId: childId,
+        runId: null,
+        rootNodeId: childNodeId,
+        providerThreadId: childProviderId,
+        status: "running" as const,
+        completedAt: null,
+      };
+      const childProvider = { ...providerThread, id: childProviderId, appThreadId: childId };
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-runless-create"),
+            type: "thread.created",
+            threadId: childId,
+            occurredAt: now,
+            payload: {
+              ...stopped.thread,
+              id: childId,
+              runtimeMode: "full-access",
+              creationSource: "provider",
+              activeProviderThreadId: childProviderId,
+              lineage: {
+                parentThreadId: threadId,
+                rootThreadId: threadId,
+                relationshipToParent: "subagent",
+              },
+            },
+          },
+          {
+            id: EventId.make("mode-runless-provider"),
+            type: "provider-thread.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: childProvider,
+          },
+          {
+            id: EventId.make("mode-runless-node"),
+            type: "node.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: childNode,
+          },
+        ],
+      });
+      const refuseRunless = (source: string) =>
+        Effect.gen(function* () {
+          const before = yield* orchestrator.getThreadProjection(childId);
+          assert.isEmpty(before.runs);
+          const sequence = yield* orchestrator.getThreadEventSequence(childId);
+          const error = yield* orchestrator
+            .dispatch({
+              type: "thread.runtime-mode.set",
+              commandId: CommandId.make(`mode-runless-refused-${source}`),
+              threadId: childId,
+              runtimeMode: "approval-required",
+            })
+            .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"), Effect.flip);
+          assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
+          assert.include(String(error.cause), "work is active");
+          assert.equal(yield* orchestrator.getThreadEventSequence(childId), sequence);
+        });
+      yield* refuseRunless("node");
+      const childTurn = {
+        id: ProviderTurnId.make("mode-runless-turn"),
+        providerThreadId: childProviderId,
+        nodeId: childNodeId,
+        runAttemptId: null,
+        nativeTurnRef: null,
+        ordinal: 1,
+        status: "running" as const,
+        startedAt: now,
+        completedAt: null,
+      };
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-runless-node-finished"),
+            type: "node.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: { ...childNode, status: "completed", completedAt: now },
+          },
+          {
+            id: EventId.make("mode-runless-turn"),
+            type: "provider-turn.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: childTurn,
+          },
+        ],
+      });
+      yield* refuseRunless("provider-turn");
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-runless-turn-finished"),
+            type: "provider-turn.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: { ...childTurn, status: "completed", completedAt: now },
+          },
+          {
+            id: EventId.make("mode-runless-background"),
+            type: "provider-thread.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: {
+              ...childProvider,
+              pendingBackgroundTasks: [{ taskId: "runless-background", kind: "command" }],
+            },
+          },
+        ],
+      });
+      yield* refuseRunless("background");
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-runless-background-finished"),
+            type: "provider-thread.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: { ...childProvider, pendingBackgroundTasks: [] },
+          },
+        ],
+      });
+      const childItem = {
+        id: TurnItemId.make("mode-runless-command"),
+        threadId: childId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: childProviderId,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        type: "command_execution" as const,
+        status: "running" as const,
+        title: null,
+        input: "background work",
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+      };
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-runless-command-started"),
+            type: "turn-item.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: childItem,
+          },
+        ],
+      });
+      yield* refuseRunless("turn-item");
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-runless-command-finished"),
+            type: "turn-item.updated",
+            threadId: childId,
+            occurredAt: now,
+            payload: { ...childItem, status: "completed", completedAt: now },
+          },
+        ],
+      });
+      yield* orchestrator
+        .dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("mode-runless-idle-lower"),
+          threadId: childId,
+          runtimeMode: "approval-required",
+        })
+        .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"));
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(childId)).thread.runtimeMode,
+        "approval-required",
+      );
     }),
   );
   it.effect("applies lifecycle commands idempotently and emits archive/removal shell deltas", () =>

@@ -3784,21 +3784,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Thread runtimeMode is already ${thread.runtimeMode}; MCP can only lower it.`,
         });
       }
-      const { runs, providerThreads, turnItems } = yield* loadProjectionForCommand(command, [
-        "runs",
-        "providerThreads",
-        "turnItems",
-      ]);
-      const backgroundWork = derivePendingBackgroundWork({
-        latestRun: latestExecutedRun(runs),
-        runs,
-        providerThreads,
-        turnItems,
-        activeProviderThreadId: thread.activeProviderThreadId,
-      });
+      const { runs, nodes, providerTurns, providerThreads, turnItems } =
+        yield* loadProjectionForCommand(
+          command,
+          ["runs", "nodes", "providerTurns", "providerThreads", "turnItems"],
+          {
+            turnItemTypes: ["command_execution", "dynamic_tool", "subagent"],
+            turnItemStatuses: ["pending", "running", "waiting"],
+            omitSettledLeafNodes: true,
+          },
+        );
+      const hasBackgroundWork =
+        pendingBackgroundTurnItems({ runs, turnItems }).length > 0 ||
+        providerThreads.some(
+          (providerThread) =>
+            (thread.activeProviderThreadId === null ||
+              providerThread.id === thread.activeProviderThreadId) &&
+            (providerThread.pendingBackgroundTasks?.length ?? 0) > 0,
+        );
       if (
         runs.some((run) => ["preparing", "starting", "running", "waiting"].includes(run.status)) ||
-        backgroundWork.length > 0
+        nodes.some((node) => node.runId === null && isOrchestrationV2WorkActive(node.status)) ||
+        providerTurns.some((turn) => isOrchestrationV2WorkActive(turn.status)) ||
+        hasBackgroundWork
       ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
