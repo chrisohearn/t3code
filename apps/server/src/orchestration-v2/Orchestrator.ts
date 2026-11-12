@@ -3777,14 +3777,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: "MCP can only lower a thread's runtimeMode.",
         });
       }
-      const { runs } = yield* loadProjectionForCommand(command, ["runs"]);
+      if (command.runtimeMode === thread.runtimeMode) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread runtimeMode is already ${thread.runtimeMode}; MCP can only lower it.`,
+        });
+      }
+      const { runs, providerThreads, turnItems } = yield* loadProjectionForCommand(command, [
+        "runs",
+        "providerThreads",
+        "turnItems",
+      ]);
+      const backgroundWork = derivePendingBackgroundWork({
+        latestRun: latestExecutedRun(runs),
+        runs,
+        providerThreads,
+        turnItems,
+        activeProviderThreadId: thread.activeProviderThreadId,
+      });
       if (
-        runs.some((run) => ["preparing", "starting", "running", "waiting"].includes(run.status))
+        runs.some((run) => ["preparing", "starting", "running", "waiting"].includes(run.status)) ||
+        backgroundWork.length > 0
       ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
-          cause: "Cannot change runtimeMode while a run is active. Stop the run first.",
+          cause:
+            "Cannot change runtimeMode while a run is active or background work is active. Stop the work first.",
         });
       }
     }

@@ -2987,6 +2987,53 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         commandId: CommandId.make("mode-active-stop"),
         threadId,
       });
+      const eventSink = yield* EventSink.EventSinkV2;
+      const stoppedProjection = yield* orchestrator.getThreadProjection(threadId);
+      const providerThread = stoppedProjection.providerThreads[0]!;
+      const now = yield* DateTime.now;
+      for (const kind of ["subagent", "background_task", "command"] as const) {
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`mode-background-${kind}`),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...providerThread,
+                pendingBackgroundTasks: [{ taskId: `mode-task-${kind}`, kind }],
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+        assert.isNull((yield* orchestrator.getThreadShell(threadId))!.activeRunId);
+        const backgroundFailure = yield* orchestrator
+          .dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make(`mode-background-refused-${kind}`),
+            threadId,
+            runtimeMode: "approval-required",
+          })
+          .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"), Effect.flip);
+        assert.instanceOf(backgroundFailure, Orchestrator.OrchestratorDispatchError);
+        assert.include(String(backgroundFailure.cause), "background work is active");
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(threadId)).thread.runtimeMode,
+          "full-access",
+        );
+      }
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-background-finished"),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...providerThread, pendingBackgroundTasks: [], updatedAt: now },
+          },
+        ],
+      });
       yield* orchestrator
         .dispatch({
           type: "thread.runtime-mode.set",
@@ -3147,6 +3194,17 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"), Effect.flip);
       assert.instanceOf(raised, Orchestrator.OrchestratorDispatchError);
       assert.include(String(raised.cause), "only lower");
+      const sequenceBeforeUnchanged = yield* orchestrator.getThreadEventSequence(threadId);
+      const unchanged = yield* orchestrator
+        .dispatch({
+          ...lowerMode,
+          commandId: CommandId.make("runtime-layer-lifecycle-unchanged-refused"),
+        })
+        .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"), Effect.flip);
+      assert.instanceOf(unchanged, Orchestrator.OrchestratorDispatchError);
+      assert.include(String(unchanged.cause), "already approval-required");
+      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequenceBeforeUnchanged);
+
       yield* orchestrator.dispatch({
         type: "thread.interaction-mode.set",
         commandId: CommandId.make("runtime-layer-lifecycle-interaction"),
