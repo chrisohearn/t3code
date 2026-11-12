@@ -1267,10 +1267,16 @@ function appendContextHandoffId(
 }
 
 /** Ordinal of the latest started fresh-context run. Runs before it never reach a provider again. */
-/** The run whose message opened the conversation; its standing instructions survive handoffs. */
+/**
+ * The run whose message opened the current conversation; its standing instructions survive
+ * handoffs. A fresh-context run starts a new conversation, so nothing before it counts.
+ */
 function firstConversationRunId(runs: ReadonlyArray<OrchestrationV2Run>): RunId | undefined {
+  const boundary = contextBoundaryOrdinal(runs);
   return runs
-    .filter((run) => run.status !== "queued" && run.status !== "rolled_back")
+    .filter(
+      (run) => run.status !== "queued" && run.status !== "rolled_back" && run.ordinal >= boundary,
+    )
     .reduce<OrchestrationV2Run | undefined>(
       (first, run) => (first === undefined || run.ordinal < first.ordinal ? run : first),
       undefined,

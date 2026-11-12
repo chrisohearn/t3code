@@ -179,7 +179,7 @@ describe("handoff budget", () => {
     assert.isAtMost(historyCost(selected.messages, selected.context), 3_000);
   });
 
-  it("keeps the standing first message ahead of recent work, cutting one too large to its head", () => {
+  it("keeps a standing first message that fits ahead of recent work, and omits one that does not", () => {
     const role = "You are the inbox. Reply only 'Queued for Jarvis: …' and never use tools.";
     const recent = Array.from({ length: 40 }, (_, i) =>
       message(`item:recent-${i}`, i % 2 ? "assistant" : "user", "r".repeat(400)),
@@ -194,17 +194,18 @@ describe("handoff budget", () => {
         coverage: "thread:handoff runs 1-41",
         budget: 6_000,
       });
-      const kept = selected.messages.find((candidate) => candidate.itemId === standing.itemId);
-      assert.isDefined(kept);
-      assert.isTrue(kept.text.startsWith(role));
-      assert.equal(kept.text === text, text === role);
+      const fits = text === role;
       const keptIds = selected.messages.map((candidate) => candidate.itemId);
+      // Items stay intact; an oversized one is listed for t3_thread_read instead.
+      assert.equal(keptIds.includes(standing.itemId), fits);
       assert.includeMembers(keptIds, [recent.at(-1)!.itemId, recent.at(-2)!.itemId]);
-      assert.include(selected.context, "standing-instructions is this thread's first message");
-      assert.include(
-        historyResponseItems(selected.messages, selected.context)[1]?.content[0]?.text,
-        "; standing-instructions]",
-      );
+      assert.equal(selected.context.includes("standing-instructions is this thread's first"), fits);
+      if (fits) {
+        assert.include(
+          historyResponseItems(selected.messages, selected.context)[1]?.content[0]?.text,
+          "; standing-instructions]",
+        );
+      }
       assert.isAtMost(historyCost(selected.messages, selected.context), 6_000);
     }
   });

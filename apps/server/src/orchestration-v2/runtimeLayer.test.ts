@@ -11607,7 +11607,7 @@ it.layer(
     });
 
   it.effect.each([false, true])(
-    "re-sends the failed message once on the fallback, keeping the role (fresh context: %s)",
+    "re-sends the failed message once on the fallback with its conversation's first message (fresh context: %s)",
     (freshContext) =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -11659,7 +11659,12 @@ it.layer(
         const standing = handoff?.history?.messages.find(
           (message) => message.standingInstructions === true,
         );
-        assert.equal(standing?.text, role);
+        // A fresh-context run starts a new conversation; history before it never reaches a provider.
+        assert.equal(standing?.text, freshContext ? "Start over from here." : role);
+        assert.isFalse(
+          freshContext &&
+            (handoff?.history?.messages.some((message) => message.text === role) ?? false),
+        );
       }),
   );
 
