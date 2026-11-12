@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import type { ManagedPolicyDocument } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -24,6 +25,7 @@ import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
 import * as ServerSelfUpdate from "./selfUpdate.ts";
 
 interface HarnessOptions {
+  readonly releaseVersion?: string;
   readonly mode?: "web" | "desktop";
   readonly managed?: boolean;
   readonly launcherProtocol?: 3 | typeof SERVICE_LAUNCHER_PROTOCOL;
@@ -38,7 +40,12 @@ interface HarnessOptions {
 }
 
 const archiveBytes = new TextEncoder().encode("not really a tarball");
-const releaseHttpClient = (order: string[], urls: string[], beforeDownload?: Effect.Effect<void>) =>
+const releaseHttpClient = (
+  order: string[],
+  urls: string[],
+  beforeDownload?: Effect.Effect<void>,
+  version = "1.1.0",
+) =>
   HttpClient.make((request) =>
     Effect.gen(function* () {
       urls.push(request.url);
@@ -49,7 +56,7 @@ const releaseHttpClient = (order: string[], urls: string[], beforeDownload?: Eff
         ).join("");
         return HttpClientResponse.fromWeb(
           request,
-          new Response(`${hex}  t3-1.1.0-linux-x64.tar.gz\n`),
+          new Response(`${hex}  t3-${version}-linux-x64.tar.gz\n`),
         );
       }
       if (beforeDownload) yield* beforeDownload;
@@ -121,7 +128,11 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
         const result =
           options.preflight === "blocked"
             ? { status: "blocked", version: "1.1.0", reason: "local update required" }
-            : { status: "ready", version: "1.1.0", launcherProtocol: Number(named) };
+            : {
+                status: "ready",
+                version: options.releaseVersion ?? "1.1.0",
+                launcherProtocol: Number(named),
+              };
         return {
           stdout: JSON.stringify(result),
           stderr: "",
@@ -550,4 +561,54 @@ it("a host crosses tracks only to a release that knows its whole database", () =
       databaseMigration: () => undefined,
     }),
   ).toContain("Cannot confirm");
+});
+
+it.layer(NodeServices.layer)("fork self update", (it) => {
+  it.effect("maps a nightly desktop target to a published fork archive and handoff", () =>
+    Effect.gen(function* () {
+      const version = "1.1.0-preview.20261112.1";
+      const urls: string[] = [];
+      const archive = releaseHttpClient([], urls, undefined, version);
+      const httpClient = HttpClient.make((request) =>
+        request.url.startsWith("https://api.github.com/")
+          ? Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                new Response(
+                  JSON.stringify([
+                    {
+                      tag_name: `v${version}`,
+                      draft: false,
+                      assets: [{ name: "SHA256SUMS" }, { name: `t3-${version}-linux-x64.tar.gz` }],
+                    },
+                  ]),
+                ),
+              ),
+            )
+          : archive.execute(request),
+      );
+      const harness = yield* makeHarness({ releaseVersion: version, httpClient }).pipe(
+        Effect.provide(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({
+              env: {
+                T3CODE_RELEASE_BASE_URL: "https://github.com/chrisohearn/t3code/releases/download",
+              },
+            }),
+          ),
+        ),
+      );
+      expect(
+        yield* harness.selfUpdate.update({ targetVersion: "0.1.10-nightly.20261111.4544" }),
+      ).toEqual({
+        targetVersion: version,
+        method: "boot-service",
+        updateId: "launcher-id",
+      });
+      expect(urls).toEqual([
+        `https://github.com/chrisohearn/t3code/releases/download/v${version}/SHA256SUMS`,
+        `https://github.com/chrisohearn/t3code/releases/download/v${version}/t3-${version}-linux-x64.tar.gz`,
+      ]);
+    }),
+  );
 });

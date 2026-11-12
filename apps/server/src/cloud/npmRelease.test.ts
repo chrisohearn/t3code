@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { ServerNpmReleaseError } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -195,4 +196,61 @@ it.effect.each(["--registry=https://example.com", "../other", "other-package@lat
       const service = yield* makeService(() => Effect.die("invalid specs must not spawn npm"));
       expect(Result.isFailure(yield* service.get({ spec }).pipe(Effect.result))).toBe(true);
     }),
+);
+
+// The desktop requests its own nightly version even when the host runs a fork.
+it.effect("uses the fork feed for nightly metadata without spawning npm", () =>
+  Effect.gen(function* () {
+    const service = yield* makeService(
+      () => Effect.die("must not query npm for a fork"),
+      HttpClient.make((request) =>
+        Effect.succeed(
+          HttpClientResponse.fromWeb(
+            request,
+            new Response(
+              JSON.stringify([
+                {
+                  tag_name: "v0.1.9-preview.20261112.2",
+                  draft: false,
+                  assets: [
+                    { name: "SHA256SUMS" },
+                    { name: "t3-0.1.9-preview.20261112.2-linux-x64.tar.gz" },
+                  ],
+                },
+                {
+                  tag_name: "v0.1.9-preview.20261112.10",
+                  draft: false,
+                  assets: [
+                    { name: "SHA256SUMS" },
+                    { name: "t3-0.1.9-preview.20261112.10-linux-x64.tar.gz" },
+                  ],
+                },
+                {
+                  tag_name: "v0.1.10-nightly.20261113.1",
+                  draft: false,
+                  assets: [{ name: "SHA256SUMS" }],
+                },
+              ]),
+            ),
+          ),
+        ),
+      ),
+    ).pipe(
+      Effect.provide(
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({
+            env: {
+              T3CODE_RELEASE_BASE_URL: "https://github.com/chrisohearn/t3code/releases/download",
+            },
+          }),
+        ),
+      ),
+      Effect.provideService(HostProcess.Platform, "linux"),
+      Effect.provideService(HostProcess.Architecture, "x64"),
+    );
+    expect(yield* service.get({ spec: "nightly" })).toEqual({
+      version: "0.1.9-preview.20261112.10",
+    });
+    expect(yield* service.get({ spec: version })).toEqual({ version: "0.1.9-preview.20261112.10" });
+  }),
 );

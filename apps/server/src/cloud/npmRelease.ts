@@ -3,8 +3,16 @@ import {
   ServerNpmReleaseInput,
   type ServerNpmRelease,
 } from "@t3tools/contracts";
-import { npmReleaseDatabaseMigration } from "@t3tools/shared/cliRelease";
+import {
+  CLI_RELEASE_BASE_URL_ENV,
+  cliArchivePlatformKey,
+  cliArchiveFileName,
+  npmReleaseDatabaseMigration,
+} from "@t3tools/shared/cliRelease";
 import { resolveCommandPath } from "@t3tools/shared/shell";
+import { compareSemverVersions } from "@t3tools/shared/semver";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Config from "effect/Config";
 import * as Cache from "effect/Cache";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
@@ -55,9 +63,67 @@ function toRelease(spec: string, json: string) {
   });
 }
 
+const decodeForkReleases = Schema.decodeUnknownEffect(
+  Schema.Array(
+    Schema.Struct({
+      tag_name: Schema.String,
+      draft: Schema.Boolean,
+      assets: Schema.Array(Schema.Struct({ name: Schema.String })),
+    }),
+  ),
+);
+
+// Fork releases are not published to npm. Resolve desktop targets at the host boundary.
+export const lookupForkRelease = Effect.fn("NpmRelease.lookupForkRelease")(function* (
+  baseUrl: string | undefined,
+  spec: string,
+) {
+  if (baseUrl?.replace(/\/+$/, "") !== "https://github.com/chrisohearn/t3code/releases/download")
+    return undefined;
+  const http = yield* HttpClient.HttpClient;
+  const platform = yield* HostProcess.Platform;
+  const arch = yield* HostProcess.Architecture;
+  const key = cliArchivePlatformKey(platform, arch);
+  const unavailable = new ServerNpmReleaseError({
+    reason: "The fork release feed could not be read.",
+  });
+  const releases = yield* Effect.gen(function* () {
+    const response = yield* http.get(
+      "https://api.github.com/repos/chrisohearn/t3code/releases?per_page=50",
+    );
+    if (response.status !== 200) return yield* unavailable;
+    return yield* decodeForkReleases(yield* response.json);
+  }).pipe(
+    Effect.timeout(Duration.seconds(15)),
+    Effect.mapError(() => unavailable),
+  );
+  const versions = releases
+    .filter((release) => {
+      const version = release.tag_name.replace(/^v/, "");
+      return (
+        !release.draft &&
+        release.tag_name.startsWith("v") &&
+        /^\d+\.\d+\.\d+-preview\.\d{8}\.\d+$/.test(version) &&
+        key !== undefined &&
+        release.assets.some((asset) => asset.name === "SHA256SUMS") &&
+        release.assets.some((asset) => asset.name === cliArchiveFileName(version, key))
+      );
+    })
+    .map((release) => release.tag_name.slice(1))
+    .sort(compareSemverVersions);
+  // Keep exact fork selections exact; upstream desktop versions follow the newest fork.
+  const version = spec.includes("-preview.")
+    ? versions.find((version) => version === spec)
+    : versions.at(-1);
+  return version === undefined ? null : { version };
+});
+
 export const make = Effect.fn("NpmRelease.make")(function* () {
   const runner = yield* ProcessRunner.ProcessRunner;
   const http = yield* HttpClient.HttpClient;
+  const releaseBaseUrl = Option.getOrUndefined(
+    yield* Config.String(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
+  );
   const lookupPublic = Effect.fn("NpmRelease.lookupPublic")(function* (spec: string) {
     const unreachable = new ServerNpmReleaseError({
       reason: "npm is not installed and the public npm registry could not be reached.",
@@ -79,6 +145,8 @@ export const make = Effect.fn("NpmRelease.make")(function* () {
     capacity: 32,
     timeToLive: Duration.minutes(1),
     lookup: Effect.fn("NpmRelease.lookup")(function* (spec: string) {
+      const fork = yield* lookupForkRelease(releaseBaseUrl, spec);
+      if (fork !== undefined) return fork;
       // Without npm there is no configured registry to honor, so use the public one.
       const npmPath = yield* resolveCommandPath("npm");
       if (npmPath === null) return yield* lookupPublic(spec);

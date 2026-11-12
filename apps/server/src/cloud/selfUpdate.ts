@@ -32,6 +32,7 @@ import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
 import { databaseMigrationHead } from "../persistence/databaseMigrationHead.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import { managedUpdateMirror, managedUpdateRefusal } from "../policy/managedUpdates.ts";
+import { lookupForkRelease } from "./npmRelease.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import {
   ensurePinnedRuntimeInstalled,
@@ -207,12 +208,21 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
       );
     }
 
-    const unsafeCrossing = crossesTrackUnsafely(input);
-    if (unsafeCrossing !== null) return yield* failWith(unsafeCrossing);
-    const targetVersion = input.targetVersion.trim();
+    let targetVersion = input.targetVersion.trim();
     if (!isExactServiceVersion(targetVersion)) {
       return yield* failWith(`'${targetVersion}' is not an exact t3 version.`);
     }
+    const fork = yield* lookupForkRelease(releaseBaseUrl, targetVersion).pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(HostProcess.Platform, platform),
+      Effect.provideService(HostProcess.Architecture, arch),
+      Effect.mapError((cause) => failWith(cause.reason, cause)),
+    );
+    if (fork === null)
+      return yield* failWith("No compatible fork release is published for this machine.");
+    if (fork !== undefined) targetVersion = fork.version;
+    const unsafeCrossing = crossesTrackUnsafely({ ...input, targetVersion });
+    if (unsafeCrossing !== null) return yield* failWith(unsafeCrossing);
     if (yield* Ref.getAndSet(inFlight, true)) {
       return yield* failWith("A server update is already in progress.");
     }
@@ -229,7 +239,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
         platform,
         arch,
         releaseBaseUrl,
-        requirePublishedRelease: mirror !== undefined,
+        requirePublishedRelease: mirror !== undefined || fork !== undefined,
         validate: (runtime) =>
           runner
             .run({

@@ -24,3 +24,10 @@ Upstream owns every id in `effect_sql_migrations`. Effect's migrator skips every
 A conflict opens (or updates) an issue labelled `upstream-sync`, or comments on the open sync PR. A failed check opens a PR that says what failed. Neither publishes anything. Exit codes: 0 done or nothing to do, 3 conflict, 4 failed check, 2 environment problem.
 
 To release by hand from a clean, merged integration commit: `scripts/fork/build-release.sh <version>`, then `scripts/fork/publish-release.sh <version> <artifacts-dir> <merge-commit> "<notes>"`. Versions must sort above every earlier fork release under `sort -V`, because the guard installs the newest one.
+
+The service's `T3CODE_RELEASE_BASE_URL` selects the fork feed for both metadata and
+self-update targets. An upstream desktop's exact nightly target resolves to the
+newest published fork archive for the host platform; exact fork versions remain
+exact. Feed failures never fall back to npm or upstream archives. The service
+launcher and runtime must be upgraded together through `t3-service-update`, which
+waits for idle and snapshots the stopped database before changing it.
