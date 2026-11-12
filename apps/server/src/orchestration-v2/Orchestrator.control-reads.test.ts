@@ -2008,6 +2008,20 @@ it.effect.each(
           : "running",
       );
     }
+    if (state === "restart-retry-unscheduled") {
+      const retry = Option.getOrThrow(yield* outbox.get(`effect:restart-continuation:${runId}`));
+      assert.equal(retry.availableAt, DateTime.formatIso(DateTime.add(now, { seconds: 60 })));
+      yield* TestClock.adjust("1 second");
+      const repeated = yield* orchestrator
+        .dispatch({
+          type: "thread.settle",
+          commandId: CommandId.make("settle-again-before-retry"),
+          threadId,
+        })
+        .pipe(Effect.result);
+      assert.ok(Result.isFailure(repeated));
+      assert.deepEqual(Option.getOrThrow(yield* outbox.get(retry.id)), retry);
+    }
   }).pipe(Effect.provide(layerTest)),
 );
 
