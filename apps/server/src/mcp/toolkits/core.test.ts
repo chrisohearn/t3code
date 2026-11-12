@@ -1,3 +1,4 @@
+import * as McpEvents from "../McpEvents.ts";
 import * as McpRequestLog from "../../persistence/McpRequestLog.ts";
 import * as BridgeStatusService from "../BridgeStatusService.ts";
 import { BridgeToolkit } from "./bridge/tools.ts";
@@ -202,6 +203,7 @@ it.effect(
           McpHttpServer.toolkitRegistration(BridgeToolkit, BridgeHandlers.layer),
         ).pipe(
           Layer.provide(Layer.mock(BridgeStatusService.BridgeStatusService)({})),
+          Layer.provide(Layer.mock(McpEvents.McpEvents)({})),
           Layer.provideMerge(McpRequestLog.layer.pipe(Layer.provide(Sqlite.layerMemory))),
           Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
           Layer.provideMerge(McpBridgeMetrics.layer),
