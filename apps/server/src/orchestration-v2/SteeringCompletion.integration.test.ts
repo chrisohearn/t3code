@@ -460,7 +460,9 @@ it.effect.each(
             mcpSender,
           );
           assert.deepEqual(
-            final.turnItems.find((item) => item.messageId === messageId)?.mcpSender,
+            final.turnItems
+              .filter((item) => item.type === "user_message")
+              .find((item) => item.messageId === messageId)?.mcpSender,
             mcpSender,
           );
         }
