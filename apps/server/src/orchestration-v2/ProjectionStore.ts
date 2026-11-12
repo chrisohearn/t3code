@@ -5995,8 +5995,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         SELECT thread.thread_id
         FROM ancestors JOIN orchestration_v2_projection_threads AS thread USING (thread_id)
         WHERE thread.thread_id = ${threadId} OR thread.deleted_at IS NOT NULL
-      ), live_sources(thread_id, run_ordinal) AS (
-        SELECT run.thread_id, run.ordinal
+      ), live_sources(thread_id, run_ordinal, fork_thread_id) AS (
+        SELECT run.thread_id, run.ordinal, fork.thread_id
         FROM orchestration_v2_projection_threads AS fork
         JOIN orchestration_v2_projection_runs AS run
           ON run.run_id = json_extract(fork.payload_json, '$.forkedFrom.runId')
@@ -6004,7 +6004,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           AND json_extract(fork.payload_json, '$.forkedFrom.type') = 'run'
           AND json_extract(fork.payload_json, '$.lineage.sideChat') IS NOT 1
         UNION
-        SELECT run.thread_id, run.ordinal
+        SELECT run.thread_id, run.ordinal, fork.thread_id
         FROM live_sources
         JOIN orchestration_v2_projection_threads AS fork ON fork.thread_id = live_sources.thread_id
         JOIN orchestration_v2_projection_runs AS run
@@ -6020,6 +6020,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ON item_run.run_id = ${sql.literal(`${alias}.run_id`)}
         WHERE live_sources.thread_id = ${sql.literal(`${alias}.thread_id`)}
           AND (${sql.literal(`${alias}.run_id`)} IS NULL OR item_run.ordinal <= live_sources.run_ordinal)
+          AND NOT EXISTS (
+            SELECT 1 FROM fork_run_exclusions AS snapshot, json_each(snapshot.run_ids_json) AS excluded
+            WHERE snapshot.thread_id = live_sources.fork_thread_id
+              AND excluded.value = ${sql.literal(`${alias}.run_id`)}
+          )
       )
     `;
 

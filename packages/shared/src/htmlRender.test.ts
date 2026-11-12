@@ -1,3 +1,4 @@
+import * as NodeVM from "node:vm";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -112,6 +113,55 @@ describe("readHtmlRenderLinkRequest", () => {
 });
 
 describe("readHtmlRenderImageRequest", () => {
+  it("bounds the bootstrap's gallery before posting it and keeps the clicked image selected", () => {
+    const image = (src: string) => ({ src, tagName: "IMG", closest: () => null });
+    const clicked = image("https://example.com/clicked.png");
+    const large = image(`data:image/png;base64,${"A".repeat(3 * 1024 * 1024)}`);
+    const document = {
+      images: [large, large, large, clicked],
+      getElementById: () => ({ textContent: "" }),
+      addEventListener: () => {},
+    };
+    let click: (event: object) => void = () => {};
+    let posted = { params: { images: [] as Array<{ src: string; name: string }>, index: -1 } };
+    const window = {
+      parent: {
+        postMessage: (message: typeof posted) => {
+          posted = message;
+        },
+      },
+      addEventListener: (name: string, handler: typeof click) => {
+        if (name === "click") click = handler;
+      },
+    };
+    const script = injectHtmlRenderBootstrap("<p>Report</p>").match(
+      /<script>([\s\S]*?)<\/script>/,
+    )?.[1];
+    if (script === undefined) throw new Error("Missing HTML bootstrap");
+    NodeVM.runInNewContext(script, {
+      window,
+      document,
+      location: { hash: "" },
+      setTimeout: (run: () => void) => run(),
+    });
+    const event = { composedPath: () => [clicked], isTrusted: true, button: 0 };
+    click(event);
+    expect(
+      posted.params.images.reduce(
+        (size, entry) => size + entry.src.length + entry.name.length,
+        clicked.src.length,
+      ),
+    ).toBeLessThanOrEqual(8 * 1024 * 1024);
+    expect(posted.params.images[posted.params.index]?.src).toBe(clicked.src);
+    document.images = [
+      ...Array.from({ length: 1000 }, () => image("https://example.com/other.png")),
+      clicked,
+    ];
+    click(event);
+    expect(posted.params.images.length).toBeLessThanOrEqual(64);
+    expect(posted.params.images[posted.params.index]?.src).toBe(clicked.src);
+  });
+
   it("accepts http(s) and inline image URLs in an open-image notification", () => {
     const image = (params: unknown) => ({
       jsonrpc: "2.0",
@@ -155,6 +205,17 @@ describe("readHtmlRenderImageRequest", () => {
     // An index that does not point at the clicked image falls back to that image alone.
     expect(request({ index: 0 })).toEqual({ images: [b], index: 0 });
     expect(request({ index: -1 })).toEqual({ images: [b], index: 0 });
+    const largeImage = { src: `data:image/png;base64,${"A".repeat(3 * 1024 * 1024)}` };
+    expect(
+      request({ images: [largeImage, largeImage, largeImage, b], index: 3 })?.images,
+    ).toHaveLength(1);
+    expect(request({ images: Array.from({ length: 1000 }, () => b), index: 999 })).toEqual({
+      images: [b],
+      index: 0,
+    });
+    expect(
+      request({ src: `data:image/png;base64,${"A".repeat(8 * 1024 * 1024)}` }) === undefined,
+    ).toBe(true);
   });
 });
 
