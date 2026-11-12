@@ -1386,6 +1386,10 @@ export function createServerEnvironmentAtoms<R, E>(
       execute: (input: EnvironmentRpcInput<typeof WS_METHODS.serverGetHostResources>) =>
         request(WS_METHODS.serverGetHostResources, input).pipe(Effect.timeout("5 seconds")),
     }),
+    workLedger: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:work-ledger",
+      tag: WS_METHODS.serverQueryWorkLedger,
+    }),
     processResourceHistory: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:process-resource-history",
       tag: WS_METHODS.serverGetProcessResourceHistory,

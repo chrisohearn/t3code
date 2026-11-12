@@ -69,7 +69,11 @@ describe("RPC authorization scopes", () => {
   });
 
   it("lets thread readers observe and refresh checkout branches", () => {
-    for (const method of [WS_METHODS.subscribeVcsBranch, WS_METHODS.vcsRefreshBranch]) {
+    for (const method of [
+      WS_METHODS.subscribeVcsBranch,
+      WS_METHODS.vcsRefreshBranch,
+      WS_METHODS.serverQueryWorkLedger,
+    ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
     }
   });

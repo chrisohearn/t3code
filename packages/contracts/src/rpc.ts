@@ -1,3 +1,5 @@
+import { WorkLedgerQueryInput, WorkLedgerQueryResult } from "./workLedger.ts";
+import { OrchestratorMcpFailure } from "./orchestratorMcp.ts";
 import {
   OrchestrationV2SearchThreadError,
   OrchestrationV2SearchThreadInput,
@@ -546,6 +548,7 @@ export const WS_METHODS = {
   serverSignalProcess: "server.signalProcess",
   serverReportClientActivity: "server.reportClientActivity",
   serverGetUsageSummary: "server.getUsageSummary",
+  serverQueryWorkLedger: "server.queryWorkLedger",
   serverRefreshUsageRates: "server.refreshUsageRates",
 
   scheduledTasksSubscribe: "scheduledTasks.subscribe",
@@ -992,6 +995,12 @@ const WsServerPrepareTriageRpc = Rpc.make(WS_METHODS.serverPrepareTriage, {
   payload: ServerPrepareTriageInput,
   success: ServerPrepareTriageResult,
   error: Schema.Union([ServerPrepareTriageError, EnvironmentAuthorizationError]),
+});
+
+const WsServerQueryWorkLedgerRpc = Rpc.make(WS_METHODS.serverQueryWorkLedger, {
+  payload: WorkLedgerQueryInput,
+  success: WorkLedgerQueryResult,
+  error: Schema.Union([EnvironmentAuthorizationError, OrchestratorMcpFailure]),
 });
 
 const WsServerGetUsageSummaryRpc = Rpc.make(WS_METHODS.serverGetUsageSummary, {
@@ -2121,6 +2130,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerCheckOtlpEndpointRpc,
   WsServerListTextGeneratorModelsRpc,
   WsServerPrepareTriageRpc,
+  WsServerQueryWorkLedgerRpc,
   WsServerGetUsageSummaryRpc,
   WsServerRefreshUsageRatesRpc,
   WsServerSignalProcessRpc,
