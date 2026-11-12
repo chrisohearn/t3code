@@ -61,7 +61,7 @@ const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const CODE_CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const CODE_VERIFIER_PATTERN = /^[A-Za-z0-9\-._~]{43,128}$/;
 
-const MCP_OAUTH_SCOPES = [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
+const MCP_OAUTH_SCOPES = [AuthOrchestrationReadScope, AuthOrchestrationOperateScope] as const;
 
 export interface McpOAuthUrls {
   readonly issuer: string;
@@ -94,10 +94,10 @@ export const authorizationServerMetadata = (
   token_endpoint: `${urls.issuer}/oauth/mcp/token`,
   registration_endpoint: `${urls.issuer}/oauth/mcp/register`,
   response_types_supported: ["code"],
-  grant_types_supported: ["authorization_code"],
+  grant_types_supported: ["authorization_code", "refresh_token"],
   code_challenge_methods_supported: ["S256"],
   token_endpoint_auth_methods_supported: ["none"],
-  scopes_supported: MCP_OAUTH_SCOPES,
+  scopes_supported: [...MCP_OAUTH_SCOPES, "offline_access"],
   authorization_response_iss_parameter_supported: true,
 });
 
@@ -180,6 +180,7 @@ export interface AuthorizationRequest {
   readonly state: Redacted.Redacted<string> | undefined;
   readonly resource: string;
   readonly issuer: string;
+  readonly offlineAccess: boolean;
 }
 
 interface PendingCode {
@@ -191,6 +192,7 @@ interface PendingCode {
   readonly resource: string;
   readonly access: AuthMcpClientAccess;
   readonly expiresAtMs: number;
+  readonly offlineAccess: boolean;
 }
 
 export type ApprovalDecision = Exclude<AuthMcpApprovalDecision, { readonly _tag: "deny" }>;
@@ -404,6 +406,7 @@ const make = Effect.gen(function* () {
       state,
       resource: urls.resource,
       issuer: urls.issuer,
+      offlineAccess: request.scope?.split(/\s+/u).includes("offline_access") ?? false,
     } satisfies AuthorizationRequest;
   });
 
@@ -442,6 +445,7 @@ const make = Effect.gen(function* () {
         resource: authorization.resource,
         access,
         expiresAtMs: now + AUTHORIZATION_CODE_TTL_MS,
+        offlineAccess: authorization.offlineAccess,
       });
       return next;
     });
@@ -507,8 +511,50 @@ const make = Effect.gen(function* () {
     function* ({ request, urls, token }) {
       const fail = (error: AuthMcpTokenError["error"], description: string) =>
         new AuthMcpTokenError({ error, error_description: description });
+      if (token.grant_type === "refresh_token") {
+        if (token.client_id === undefined || token.refresh_token === undefined) {
+          return yield* fail("invalid_request", "client_id and refresh_token are required.");
+        }
+        if ((yield* parseClientId(token.client_id)) === undefined) {
+          return yield* fail("invalid_client", "The client is unknown.");
+        }
+        if (!sameResource(urls, token.resource)) {
+          return yield* fail("invalid_grant", "The renewal token is not valid for this resource.");
+        }
+        const issued = yield* environmentAuth
+          .refreshMcpClientSession({
+            clientId: token.client_id,
+            resource: urls.resource,
+            refreshToken: token.refresh_token,
+            ...(token.scope === undefined ? {} : { scope: token.scope }),
+          })
+          .pipe(
+            Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, () =>
+              Effect.fail(fail("invalid_grant", "The session could not be renewed.")),
+            ),
+          );
+        const scopes = [
+          ...mcpClientScopes(issued.access),
+          ...(issued.offlineAccess ? ["offline_access"] : []),
+        ];
+        return {
+          access_token: issued.token,
+          refresh_token: issued.refreshToken,
+          token_type: "Bearer" as const,
+          expires_in: Math.max(
+            0,
+            Math.floor(
+              (issued.expiresAt.epochMilliseconds - (yield* Clock.currentTimeMillis)) / 1000,
+            ),
+          ),
+          scope: encodeOAuthScope(scopes),
+        };
+      }
       if (token.grant_type !== "authorization_code") {
-        return yield* fail("unsupported_grant_type", "Only authorization_code is supported.");
+        return yield* fail(
+          "unsupported_grant_type",
+          "Only authorization_code and refresh_token are supported.",
+        );
       }
       const { redirect_uri: redirectUri, client_id: clientId } = token;
       const code = token.code && Redacted.value(token.code);
@@ -548,6 +594,7 @@ const make = Effect.gen(function* () {
           access: pending.access,
           peerLink: pending.peerLink,
           client: deriveAuthClientMetadata({ request }),
+          oauth: { clientId, resource: pending.resource, offlineAccess: pending.offlineAccess },
         })
         .pipe(
           Effect.catch((cause) =>
@@ -560,9 +607,13 @@ const make = Effect.gen(function* () {
         );
       return {
         access_token: issued.token,
+        ...(issued.refreshToken === undefined ? {} : { refresh_token: issued.refreshToken }),
         token_type: "Bearer",
         expires_in: Math.max(0, Math.floor((issued.expiresAt.epochMilliseconds - now) / 1000)),
-        scope: encodeOAuthScope(mcpClientScopes(pending.access)),
+        scope: encodeOAuthScope([
+          ...mcpClientScopes(pending.access),
+          ...(pending.offlineAccess ? ["offline_access"] : []),
+        ]),
       };
     },
   );

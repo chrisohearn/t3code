@@ -475,10 +475,12 @@ export const AuthMcpAuthorizationServerMetadata = Schema.Struct({
   token_endpoint: Schema.String,
   registration_endpoint: Schema.String,
   response_types_supported: Schema.Array(Schema.Literal("code")),
-  grant_types_supported: Schema.Array(Schema.Literal("authorization_code")),
+  grant_types_supported: Schema.Array(Schema.Literals(["authorization_code", "refresh_token"])),
   code_challenge_methods_supported: Schema.Array(Schema.Literal("S256")),
   token_endpoint_auth_methods_supported: Schema.Array(Schema.Literal("none")),
-  scopes_supported: Schema.Array(AuthEnvironmentScope),
+  scopes_supported: Schema.Array(
+    Schema.Union([AuthEnvironmentScope, Schema.Literal("offline_access")]),
+  ),
   authorization_response_iss_parameter_supported: Schema.Boolean,
 });
 export type AuthMcpAuthorizationServerMetadata = typeof AuthMcpAuthorizationServerMetadata.Type;
@@ -502,7 +504,7 @@ export const AuthMcpRegisteredClient = Schema.Struct({
   client_id: Schema.String,
   client_name: Schema.String,
   redirect_uris: Schema.Array(Schema.String),
-  grant_types: Schema.Array(Schema.Literal("authorization_code")),
+  grant_types: Schema.Array(Schema.Literals(["authorization_code", "refresh_token"])),
   response_types: Schema.Array(Schema.Literal("code")),
   token_endpoint_auth_method: Schema.Literal("none"),
 }).pipe(HttpApiSchema.status(201));
@@ -531,6 +533,7 @@ export const AuthMcpAuthorizationRequest = Schema.Struct({
   code_challenge_method: Schema.optionalKey(Schema.String),
   state: Schema.optionalKey(Schema.RedactedFromValue(Schema.String)),
   resource: Schema.optionalKey(Schema.String),
+  scope: Schema.optionalKey(Schema.String),
 });
 export type AuthMcpAuthorizationRequest = typeof AuthMcpAuthorizationRequest.Type;
 
@@ -587,11 +590,14 @@ export const AuthMcpTokenRequest = Schema.Struct({
   client_id: Schema.optionalKey(Schema.String),
   code_verifier: Schema.optionalKey(Schema.RedactedFromValue(Schema.String)),
   resource: Schema.optionalKey(Schema.String),
+  refresh_token: Schema.optionalKey(Schema.RedactedFromValue(Schema.String)),
+  scope: Schema.optionalKey(Schema.String),
 }).pipe(HttpApiSchema.asFormUrlEncoded());
 export type AuthMcpTokenRequest = typeof AuthMcpTokenRequest.Type;
 
 export const AuthMcpTokenResult = Schema.Struct({
   access_token: Schema.String,
+  refresh_token: Schema.optionalKey(Schema.String),
   token_type: Schema.Literal("Bearer"),
   expires_in: Schema.Number,
   scope: Schema.String,
@@ -604,6 +610,7 @@ export class AuthMcpTokenError extends Schema.Error<AuthMcpTokenError>("AuthMcpT
       "invalid_request",
       "invalid_client",
       "invalid_grant",
+      "invalid_scope",
       "unsupported_grant_type",
     ]),
     error_description: Schema.String,

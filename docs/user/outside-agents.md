@@ -145,6 +145,7 @@ answer user-input questions, but approval responses still require the app.
 
 `t3_thread_list` includes `launchedBy` and `pendingRequestCount`. Pass
 `launchedByMe: true` to find threads launched through this sign-in session.
+Token refresh keeps this sign-in's launch history and event subscriptions.
 After signing in again, the new session has a separate launch history. The
 filter works on the environment you signed in to, not through a linked one.
 
@@ -263,5 +264,7 @@ result that always includes the thread id.
 ## Remove an agent
 
 Approved agents appear under **Settings → Sharing & access** like other clients.
-Revoke one there to cut off its access immediately. A sign-in lasts 30 days;
-after that the agent asks you to approve it again.
+Revoke one there to cut off its access immediately. New sign-ins renew with use
+and expire after 30 days without use. Clients receive a renewal token, which is
+replaced each time they use it. Reusing a replaced token cuts off the sign-in.
+Sign-ins created before rolling renewal keep their original expiry.
