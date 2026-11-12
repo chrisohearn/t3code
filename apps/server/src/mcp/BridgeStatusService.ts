@@ -2,6 +2,7 @@ import {
   EnvironmentId,
   EnvironmentConnectReachability,
   McpEventSubscriptionsResult,
+  McpEventWatch,
   OrchestratorMcpFailure,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -18,6 +19,11 @@ export const BridgeStatusResult = Schema.Struct({
   tunnel: Schema.NullOr(EnvironmentConnectReachability),
   daysUntilSessionExpires: Schema.Number,
   subscriptions: McpEventSubscriptionsResult.fields.subscriptions,
+  inboxThreadId: McpEventSubscriptionsResult.fields.inboxThreadId,
+  watches: Schema.Array(McpEventWatch),
+  relayFailures: Schema.Number,
+  relayPending: Schema.Number,
+  relayLastError: Schema.NullOr(Schema.String),
   lastSuccessfulEventDeliveryAt: Schema.NullOr(Schema.String),
   deliveriesExhaustedRetries: Schema.Number,
   linkedEnvironments: Schema.NullOr(

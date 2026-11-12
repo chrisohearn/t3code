@@ -208,7 +208,7 @@ subscription for its granted lifetime, up to the current sign-in expiry. Failed
 deliveries do not extend it. A quiet subscription still expires, so an inbox that
 must stay available needs activity before its lifetime ends. Client refreshes and
 signing-secret rotation remain supported. Existing watches adopt rolling renewal;
-new watches made by `notify` retain their fixed expiry. Updates
+legacy notify-only watches retain their existing grants. New `notify` calls use inbox relays. Updates
 can replay after a server restart, although older history may no longer be
 available. When T3 Connect is enabled, T3 holds startup notifications until its
 public address is reachable, for up to three minutes, so clients can call back. Delivery stops after eight failed attempts or a permanent callback
@@ -220,19 +220,40 @@ subscription starts at current events; provide a saved cursor to request replay.
 subscription made after a run ends does not replay that run's completion event.
 Check the thread once after subscribing to catch a result that arrived earlier.
 
-To monitor a new launch or send, include `notify: {}` in `t3_thread_launch` or
-`t3_thread_send`. T3 reuses this sign-in's most recently refreshed active
-subscription's callback and secret. It captures the event cursor before starting
-the run, so even an immediate completion is covered. The default events are
-`thread.run.result`, `thread.needs-decision`, and `thread.blocker`. Set
-`notify.events` to choose a subset. The response's `notify` field reports
-`subscribed`, `unavailable`, or `failed`, with subscription IDs and a reason when
-needed. Without an active subscription, the launch or send still succeeds and
-reports `no_active_subscription`. Check this field and read the thread once if
-notification setup fails. These subscriptions last up to a day, or less if the
-sign-in expires sooner, and `refreshBefore` gives the time. Another launch or
-send with `notify` renews them. A lapsed one restarts at the new run instead of
-replaying older events. Subscriptions are deleted a day after they expire.
+To receive notifications for a launch or send, first pin a writable inbox thread
+with `event_inbox_set: { threadId: "<thread-id>" }`. Then include `notify: {}` in
+`t3_thread_launch` or `t3_thread_send`. T3 queues a message to that inbox when the
+source run produces a matching event. This creates no event subscription or
+ChatGPT watch. Your existing inbox watch receives the inbox run's normal event.
+Keep the inbox's run-per-message acknowledger enabled.
+
+The response reports `bound` with the inbox thread id, or `unavailable` or `failed`
+with a reason. Without a pin it reports `no_pinned_inbox`; the launch or send still
+succeeds. Clear the pin with `event_inbox_set: { threadId: null }`. A pin belongs to
+one sign-in. A changed or cleared pin prevents pending deliveries to the old inbox.
+
+The default events are `thread.run.result`, `thread.needs-decision`, and
+`thread.blocker`; `notify.events` chooses a subset. Each source run outcome
+produces at most one inbox message. Messages include the source thread, run,
+request key, a bounded result excerpt, and PR links. Relay messages cannot relay
+their own inbox run. Read the source thread if setup or delivery fails.
+
+`event_subscriptions` lists your inbox pin, native subscription ids, threads,
+events, expiry, and callback groups. `notifyDerived` identifies legacy notify
+copies using creation order within each callback group. Remove a duplicate with
+`event_unsubscribe` and its native id; repeating a removal is safe.
+`bridge_status.watches` groups active subscriptions by callback and reports each
+watch's soonest expiry. `inboxThreadId`, `relayFailures`, `relayPending`, and
+`relayLastError` show relay state separately from webhook acknowledgements.
+Callback paths, queries, and secrets stay private.
+
+Exhausted webhook deliveries produce one inbox alert per subscription per day.
+Exhausted relay jobs also produce a daily inbox alert; alert failures do not create
+more alerts. Dispatch rechecks the sign-in, inbox, and permission limits. Revoked
+or insufficient authority stops delivery. Use `event_deliveries_replay` with a
+subscription id to copy up to 256 exhausted webhook deliveries into your pinned
+inbox. Repeating the call continues with remaining events and does not duplicate
+already queued messages. It does not reactivate the original callback.
 
 For direct protocol clients, the T3 extension `events/subscriptions/list` lists
 this sign-in's subscriptions: event/thread, active/stopped/expired status, expiry,
