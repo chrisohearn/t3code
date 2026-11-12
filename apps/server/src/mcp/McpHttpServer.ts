@@ -1,3 +1,4 @@
+import * as JarvisPlaybook from "./JarvisPlaybook.ts";
 import * as BridgeStatusService from "./BridgeStatusService.ts";
 import { BridgeToolkit } from "./toolkits/bridge/tools.ts";
 import * as BridgeHandlers from "./toolkits/bridge/handlers.ts";
@@ -1344,6 +1345,13 @@ export const layerMcpTransport = <RA, RE, RR>(registrations: Layer.Layer<RA, RE,
 
 /** Every tool the T3 MCP server advertises. AgentContextBudget.test.ts measures this set. */
 export const layerTools = Layer.mergeAll(
+  McpServer.resource({
+    uri: JarvisPlaybook.URI,
+    name: "Jarvis playbook",
+    description: "Current docs/jarvis vocabulary and decisions from this running T3 build.",
+    mimeType: "text/markdown",
+    content: JarvisPlaybook.read(),
+  }).pipe(Layer.provide(provideRegistrationServices<FileSystem.FileSystem | Path.Path>().layer)),
   toolkitRegistration(BridgeToolkit, BridgeHandlers.layer).pipe(
     Layer.provide(BridgeStatusService.layer),
   ),
