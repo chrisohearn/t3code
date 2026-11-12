@@ -146,6 +146,7 @@ describe("fork migrations", () => {
           [4, "McpBridgeStatus"],
           [5, "McpOAuthRenewal"],
           [6, "McpSubscriptionRenewal"],
+          [7, "McpRequestLog"],
         ],
       );
       assert.equal((yield* forkHistory)[0]?.[2], "2026-11-12 04:10:00");
@@ -155,6 +156,7 @@ describe("fork migrations", () => {
       yield* sql`SELECT * FROM work_ledger`;
       yield* sql`SELECT * FROM mcp_client_threads`;
       yield* sql`SELECT * FROM mcp_bridge_status`;
+      yield* sql`SELECT * FROM mcp_request_log`;
       assert.deepStrictEqual(
         yield* sql`SELECT renewal_ttl_ms FROM mcp_event_subscription_activity WHERE subscription_id = 'preserved'`,
         [{ renewal_ttl_ms: 86_400_000 }],
