@@ -5969,7 +5969,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     )(
       function* (threadId: ThreadId, seen: ReadonlySet<ThreadId>, includePersistentOutput = false) {
         const records = yield* getThreadRecords(threadId, ["runs", "attempts"]);
-        const rows = yield* sql<{
+        let rows = yield* sql<{
           turn_item_id: string;
           run_id: string | null;
           node_id: string | null;
@@ -6035,7 +6035,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             legacyPosts.has(row.turn_item_id)
               ? (anchors.get(row.turn_item_id) ?? fallback)
               : row.ordinal;
-          rows.sort((left, right) => position(left) - position(right));
+          rows = rows.toSorted((left, right) => position(left) - position(right));
         }
         const runStatuses = new Map(records.runs.map((run) => [String(run.id), run.status]));
         const items: Array<TimelineIndexItem> = rows.map((row) => ({
