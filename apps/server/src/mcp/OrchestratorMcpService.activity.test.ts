@@ -433,7 +433,8 @@ it("taskStatus returns task.providerInstanceId rather than the driver kind", asy
   }).pipe(Effect.provide(layer), Effect.runPromise);
 });
 
-it("readThread and sendToThread reach threads in other projects", async () => {
+it("readThread, postToThread and sendToThread reach threads in other projects", async () => {
+  const posts: unknown[] = [];
   let parentShell: OrchestrationV2ThreadShell | null = null;
   let parentRuns: ReadonlyArray<unknown> = [
     makeRun({ id: RunId.make("run-parent-live"), ordinal: 1, status: "running" }),
@@ -529,6 +530,11 @@ it("readThread and sendToThread reach threads in other projects", async () => {
                     threadId: input.threadId,
                   }),
                 ),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              posts.push(command);
+              return { sequence: 1, storedEvents: [] };
+            }),
           sendToThread: () =>
             Effect.succeed({
               run: { id: "run-foreign", status: "queued" },
@@ -570,6 +576,24 @@ it("readThread and sendToThread reach threads in other projects", async () => {
     expect(foreign.thread.projectId).toBe(foreignProjectId);
     expect(foreign.items.map((item) => item.text)).toEqual(["Foreign thread said hello"]);
 
+    const posted = yield* service.postToThread(makeScope(), {
+      threadId: foreignThreadId,
+      message: "inbox",
+      clientRequestId: "post-1",
+    });
+    const retried = yield* service.postToThread(makeScope(), {
+      threadId: foreignThreadId,
+      message: "inbox",
+      clientRequestId: "post-1",
+    });
+    expect(retried).toEqual(posted);
+    expect(posts[0]).toMatchObject({
+      type: "message.dispatch",
+      postOnly: true,
+      createdBy: "agent",
+      creationSource: "mcp",
+      senderThreadId: parentThreadId,
+    });
     const sent = yield* service.sendToThread(makeScope(), {
       threadId: foreignThreadId,
       message: "hi",
@@ -581,6 +605,11 @@ it("readThread and sendToThread reach threads in other projects", async () => {
     const stale = yield* service
       .sendToThread(makeScope(), { threadId: foreignThreadId, message: "hi again" })
       .pipe(Effect.flip);
+    expect(
+      (yield* service
+        .postToThread(makeScope(), { threadId: foreignThreadId, message: "stale" })
+        .pipe(Effect.flip)).code,
+    ).toBe("parent_not_active");
     expect(stale.code).toBe("parent_not_active");
     const staleInterrupt = yield* service
       .interruptThread(makeScope(), { threadId: foreignThreadId })
