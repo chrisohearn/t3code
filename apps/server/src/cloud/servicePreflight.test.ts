@@ -10,6 +10,7 @@ import {
   BUILD_MIGRATION_HEAD,
   databaseMigrationHead,
 } from "../persistence/databaseMigrationHead.ts";
+import { FORK_MIGRATION_HEAD, forkMigrationManifest } from "../persistence/ForkMigrations.ts";
 import { migrationManifest } from "../persistence/Migrations.ts";
 
 import { runServicePreflight } from "./servicePreflight.ts";
@@ -32,6 +33,21 @@ it.each([1])("blocks legacy launcher protocol %i with exact recovery steps", (la
   expect(reason).toContain("t3 --version");
   expect(reason).toContain("which -a t3");
 });
+
+// regression: #34502 every installed launcher was protocol 3, so protocol 4 blocked every remote update
+it.each([3, SERVICE_LAUNCHER_PROTOCOL])(
+  "is ready under launcher protocol %i and reports it back",
+  (launcherProtocol) => {
+    // A released server accepts a ready result only when it names that server's own protocol.
+    expect(
+      runServicePreflight({
+        databasePath: "/missing/state.sqlite",
+        launcherProtocol,
+        version: "9.8.7",
+      }),
+    ).toEqual({ status: "ready", version: "9.8.7", launcherProtocol });
+  },
+);
 
 it.layer(NodeServices.layer)("service preflight database", (it) => {
   it.effect("blocks a database that a newer build migrated", () =>
@@ -74,6 +90,58 @@ it.layer(NodeServices.layer)("service preflight database", (it) => {
       // A missing database is a fresh install.
       expect(databaseMigrationHead(path.join(path.dirname(databasePath), "missing.sqlite"))).toBe(
         BUILD_MIGRATION_HEAD,
+      );
+    }),
+  );
+
+  it.effect("blocks ids another build took, unless startup moves them to the fork table", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-preflight-" });
+      const preflight = (databasePath: string) =>
+        runServicePreflight({ databasePath, launcherProtocol: SERVICE_LAUNCHER_PROTOCOL });
+      const seed = (file: string, rows: ReadonlyArray<readonly [number, string]>) => {
+        const databasePath = path.join(dir, file);
+        const db = new NodeSqlite.DatabaseSync(databasePath);
+        db.exec("CREATE TABLE effect_sql_migrations (migration_id INTEGER PRIMARY KEY, name TEXT)");
+        const insert = db.prepare("INSERT INTO effect_sql_migrations VALUES (?, ?)");
+        for (const [id, name] of rows) insert.run(id, name);
+        return { databasePath, db };
+      };
+      const [headId, headName] = migrationManifest.at(-1)!;
+
+      // Another build's migration at this build's head: startup would skip headName.
+      const collided = seed("collided.sqlite", [
+        ...migrationManifest.slice(0, -1),
+        [headId, "OtherBuildMigration"],
+      ]);
+      collided.db.close();
+      const result = preflight(collided.databasePath);
+      expect(result.status).toBe("blocked");
+      expect(result.status === "blocked" ? result.reason : "").toContain(
+        `${headId}_${headName} (recorded: OtherBuildMigration)`,
+      );
+
+      // An older fork build's McpEvents at 81: startup moves it, then upstream's ids run.
+      const legacyFork = seed("legacy-fork.sqlite", [
+        ...migrationManifest.filter(([id]) => id <= 80),
+        [81, forkMigrationManifest[0]![1]],
+      ]);
+      expect(preflight(legacyFork.databasePath).status).toBe("ready");
+
+      // A newer fork build's fork migration is unknown here.
+      legacyFork.db.exec(
+        "CREATE TABLE t3_fork_migrations (migration_id INTEGER PRIMARY KEY, name TEXT)",
+      );
+      legacyFork.db
+        .prepare("INSERT INTO t3_fork_migrations VALUES (?, ?)")
+        .run(FORK_MIGRATION_HEAD + 1, "NewerForkMigration");
+      legacyFork.db.close();
+      const newerFork = preflight(legacyFork.databasePath);
+      expect(newerFork.status).toBe("blocked");
+      expect(newerFork.status === "blocked" ? newerFork.reason : "").toContain(
+        `fork ${FORK_MIGRATION_HEAD + 1}_NewerForkMigration`,
       );
     }),
   );
