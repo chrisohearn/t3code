@@ -13,6 +13,8 @@ export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
 
 export const forkMigrationManifest = forkMigrationEntries.map(([id, name]) => [id, name] as const);
 
+export const FORK_MIGRATION_HEAD = Math.max(0, ...forkMigrationManifest.map(([id]) => id));
+
 const forkIdsByName = new Map<string, number>(
   forkMigrationManifest.map(([id, name]) => [name, id]),
 );
@@ -36,8 +38,29 @@ export function legacyForkRows(
   );
 }
 
+/** Both histories as they will be once startup's repair has moved legacy fork rows. */
+export function historyAfterForkRepair(
+  recorded: ReadonlyArray<RecordedMigration>,
+  forkRecorded: ReadonlyArray<RecordedMigration>,
+  upstreamManifest: ReadonlyArray<readonly [number, string]>,
+): {
+  readonly upstream: ReadonlyArray<RecordedMigration>;
+  readonly fork: ReadonlyArray<RecordedMigration>;
+} {
+  const legacy = legacyForkRows(recorded, upstreamManifest);
+  const fork = new Map(forkRecorded.map(({ id, name }) => [id, name]));
+  for (const { name } of legacy) {
+    const id = forkIdsByName.get(name)!;
+    if (!fork.has(id)) fork.set(id, name);
+  }
+  return {
+    upstream: recorded.filter((row) => !legacy.includes(row)),
+    fork: [...fork].map(([id, name]) => ({ id, name })).toSorted((a, b) => a.id - b.id),
+  };
+}
+
 /** Fork-table history problems that would make the fork migrator skip a migration. */
-function forkHistoryProblems(recorded: ReadonlyArray<RecordedMigration>): Array<string> {
+export function forkHistoryProblems(recorded: ReadonlyArray<RecordedMigration>): Array<string> {
   const latest = Math.max(0, ...recorded.map(({ id }) => id));
   const names = new Map(recorded.map(({ id, name }) => [id, name]));
   return forkMigrationManifest.flatMap(([id, name]) => {
