@@ -8,15 +8,22 @@ import {
   type EnvironmentId,
   type ModelSelection,
   ProviderInstanceId,
+  type ScopedThreadRef,
   type ServerProvider,
   type ThreadId,
   RuntimeMode,
 } from "@t3tools/contracts";
 import type { deriveThreadStructureRuntime } from "@t3tools/client-runtime/state/thread-execution";
-import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
 import { type SetStateAction } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { toastManager } from "../ui/toast";
+import { threadEnvironment } from "../../state/threads";
+import { useOrchestrationCommand } from "../../state/use-orchestration-command";
+import { stackedThreadToast, toastManager } from "../ui/toast";
 import { resolveAppModelSelectionForInstance } from "../../modelSelection";
 import { resolveNewDraftStartFromOrigin } from "../../lib/chatThreadActions";
 import { type DraftThreadEnvMode, useComposerDraftStore } from "../../composerDraftStore";
@@ -83,12 +90,56 @@ export function useComposerSelection(input: ComposerSelectionInput) {
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
   const applyThreadModelPick = useApplyThreadModelPick();
+  const setThreadRuntimeMode = useOrchestrationCommand(threadEnvironment.setRuntimeMode, {
+    label: "change permissions",
+  });
+
+  const applyThreadRuntimeMode = async (threadRef: ScopedThreadRef, mode: RuntimeMode) => {
+    const result = await setThreadRuntimeMode({
+      environmentId: threadRef.environmentId,
+      input: { threadId: threadRef.threadId, runtimeMode: mode },
+    });
+    const store = useComposerDraftStore.getState();
+    // A newer pick is still waiting for its own reply.
+    if (store.draftsByThreadKey[scopedThreadKey(threadRef)]?.runtimeMode !== mode) return;
+    store.setRuntimeMode(threadRef, null);
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not change permissions",
+          description: error instanceof Error ? error.message : "Try again.",
+        }),
+      );
+    }
+  };
 
   const handleRuntimeModeChange = (mode: RuntimeMode) => {
-    if (mode === runtimeMode) return;
-    setComposerDraftRuntimeMode(composerDraftTarget, mode);
-    if (isLocalDraftThread) {
-      setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
+    if (isLocalDraftThread || !activeThread) {
+      if (mode === runtimeMode) return;
+      setComposerDraftRuntimeMode(composerDraftTarget, mode);
+      if (isLocalDraftThread) {
+        setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
+      }
+      scheduleComposerFocus();
+      return;
+    }
+    const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
+    if (mode === activeThread.runtimeMode) {
+      setComposerDraftRuntimeMode(threadRef, null);
+    } else if ((activeRuntime?.activeRunId ?? null) !== null) {
+      // The server accepts it mid-run, but Claude would end its live session to apply it.
+      toastManager.add(
+        stackedThreadToast({
+          type: "warning",
+          title: "Permissions not changed",
+          description: "Wait for the current run to finish, or stop it, then change permissions.",
+        }),
+      );
+    } else {
+      setComposerDraftRuntimeMode(threadRef, mode);
+      void applyThreadRuntimeMode(threadRef, mode);
     }
     scheduleComposerFocus();
   };
