@@ -14,6 +14,7 @@ import { makeDpopKey } from "./dpop.testkit.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
+import * as McpOAuthSessions from "./McpOAuthSessions.ts";
 
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
@@ -38,7 +39,7 @@ const layerEnvironmentAuth = (overrides?: Partial<ServerConfig.ServerConfig["Ser
   EnvironmentAuth.layer.pipe(
     Layer.provide(ManagedPolicy.layerTest()),
     Layer.provideMerge(SqlitePersistence.layerMemory),
-    Layer.provide(ServerSecretStore.layer),
+    Layer.provideMerge(ServerSecretStore.layer),
     Layer.provide(ServerEnvironment.layerIdentity),
     Layer.provide(layerServerConfig(overrides)),
   );
@@ -117,6 +118,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
           }>`SELECT token_hash FROM mcp_oauth_tokens`;
           expect(tokens.every(({ token_hash }) => /^[a-f0-9]{64}$/.test(token_hash))).toBe(true);
           expect(JSON.stringify(yield* auth.listSessions())).not.toContain(issued.refreshToken);
+          const independent = yield* auth.issueMcpClientSession({
+            label: "Independent client",
+            access: "full-access",
+            peerLink: false,
+            client: { deviceType: "bot" },
+            oauth,
+          });
+          yield* TestClock.adjust("90 seconds");
           expect(
             yield* auth
               .refreshMcpClientSession({
@@ -136,111 +145,192 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
               })
               .pipe(Effect.flip),
           ).toMatchObject({ error: "invalid_grant" });
+          expect(
+            (yield* auth.authenticateMcpClient(makeBearerRequest(independent.token))).sessionId,
+          ).toBe(independent.sessionId);
         }).pipe(Effect.provide(layerEnvironmentAuth())),
     );
 
-    it.effect.each(["idle", "revoke", "rolling", "binding", "race", "legacy"] as const)(
-      "enforces MCP renewal %s",
-      (scenario) =>
-        Effect.gen(function* () {
-          const auth = yield* EnvironmentAuth.EnvironmentAuth;
-          const oauth = { clientId: "test-oauth-client", resource: "https://test.example/mcp" };
-          const issued = yield* auth.issueMcpClientSession({
-            label: "Test outside client",
-            access: "approval-required",
-            peerLink: false,
-            client: { deviceType: "bot" },
-            ...(scenario === "legacy" ? {} : { oauth }),
+    it.effect.each([
+      "idle",
+      "revoke",
+      "rolling",
+      "binding",
+      "race",
+      "retry",
+      "revoked-retry",
+      "legacy-rotation",
+      "legacy",
+    ] as const)("enforces MCP renewal %s", (scenario) =>
+      Effect.gen(function* () {
+        const auth = yield* EnvironmentAuth.EnvironmentAuth;
+        const oauth = { clientId: "test-oauth-client", resource: "https://test.example/mcp" };
+        const issued = yield* auth.issueMcpClientSession({
+          label: "Test outside client",
+          access: "approval-required",
+          peerLink: false,
+          client: { deviceType: "bot" },
+          ...(scenario === "legacy" ? {} : { oauth }),
+        });
+        const refresh = (
+          refreshToken: string,
+          clientId = oauth.clientId,
+          resource = oauth.resource,
+        ) =>
+          auth.refreshMcpClientSession({
+            clientId,
+            resource,
+            refreshToken: Redacted.make(refreshToken),
           });
-          const refresh = (
-            refreshToken: string,
-            clientId = oauth.clientId,
-            resource = oauth.resource,
-          ) =>
-            auth.refreshMcpClientSession({
-              clientId,
-              resource,
-              refreshToken: Redacted.make(refreshToken),
-            });
-          if (scenario === "legacy") {
-            expect(issued.refreshToken).toBeUndefined();
-            yield* TestClock.adjust("29 days");
-            expect(
-              (yield* auth.authenticateMcpClient(makeBearerRequest(issued.token))).sessionId,
-            ).toBe(issued.sessionId);
-            yield* TestClock.adjust("1 day");
-            expect(
-              yield* auth.authenticateMcpClient(makeBearerRequest(issued.token)).pipe(Effect.flip),
-            ).toMatchObject({ _tag: "ServerAuthInvalidCredentialError" });
-            return;
-          }
-          if (scenario === "race") {
-            const results = yield* Effect.all(
-              [
-                refresh(issued.refreshToken!).pipe(Effect.result),
-                refresh(issued.refreshToken!).pipe(Effect.result),
-              ],
-              { concurrency: "unbounded" },
-            );
-            expect(results.filter((result) => result._tag === "Success")).toHaveLength(1);
-            expect(results.filter((result) => result._tag === "Failure")).toHaveLength(1);
-            expect(
-              (yield* auth.listSessions()).some(
-                (session) => session.sessionId === issued.sessionId,
-              ),
-            ).toBe(false);
-            return;
-          }
-          if (scenario === "binding") {
-            for (const scope of [
-              "orchestration:read",
-              "orchestration:read orchestration:operate offline_access",
-            ]) {
-              expect(
-                yield* auth
-                  .refreshMcpClientSession({
-                    ...oauth,
-                    refreshToken: Redacted.make(issued.refreshToken!),
-                    scope,
-                  })
-                  .pipe(Effect.flip),
-              ).toMatchObject({ error: "invalid_scope" });
-            }
-            expect(
-              yield* refresh(issued.refreshToken!, "another-client").pipe(Effect.flip),
-            ).toMatchObject({ error: "invalid_grant" });
-            expect(
-              yield* refresh(
-                issued.refreshToken!,
-                oauth.clientId,
-                "https://other.example/mcp",
-              ).pipe(Effect.flip),
-            ).toMatchObject({ error: "invalid_grant" });
-            expect((yield* refresh(issued.refreshToken!)).sessionId).toBe(issued.sessionId);
-            return;
-          }
-          if (scenario === "revoke") yield* auth.revokeSession(issued.sessionId);
-          if (scenario === "idle") yield* TestClock.adjust("30 days");
-          if (scenario !== "rolling") {
-            expect(yield* refresh(issued.refreshToken!).pipe(Effect.flip)).toMatchObject({
-              error: "invalid_grant",
-            });
-            return;
-          }
+        if (scenario === "legacy") {
+          expect(issued.refreshToken).toBeUndefined();
           yield* TestClock.adjust("29 days");
+          expect(
+            (yield* auth.authenticateMcpClient(makeBearerRequest(issued.token))).sessionId,
+          ).toBe(issued.sessionId);
+          yield* TestClock.adjust("1 day");
+          expect(
+            yield* auth.authenticateMcpClient(makeBearerRequest(issued.token)).pipe(Effect.flip),
+          ).toMatchObject({ _tag: "ServerAuthInvalidCredentialError" });
+          return;
+        }
+        if (scenario === "race") {
+          const results = yield* Effect.all(
+            [refresh(issued.refreshToken!), refresh(issued.refreshToken!)],
+            { concurrency: "unbounded" },
+          );
+          expect(results[0]).toEqual(results[1]);
+          expect(results[0]!.sessionId).toBe(issued.sessionId);
+          expect(
+            (yield* auth.authenticateMcpClient(makeBearerRequest(results[0]!.token))).sessionId,
+          ).toBe(issued.sessionId);
+          const sql = yield* SqlClient.SqlClient;
+          expect(yield* sql`SELECT count(*) AS n FROM mcp_oauth_tokens`).toEqual([{ n: 4 }]);
+          return;
+        }
+        if (scenario === "legacy-rotation") {
           const renewed = yield* refresh(issued.refreshToken!);
-          yield* TestClock.adjust("30 minutes");
+          const sql = yield* SqlClient.SqlClient;
+          // A random successor from an older build cannot match the new derivation.
+          yield* sql`UPDATE mcp_oauth_tokens SET used_at = used_at - 1 WHERE used_at IS NOT NULL`;
+          expect(yield* refresh(issued.refreshToken!).pipe(Effect.flip)).toMatchObject({
+            error: "invalid_grant",
+          });
           expect(
             (yield* auth.authenticateMcpClient(makeBearerRequest(renewed.token))).sessionId,
           ).toBe(issued.sessionId);
-          yield* TestClock.adjust(30 * 86400_000 - 15 * 60_000);
-          const again = yield* refresh(renewed.refreshToken!);
-          expect(again.sessionId).toBe(issued.sessionId);
-          yield* TestClock.adjust("30 days");
-          expect(yield* refresh(again.refreshToken!).pipe(Effect.flip)).toMatchObject({
+          yield* TestClock.adjust("90 seconds");
+          expect(yield* refresh(issued.refreshToken!).pipe(Effect.flip)).toMatchObject({
             error: "invalid_grant",
           });
-        }).pipe(Effect.provide(layerEnvironmentAuth())),
+          expect(
+            yield* auth.authenticateMcpClient(makeBearerRequest(renewed.token)).pipe(Effect.flip),
+          ).toMatchObject({ _tag: "ServerAuthInvalidCredentialError" });
+          return;
+        }
+        if (scenario === "retry" || scenario === "revoked-retry") {
+          const renewed = yield* refresh(issued.refreshToken!);
+          if (scenario === "revoked-retry") {
+            yield* auth.revokeSession(issued.sessionId);
+            expect(yield* refresh(issued.refreshToken!).pipe(Effect.flip)).toMatchObject({
+              error: "invalid_grant",
+            });
+            expect(
+              yield* auth.authenticateMcpClient(makeBearerRequest(renewed.token)).pipe(Effect.flip),
+            ).toMatchObject({ _tag: "ServerAuthInvalidCredentialError" });
+            return;
+          }
+          const sql = yield* SqlClient.SqlClient;
+          const before =
+            yield* sql`SELECT token_hash, used_at FROM mcp_oauth_tokens WHERE kind = 'refresh' ORDER BY token_hash`;
+          yield* TestClock.adjust("80 seconds");
+          const retry = { ...oauth, refreshToken: Redacted.make(issued.refreshToken!) };
+          const restored = yield* McpOAuthSessions.McpOAuthSessions.pipe(
+            Effect.flatMap((sessions) => sessions.refresh(retry)),
+            Effect.provide(Layer.fresh(McpOAuthSessions.layer)),
+          );
+          expect(restored).toEqual(renewed);
+          expect(
+            yield* refresh(issued.refreshToken!, "another-client").pipe(Effect.flip),
+          ).toMatchObject({ error: "invalid_grant" });
+          expect(
+            yield* refresh(issued.refreshToken!, oauth.clientId, "https://other.example/mcp").pipe(
+              Effect.flip,
+            ),
+          ).toMatchObject({ error: "invalid_grant" });
+          expect(
+            yield* auth
+              .refreshMcpClientSession({ ...retry, scope: "orchestration:read" })
+              .pipe(Effect.flip),
+          ).toMatchObject({ error: "invalid_scope" });
+          yield* TestClock.adjust("9 seconds");
+          expect(yield* refresh(issued.refreshToken!)).toEqual(renewed);
+          expect(yield* sql`SELECT count(*) AS n FROM mcp_oauth_tokens`).toEqual([{ n: 4 }]);
+          expect(
+            yield* sql`SELECT token_hash, used_at FROM mcp_oauth_tokens WHERE kind = 'refresh' ORDER BY token_hash`,
+          ).toEqual(before);
+          expect(
+            yield* sql`SELECT expires_at FROM auth_sessions WHERE session_id = ${issued.sessionId}`,
+          ).toEqual([
+            { expires_at: DateTime.formatIso(DateTime.add(yield* DateTime.now, { days: 30 })) },
+          ]);
+          yield* TestClock.adjust("1 second");
+          expect(yield* refresh(issued.refreshToken!).pipe(Effect.flip)).toMatchObject({
+            error: "invalid_grant",
+          });
+          expect(
+            yield* auth.authenticateMcpClient(makeBearerRequest(renewed.token)).pipe(Effect.flip),
+          ).toMatchObject({ _tag: "ServerAuthInvalidCredentialError" });
+          return;
+        }
+        if (scenario === "binding") {
+          for (const scope of [
+            "orchestration:read",
+            "orchestration:read orchestration:operate offline_access",
+          ]) {
+            expect(
+              yield* auth
+                .refreshMcpClientSession({
+                  ...oauth,
+                  refreshToken: Redacted.make(issued.refreshToken!),
+                  scope,
+                })
+                .pipe(Effect.flip),
+            ).toMatchObject({ error: "invalid_scope" });
+          }
+          expect(
+            yield* refresh(issued.refreshToken!, "another-client").pipe(Effect.flip),
+          ).toMatchObject({ error: "invalid_grant" });
+          expect(
+            yield* refresh(issued.refreshToken!, oauth.clientId, "https://other.example/mcp").pipe(
+              Effect.flip,
+            ),
+          ).toMatchObject({ error: "invalid_grant" });
+          expect((yield* refresh(issued.refreshToken!)).sessionId).toBe(issued.sessionId);
+          return;
+        }
+        if (scenario === "revoke") yield* auth.revokeSession(issued.sessionId);
+        if (scenario === "idle") yield* TestClock.adjust("30 days");
+        if (scenario !== "rolling") {
+          expect(yield* refresh(issued.refreshToken!).pipe(Effect.flip)).toMatchObject({
+            error: "invalid_grant",
+          });
+          return;
+        }
+        yield* TestClock.adjust("29 days");
+        const renewed = yield* refresh(issued.refreshToken!);
+        yield* TestClock.adjust("30 minutes");
+        expect(
+          (yield* auth.authenticateMcpClient(makeBearerRequest(renewed.token))).sessionId,
+        ).toBe(issued.sessionId);
+        yield* TestClock.adjust(30 * 86400_000 - 15 * 60_000);
+        const again = yield* refresh(renewed.refreshToken!);
+        expect(again.sessionId).toBe(issued.sessionId);
+        yield* TestClock.adjust("30 days");
+        expect(yield* refresh(again.refreshToken!).pipe(Effect.flip)).toMatchObject({
+          error: "invalid_grant",
+        });
+      }).pipe(Effect.provide(layerEnvironmentAuth())),
     );
 
     it.effect("uses the reusable dev cookie without overriding a normal scoped cookie", () =>
