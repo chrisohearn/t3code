@@ -1624,7 +1624,7 @@ export function threadShellFromProjection(
       pendingRuntimeRequest = waitingCard;
     }
   }
-  const latestUserMessage = userMessages[0] ?? null;
+  const latestUserMessage = userMessages.find((message) => !message.posted) ?? null;
   const pendingBackgroundTasks = derivePendingBackgroundWork({
     latestRun,
     providerThreads: projection.providerThreads,
@@ -6638,6 +6638,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 FROM orchestration_v2_projection_messages message
                 WHERE message.thread_id = t.thread_id
                   AND message.role = 'user'
+                  AND COALESCE(json_extract(message.payload_json, '$.posted'), 0) = 0
                   AND NOT ${isIdleCompactionMessage("message")}
                 ORDER BY message.updated_at DESC, message.message_id DESC
                 LIMIT 1
@@ -6888,6 +6889,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 SELECT message.updated_at
                 FROM orchestration_v2_projection_messages message
                 WHERE message.thread_id = t.thread_id AND message.role = 'user'
+                  AND COALESCE(json_extract(message.payload_json, '$.posted'), 0) = 0
                   AND NOT ${isIdleCompactionMessage("message")}
                 ORDER BY message.updated_at DESC, message.message_id DESC
                 LIMIT 1
