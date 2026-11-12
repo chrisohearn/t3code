@@ -827,6 +827,13 @@ describe("orchestrator MCP toolkit", () => {
             WHERE thread_id = ${delegated.childThreadId} AND turn_item_id IN (
               SELECT turn_item_id FROM orchestration_v2_projection_turn_items
               WHERE thread_id = ${delegated.childThreadId} AND json_extract(payload_json, '$.messageId') = ${postId})`;
+          yield* sql`UPDATE orchestration_v2_projection_turn_items
+            SET updated_at = '2099-01-01T00:00:00.000Z'
+            WHERE thread_id = ${delegated.childThreadId}
+              AND turn_item_id NOT IN (
+                SELECT turn_item_id FROM orchestration_v2_projection_turn_items
+                WHERE thread_id = ${delegated.childThreadId}
+                  AND json_extract(payload_json, '$.inputIntent') = 'post')`;
           const tail = yield* readPosts({
             afterPosition: beforePost.thread.itemCount - 1,
             sinceRevision: beforePost.revision,
