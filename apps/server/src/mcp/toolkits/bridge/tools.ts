@@ -5,7 +5,7 @@ import * as Invocation from "../../McpInvocationContext.ts";
 export const BridgeToolkit = Toolkit.make(
   Tool.make("bridge_status", {
     description:
-      "Read this outside MCP sign-in's expiry, event subscriptions, last successful webhook and exhausted retries. Per-tool calls, errors and response bytes count since this server started. Never returns callback secrets.",
+      "Read this outside MCP sign-in's expiry, event subscriptions, last successful webhook and exhausted retries. Per-tool calls, errors and response bytes count since this server started. Linked environments include a fresh identity probe result and check time; null means links are disabled or unavailable. Never returns callback secrets.",
     parameters: Tool.EmptyParams,
     success: Bridge.BridgeStatusResult,
     failure: OrchestratorMcpFailure,
