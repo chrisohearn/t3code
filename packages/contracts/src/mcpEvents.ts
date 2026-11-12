@@ -39,13 +39,22 @@ export const McpEventUnsubscribe = Schema.Union([
   McpEventUnsubscribeById,
 ]);
 export type McpEventUnsubscribe = typeof McpEventUnsubscribe.Type;
+export const McpEventReplayInput = McpEventUnsubscribeById;
+export const McpEventReplayResult = Schema.Struct({ replayed: Schema.Number });
+export const McpEventInboxInput = Schema.Struct({ threadId: Schema.NullOr(ThreadId) });
+export type McpEventInboxInput = typeof McpEventInboxInput.Type;
+export const McpEventInboxResult = Schema.Struct({ inboxThreadId: Schema.NullOr(ThreadId) });
+export type McpEventInboxResult = typeof McpEventInboxResult.Type;
 export const McpEventSubscriptionsResult = Schema.Struct({
+  ...McpEventInboxResult.fields,
   subscriptions: Schema.Array(
     Schema.Struct({
       id: Schema.String,
       name: McpEventName,
       arguments: McpEventArguments,
       callbackOrigin: Schema.String,
+      callbackGroup: Schema.String,
+      notifyDerived: Schema.Boolean,
       status: Schema.Literals(["active", "stopped", "expired"]),
       expiresAt: Schema.String,
       cursor: Schema.String,
@@ -53,6 +62,13 @@ export const McpEventSubscriptionsResult = Schema.Struct({
   ),
 });
 export type McpEventSubscriptionsResult = typeof McpEventSubscriptionsResult.Type;
+
+export const McpEventWatch = Schema.Struct({
+  callbackGroup: Schema.String,
+  callbackOrigin: Schema.String,
+  subscriptionIds: Schema.Array(Schema.String),
+  soonestExpiry: Schema.String,
+});
 
 export const McpEventSubscriptionResult = Schema.Struct({
   id: Schema.String,
@@ -97,9 +113,11 @@ export const McpThreadNotify = Schema.Struct({
 });
 export type McpThreadNotify = typeof McpThreadNotify.Type;
 export const McpThreadNotifyResult = Schema.Struct({
-  status: Schema.Literals(["subscribed", "unavailable", "failed"]),
-  subscriptionIds: Schema.Array(Schema.String),
+  status: Schema.Literals(["bound", "subscribed", "unavailable", "failed"]),
   refreshBefore: Schema.optional(Schema.String),
+  inboxThreadId: Schema.optional(ThreadId),
+  relay: Schema.optional(Schema.String),
+  subscriptionIds: Schema.Array(Schema.String),
   reason: Schema.optional(Schema.String),
 });
 export type McpThreadNotifyResult = typeof McpThreadNotifyResult.Type;

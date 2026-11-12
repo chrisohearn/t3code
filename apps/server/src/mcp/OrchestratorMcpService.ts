@@ -3367,9 +3367,12 @@ const make = Effect.gen(function* () {
                 ),
           ),
         );
-      const notify = yield* ThreadNotifications.finish(notification, input.threadId).pipe(
-        Effect.provideService(Invocation.McpInvocationContext, scope),
-      );
+      const notify = yield* ThreadNotifications.finish(
+        notification,
+        input.threadId,
+        result.run.id,
+        input.clientRequestId,
+      ).pipe(Effect.provideService(Invocation.McpInvocationContext, scope));
       return {
         ...(notify === undefined ? {} : { notify }),
         threadId: input.threadId,

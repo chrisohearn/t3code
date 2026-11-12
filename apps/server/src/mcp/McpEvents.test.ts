@@ -2,6 +2,7 @@ import * as ConnectReachability from "../cloud/ConnectReachability.ts";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import type { EnvironmentConnectReachability } from "@t3tools/contracts";
+import * as Relay from "./McpEventRelay.ts";
 import * as ThreadNotifications from "./ThreadNotifications.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -44,7 +45,7 @@ import * as Sqlite from "../persistence/Sqlite.ts";
 import * as McpEvents from "./McpEvents.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as Webhook from "./McpEventsWebhook.ts";
-import { liveThreadShell } from "./McpToolAccess.testkit.ts";
+import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const environmentId = EnvironmentId.make("events-test-environment");
 const secret = Redacted.make(`whsec_${Buffer.alloc(32, 7).toString("base64")}`);
@@ -72,6 +73,7 @@ const fixture = Effect.gen(function* () {
   const deliveries = Context.get(context, Deliveries.McpEventDeliveries);
   const store = Context.get(context, EventStore.OrchestrationEventStore);
   const deleted = new Set<string>();
+  const projections = new Map<string, ReturnType<typeof idleThreadProjection>>();
   const sent: Array<Parameters<Webhook.McpEventsWebhook["Service"]["send"]>[0]> = [];
   const delivered =
     yield* Queue.unbounded<Parameters<Webhook.McpEventsWebhook["Service"]["send"]>[0]>();
@@ -86,32 +88,57 @@ const fixture = Effect.gen(function* () {
     hint: null,
     fix: "Connect",
   };
+  const inboxSends: Array<
+    Parameters<ThreadManagement.ThreadManagementService["Service"]["sendToThread"]>[0]
+  > = [];
+  let sendWork: Effect.Effect<void, McpEventsError> = Effect.void;
+  const writable = new Set<string>();
+  const dependencies = Layer.mergeAll(
+    Layer.succeed(ConnectReachability.ConnectReachability, {
+      latest: Effect.sync(() => Option.some(tunnel)),
+      check: Effect.sync(() => tunnel),
+    }),
+    Layer.mock(ThreadManagement.ThreadManagementService)({
+      sendToThread: (input) =>
+        Effect.sync(() => {
+          inboxSends.push(input);
+        }).pipe(
+          Effect.andThen(Effect.suspend(() => sendWork)),
+          Effect.mapError(
+            () =>
+              new ThreadManagement.ThreadManagementThreadArchivedError({
+                threadId: input.threadId,
+              }),
+          ),
+          // The relay consumes the receipt only through the send service's durable ids.
+          Effect.as(
+            {} as Effect.Success<
+              ReturnType<ThreadManagement.ThreadManagementService["Service"]["sendToThread"]>
+            >,
+          ),
+        ),
+      getThreadRecords: (id) =>
+        Effect.succeed(projections.get(id) ?? idleThreadProjection(liveThreadShell(id))),
+      getThreadShell: (id) => Effect.succeed(deleted.has(id) ? null : liveThreadShell(id)),
+    }),
+    Layer.mock(ServerEnvironment.ServerEnvironment)({
+      getEnvironmentId: Effect.succeed(environmentId),
+    }),
+    Layer.succeed(Webhook.McpEventsWebhook, {
+      verify: (input) =>
+        Effect.sync(() => {
+          verify.push(input);
+        }).pipe(Effect.andThen(Effect.suspend(() => verificationWork))),
+      send: (input) =>
+        Effect.sync(() => {
+          sent.push(input);
+          return responses.get(input.id) ?? 204;
+        }).pipe(Effect.tap(() => Queue.offer(delivered, input))),
+    }),
+  );
   const layer = McpEvents.layer.pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        Layer.succeed(ConnectReachability.ConnectReachability, {
-          latest: Effect.sync(() => Option.some(tunnel)),
-          check: Effect.sync(() => tunnel),
-        }),
-        Layer.mock(ThreadManagement.ThreadManagementService)({
-          getThreadShell: (id) => Effect.succeed(deleted.has(id) ? null : liveThreadShell(id)),
-        }),
-        Layer.mock(ServerEnvironment.ServerEnvironment)({
-          getEnvironmentId: Effect.succeed(environmentId),
-        }),
-        Layer.succeed(Webhook.McpEventsWebhook, {
-          verify: (input) =>
-            Effect.sync(() => {
-              verify.push(input);
-            }).pipe(Effect.andThen(Effect.suspend(() => verificationWork))),
-          send: (input) =>
-            Effect.sync(() => {
-              sent.push(input);
-              return responses.get(input.id) ?? 204;
-            }).pipe(Effect.tap(() => Queue.offer(delivered, input))),
-        }),
-      ),
-    ),
+    Layer.provide(Relay.layer.pipe(Layer.provide(dependencies))),
+    Layer.provide(dependencies),
   );
   const build = () =>
     Layer.build(layer).pipe(
@@ -142,7 +169,11 @@ const fixture = Effect.gen(function* () {
     environmentId,
     requestNamespace: sessionId,
     thread: undefined,
-    client: { sessionId, label: "test", access: "read-only" },
+    client: {
+      sessionId,
+      label: "test",
+      access: writable.has(sessionId) ? "full-access" : "read-only",
+    },
     capabilities: new Set(["orchestration"]),
     issuedAt: 0,
   });
@@ -164,8 +195,55 @@ const fixture = Effect.gen(function* () {
         },
       })),
     });
+  const outcome = (
+    threadId: ThreadId,
+    runId: RunId,
+    suffix = "",
+    userMessageId = MessageId.make("source-message"),
+  ) => {
+    const now = DateTime.makeUnsafe(1);
+    return store.appendAgentEvents({
+      events: [
+        {
+          id: EventId.make(`outcome-${runId}${suffix}`),
+          threadId,
+          occurredAt: now,
+          type: "run.updated",
+          payload: {
+            id: runId,
+            threadId,
+            ordinal: 1,
+            providerInstanceId: ProviderInstanceId.make("replay"),
+            modelSelection: { instanceId: ProviderInstanceId.make("replay"), model: "fixture" },
+            providerThreadId: null,
+            userMessageId,
+            rootNodeId: null,
+            activeAttemptId: null,
+            status: "failed",
+            requestedAt: now,
+            startedAt: now,
+            completedAt: now,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        },
+      ],
+    });
+  };
   return {
     context,
+    outcome,
+    inboxSends,
+    projections,
+    grantWrite: (principal: AuthSessionId) =>
+      Effect.gen(function* () {
+        writable.add(principal);
+        const sql = Context.get(context, SqlClient.SqlClient);
+        yield* sql`UPDATE auth_sessions SET scopes = ${JSON.stringify(mcpClientScopes("full-access"))} WHERE session_id = ${principal}`;
+      }),
+    setSendWork: (work: Effect.Effect<void, McpEventsError>) => {
+      sendWork = work;
+    },
     service,
     build,
     call,
@@ -192,99 +270,202 @@ const fixture = Effect.gen(function* () {
 });
 
 it.effect(
-  "notify delivers an immediately completed run from the cursor captured before launch or send",
+  "binds notify to a pinned inbox without creating subscriptions and survives rebuild",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
         const f = yield* fixture;
-        const source = ThreadId.make("source");
-        const invoke = <A, E, R>(
-          effect: Effect.Effect<A, E, R | Invocation.McpInvocationContext | McpEvents.McpEvents>,
-        ) =>
-          effect.pipe(
+        yield* f.grantWrite(f.principal);
+        const threadId = ThreadId.make("source");
+        const inbox = ThreadId.make("inbox");
+        const runId = RunId.make("source-run");
+        expect(yield* f.call(f.service.prepareNotify({}))).toMatchObject({
+          status: "unavailable",
+          reason: "no_pinned_inbox",
+        });
+        yield* f.call(f.service.setInbox({ threadId: inbox }));
+        expect((yield* f.call(f.service.listSubscriptions())).inboxThreadId).toBe(inbox);
+        const notification = yield* f.call(
+          ThreadNotifications.prepare({}).pipe(
             Effect.provideService(McpEvents.McpEvents, f.service),
-            Effect.provideService(Invocation.McpInvocationContext, f.scope()),
-          );
-        expect(
-          yield* invoke(
-            ThreadNotifications.finish(yield* invoke(ThreadNotifications.prepare({})), source),
-          ),
-        ).toMatchObject({ status: "unavailable", reason: "no_active_subscription" });
-        yield* f.call(f.service.subscribe(inputFor(source)));
-        let sendSubscriptions: ReadonlyArray<string> = [];
-        for (const operation of ["launch", "send", "send-again"]) {
-          const threadId = ThreadId.make(
-            `immediate-${operation.startsWith("send") ? "send" : "launch"}`,
-          );
-          // A lapsed subscription is replaced at the new cursor, not resumed to replay old runs.
-          if (operation === "send-again")
-            for (const id of sendSubscriptions)
-              yield* f.subscriptions.stop(id, f.scope().client!.sessionId);
-          const prepared = yield* invoke(ThreadNotifications.prepare({}));
-          const now = DateTime.makeUnsafe(1);
-          yield* f.store.appendAgentEvents({
-            events: [
-              {
-                id: EventId.make(`immediate-${operation}`),
-                threadId,
-                occurredAt: now,
-                type: "run.updated",
-                payload: {
-                  id: RunId.make(`run-${operation}`),
-                  threadId,
-                  ordinal: 1,
-                  providerInstanceId: ProviderInstanceId.make("replay"),
-                  modelSelection: {
-                    instanceId: ProviderInstanceId.make("replay"),
-                    model: "fixture",
-                  },
-                  providerThreadId: null,
-                  userMessageId: MessageId.make(`message-${operation}`),
-                  rootNodeId: null,
-                  activeAttemptId: null,
-                  status: "completed",
-                  requestedAt: now,
-                  startedAt: now,
-                  completedAt: now,
-                  checkpointId: null,
-                  contextHandoffId: null,
-                },
-              },
-            ],
-          });
-          const notified = yield* invoke(ThreadNotifications.finish(prepared, threadId));
-          expect(notified).toMatchObject({
-            status: "subscribed",
-            subscriptionIds: expect.any(Array),
-            refreshBefore: expect.any(String),
-          });
-          if (operation === "send") sendSubscriptions = notified!.subscriptionIds;
-          yield* f.service.drain();
-          const delivered = f.sent.find((delivery) => delivery.id === `immediate-${operation}`);
-          expect(delivered).toBeDefined();
-          expect(json(delivered!.body)).toMatchObject({
-            name: "thread.run.result",
-            data: { threadId, state: "completed" },
-          });
-        }
-        expect(f.sent.filter((delivery) => delivery.id === "immediate-send")).toHaveLength(1);
-        // A notify near its source's expiry still gets a full day, not the source's remainder.
-        yield* TestClock.adjust("23 hours");
-        const late = yield* invoke(
-          ThreadNotifications.finish(
-            yield* invoke(ThreadNotifications.prepare({})),
-            ThreadId.make("late"),
           ),
         );
-        expect(late).toMatchObject({
-          refreshBefore: DateTime.formatIso(
-            DateTime.makeUnsafe((yield* Clock.currentTimeMillis) + 86_400_000),
-          ),
+        const now = DateTime.makeUnsafe(1);
+        const records = idleThreadProjection(liveThreadShell(threadId));
+        f.projections.set(threadId, {
+          ...records,
+          thread: {
+            ...records.thread,
+            linkedPullRequest: {
+              projectId: records.thread.projectId,
+              repository: "acme/app",
+              number: 1,
+              url: "https://github.com/acme/app/pull/1",
+            },
+          },
+          messages: [
+            {
+              id: MessageId.make("answer"),
+              threadId,
+              runId,
+              nodeId: null,
+              role: "assistant",
+              text: "é".repeat(800),
+              attachments: [],
+              streaming: false,
+              createdAt: now,
+              updatedAt: now,
+              createdBy: "agent",
+              creationSource: "provider",
+            },
+          ],
         });
-        expect(yield* f.call(f.service.prepareNotify({}), f.other)).toMatchObject({
-          status: "unavailable",
-          reason: "no_active_subscription",
+        yield* f.store.appendAgentEvents({
+          events: [
+            {
+              id: EventId.make("source-outcome"),
+              threadId,
+              occurredAt: now,
+              type: "run.updated",
+              payload: {
+                id: runId,
+                threadId,
+                ordinal: 1,
+                providerInstanceId: ProviderInstanceId.make("replay"),
+                modelSelection: { instanceId: ProviderInstanceId.make("replay"), model: "fixture" },
+                providerThreadId: null,
+                userMessageId: MessageId.make("source-message"),
+                rootNodeId: null,
+                activeAttemptId: null,
+                status: "failed",
+                requestedAt: now,
+                startedAt: now,
+                completedAt: now,
+                checkpointId: null,
+                contextHandoffId: null,
+              },
+            },
+          ],
         });
+        expect(
+          yield* f.call(ThreadNotifications.finish(notification, threadId, runId, "ledger/key")),
+        ).toMatchObject({
+          status: "bound",
+          inboxThreadId: inbox,
+          relay: "relay: inbox inbox",
+          subscriptionIds: [],
+        });
+        const rebuilt = yield* f.build();
+        yield* rebuilt.drain();
+        yield* f.outcome(threadId, runId, "-second-terminal");
+        yield* rebuilt.drain();
+        expect(f.inboxSends).toHaveLength(1);
+        expect(f.sent).toHaveLength(0);
+        expect((yield* f.call(rebuilt.listSubscriptions())).subscriptions).toHaveLength(0);
+        expect(f.inboxSends[0]).toMatchObject({
+          threadId: inbox,
+          mode: "queue",
+          commandId: expect.stringMatching(/^relay:/),
+        });
+        const body = json(f.inboxSends[0]!.text.slice("[T3 event relay]\n".length));
+        expect(body).toMatchObject({
+          sourceEventId: "source-outcome",
+          eventName: "thread.blocker",
+          threadId,
+          runId,
+          ledgerKey: "ledger/key",
+          threadTitle: expect.any(String),
+          resultExcerpt: "é".repeat(512),
+          pullRequestUrls: ["https://github.com/acme/app/pull/1"],
+        });
+        yield* f.call(rebuilt.setInbox({ threadId: null }));
+        expect(yield* f.call(rebuilt.prepareNotify({}))).toMatchObject({
+          reason: "no_pinned_inbox",
+        });
+        expect(
+          (yield* f.call(f.service.setInbox({ threadId: inbox }), f.other).pipe(Effect.flip))
+            .reason,
+        ).toBe("access_denied");
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect(
+  "keeps relay retry identities stable across a restart and never relays its inbox run",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const source = ThreadId.make("retry-source");
+        const inbox = ThreadId.make("retry-inbox");
+        const run = RunId.make("retry-run");
+        yield* f.call(f.service.setInbox({ threadId: inbox }));
+        const prepared = yield* f.call(f.service.prepareNotify({}));
+        if ("status" in prepared) throw new Error("Expected pinned inbox");
+        yield* f.call(f.service.notifyThread(prepared, source, run));
+        yield* f.outcome(source, run);
+        f.setSendWork(
+          Effect.fail(new McpEventsError({ code: -32603, reason: "receipt_response_lost" })),
+        );
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(1);
+        expect(yield* f.call(f.service.bridgeStatus())).toMatchObject({
+          relayFailures: 1,
+          relayPending: 1,
+          relayLastError: "inbox_send_failed",
+        });
+        f.setSendWork(Effect.void);
+        yield* TestClock.adjust("1 second");
+        const rebuilt = yield* f.build();
+        yield* rebuilt.drain();
+        expect(f.inboxSends).toHaveLength(2);
+        expect(f.inboxSends[1]?.commandId).toBe(f.inboxSends[0]?.commandId);
+        expect(f.inboxSends[1]?.messageId).toBe(f.inboxSends[0]?.messageId);
+        const inboxRun = RunId.make("relay-generated-run");
+        yield* f.call(rebuilt.notifyThread(prepared, inbox, inboxRun));
+        yield* f.outcome(inbox, inboxRun, "", f.inboxSends[0]!.messageId);
+        yield* rebuilt.drain();
+        expect(f.inboxSends).toHaveLength(2);
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect(
+  "rechecks relay authority and deduplicates exhausted webhook alerts and replay by principal",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const inbox = ThreadId.make("alerts-inbox");
+        const source = ThreadId.make("exhausted-source");
+        yield* f.call(f.service.setInbox({ threadId: inbox }));
+        const sub = yield* f.call(f.service.subscribe(inputFor(source)));
+        yield* f.append([source]);
+        f.responses.set("event-0", 503);
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* f.service.drain();
+        yield* sql`UPDATE mcp_event_deliveries SET attempts = 8, next_attempt_at = 0 WHERE subscription_id = ${sub.id}`;
+        yield* f.service.drain();
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(1);
+        expect(f.inboxSends[0]?.text).toContain('"relay":"delivery-alert"');
+        yield* TestClock.adjust("1 day");
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(2);
+        expect(f.inboxSends[1]?.messageId).not.toBe(f.inboxSends[0]?.messageId);
+        expect(
+          (yield* f.call(f.service.replay({ id: sub.id }), f.other).pipe(Effect.flip)).reason,
+        ).toBe("access_denied");
+        expect(yield* f.call(f.service.replay({ id: sub.id }))).toEqual({ replayed: 1 });
+        expect(yield* f.call(f.service.replay({ id: sub.id }))).toEqual({ replayed: 0 });
+        yield* f.sessions.revoke({ sessionId: f.principal, revokedAt: DateTime.makeUnsafe(0) });
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(2);
+        const status =
+          yield* sql`SELECT status, last_error FROM mcp_event_relay_outbox WHERE alert = 0`;
+        expect(status).toEqual([{ status: "failed", last_error: "access_denied" }]);
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );
@@ -854,14 +1035,26 @@ it.effect(
             name: input.name,
             arguments: input.arguments,
             callbackOrigin: "https://callbacks.example.com",
+            callbackGroup: expect.stringMatching(/^watch_[0-9a-f]{64}$/),
+            notifyDerived: false,
             status: "active",
             expiresAt: "1970-01-02T00:00:00.000Z",
             cursor: "0",
           },
         ]);
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`DELETE FROM mcp_event_subscription_routing WHERE subscription_id = ${own.id}`;
+        expect((yield* f.call(f.service.listSubscriptions())).subscriptions[0]?.notifyDerived).toBe(
+          false,
+        );
+        expect((yield* f.call(f.service.prepareNotify({})).pipe(Effect.flip)).reason).toBe(
+          "access_denied",
+        );
         expect(encode(listed)).not.toContain(Redacted.value(secret));
         expect(encode(listed)).not.toContain(input.delivery.url);
-        yield* f.call(f.service.unsubscribe({ id: own.id }), f.other);
+        expect(
+          (yield* f.call(f.service.unsubscribe({ id: own.id }), f.other).pipe(Effect.flip)).reason,
+        ).toBe("access_denied");
         expect(yield* f.subscriptions.get(own.id)).toBeDefined();
         yield* f.append([input.arguments.threadId]);
         f.responses.set("event-0", 503);
@@ -1049,25 +1242,19 @@ it.effect(
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
-it.effect("keeps notify-only expiry fixed while renewing its explicit source on delivery", () =>
+it.effect("retains a legacy positive renewal grant when classifying a notify-derived row", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const f = yield* fixture;
-      const input = inputFor(ThreadId.make("explicit-source"));
-      const source = yield* f.call(f.service.subscribe(input));
-      const prepared = yield* f.call(
-        f.service.prepareNotify({ events: ["thread.resource-released"] }),
-      );
-      if ("status" in prepared) throw new Error("Expected an active source");
-      const notifiedThread = ThreadId.make("notify-only");
-      const notified = yield* f.call(f.service.notifyThread(prepared, notifiedThread));
+      const source = yield* f.call(f.service.subscribe(inputFor(ThreadId.make("legacy-explicit"))));
+      const copy = yield* f.call(f.service.subscribe(inputFor(ThreadId.make("legacy-copy"))));
+      const sql = Context.get(f.context, SqlClient.SqlClient);
+      yield* sql`UPDATE mcp_event_subscription_routing SET notify_derived = 1 WHERE subscription_id = ${copy.id}`;
       yield* TestClock.adjust("12 hours");
-      yield* f.append([input.arguments.threadId, notifiedThread]);
+      yield* f.append([ThreadId.make("legacy-explicit"), ThreadId.make("legacy-copy")]);
       yield* f.service.drain();
       expect((yield* f.subscriptions.get(source.id))?.expiresAt).toBe(129_600_000);
-      expect((yield* f.subscriptions.get(notified.subscriptionIds[0]!))?.expiresAt).toBe(
-        86_400_000,
-      );
+      expect((yield* f.subscriptions.get(copy.id))?.expiresAt).toBe(129_600_000);
     }),
   ).pipe(Effect.provide(NodeCrypto.layer)),
 );

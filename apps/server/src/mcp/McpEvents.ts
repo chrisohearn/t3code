@@ -10,8 +10,13 @@ import {
   McpEventEnvelope,
   McpEventArguments,
   McpEventData,
+  McpEventWatch,
   McpEventsError,
   type McpEventSubscribe,
+  type McpEventInboxInput,
+  type McpEventReplayInput,
+  type McpEventReplayResult,
+  type McpEventInboxResult,
   type McpEventSubscriptionsResult,
   type McpEventUnsubscribe,
   type OrchestrationV2StoredEvent,
@@ -38,6 +43,7 @@ import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as Deliveries from "../persistence/McpEventDeliveries.ts";
 import * as Subscriptions from "../persistence/McpEventSubscriptions.ts";
 import * as EventStore from "../persistence/OrchestrationEventStore.ts";
+import * as Relay from "./McpEventRelay.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as Webhook from "./McpEventsWebhook.ts";
 
@@ -112,16 +118,21 @@ export const observeEvent = (
   };
 };
 
-export interface PreparedThreadNotify {
-  readonly principal: string;
-  readonly subscriptionId: string;
-  readonly cursor: string;
-  readonly events: ReadonlyArray<McpEventName>;
-}
+export type PreparedThreadNotify = Relay.PreparedRelay;
 
 export class McpEvents extends Context.Service<
   McpEvents,
   {
+    readonly replay: (
+      input: typeof McpEventReplayInput.Type,
+    ) => Effect.Effect<
+      typeof McpEventReplayResult.Type,
+      McpEventsError,
+      Invocation.McpInvocationContext
+    >;
+    readonly setInbox: (
+      input: McpEventInboxInput,
+    ) => Effect.Effect<McpEventInboxResult, McpEventsError, Invocation.McpInvocationContext>;
     readonly prepareNotify: (
       input: McpThreadNotify,
     ) => Effect.Effect<
@@ -132,6 +143,8 @@ export class McpEvents extends Context.Service<
     readonly notifyThread: (
       prepared: PreparedThreadNotify,
       threadId: ThreadId,
+      runId?: import("@t3tools/contracts").RunId,
+      clientRequestId?: string,
     ) => Effect.Effect<McpThreadNotifyResult, McpEventsError, Invocation.McpInvocationContext>;
     readonly bridgeStatus: () => Effect.Effect<
       {
@@ -139,6 +152,11 @@ export class McpEvents extends Context.Service<
         readonly tunnel: EnvironmentConnectReachability | null;
         readonly daysUntilSessionExpires: number;
         readonly subscriptions: McpEventSubscriptionsResult["subscriptions"];
+        readonly inboxThreadId: ThreadId | null;
+        readonly relayFailures: number;
+        readonly relayPending: number;
+        readonly relayLastError: string | null;
+        readonly watches: ReadonlyArray<typeof McpEventWatch.Type>;
         readonly lastSuccessfulEventDeliveryAt: string | null;
         readonly deliveriesExhaustedRetries: number;
       },
@@ -203,6 +221,7 @@ const make = Effect.gen(function* () {
     startupHoldReleased = true;
   });
   const bridge = yield* BridgeStatus.McpBridgeStatus;
+  const relay = yield* Relay.McpEventRelay;
   const sessions = yield* AuthSessions.AuthSessionRepository;
   const subscriptions = yield* Subscriptions.McpEventSubscriptions;
   const deliveries = yield* Deliveries.McpEventDeliveries;
@@ -336,7 +355,13 @@ const make = Effect.gen(function* () {
     yield* authorizeDelivery(sub);
     if (delivery.attempts >= 8) {
       yield* subscriptions.stop(sub.id, sub.principal);
-      return yield* bridge.exhausted(sub.principal);
+      yield* bridge.exhausted(sub.principal);
+      return yield* relay.alert(
+        sub.principal,
+        `subscription:${sub.id}`,
+        sub.threadId,
+        "webhook_retries_exhausted",
+      );
     }
     const now = yield* Clock.currentTimeMillis;
     yield* deliveries.begin(delivery, now);
@@ -375,7 +400,15 @@ const make = Effect.gen(function* () {
       delivery.attempts + 1 >= 8
     ) {
       yield* subscriptions.stop(sub.id, sub.principal);
-      if (delivery.attempts + 1 >= 8) yield* bridge.exhausted(sub.principal);
+      if (delivery.attempts + 1 >= 8) {
+        yield* bridge.exhausted(sub.principal);
+        yield* relay.alert(
+          sub.principal,
+          `subscription:${sub.id}`,
+          sub.threadId,
+          "webhook_retries_exhausted",
+        );
+      }
       return;
     }
     yield* deliveries.retry(
@@ -411,38 +444,47 @@ const make = Effect.gen(function* () {
             withSubscription(delivery.subscriptionId, deliver(delivery)).pipe(Effect.ignore),
           { concurrency: 8, discard: true },
         );
-        return behind;
+        return (yield* relay.drain()) || behind;
       }),
     ),
   );
+
+  const callbackGroup = Effect.fn("McpEvents.callbackGroup")(function* (url: string) {
+    const bytes = yield* digest.digest(Digest.sha256, Buffer.from(url));
+    return `watch_${Buffer.from(bytes).toString("hex")}`;
+  });
 
   const listSubscriptions = Effect.fn("McpEvents.listSubscriptions")(function* () {
     const { principal } = yield* caller();
     const now = yield* Clock.currentTimeMillis;
     const own = yield* subscriptions.forPrincipal(principal.sessionId);
     return {
-      subscriptions: own.map((sub) => ({
-        id: sub.id,
-        name: sub.name,
-        arguments: { threadId: sub.threadId },
-        // Callback paths and queries may be credentials. Management needs only the destination origin.
-        callbackOrigin: new URL(sub.url).origin,
-        status:
-          sub.expiresAt <= now
-            ? ("expired" as const)
-            : sub.active === 1
-              ? ("active" as const)
-              : ("stopped" as const),
-        expiresAt: DateTime.formatIso(DateTime.makeUnsafe(sub.expiresAt)),
-        cursor: String(sub.ackCursor),
-      })),
+      inboxThreadId: yield* relay.inbox(principal.sessionId),
+      subscriptions: yield* Effect.forEach(own, (sub) =>
+        Effect.gen(function* () {
+          return {
+            id: sub.id,
+            name: sub.name,
+            arguments: { threadId: sub.threadId },
+            // Callback paths and queries may be credentials. Management needs only the destination origin.
+            callbackOrigin: new URL(sub.url).origin,
+            callbackGroup: yield* callbackGroup(sub.url),
+            notifyDerived: sub.notifyDerived === 1,
+            status:
+              sub.expiresAt <= now
+                ? ("expired" as const)
+                : sub.active === 1
+                  ? ("active" as const)
+                  : ("stopped" as const),
+            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(sub.expiresAt)),
+            cursor: String(sub.ackCursor),
+          };
+        }),
+      ),
     };
   });
 
-  const subscribe = Effect.fn("McpEvents.subscribe")(function* (
-    input: McpEventSubscribe,
-    renewOnDelivery = true,
-  ) {
+  const subscribe = Effect.fn("McpEvents.subscribe")(function* (input: McpEventSubscribe) {
     const { scope, principal } = yield* caller();
     yield* resource(input.arguments.threadId);
     const { id, url } = yield* identity(principal.sessionId, input);
@@ -502,6 +544,7 @@ const make = Effect.gen(function* () {
         );
         yield* subscriptions.save({
           id,
+          notifyDerived: 0,
           principal: principal.sessionId,
           name: input.name,
           threadId: input.arguments.threadId,
@@ -511,7 +554,7 @@ const make = Effect.gen(function* () {
           active: 1,
           now,
           expiresAt,
-          renewalTtlMs: renewOnDelivery || (current?.renewalTtlMs ?? 0) > 0 ? ttlMs : 0,
+          renewalTtlMs: ttlMs,
           scanCursor:
             current !== undefined && cursor === current.ackCursor ? current.scanCursor : cursor,
           ackCursor: cursor,
@@ -529,6 +572,20 @@ const make = Effect.gen(function* () {
   });
 
   return McpEvents.of({
+    replay: Effect.fn("McpEvents.replay")(function* (input) {
+      const { scope, principal } = yield* caller();
+      const subscription = yield* subscriptions.get(input.id);
+      if (subscription === undefined || subscription.principal !== principal.sessionId)
+        return yield* refused();
+      const result = yield* relay.replay(scope, input.id);
+      yield* Queue.offer(wake, undefined);
+      return result;
+    }),
+    setInbox: Effect.fn("McpEvents.setInbox")(function* (input) {
+      const { scope } = yield* caller();
+      yield* relay.pin(scope, input.threadId);
+      return { inboxThreadId: input.threadId };
+    }),
     prepareNotify: Effect.fn("McpEvents.prepareNotify")(function* (input) {
       const scope = yield* Invocation.McpInvocationContext;
       if (scope.client === undefined || scope.thread !== undefined || scope.client.linked === true)
@@ -537,86 +594,51 @@ const make = Effect.gen(function* () {
           subscriptionIds: [],
           reason: "outside_client_required",
         };
-      const { principal } = yield* caller();
-      const now = yield* Clock.currentTimeMillis;
-      const source = (yield* subscriptions.forPrincipal(principal.sessionId)).find(
-        (sub) => sub.active === 1 && sub.expiresAt > now,
-      );
-      if (source === undefined)
-        return {
+      yield* caller();
+      const prepared = yield* relay.prepare(scope, input);
+      return (
+        prepared ?? {
           status: "unavailable" as const,
           subscriptionIds: [],
-          reason: "no_active_subscription",
-        };
-      const cursor = String(yield* events.latestApplicationSequence.pipe(Effect.mapError(storage)));
-      return {
-        principal: principal.sessionId,
-        subscriptionId: source.id,
-        cursor,
-        events: input.events ?? ["thread.run.result", "thread.needs-decision", "thread.blocker"],
-      };
-    }),
-    notifyThread: Effect.fn("McpEvents.notifyThread")(function* (prepared, threadId) {
-      const { principal } = yield* caller();
-      if (principal.sessionId !== prepared.principal) return yield* refused();
-      const source = yield* subscriptions.get(prepared.subscriptionId);
-      const now = yield* Clock.currentTimeMillis;
-      if (
-        source === undefined ||
-        source.principal !== principal.sessionId ||
-        source.active !== 1 ||
-        source.expiresAt <= now
-      )
-        return {
-          status: "unavailable" as const,
-          subscriptionIds: [],
-          reason: "no_active_subscription",
-        };
-      const subscriptionIds: Array<string> = [];
-      let refreshBefore: string | undefined;
-      for (const name of new Set(prepared.events)) {
-        const delivery = { mode: "webhook" as const, url: source.url, secret: source.secret };
-        const existingId = (yield* identity(principal.sessionId, {
-          name,
-          arguments: { threadId },
-          delivery,
-        })).id;
-        let existing = yield* subscriptions.get(existingId);
-        // A lapsed subscription would resume at its old cursor and replay old runs.
-        if (existing !== undefined && (existing.active !== 1 || existing.expiresAt <= now)) {
-          yield* withSubscription(
-            existingId,
-            subscriptions.remove(existingId, principal.sessionId),
-          );
-          existing = undefined;
+          reason: "no_pinned_inbox",
         }
-        const result = yield* subscribe(
-          {
-            name,
-            arguments: { threadId },
-            cursor: existing === undefined ? prepared.cursor : null,
-            delivery,
-            // Each active subscription scans the event log, so one made for a run lapses within a day.
-            // Not the source's own expiry: it may be an earlier notify subscription near its end.
-            ttlMs: 86_400_000,
-          },
-          false,
-        ).pipe(Effect.result);
-        if (result._tag === "Failure")
-          return { status: "failed" as const, subscriptionIds, reason: result.failure.reason };
-        subscriptionIds.push(result.success.id);
-        refreshBefore = result.success.refreshBefore;
-      }
-      return {
-        status: "subscribed" as const,
-        subscriptionIds,
-        ...(refreshBefore === undefined ? {} : { refreshBefore }),
-      };
+      );
     }),
+    notifyThread: Effect.fn("McpEvents.notifyThread")(
+      function* (prepared, threadId, runId, clientRequestId) {
+        const { principal } = yield* caller();
+        if (principal.sessionId !== prepared.principal) return yield* refused();
+        if (runId === undefined)
+          return { status: "unavailable" as const, subscriptionIds: [], reason: "run_required" };
+        yield* relay.bind(prepared, threadId, runId, clientRequestId);
+        yield* Queue.offer(wake, undefined);
+        return {
+          status: "bound" as const,
+          subscriptionIds: [],
+          inboxThreadId: prepared.inboxThreadId,
+          relay: `relay: inbox ${prepared.inboxThreadId}`,
+        };
+      },
+    ),
     bridgeStatus: Effect.fn("McpEvents.bridgeStatus")(function* () {
       const { principal } = yield* caller();
       const now = yield* Clock.currentTimeMillis;
       const status = yield* bridge.read(principal.sessionId);
+      const listing = yield* listSubscriptions();
+      const listed = listing.subscriptions;
+      const watches = new Map<string, typeof McpEventWatch.Type>();
+      for (const sub of listed.filter((sub) => sub.status === "active")) {
+        const watch = watches.get(sub.callbackGroup);
+        watches.set(sub.callbackGroup, {
+          callbackGroup: sub.callbackGroup,
+          callbackOrigin: sub.callbackOrigin,
+          subscriptionIds: [...(watch?.subscriptionIds ?? []), sub.id],
+          soonestExpiry:
+            watch === undefined || sub.expiresAt < watch.soonestExpiry
+              ? sub.expiresAt
+              : watch.soonestExpiry,
+        });
+      }
       return {
         serviceStartedAt: DateTime.formatIso(DateTime.makeUnsafe(serviceStartedAt)),
         tunnel: Option.getOrNull(yield* reachability.latest),
@@ -624,7 +646,10 @@ const make = Effect.gen(function* () {
           0,
           (principal.expiresAt.epochMilliseconds - now) / 86400_000,
         ),
-        subscriptions: (yield* listSubscriptions()).subscriptions,
+        inboxThreadId: listing.inboxThreadId,
+        subscriptions: listed,
+        watches: [...watches.values()],
+        ...(yield* relay.status(principal.sessionId)),
         lastSuccessfulEventDeliveryAt:
           status.lastSuccessAt === null
             ? null
@@ -649,6 +674,9 @@ const make = Effect.gen(function* () {
     unsubscribe: Effect.fn("McpEvents.unsubscribe")(function* (input) {
       const { principal } = yield* caller();
       const id = "id" in input ? input.id : (yield* identity(principal.sessionId, input)).id;
+      const existing = yield* subscriptions.get(id);
+      if (existing !== undefined && existing.principal !== principal.sessionId)
+        return yield* refused();
       // Explicit unsubscribe forgets the transport backlog. Recovery after a
       // delivery failure still uses stop(), retaining the acknowledged cursor.
       yield* withSubscription(id, subscriptions.remove(id, principal.sessionId));
@@ -683,7 +711,14 @@ const make = Effect.gen(function* () {
           const behind = yield* drain();
           if (behind) return;
           const now = yield* Clock.currentTimeMillis;
-          const next = yield* deliveries.nextAttempt(now);
+          const webhookNext = yield* deliveries.nextAttempt(now);
+          const relayNext = yield* relay.nextAttempt;
+          const next =
+            webhookNext === null
+              ? relayNext
+              : relayNext === null
+                ? webhookNext
+                : Math.min(webhookNext, relayNext);
           if (next === null) yield* Queue.take(wake);
           else
             yield* Queue.take(wake).pipe(

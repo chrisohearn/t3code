@@ -54,6 +54,7 @@ import {
 } from "../telemetry/ProviderDimensions.ts";
 import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as McpEventRelay from "./McpEventRelay.ts";
 import * as McpEvents from "./McpEvents.ts";
 import * as McpEventsProtocol from "./McpEventsProtocol.ts";
 import * as McpEventsWebhook from "./McpEventsWebhook.ts";
@@ -1370,6 +1371,11 @@ export const layerTools = Layer.mergeAll(
 );
 
 const layerEvents = McpEvents.layer.pipe(
+  Layer.provide(
+    McpEventRelay.layer.pipe(
+      Layer.provide(Layer.mergeAll(AuthSessions.layer, OrchestrationEventStore.layer)),
+    ),
+  ),
   Layer.provide(
     Layer.mergeAll(
       BridgeStatus.layer,
