@@ -220,6 +220,10 @@ it.effect("registers every fork migration file", () =>
     const ids = forkMigrationManifest.map(([id]) => id);
     assert.deepStrictEqual(
       ids,
+      ids.map((_, index) => index + 1),
+    );
+    assert.deepStrictEqual(
+      ids,
       [...new Set(ids)].toSorted((a, b) => a - b),
     );
     const fs = yield* FileSystem.FileSystem;
