@@ -19,6 +19,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
+import * as PeerMcpClient from "./PeerMcpClient.ts";
+import { OrchestratorToolkit } from "../mcp/toolkits/orchestrator/tools.ts";
 import { McpSchema, McpServer } from "effect/ai";
 
 import * as ServerConfig from "../config.ts";
@@ -728,4 +731,53 @@ it.effect("refuses what a linked environment cannot take before anything leaves"
       expect(yield* Ref.get(b.bearers)).toEqual([]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("clears provider context when a rollover reaches an older peer", () =>
+  Effect.gen(function* () {
+    const oldInput = Schema.Struct({
+      message: Schema.String,
+      freshContext: Schema.optional(Schema.Boolean),
+    });
+    const received = yield* Ref.make<ReadonlyArray<Schema.Schema.Type<typeof oldInput>>>([]);
+    const layer = PeerForwarding.layer.pipe(
+      Layer.provide([
+        NodeCrypto.layer,
+        Layer.mock(ThreadManagement.ThreadManagementService)({}),
+        Layer.mock(PeerLinks.PeerLinks)({ enabled: Effect.succeed(true) }),
+        Layer.mock(PeerMcpClient.PeerMcpClient)({
+          call: (input) =>
+            Ref.update(received, (items) => [
+              ...items,
+              Schema.decodeUnknownSync(oldInput)(input.arguments),
+            ]).pipe(Effect.as({} as never)),
+        }),
+      ]),
+    );
+    yield* Effect.gen(function* () {
+      const forwarding = yield* PeerForwarding.PeerForwarding;
+      const scope: McpInvocationContext.McpInvocationScope = {
+        environmentId: laptop.environmentId,
+        requestNamespace: "old-peer-rollover",
+        thread: undefined,
+        client: { sessionId: "caller", label: "Caller", access: "full-access" },
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      };
+      yield* forwarding.call(scope, OrchestratorToolkit.tools.t3_thread_send, box.environmentId, {
+        threadId: boxThread,
+        message: "Continue",
+        coordinatorRollover: true,
+        freshContext: false,
+      });
+      yield* forwarding.call(scope, OrchestratorToolkit.tools.t3_thread_send, box.environmentId, {
+        threadId: boxThread,
+        message: "Ordinary send",
+      });
+      expect(yield* Ref.get(received)).toEqual([
+        { message: "Continue", freshContext: true },
+        { message: "Ordinary send" },
+      ]);
+    }).pipe(Effect.provide(layer));
+  }),
 );
