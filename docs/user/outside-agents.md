@@ -187,7 +187,12 @@ Notifications contain identifiers, native status, and a link to the source threa
 Read that thread for the full result or decision. A finished run or helper does
 not establish that the requested work has been accepted.
 
-Subscriptions last one day by default and the client can refresh them. Updates
+Subscriptions last one day by default. Each acknowledged delivery renews an explicit
+subscription for its granted lifetime, up to the current sign-in expiry. Failed
+deliveries do not extend it. A quiet subscription still expires, so an inbox that
+must stay available needs activity before its lifetime ends. Client refreshes and
+signing-secret rotation remain supported. Existing watches adopt rolling renewal;
+new watches made by `notify` retain their fixed expiry. Updates
 can replay after a server restart, although older history may no longer be
 available. When T3 Connect is enabled, T3 holds startup notifications until its
 public address is reachable, for up to three minutes, so clients can call back. Delivery stops after eight failed attempts or a permanent callback
