@@ -63,6 +63,8 @@ function toRelease(spec: string, json: string) {
   });
 }
 
+const FORK_RELEASE_BASE_URL = "https://github.com/chrisohearn/t3code/releases/download";
+
 const decodeForkReleases = Schema.decodeUnknownEffect(
   Schema.Array(
     Schema.Struct({
@@ -78,8 +80,7 @@ export const lookupForkRelease = Effect.fn("NpmRelease.lookupForkRelease")(funct
   baseUrl: string | undefined,
   spec: string,
 ) {
-  if (baseUrl?.replace(/\/+$/, "") !== "https://github.com/chrisohearn/t3code/releases/download")
-    return undefined;
+  if (baseUrl?.replace(/\/+$/, "") !== FORK_RELEASE_BASE_URL) return undefined;
   const http = yield* HttpClient.HttpClient;
   const platform = yield* HostProcess.Platform;
   const arch = yield* HostProcess.Architecture;
@@ -143,7 +144,10 @@ export const make = Effect.fn("NpmRelease.make")(function* () {
   const npmPermits = yield* Semaphore.make(2);
   const cache = yield* Cache.make({
     capacity: 32,
-    timeToLive: Duration.minutes(1),
+    // GitHub's anonymous feed budget is shared by every client and exact version lookup.
+    timeToLive: Duration.minutes(
+      releaseBaseUrl?.replace(/\/+$/, "") === FORK_RELEASE_BASE_URL ? 15 : 1,
+    ),
     lookup: Effect.fn("NpmRelease.lookup")(function* (spec: string) {
       const fork = yield* lookupForkRelease(releaseBaseUrl, spec);
       if (fork !== undefined) return fork;

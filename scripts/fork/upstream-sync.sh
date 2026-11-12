@@ -156,38 +156,9 @@ vp fmt --check >"$logs/fmt.log" 2>&1 || fail "format check" fmt.log
 vp lint --report-unused-disable-directives >"$logs/lint.log" 2>&1 || fail "lint" lint.log
 vp run typecheck >"$logs/typecheck.log" 2>&1 || fail "typecheck" typecheck.log
 
-# Server tests. A file that also fails on the integration branch before the merge is a
-# pre-existing failure and does not block; any other failing file does.
-if ! (cd apps/server && vp test run --maxWorkers=50% --reporter=json --outputFile="$logs/server-tests.json") \
-  >"$logs/server-tests.log" 2>&1; then
-  failed=$(python3 -I -c '
-import json, sys
-r = json.load(open(sys.argv[1]))
-print("\n".join(sorted(t["name"] for t in r["testResults"] if t["status"] != "passed")))' \
-    "$logs/server-tests.json")
-  [[ -n "$failed" ]] || fail "server tests did not report results" server-tests.log
-  base="$WORKTREES/upstream-sync-$stamp-base"
-  git -C "$SOURCE" worktree add -q --detach "$base" "origin/$BRANCH"
-  (cd "$base" && pnpm install --frozen-lockfile >/dev/null 2>&1 &&
-    cd apps/server && "$base/node_modules/.bin/vp" test run --reporter=json --outputFile="$logs/base-tests.json" \
-      $(printf '%s\n' $failed | sed "s#^$wt/apps/server/##") >"$logs/base-tests.log" 2>&1) || true
-  git -C "$SOURCE" worktree remove --force "$base"
-  new_failures=$(python3 -I -c '
-import json, sys
-failed = sys.argv[2].split()
-try:
-    base = json.load(open(sys.argv[1]))["testResults"]
-    base_failed = {t["name"].split("/apps/server/")[-1] for t in base if t["status"] != "passed"}
-except Exception:
-    base_failed = set()
-print("\n".join(f for f in failed if f.split("/apps/server/")[-1] not in base_failed))' \
-    "$logs/base-tests.json" "$failed")
-  if [[ -n "$new_failures" ]]; then
-    printf '%s\n' "$new_failures" >"$logs/new-failures.log"
-    fail "server tests fail that pass on $BRANCH" new-failures.log
-  fi
-  log "pre-existing server test failures (also fail on $BRANCH): $(echo $failed)"
-fi
+# Do not publish a failing candidate, even when the same test fails on the base.
+(cd apps/server && vp test run --maxWorkers=50% --reporter=json --outputFile="$logs/server-tests.json") \
+  >"$logs/server-tests.log" 2>&1 || fail "server tests" server-tests.log
 
 base_version=$(python3 -I -c 'import json; print(json.load(open("apps/server/package.json"))["version"])')
 day=$(date -u +%Y%m%d)
@@ -229,6 +200,13 @@ else
   pr_url=$(gh pr create -R "$FORK" --base "$BRANCH" --head "$sync_branch" \
     --title "Merge upstream main (${upstream_sha:0:10})" --body "$summary")
 fi
+# Observe once, then let the next scheduled run resume this PR; never merge while CI is pending.
+checks=$(gh pr checks "$pr_url" -R "$FORK" --json name,bucket) || {
+  log "hosted checks are pending or failing for $pr_url; nothing released"
+  exit 4
+}
+python3 -I -c 'import json,sys; c=json.load(sys.stdin); sys.exit(0 if c and all(x["bucket"] in ("pass", "skipping") for x in c) else 1)' \
+  <<<"$checks" || { log "hosted checks have not all passed for $pr_url; nothing released"; exit 4; }
 gh pr merge "$pr_url" -R "$FORK" --merge --match-head-commit "$(git rev-parse HEAD)"
 git -C "$SOURCE" fetch -q origin
 merge_commit=$(gh pr view "$pr_url" -R "$FORK" --json mergeCommit --jq .mergeCommit.oid)

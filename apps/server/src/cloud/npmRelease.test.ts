@@ -252,5 +252,29 @@ it.effect("uses the fork feed for nightly metadata without spawning npm", () =>
       version: "0.1.9-preview.20261112.10",
     });
     expect(yield* service.get({ spec: version })).toEqual({ version: "0.1.9-preview.20261112.10" });
+    expect(yield* service.get({ spec: "0.1.9-preview.20261112.2" })).toEqual({
+      version: "0.1.9-preview.20261112.2",
+    });
+    expect(yield* service.get({ spec: "0.1.9-preview.20261112.99" })).toBeNull();
   }),
+);
+
+it.effect.each([503, 200])("fails closed on an unavailable or malformed fork feed (%s)", (status) =>
+  NpmRelease.lookupForkRelease(
+    "https://github.com/chrisohearn/t3code/releases/download",
+    "nightly",
+  ).pipe(
+    Effect.flip,
+    Effect.tap((error) => Effect.sync(() => expect(error).toBeInstanceOf(ServerNpmReleaseError))),
+    Effect.provideService(
+      HttpClient.HttpClient,
+      HttpClient.make((request) =>
+        Effect.succeed(
+          HttpClientResponse.fromWeb(request, new Response("not release metadata", { status })),
+        ),
+      ),
+    ),
+    Effect.provideService(HostProcess.Platform, "linux"),
+    Effect.provideService(HostProcess.Architecture, "x64"),
+  ),
 );
