@@ -1,4 +1,10 @@
-import type { FileFinder, FileItem, GrepCursor, GrepOptions, GrepResult } from "@ff-labs/fff-node";
+import {
+  FileFinder,
+  type FileItem,
+  type GrepCursor,
+  type GrepOptions,
+  type GrepResult,
+} from "@ff-labs/fff-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { afterEach, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -7,7 +13,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import { vi } from "vite-plus/test";
 
-import { WorkspaceFinderOpener } from "./WorkspaceFinderThread.ts";
+import { WorkspaceFinderOpener } from "./WorkspaceFinderProcess.ts";
 import * as WorkspaceSearchIndex from "./WorkspaceSearchIndex.ts";
 
 afterEach(() => {
@@ -37,6 +43,37 @@ function fileItem(relativePath: string): FileItem {
   };
 }
 
+it.effect("runs file and content searches outside the server thread", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspace = yield* fs.makeTempDirectoryScoped({ prefix: "t3-search-process-" });
+      yield* fs.writeFileString(path.join(workspace, "needle.txt"), "isolated finder\n");
+      const createInServer = vi.spyOn(FileFinder, "create").mockImplementation(() => {
+        throw new Error("Native finders must not run on the server thread.");
+      });
+
+      const paths = yield* WorkspaceSearchIndex.make(workspace);
+      yield* paths.refresh();
+      expect((yield* paths.list()).entries).toContainEqual({ kind: "file", path: "needle.txt" });
+      expect((yield* paths.search("needle", 10, "file", false)).entries).toEqual([
+        { kind: "file", path: "needle.txt" },
+      ]);
+      const contents = yield* WorkspaceSearchIndex.make(workspace, "content");
+      const result = yield* contents.searchContents({
+        query: "isolated",
+        limit: 10,
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: false,
+      });
+      expect(result.matches).toHaveLength(1);
+      expect(createInServer).not.toHaveBeenCalled();
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect("filters image searches before applying the result limit", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -58,7 +95,6 @@ it.effect("filters image searches before applying the result limit", () =>
         waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
         fileSearch,
       } as unknown as FileFinder;
-
       const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project").pipe(
         withInProcessFinder(finder),
       );
@@ -122,7 +158,6 @@ it.effect("continues whole-word searches after a filtered grep page", () =>
         waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
         grep,
       } as unknown as FileFinder;
-
       const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project", "content").pipe(
         withInProcessFinder(finder),
       );

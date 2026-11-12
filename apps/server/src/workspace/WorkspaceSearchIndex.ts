@@ -24,7 +24,7 @@ import type {
 } from "@t3tools/contracts";
 import { isProjectFaviconPath } from "@t3tools/shared/projectFavicon";
 
-import { type ThreadedFinder, WorkspaceFinderOpener } from "./WorkspaceFinderThread.ts";
+import { type ProcessFinder, WorkspaceFinderOpener } from "./WorkspaceFinderProcess.ts";
 
 const WORKSPACE_INDEX_MAX_ENTRIES = 25_000;
 const WORKSPACE_INDEX_PAGE_SIZE = WORKSPACE_INDEX_MAX_ENTRIES + 2;
@@ -309,7 +309,7 @@ const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
 
 const waitForIndexReady = Effect.fn("WorkspaceSearchIndex.waitForIndexReady")(function* <E>(
   cwd: string,
-  finder: ThreadedFinder,
+  finder: ProcessFinder,
   onFailure: (input: { readonly reason: string; readonly cause?: unknown }) => E,
 ): Effect.fn.Return<void, E | WorkspaceSearchIndexScanTimedOut> {
   const result = yield* Effect.tryPromise({
