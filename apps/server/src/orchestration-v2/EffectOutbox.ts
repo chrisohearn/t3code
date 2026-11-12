@@ -218,6 +218,10 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly hasUnsettled: (input: {
+    readonly threadId: ThreadId;
+    readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+  }) => Effect.Effect<boolean, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -464,6 +468,21 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               : new EffectOutboxError({ operation: "list", cause }),
           ),
         ),
+      hasUnsettled: Effect.fn("EffectOutbox.hasUnsettled")(
+        function* ({ threadId, effectTypes }) {
+          if (effectTypes.length === 0) return false;
+          const rows = yield* sql`
+            SELECT 1
+            FROM orchestration_v2_effect_outbox
+            WHERE thread_id = ${threadId}
+              AND status IN ('pending', 'running')
+              AND effect_type IN ${sql.in(effectTypes)}
+            LIMIT 1
+          `.pipe(NodeSqliteClient.readOnly);
+          return rows.length > 0;
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "has-unsettled", cause })),
+      ),
       cancelUnsettled: Effect.fn("EffectOutbox.cancelUnsettled")(
         function* ({ threadId, effectTypes, reason }) {
           if (effectTypes.length === 0) return [];
