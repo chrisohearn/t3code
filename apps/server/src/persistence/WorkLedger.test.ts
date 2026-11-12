@@ -48,6 +48,12 @@ it.effect(
         updatedBy: "thread-b",
       });
       expect(updated.updatedAt).not.toBe(first.updatedAt);
+      yield* ledger.upsert({ key: "a", ownerThreadId: ThreadId.make("coordinator") }, "session-a");
+      expect(yield* ledger.forThread("coordinator")).toEqual([]);
+      yield* ledger.upsert({ key: "a", status: "open" }, "session-a");
+      expect((yield* ledger.forThread("coordinator")).map((row) => row.key)).toEqual(["a"]);
+      expect(yield* ledger.forThread("other")).toEqual([]);
+      yield* ledger.upsert({ key: "a", status: "done", ownerThreadId: null }, "thread-b");
       yield* ledger.upsert(
         { key: "b", title: "Other", ownerKind: "human", ownerName: "Chris" },
         "session-b",
