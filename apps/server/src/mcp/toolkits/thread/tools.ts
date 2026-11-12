@@ -24,6 +24,7 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/ai";
 
+import * as ScratchThreadPromotion from "../../../project/ScratchThreadPromotion.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -31,7 +32,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
-    "Pin, snooze, settle, archive, or mark a thread unread. Omit `threadId` for this thread. `snooze` needs `snoozedUntil`. Settling this thread applies at turn end. A failed turn or queued message leaves it active.",
+    "Pin, snooze, settle, archive, or mark unread. move: file an idle No project thread into existing `projectId`; keeps its folder. Omit `threadId` for this thread. `snooze` needs `snoozedUntil`. Settling this thread applies at turn end. A failed turn or queued message leaves it active.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
@@ -45,16 +46,20 @@ const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
       "archive",
       "unarchive",
       "mark_unread",
+      "move",
     ]),
     snoozedUntil: Schema.optional(IsoDateTime),
+    projectId: Schema.optional(ProjectId),
   }),
   success: Schema.Union([
     OrchestrationV2DispatchCommandResult,
+    Schema.Struct({ moved: Schema.Literal(true), threadIds: Schema.Array(ThreadId) }),
     Schema.Struct({ settlesWhenTurnEnds: Schema.Literal(true) }),
   ]),
   failure: OrchestratorMcpFailure,
   failureMode: "return" as const,
   dependencies: [
+    ScratchThreadPromotion.ScratchThreadPromotion,
     McpInvocationContext.McpInvocationContext,
     ThreadManagementService.ThreadManagementService,
     SecureRandom.SecureRandom,

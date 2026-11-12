@@ -35,6 +35,7 @@ import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -130,7 +131,12 @@ const layerTools = Layer.mergeAll(
       list: () => Effect.succeed([]),
     }),
   ),
-  Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+  Layer.provide(
+    Layer.merge(
+      Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+    ),
+  ),
   Layer.provide(
     Layer.mock(ProjectService.ProjectService)({
       getById: () => Effect.succeedNone,

@@ -125,6 +125,10 @@ export type ProjectServiceError =
 export class ProjectService extends Context.Service<
   ProjectService,
   {
+    readonly withProjectLock: <A, E, R>(
+      projectId: ProjectId,
+      effect: Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E, R>;
     readonly create: (input: ProjectCreateInput) => Effect.Effect<Project, ProjectServiceError>;
     readonly bootstrap: (
       input: ProjectBootstrapInput,
@@ -278,14 +282,17 @@ export const make = Effect.gen(function* () {
         error: encodeProjectCommandRejection(planned.failure),
       });
     });
-    const receipt = yield* projectLocks
-      .withLock(
-        projectId,
-        workspaceRoot === undefined
-          ? planAndCommit
-          : workspaceLocks.withLock(workspaceRoot, planAndCommit),
-      )
-      .pipe(Effect.mapError(dispatchError));
+    // Deletion holds the project lock across its child cascade and this commit.
+    const receipt = yield* (
+      command.type === "project.delete"
+        ? planAndCommit
+        : projectLocks.withLock(
+            projectId,
+            workspaceRoot === undefined
+              ? planAndCommit
+              : workspaceLocks.withLock(workspaceRoot, planAndCommit),
+          )
+    ).pipe(Effect.mapError(dispatchError));
     if (receipt.projectId !== projectId || receipt.commandType !== command.type) {
       return yield* dispatchError(
         `Command ${command.commandId} was already used by ${receipt.commandType} for ${receipt.projectId}.`,
@@ -532,6 +539,7 @@ export const make = Effect.gen(function* () {
       yield* projectEnrichment.invalidate([existing.value.workspaceRoot]);
       return yield* readCommitted(projectId);
     },
+    (effect, input) => projectLocks.withLock(input.projectId, effect),
   );
 
   const enrichShell = (shell: OrchestrationProjectShell) =>
@@ -605,6 +613,7 @@ export const make = Effect.gen(function* () {
   );
 
   return ProjectService.of({
+    withProjectLock: projectLocks.withLock,
     create,
     bootstrap,
     update,

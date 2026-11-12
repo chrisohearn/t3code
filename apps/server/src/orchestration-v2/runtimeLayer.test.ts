@@ -8,6 +8,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
+import { McpSchema, McpServer } from "effect/ai";
 import {
   type ApplicationStoredEvent,
   CheckpointId,
@@ -15,6 +16,7 @@ import {
   CommandId,
   ContextTransferId,
   EventId,
+  EnvironmentId,
   MessageId,
   NodeId,
   RuntimeRequestId,
@@ -56,6 +58,9 @@ import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as McpHttpServer from "../mcp/McpHttpServer.ts";
+import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import * as ThreadSearch from "./ThreadSearch.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
@@ -343,7 +348,7 @@ const layerScheduledTasksTest = ScheduledTaskService.layer.pipe(
       Layer.mock(SecretRequests.SecretRequests)({}),
       Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
         namedProjectsRoot: "/projects",
-        isScratchProject: () => Effect.succeed(false),
+        isScratchProject: (projectId) => Effect.succeed(projectId === SCRATCH_PROJECT_ID),
       }),
       Scheduler.layer,
     ),
@@ -7152,24 +7157,35 @@ it.layer(layerTest)("snooze queued runs", (it) => {
   );
 });
 
-const SCRATCH_ROOT = "/tmp/runtime-layer-promotion-scratch";
+const scratchRoot = ServerConfig.ServerConfig.pipe(
+  Effect.map((config) => `${config.baseDir}/scratch`),
+);
 const SCRATCH_PROJECT_ID = ProjectId.make("runtime-layer-promotion-scratch");
 const layerScratchPromotionTest = ScratchThreadPromotion.layer.pipe(
   Layer.provide(
-    Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
-      scratchRoot: Effect.succeedSome(SCRATCH_ROOT),
-      isScratchProject: (projectId) => Effect.succeed(projectId === SCRATCH_PROJECT_ID),
-      namedProjectsRoot: "/projects",
-    }),
+    Layer.unwrap(
+      scratchRoot.pipe(
+        Effect.map((root) =>
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            scratchRoot: Effect.succeedSome(root),
+            isScratchProject: (projectId) => Effect.succeed(projectId === SCRATCH_PROJECT_ID),
+            namedProjectsRoot: "/projects",
+          }),
+        ),
+      ),
+    ),
   ),
   Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   Layer.provideMerge(layerProjectDeletionTest),
+  Layer.provideMerge(layerServerConfig),
+  Layer.provide(layerPlatformTest),
 );
 
 it.layer(layerScratchPromotionTest)("turning a No project thread into a project", (it) => {
   const setup = Effect.fn(function* (name: string) {
     const projects = yield* ProjectService.ProjectService;
     const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const SCRATCH_ROOT = yield* scratchRoot;
     const folder = `${SCRATCH_ROOT}/2026-01-01-${name}`;
     if (Option.isNone(yield* projects.getById(SCRATCH_PROJECT_ID))) {
       yield* projects.create({
@@ -7179,7 +7195,11 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
         workspaceRoot: SCRATCH_ROOT,
       });
     }
-    const createThread = (suffix: string, worktreePath: string) =>
+    const createThread = (
+      suffix: string,
+      worktreePath: string,
+      runtimeMode: "auto" | "full-access" = "full-access",
+    ) =>
       orchestrator
         .dispatch({
           type: "thread.create",
@@ -7190,7 +7210,7 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
           projectId: SCRATCH_PROJECT_ID,
           title: `${name} ${suffix}`,
           modelSelection,
-          runtimeMode: "full-access",
+          runtimeMode,
           interactionMode: "default",
           branch: null,
           worktreePath,
@@ -7203,6 +7223,943 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
       Effect.flatMap((orchestrator) => orchestrator.getThreadShell(threadId)),
     );
 
+  const createTarget = Effect.fn(function* (name: string) {
+    const projects = yield* ProjectService.ProjectService;
+    return yield* projects.create({
+      commandId: CommandId.make(`filing-target-${name}`),
+      projectId: ProjectId.make(`filing-target-${name}`),
+      title: "Existing",
+      workspaceRoot: `/tmp/runtime-layer-filing-${name}`,
+    });
+  });
+
+  it.effect(
+    "files scratch folder-mates, preserves their folders, and keeps tasks aligned on save",
+    () =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+        const { folder, createThread } = yield* setup("file");
+        const threadId = yield* createThread("main", folder);
+        const siblingId = yield* createThread("archived", folder);
+        const otherId = yield* createThread("other", `${yield* scratchRoot}/elsewhere`);
+        const target = yield* createTarget("file");
+        const taskInput = {
+          id: ScheduledTaskId.make("filing-bound"),
+          title: "Bound",
+          prompt: "Check in",
+          enabled: true,
+          schedule: { type: "interval" as const, everyMs: 60_000 },
+          projectId: SCRATCH_PROJECT_ID,
+          threadId,
+          workspaceStrategy: { type: "root" as const },
+          modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+        };
+        yield* tasks.upsert(taskInput);
+        yield* orchestrator.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make("file-archive"),
+          threadId: siblingId,
+        });
+        const result = yield* filing.file({ threadId, projectId: target.id });
+        assert.sameMembers([...result.threadIds], [threadId, siblingId]);
+        for (const id of [threadId, siblingId]) {
+          assert.equal((yield* shellOf(id))?.projectId, target.id);
+          assert.equal((yield* shellOf(id))?.worktreePath, folder);
+        }
+        assert.equal((yield* shellOf(otherId))?.projectId, SCRATCH_PROJECT_ID);
+        assert.equal(
+          (yield* tasks.list()).tasks.find((task) => task.id === taskInput.id)?.projectId,
+          target.id,
+        );
+        assert.equal(
+          (yield* tasks.upsert({ ...taskInput, projectId: target.id })).task.projectId,
+          target.id,
+        );
+        assert.deepEqual(yield* filing.file({ threadId, projectId: target.id }), { threadIds: [] });
+        const repeat = yield* orchestrator
+          .dispatch({
+            type: "thread.project.file-scratch",
+            commandId: CommandId.make("file-repeat"),
+            threadId,
+            projectId: target.id,
+          })
+          .pipe(Effect.flip);
+        assert.include(String(repeat.cause), "already in that project");
+        const regular = yield* filing
+          .file({ threadId, projectId: (yield* createTarget("other")).id })
+          .pipe(Effect.flip);
+        assert.include(regular.message, "Only a No project thread");
+      }),
+  );
+
+  it.effect("a stale scratch save after filing preserves binding but a genuine move unbinds", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+      const { folder, createThread } = yield* setup("file-stale-save");
+      const threadId = yield* createThread("main", folder);
+      const target = yield* createTarget("stale-save");
+      const input = {
+        id: ScheduledTaskId.make("filing-stale-save"),
+        title: "Bound",
+        prompt: "Check in",
+        enabled: true,
+        schedule: { type: "interval" as const, everyMs: 60_000 },
+        projectId: SCRATCH_PROJECT_ID,
+        threadId,
+        workspaceStrategy: { type: "root" as const },
+        modelSelection,
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+      };
+      yield* tasks.upsert(input);
+      yield* filing.file({ threadId, projectId: target.id });
+      const saved = yield* tasks.upsert({ ...input, title: "Edited after filing" });
+      assert.equal(saved.task.threadId, threadId);
+      assert.equal(saved.task.projectId, target.id);
+      const other = yield* createTarget("genuine-task-move");
+      const moved = yield* tasks.upsert({ ...input, projectId: other.id });
+      assert.isNull(moved.task.threadId);
+      assert.equal(moved.task.projectId, other.id);
+    }),
+  );
+
+  it.effect("a late native child inherits its filed parent's committed project", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const { folder, createThread } = yield* setup("file-native-child");
+      const threadId = yield* createThread("main", folder);
+      const stale = (yield* orchestrator.getThreadProjection(threadId)).thread;
+      const target = yield* createTarget("native-child");
+      yield* filing.file({ threadId, projectId: target.id });
+      const childId = ThreadId.make("filing-late-native-child");
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("filing-late-native-child-created"),
+            type: "thread.created",
+            threadId: childId,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...stale,
+              id: childId,
+              createdBy: "agent",
+              creationSource: "provider",
+              lineage: {
+                rootThreadId: threadId,
+                parentThreadId: threadId,
+                relationshipToParent: "subagent",
+              },
+            },
+          },
+        ],
+      });
+      assert.equal((yield* shellOf(childId))?.projectId, target.id);
+      assert.equal((yield* shellOf(childId))?.worktreePath, folder);
+    }),
+  );
+
+  it.effect("a rejected filing leaves its scheduled tasks in scratch", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+      const { folder, createThread } = yield* setup("file-rejected-task");
+      const threadId = yield* createThread("main", folder);
+      const target = yield* createTarget("rejected-task");
+      const { task } = yield* tasks.upsert({
+        id: ScheduledTaskId.make("filing-rejected-task"),
+        title: "Bound",
+        prompt: "Check in",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60_000 },
+        projectId: SCRATCH_PROJECT_ID,
+        threadId,
+        workspaceStrategy: { type: "root" },
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      });
+      const dispatch = threads.dispatch;
+      const spy = vi.spyOn(threads, "dispatch").mockImplementation((command) =>
+        command.type === "thread.project.file-scratch"
+          ? Effect.fail(
+              new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "Rejected filing",
+              }),
+            )
+          : dispatch(command),
+      );
+      try {
+        yield* filing.file({ threadId, projectId: target.id }).pipe(Effect.flip);
+        assert.equal((yield* shellOf(threadId))?.projectId, SCRATCH_PROJECT_ID);
+        assert.equal(
+          (yield* tasks.list()).tasks.find((row) => row.id === task.id)?.projectId,
+          SCRATCH_PROJECT_ID,
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    }),
+  );
+
+  it.effect.each(["folder-mate", "family"] as const)(
+    "a linked caller cannot file an unauthorized %s and moves nothing",
+    (relationship) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`file-linked-${relationship}`);
+        const ownedId = ThreadId.make(`filing-linked-owned-${relationship}`);
+        const foreignId = yield* createThread("foreign", folder, "auto");
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${ownedId}`),
+          threadId: ownedId,
+          projectId: SCRATCH_PROJECT_ID,
+          title: "Link owned",
+          modelSelection,
+          runtimeMode: "auto",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: folder,
+          createdBy: "user",
+          creationSource: "web",
+          linkOrigin: { sessionId: "filing-link", label: "Filing link", access: "auto" },
+          ...(relationship === "family"
+            ? {
+                lineage: {
+                  rootThreadId: foreignId,
+                  parentThreadId: foreignId,
+                  relationshipToParent: "subagent" as const,
+                },
+              }
+            : {}),
+        });
+        const target = yield* createTarget(`linked-${relationship}`);
+        const result = yield* McpServer.McpServer.pipe(
+          Effect.flatMap((server) =>
+            server.callTool({
+              name: "t3_thread_organize",
+              arguments: { action: "move", threadId: ownedId, projectId: target.id },
+            }),
+          ),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("filing-environment"),
+            requestNamespace: "filing-link",
+            thread: undefined,
+            client: {
+              sessionId: "filing-link",
+              label: "Filing link",
+              access: "auto",
+              linked: true,
+            },
+            capabilities: new Set(["orchestration"] as const),
+            issuedAt: 0,
+          }),
+          Effect.provideService(McpSchema.McpServerClient, {
+            clientId: 1,
+            protocolVersion: "2025-06-18",
+            clientCapabilities: {},
+            clientInfo: { name: "filing-test", version: "1" },
+            initializePayload: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: "filing-test", version: "1" },
+            },
+            getClient: Effect.die("unused"),
+          }),
+          Effect.provide(
+            McpHttpServer.layerThreadToolkit.pipe(
+              Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+              Layer.provide(NodeCrypto.layer),
+              Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
+            ),
+          ),
+        );
+        assert.isTrue(result.isError);
+        assert.include(JSON.stringify(result.content), "capability_denied");
+        for (const id of [ownedId, foreignId])
+          assert.equal((yield* shellOf(id))?.projectId, SCRATCH_PROJECT_ID);
+      }),
+  );
+
+  it.effect("refuses missing, deleted, scratch and same-folder targets and busy threads", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const projects = yield* ProjectService.ProjectService;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { folder, createThread } = yield* setup("file-refusals");
+      const threadId = yield* createThread("main", folder);
+      const deleted = yield* createTarget("deleted");
+      yield* projects.delete({
+        commandId: CommandId.make("file-delete-target"),
+        projectId: deleted.id,
+      });
+      for (const projectId of [
+        ProjectId.make("missing-file-target"),
+        deleted.id,
+        SCRATCH_PROJECT_ID,
+      ]) {
+        assert.equal(
+          (yield* filing.file({ threadId, projectId }).pipe(Effect.flip)).message,
+          "Target project not found.",
+        );
+        const error = yield* orchestrator
+          .dispatch({
+            type: "thread.project.file-scratch",
+            commandId: CommandId.make(`file-refuse-${projectId}`),
+            threadId,
+            projectId,
+          })
+          .pipe(Effect.flip);
+        assert.include(
+          String(error.cause),
+          projectId === SCRATCH_PROJECT_ID ? "already in that project" : "missing project",
+        );
+      }
+      const ownFolder = yield* projects.create({
+        commandId: CommandId.make("file-own-folder"),
+        projectId: ProjectId.make("file-own-folder"),
+        title: "Own",
+        workspaceRoot: folder,
+      });
+      assert.include(
+        (yield* filing.file({ threadId, projectId: ownFolder.id }).pipe(Effect.flip)).message,
+        "Promote it instead",
+      );
+      const target = yield* createTarget("busy");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("file-busy"),
+        threadId,
+        messageId: MessageId.make("file-busy"),
+        text: "Keep working",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      assert.equal(
+        (yield* filing.file({ threadId, projectId: target.id }).pipe(Effect.flip)).message,
+        '"file-refusals main" is still working. Finish or stop it first.',
+      );
+      const busy = yield* orchestrator
+        .dispatch({
+          type: "thread.project.file-scratch",
+          commandId: CommandId.make("file-busy-direct"),
+          threadId,
+          projectId: target.id,
+        })
+        .pipe(Effect.flip);
+      assert.include(String(busy.cause), "work in progress");
+      assert.equal((yield* shellOf(threadId))?.projectId, SCRATCH_PROJECT_ID);
+    }),
+  );
+
+  const createSubagent = Effect.fn(function* (parentId: ThreadId, suffix: string) {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const parent = (yield* orchestrator.getThreadProjection(parentId)).thread;
+    const id = ThreadId.make(`${parentId}:${suffix}`);
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(`${id}:created`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: yield* DateTime.now,
+          payload: {
+            ...parent,
+            id,
+            title: suffix,
+            lineage: {
+              parentThreadId: parentId,
+              rootThreadId: parent.lineage.rootThreadId,
+              relationshipToParent: "subagent",
+            },
+          },
+        },
+      ],
+    });
+    return id;
+  });
+
+  it.effect.each(["root", "child"] as const)(
+    "files a subagent family when naming its %s",
+    (named) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`file-family-${named}`);
+        const rootId = yield* createThread("root", folder);
+        const childId = yield* createSubagent(rootId, "child");
+        const grandchildId = yield* createSubagent(childId, "grandchild");
+        const archivedId = yield* createSubagent(rootId, "archived");
+        const deletedId = yield* createSubagent(rootId, "deleted");
+        const mateId = yield* createThread("folder-mate", folder);
+        yield* orchestrator.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make(`${archivedId}:archive`),
+          threadId: archivedId,
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.delete",
+          commandId: CommandId.make(`${deletedId}:delete`),
+          threadId: deletedId,
+        });
+        const target = yield* createTarget(`family-${named}`);
+        const result = yield* filing.file({
+          threadId: named === "root" ? rootId : childId,
+          projectId: target.id,
+        });
+        assert.sameMembers(
+          [...result.threadIds],
+          [rootId, childId, grandchildId, archivedId, mateId],
+        );
+        assert.isBelow(result.threadIds.indexOf(rootId), result.threadIds.indexOf(childId));
+        assert.isBelow(result.threadIds.indexOf(childId), result.threadIds.indexOf(grandchildId));
+        for (const id of result.threadIds) {
+          assert.equal((yield* shellOf(id))?.projectId, target.id);
+          assert.equal((yield* shellOf(id))?.worktreePath, folder);
+        }
+        assert.deepEqual(yield* filing.file({ threadId: childId, projectId: target.id }), {
+          threadIds: [],
+        });
+      }),
+  );
+
+  it.effect.each(["root", "child"] as const)(
+    "finishes a partial family filing from its filed %s",
+    (first) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`file-partial-${first}`);
+        const rootId = yield* createThread("root", folder);
+        const childId = yield* createSubagent(rootId, "child");
+        const movedId = first === "root" ? rootId : childId;
+        const leftId = first === "root" ? childId : rootId;
+        const target = yield* createTarget(`partial-${first}`);
+        yield* orchestrator.dispatch({
+          type: "thread.project.file-scratch",
+          commandId: CommandId.make(`file-partial-first-${first}`),
+          threadId: movedId,
+          projectId: target.id,
+        });
+        assert.deepEqual(yield* filing.file({ threadId: movedId, projectId: target.id }), {
+          threadIds: [leftId],
+        });
+        assert.equal((yield* shellOf(leftId))?.projectId, target.id);
+        assert.equal((yield* shellOf(leftId))?.worktreePath, folder);
+      }),
+  );
+
+  it.effect.each(["folder", "project", "busy"] as const)(
+    "refuses a family with a conflicting %s before moving anything",
+    (conflict) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`file-family-refuse-${conflict}`);
+        const parentId = yield* createThread("parent", folder);
+        const childId = ThreadId.make(`filing-child-${conflict}`);
+        const target = yield* createTarget(`family-refuse-${conflict}`);
+        yield* orchestrator.dispatch({
+          type: "thread.fork",
+          commandId: CommandId.make(`file-fork-${conflict}`),
+          sourceThreadId: parentId,
+          targetThreadId: childId,
+          sourcePoint: { type: "latest_stable" },
+          sideChat: true,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const mateId = yield* createThread("folder-mate", folder);
+        if (conflict === "busy") {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("file-family-busy"),
+            threadId: childId,
+            messageId: MessageId.make("file-family-busy"),
+            text: "Working",
+            attachments: [],
+            modelSelection,
+            dispatchMode: { type: "start_immediately" },
+          });
+        } else {
+          const projection = (yield* orchestrator.getThreadProjection(childId)).thread;
+          yield* (yield* EventSink.EventSinkV2).write({
+            events: [
+              {
+                id: EventId.make(`file-family-conflict-${conflict}`),
+                type: "thread.metadata-updated",
+                threadId: childId,
+                occurredAt: yield* DateTime.now,
+                payload: {
+                  ...projection,
+                  ...(conflict === "folder"
+                    ? { worktreePath: `${yield* scratchRoot}/child-folder` }
+                    : { projectId: (yield* createTarget("third-project")).id }),
+                },
+              },
+            ],
+          });
+        }
+        for (const threadId of [parentId, childId]) {
+          const outside = conflict === "project" && threadId === childId;
+          assert.include(
+            (yield* filing.file({ threadId, projectId: target.id }).pipe(Effect.flip)).message,
+            outside
+              ? "Only a No project thread"
+              : conflict === "busy"
+                ? "still working"
+                : "family member",
+          );
+          if (conflict === "busy" && threadId === parentId) continue;
+          const error = yield* orchestrator
+            .dispatch({
+              type: "thread.project.file-scratch",
+              commandId: CommandId.make(`file-family-${conflict}-${threadId}`),
+              threadId,
+              projectId: target.id,
+            })
+            .pipe(Effect.flip);
+          assert.include(
+            String(error.cause),
+            outside
+              ? "not a No project thread"
+              : conflict === "busy"
+                ? "work in progress"
+                : "family member",
+          );
+        }
+        for (const id of [parentId, mateId]) {
+          assert.equal((yield* shellOf(id))?.projectId, SCRATCH_PROJECT_ID);
+        }
+      }),
+  );
+
+  it.effect("files a child forked after the family snapshot before returning", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { folder, createThread } = yield* setup("file-late-child");
+      const threadId = yield* createThread("root", folder);
+      const childId = ThreadId.make("filing-late-child");
+      const target = yield* createTarget("late-child");
+      const dispatch = threads.dispatch;
+      let forked = false;
+      const spy = vi.spyOn(threads, "dispatch").mockImplementation((command) =>
+        Effect.gen(function* () {
+          if (command.type === "thread.project.file-scratch" && !forked) {
+            forked = true;
+            yield* orchestrator.dispatch({
+              type: "thread.fork",
+              commandId: CommandId.make("filing-late-child"),
+              sourceThreadId: threadId,
+              targetThreadId: childId,
+              sourcePoint: { type: "latest_stable" },
+              sideChat: true,
+              createdBy: "user",
+              creationSource: "web",
+            });
+          }
+          return yield* dispatch(command);
+        }),
+      );
+      try {
+        assert.sameMembers(
+          [...(yield* filing.file({ threadId, projectId: target.id })).threadIds],
+          [threadId, childId],
+        );
+        assert.equal((yield* shellOf(childId))?.projectId, target.id);
+      } finally {
+        spy.mockRestore();
+      }
+    }),
+  );
+
+  it.effect.each(["root", "side-chat"] as const)(
+    "a concurrent fork from a %s waits for filing and inherits the filed project",
+    (source) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const { folder, createThread } = yield* setup(`file-fork-race-${source}`);
+        const rootId = yield* createThread("main", folder);
+        const threadId = source === "root" ? rootId : ThreadId.make("filing-side-chat-source");
+        if (source === "side-chat") {
+          yield* orchestrator.dispatch({
+            type: "thread.fork",
+            commandId: CommandId.make("filing-side-chat-source"),
+            sourceThreadId: rootId,
+            targetThreadId: threadId,
+            sourcePoint: { type: "latest_stable" },
+            sideChat: true,
+            createdBy: "user",
+            creationSource: "web",
+          });
+        }
+        const target = yield* createTarget(`fork-race-${source}`);
+        const childId = ThreadId.make(`filing-concurrent-fork-${source}`);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`filing-fork-source-run-${source}`),
+          threadId,
+          messageId: MessageId.make(`filing-fork-source-run-${source}`),
+          text: "Prior work",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0];
+        assert.isDefined(run);
+        const now = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`filing-fork-source-completed-${source}`),
+              type: "run.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+            },
+          ],
+        });
+        const delegation = yield* orchestrator
+          .dispatch({
+            type: "delegated_task.request",
+            commandId: CommandId.make(`filing-settled-parent-delegate-${source}`),
+            parentThreadId: threadId,
+            parentRunId: run.id,
+            parentNodeId: run.rootNodeId!,
+            task: "Too late",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            completionWake: "always",
+            createdBy: "agent",
+            creationSource: "mcp",
+          })
+          .pipe(Effect.flip);
+        assert.include(String(delegation.cause), "is not active");
+        const ready = yield* Deferred.make<void>();
+        const proceed = yield* Deferred.make<void>();
+        const queued = yield* Deferred.make<void>();
+        const commit = eventSink.commitCommand;
+        const withLock = executor.withLock;
+        const commitSpy = vi
+          .spyOn(eventSink, "commitCommand")
+          .mockImplementation((input) =>
+            input.commandType === "thread.project.file-scratch" && input.threadId === threadId
+              ? Deferred.succeed(ready, undefined).pipe(
+                  Effect.andThen(Deferred.await(proceed)),
+                  Effect.andThen(commit(input)),
+                )
+              : commit(input),
+          );
+        try {
+          const pending = yield* Effect.forkChild(filing.file({ threadId, projectId: target.id }));
+          yield* Deferred.await(ready);
+          const observeLock: ThreadCommandExecutor.ThreadCommandExecutor["Service"]["withLock"] = (
+            id,
+            effect,
+          ) =>
+            id === threadId
+              ? Deferred.succeed(queued, undefined).pipe(Effect.andThen(withLock(id, effect)))
+              : withLock(id, effect);
+          const lockSpy = vi.spyOn(executor, "withLock").mockImplementation(observeLock);
+          try {
+            const fork = yield* Effect.forkChild(
+              orchestrator.dispatch({
+                type: "thread.fork",
+                commandId: CommandId.make(`filing-concurrent-fork-${source}`),
+                sourceThreadId: threadId,
+                targetThreadId: childId,
+                sourcePoint: { type: "run", runId: run.id },
+                createdBy: "user",
+                creationSource: "web",
+              }),
+            );
+            yield* Effect.raceFirst(
+              Deferred.await(queued),
+              Fiber.join(fork).pipe(Effect.andThen(Effect.die("Fork bypassed the source lock."))),
+            );
+            yield* Deferred.succeed(proceed, undefined);
+            yield* Fiber.join(pending);
+            yield* Fiber.join(fork);
+            assert.equal((yield* shellOf(threadId))?.projectId, target.id);
+            assert.equal((yield* shellOf(childId))?.projectId, target.id);
+          } finally {
+            lockSpy.mockRestore();
+          }
+        } finally {
+          yield* Deferred.succeed(proceed, undefined);
+          commitSpy.mockRestore();
+        }
+      }),
+  );
+
+  it.effect.each(["delete", "file"] as const)(
+    "serializes target deletion with the whole family when %s wins the lock",
+    (first) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const projects = yield* ProjectService.ProjectService;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`batch-race-${first}`);
+        const threadId = yield* createThread("main", folder);
+        const childId = ThreadId.make(`filing-delete-child-${first}`);
+        yield* orchestrator.dispatch({
+          type: "thread.fork",
+          commandId: CommandId.make(`fork:${childId}`),
+          sourceThreadId: threadId,
+          targetThreadId: childId,
+          sourcePoint: { type: "latest_stable" },
+          sideChat: true,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const target = yield* createTarget(`batch-race-${first}`);
+        const ready = yield* Deferred.make<void>();
+        const proceed = yield* Deferred.make<void>();
+        const competing = yield* Deferred.make<void>();
+        const commitProject = eventSink.commitProjectCommand;
+        const commitThread = eventSink.commitCommand;
+        const deleteTarget = projects.delete({
+          commandId: CommandId.make(`batch-delete-${first}`),
+          projectId: target.id,
+          force: true,
+        });
+        const file = filing.file({ threadId, projectId: target.id });
+        const spy =
+          first === "delete"
+            ? vi
+                .spyOn(eventSink, "commitProjectCommand")
+                .mockImplementation((input) =>
+                  input.commandType === "project.delete" && input.projectId === target.id
+                    ? Deferred.succeed(ready, undefined).pipe(
+                        Effect.andThen(Deferred.await(proceed)),
+                        Effect.andThen(commitProject(input)),
+                      )
+                    : commitProject(input),
+                )
+            : vi.spyOn(eventSink, "commitCommand").mockImplementation((input) =>
+                Effect.gen(function* () {
+                  const result = yield* commitThread(input);
+                  if (
+                    input.commandType === "thread.project.file-scratch" &&
+                    input.threadId === threadId
+                  ) {
+                    yield* Deferred.succeed(ready, undefined);
+                    yield* Deferred.await(proceed);
+                  }
+                  return result;
+                }),
+              );
+        try {
+          const pending = yield* Effect.forkChild(
+            Effect.gen(function* () {
+              if (first === "delete") yield* deleteTarget;
+              else yield* file;
+            }).pipe(Effect.result),
+          );
+          yield* Deferred.await(ready);
+          const competitor = yield* Effect.forkChild(
+            Deferred.succeed(competing, undefined).pipe(
+              Effect.andThen(
+                Effect.gen(function* () {
+                  if (first === "delete") yield* file;
+                  else yield* deleteTarget;
+                }),
+              ),
+              Effect.result,
+            ),
+          );
+          yield* Deferred.await(competing);
+          yield* TestClock.adjust(0);
+          yield* Deferred.succeed(proceed, undefined);
+          assert.equal((yield* Fiber.join(pending))._tag, "Success");
+          assert.equal(
+            (yield* Fiber.join(competitor))._tag,
+            first === "delete" ? "Failure" : "Success",
+          );
+          for (const id of [threadId, childId]) {
+            const { thread } = yield* orchestrator.getThreadProjection(id);
+            assert.equal(thread.projectId, first === "delete" ? SCRATCH_PROJECT_ID : target.id);
+            assert.equal(thread.deletedAt !== null, first === "file");
+          }
+        } finally {
+          yield* Deferred.succeed(proceed, undefined);
+          spy.mockRestore();
+        }
+      }),
+  );
+
+  it.effect.each(["delete", "promote"] as const)(
+    "serializes scratch %s with the whole filing family",
+    (operation) =>
+      Effect.gen(function* () {
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const projects = yield* ProjectService.ProjectService;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { folder, createThread } = yield* setup(`source-race-${operation}`);
+        const threadId = yield* createThread("main", folder);
+        const childId = ThreadId.make(`filing-source-child-${operation}`);
+        yield* orchestrator.dispatch({
+          type: "thread.fork",
+          commandId: CommandId.make(`fork:${childId}`),
+          sourceThreadId: threadId,
+          targetThreadId: childId,
+          sourcePoint: { type: "latest_stable" },
+          sideChat: true,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const target = yield* createTarget(`source-race-${operation}`);
+        const ready = yield* Deferred.make<void>();
+        const proceed = yield* Deferred.make<void>();
+        const competing = yield* Deferred.make<void>();
+        const commit = eventSink.commitCommand;
+        const spy = vi.spyOn(eventSink, "commitCommand").mockImplementation((input) =>
+          Effect.gen(function* () {
+            const result = yield* commit(input);
+            if (
+              input.commandType === "thread.project.file-scratch" &&
+              input.threadId === threadId
+            ) {
+              yield* Deferred.succeed(ready, undefined);
+              yield* Deferred.await(proceed);
+            }
+            return result;
+          }),
+        );
+        try {
+          const pending = yield* Effect.forkChild(
+            filing.file({ threadId, projectId: target.id }).pipe(Effect.result),
+          );
+          yield* Deferred.await(ready);
+          const competitor = yield* Effect.forkChild(
+            Deferred.succeed(competing, undefined).pipe(
+              Effect.andThen(
+                Effect.gen(function* () {
+                  if (operation === "delete") {
+                    yield* projects.delete({
+                      commandId: CommandId.make("filing-source-delete"),
+                      projectId: SCRATCH_PROJECT_ID,
+                      force: true,
+                    });
+                  } else {
+                    yield* filing.promote({ threadId: childId });
+                  }
+                }),
+              ),
+              Effect.result,
+            ),
+          );
+          yield* Deferred.await(competing);
+          yield* TestClock.adjust(0);
+          yield* Deferred.succeed(proceed, undefined);
+          assert.equal((yield* Fiber.join(pending))._tag, "Success");
+          assert.equal(
+            (yield* Fiber.join(competitor))._tag,
+            operation === "delete" ? "Success" : "Failure",
+          );
+          for (const id of [threadId, childId]) {
+            const shell = yield* shellOf(id);
+            assert.equal(shell?.projectId, target.id);
+            assert.isNull(shell?.deletedAt);
+            assert.equal(shell?.worktreePath, folder);
+          }
+        } finally {
+          yield* Deferred.succeed(proceed, undefined);
+          spy.mockRestore();
+        }
+      }).pipe(Effect.provide(Layer.fresh(layerScratchPromotionTest))),
+  );
+
+  it.effect("publishes the final task state for tasks created before thread assignment", () =>
+    Effect.gen(function* () {
+      const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+      const { folder, createThread } = yield* setup("file-late-task");
+      const threadId = yield* createThread("main", folder);
+      const target = yield* createTarget("late-task");
+      const ready = yield* Deferred.make<void>();
+      const proceed = yield* Deferred.make<void>();
+      const commit = eventSink.commitCommand;
+      const spy = vi
+        .spyOn(eventSink, "commitCommand")
+        .mockImplementation((input) =>
+          input.commandType === "thread.project.file-scratch" && input.threadId === threadId
+            ? Deferred.succeed(ready, undefined).pipe(
+                Effect.andThen(Deferred.await(proceed)),
+                Effect.andThen(commit(input)),
+              )
+            : commit(input),
+        );
+      try {
+        const pending = yield* Effect.forkChild(filing.file({ threadId, projectId: target.id }));
+        yield* Deferred.await(ready);
+        const { task } = yield* tasks.upsert({
+          id: ScheduledTaskId.make("filing-late-task"),
+          title: "Late",
+          prompt: "Check in",
+          enabled: true,
+          schedule: { type: "interval", everyMs: 60_000 },
+          projectId: SCRATCH_PROJECT_ID,
+          threadId,
+          workspaceStrategy: { type: "root" },
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        });
+        const subscribed = yield* Deferred.make<void>();
+        const updated = yield* Deferred.make<void>();
+        yield* tasks.subscribeList().pipe(
+          Stream.runForEach(({ tasks: rows }) => {
+            const row = rows.find((candidate) => candidate.id === task.id);
+            return row?.projectId === target.id
+              ? Deferred.succeed(updated, undefined)
+              : Deferred.succeed(subscribed, undefined);
+          }),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(subscribed);
+        yield* Deferred.succeed(proceed, undefined);
+        yield* Fiber.join(pending);
+        yield* Deferred.await(updated);
+        const saved = (yield* tasks.list()).tasks.find((candidate) => candidate.id === task.id);
+        assert.equal(saved?.projectId, target.id);
+        assert.equal(saved?.threadId, threadId);
+      } finally {
+        spy.mockRestore();
+      }
+    }),
+  );
+
   it.effect("moves every thread in the folder and its bound tasks into one project", () =>
     Effect.gen(function* () {
       const promotion = yield* ScratchThreadPromotion.ScratchThreadPromotion;
@@ -7212,7 +8169,7 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
       const { folder, createThread } = yield* setup("moves");
       const threadId = yield* createThread("main", folder);
       const siblingId = yield* createThread("sibling", folder);
-      const otherId = yield* createThread("other", `${SCRATCH_ROOT}/2026-01-01-elsewhere`);
+      const otherId = yield* createThread("other", `${yield* scratchRoot}/2026-01-01-elsewhere`);
       const { task } = yield* tasks.upsert({
         id: ScheduledTaskId.make("promotion-moves-bound"),
         title: "Bound",

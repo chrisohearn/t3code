@@ -19,6 +19,7 @@ import {
   readThread,
   unavailable,
 } from "../../threadAccess.ts";
+import * as ScratchThreadPromotion from "../../../project/ScratchThreadPromotion.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
@@ -87,7 +88,7 @@ const required = <A>(value: A | undefined, name: string) =>
       )
     : Effect.succeed(value);
 const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A, E, R>(
-  handle: (params: P) => Effect.Effect<A, E, R>,
+  handle: (params: P, authorize: McpToolAccess.AuthorizeThread) => Effect.Effect<A, E, R>,
 ) => McpToolAccess.writesThreads((params: P) => [params.threadId], handle);
 
 export const layer = McpToolAccess.toLayer(ThreadToolkit, {
@@ -332,9 +333,27 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       }),
     ),
   ),
-  t3_thread_organize: writesThread((input) =>
+  t3_thread_organize: writesThread((input, authorize) =>
     Effect.gen(function* () {
       const { threads, projection, caller } = yield* readThread(input.threadId);
+      if (input.action === "move") {
+        const projectId = yield* required(input.projectId, "projectId");
+        const filing = yield* ScratchThreadPromotion.ScratchThreadPromotion;
+        const { threadIds } = yield* filing
+          .file({ threadId: projection.thread.id, projectId }, authorize)
+          .pipe(
+            Effect.catchTags({
+              ScratchThreadPromotionError: (error) =>
+                Effect.fail(
+                  new OrchestratorMcpFailure({
+                    code: "orchestration_error",
+                    message: error.message,
+                  }),
+                ),
+            }),
+          );
+        return { moved: true as const, threadIds };
+      }
       const common = { commandId: yield* newCommandId(), threadId: projection.thread.id };
       if (input.action === "settle") {
         return yield* threads

@@ -30,6 +30,7 @@ import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventS
 import { projectStoredEventForWire } from "./WireProjection.ts";
 import { makeRunOutcomeRecorder, type RunOutcome } from "./RunMetrics.ts";
 
+import * as ScheduledTaskChanges from "../scheduledTasks/ScheduledTaskChanges.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventStore from "./EventStore.ts";
@@ -242,6 +243,7 @@ const layerBase: Layer.Layer<
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const scheduledTaskChanges = yield* ScheduledTaskChanges.ScheduledTaskChanges;
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -368,14 +370,33 @@ const layerBase: Layer.Layer<
       return Effect.forEach(
         events,
         (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
-          event.type === "turn-item.updated"
-            ? turnItemPositions
-                .normalize(
-                  event.payload,
-                  event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
-                )
-                .pipe(Effect.map((payload) => ({ ...event, payload })))
-            : Effect.succeed(event),
+          Effect.gen(function* () {
+            if (event.type === "turn-item.updated") {
+              const payload = yield* turnItemPositions.normalize(
+                event.payload,
+                event.payload.runId === null ? undefined : runOrdinals.get(event.payload.runId),
+              );
+              return { ...event, payload };
+            }
+            if (
+              event.type === "thread.created" &&
+              event.payload.creationSource === "provider" &&
+              event.payload.lineage.relationshipToParent === "subagent" &&
+              event.payload.lineage.parentThreadId !== null
+            ) {
+              const parent = yield* projectionStore
+                .getThread(event.payload.lineage.parentThreadId)
+                .pipe(
+                  Effect.catchTags({
+                    ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
+                  }),
+                );
+              if (parent !== null && parent.worktreePath === event.payload.worktreePath) {
+                return { ...event, payload: { ...event.payload, projectId: parent.projectId } };
+              }
+            }
+            return event;
+          }),
         { concurrency: 1 },
       );
     };
@@ -678,7 +699,12 @@ const layerBase: Layer.Layer<
           });
           if (!reserved) {
             const existing = yield* existingCommandResult(input.commandId);
-            return { ...existing, committed: false as const, cancelledEffectIds: [] };
+            return {
+              ...existing,
+              committed: false as const,
+              cancelledEffectIds: [],
+              tasksChanged: false,
+            };
           }
 
           const runId = input.updateDelegatedCompletionOnlyRunId;
@@ -702,6 +728,26 @@ const layerBase: Layer.Layer<
               new Error(`Command ${input.commandId} produced no orchestration events.`),
             );
           }
+          let tasksChanged = false;
+          if (
+            input.commandType === "thread.project.file-scratch" ||
+            input.commandType === "thread.project.adopt-folder"
+          ) {
+            for (const { event } of storedEvents) {
+              if (event.type !== "thread.metadata-updated") continue;
+              const target = yield* projectStore.get(event.payload.projectId);
+              if (Option.isNone(target) || target.value.deletedAt !== null) {
+                return yield* Effect.fail("Cannot update a thread in a missing project.");
+              }
+              // Project assignment and bound tasks commit together, including saves racing a move.
+              const moved = yield* sql`
+                UPDATE scheduled_tasks SET project_id = ${event.payload.projectId}
+                WHERE thread_id = ${event.threadId} AND project_id != ${event.payload.projectId}
+                RETURNING task_id
+              `;
+              tasksChanged ||= moved.length > 0;
+            }
+          }
           const outcomes = yield* applyStoredEvents(storedEvents);
           yield* effectOutbox.enqueue(input.effects);
           const receipt: CommandReceiptStore.CommandReceiptV2 = {
@@ -721,10 +767,18 @@ const layerBase: Layer.Layer<
                   threadId: input.threadId,
                   ...input.cancelUnsettledEffects,
                 });
-          return { receipt, storedEvents, outcomes, committed: true as const, cancelledEffectIds };
+          return {
+            receipt,
+            storedEvents,
+            outcomes,
+            committed: true as const,
+            cancelledEffectIds,
+            tasksChanged,
+          };
         }),
         (result) =>
           Effect.gen(function* () {
+            if (result.tasksChanged) yield* PubSub.publish(scheduledTaskChanges, undefined);
             yield* effectOutbox.signalCancellations(result.cancelledEffectIds);
             if (result.committed && input.effects.length > 0) {
               yield* effectOutbox.notifyAvailable(input.effects.length);
@@ -791,6 +845,16 @@ const layerBase: Layer.Layer<
             };
             if (!(yield* commandReceipts.insertIfAbsent(reserved))) {
               return { receipt: yield* existingProjectReceipt(input.commandId), event: undefined };
+            }
+            if (input.event.type === "project.deleted") {
+              // A thread may arrive after deletion took its cascade snapshot.
+              const remaining = yield* sql`
+                SELECT 1 FROM orchestration_v2_projection_threads
+                WHERE project_id = ${input.projectId} AND deleted_at IS NULL LIMIT 1
+              `;
+              if (remaining.length > 0) {
+                return yield* Effect.fail("Project gained threads during deletion. Try again.");
+              }
             }
             const event = yield* eventStore.appendProjectEvent(input.event);
             yield* projectStore.apply(event);
@@ -1116,7 +1180,7 @@ const layerBase: Layer.Layer<
         ),
     } satisfies EventSinkV2Shape);
   }),
-);
+).pipe(Layer.provide(ScheduledTaskChanges.layer));
 
 /** Share the worker's outbox instance: enqueue wakeups are in-memory. */
 export const layerFromStores = layerBase;
