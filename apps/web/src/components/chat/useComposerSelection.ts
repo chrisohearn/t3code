@@ -19,9 +19,10 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { type SetStateAction } from "react";
+import { RegistryContext } from "@effect/atom-react";
+import { type SetStateAction, useContext } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { threadEnvironment } from "../../state/threads";
+import { environmentThreadShells, threadEnvironment } from "../../state/threads";
 import { useOrchestrationCommand } from "../../state/use-orchestration-command";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { resolveAppModelSelectionForInstance } from "../../modelSelection";
@@ -58,6 +59,8 @@ interface ComposerSelectionInput {
   readonly scheduleComposerFocus: () => void;
 }
 
+const ACTIVE_RUN_STATUSES = new Set(["preparing", "starting", "running", "waiting"]);
+
 /**
  * The composer's choices for the next turn: provider and model, runtime mode,
  * and where a new thread runs (local or a new worktree, from the remote's tip or not).
@@ -90,19 +93,46 @@ export function useComposerSelection(input: ComposerSelectionInput) {
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
   const applyThreadModelPick = useApplyThreadModelPick();
+  const registry = useContext(RegistryContext);
   const setThreadRuntimeMode = useOrchestrationCommand(threadEnvironment.setRuntimeMode, {
     label: "change permissions",
   });
 
-  const applyThreadRuntimeMode = async (threadRef: ScopedThreadRef, mode: RuntimeMode) => {
+  const applyThreadRuntimeMode = async (
+    threadRef: ScopedThreadRef,
+    mode: RuntimeMode,
+    serverModeAtPick: RuntimeMode,
+  ) => {
     const result = await setThreadRuntimeMode({
       environmentId: threadRef.environmentId,
       input: { threadId: threadRef.threadId, runtimeMode: mode },
     });
-    const store = useComposerDraftStore.getState();
-    // A newer pick is still waiting for its own reply.
-    if (store.draftsByThreadKey[scopedThreadKey(threadRef)]?.runtimeMode !== mode) return;
-    store.setRuntimeMode(threadRef, null);
+    // A newer pick owns the draft until its own reply.
+    const releasePick = () => {
+      const store = useComposerDraftStore.getState();
+      if (store.draftsByThreadKey[scopedThreadKey(threadRef)]?.runtimeMode !== mode) return false;
+      store.setRuntimeMode(threadRef, null);
+      return true;
+    };
+    if (result._tag === "Success") {
+      // The reply can beat the shell update; releasing before it lands flashes the old mode.
+      const shellAtom = environmentThreadShells.threadShellAtom(threadRef);
+      const shellCaughtUp = () => {
+        const shellMode = registry.get(shellAtom)?.runtimeMode;
+        return shellMode === undefined || shellMode === mode || shellMode !== serverModeAtPick;
+      };
+      if (shellCaughtUp()) {
+        releasePick();
+        return;
+      }
+      const unsubscribe = registry.subscribe(shellAtom, () => {
+        if (!shellCaughtUp()) return;
+        unsubscribe();
+        releasePick();
+      });
+      return;
+    }
+    if (!releasePick()) return;
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
       const error = squashAtomCommandFailure(result);
       toastManager.add(
@@ -126,9 +156,16 @@ export function useComposerSelection(input: ComposerSelectionInput) {
       return;
     }
     const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
-    if (mode === activeThread.runtimeMode) {
-      setComposerDraftRuntimeMode(threadRef, null);
-    } else if ((activeRuntime?.activeRunId ?? null) !== null) {
+    const pendingMode =
+      useComposerDraftStore.getState().draftsByThreadKey[scopedThreadKey(threadRef)]?.runtimeMode ??
+      null;
+    const runStatus = (activeRuntime ?? activeThread.runtime)?.status;
+    // A pending pick is still in flight, so returning to the server's mode must be sent too.
+    if (mode === activeThread.runtimeMode && pendingMode === null) {
+      scheduleComposerFocus();
+      return;
+    }
+    if (runStatus !== undefined && ACTIVE_RUN_STATUSES.has(runStatus)) {
       // The server accepts it mid-run, but Claude would end its live session to apply it.
       toastManager.add(
         stackedThreadToast({
@@ -139,7 +176,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
       );
     } else {
       setComposerDraftRuntimeMode(threadRef, mode);
-      void applyThreadRuntimeMode(threadRef, mode);
+      void applyThreadRuntimeMode(threadRef, mode, activeThread.runtimeMode);
     }
     scheduleComposerFocus();
   };

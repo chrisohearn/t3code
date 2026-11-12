@@ -16,6 +16,7 @@ import { getRouter } from "~/router";
 import {
   ENVIRONMENT_ID,
   dispatchedCommands,
+  emitThreadShellUpdate,
   installFakeEnvironment,
   rejectPendingCommand,
   runningRun,
@@ -44,6 +45,7 @@ vi.mock(import("~/rpc/requestLatencyState"), async (original) => ({
 
 const idleThread = threadWithHistory("thread-mode-pick", 1);
 const refusedThread = threadWithHistory("thread-mode-refused", 1);
+const revertedThread = threadWithHistory("thread-mode-reverted", 1);
 const runningThread = (() => {
   const idle = threadWithHistory("thread-mode-running", 1);
   return {
@@ -52,7 +54,7 @@ const runningThread = (() => {
   };
 })();
 // The app's shell subscription outlives a test, so every test lists every thread.
-const allThreads = [idleThread, refusedThread, runningThread];
+const allThreads = [idleThread, refusedThread, revertedThread, runningThread];
 
 async function openThread(
   thread: FakeThread,
@@ -104,8 +106,13 @@ it("a permissions pick on an idle thread reaches the server before any message i
       expect.objectContaining({ threadId: thread.id, runtimeMode: "approval-required" }),
     ]),
   );
-  // The server's value takes over, so a later send cannot carry a stale pick.
+  // The pick holds until the shell shows it, then the server's value takes over.
+  expect(draftRuntimeMode(thread)).toBe("approval-required");
+  await emitThreadShellUpdate(thread.id, { runtimeMode: "approval-required" });
   await vi.waitFor(() => expect(draftRuntimeMode(thread)).toBeNull());
+  await expect
+    .element(page.getByRole("button", { name: "Permissions: Supervised" }).first())
+    .toBeVisible();
 });
 
 it("a refused permissions change shows the server's reason and the server's mode", async () => {
@@ -116,7 +123,10 @@ it("a refused permissions change shows the server's reason and the server's mode
 
   await pickSupervised();
   await vi.waitFor(() => expect(runtimeModeCommands()).toHaveLength(1));
-  expect(draftRuntimeMode(thread)).toBe("approval-required");
+  // The picker's control; the footer chip also appears once the mode leaves the default.
+  await expect
+    .element(page.getByRole("button", { name: "Permissions: Supervised" }).first())
+    .toBeVisible();
   await rejectPendingCommand("The current session is still running background agents.");
 
   await expect.element(page.getByText("Could not change permissions")).toBeVisible();
@@ -124,6 +134,30 @@ it("a refused permissions change shows the server's reason and the server's mode
     .element(page.getByText("The current session is still running background agents."))
     .toBeVisible();
   expect(draftRuntimeMode(thread)).toBeNull();
+  // The model picker stays open after the permissions pick.
+  await expect
+    .element(page.getByRole("button", { name: "Permissions: Full access" }))
+    .toBeVisible();
+});
+
+it("returning to the server's mode before a pick lands sends that mode too", async () => {
+  const thread = revertedThread;
+  await using _app = await openThread(thread, {
+    holdCommand: (command) => command.type === "thread.runtime-mode.set",
+  });
+
+  await pickSupervised();
+  await page.getByRole("button", { name: "Permissions: Supervised" }).first().click();
+  await page.getByRole("menuitemradio", { name: "Full access" }).click();
+  // Commands on one thread run in order, so the second waits for the first's reply.
+  await vi.waitFor(() => expect(runtimeModeCommands()).toHaveLength(1));
+  await rejectPendingCommand("Refused.");
+  await vi.waitFor(() =>
+    expect(runtimeModeCommands().map((command) => command.runtimeMode)).toEqual([
+      "approval-required",
+      "full-access",
+    ]),
+  );
 });
 
 it("a permissions pick during a run is refused without reaching the server", async () => {
