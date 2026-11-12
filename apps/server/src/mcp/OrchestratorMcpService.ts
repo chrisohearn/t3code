@@ -1,6 +1,7 @@
 import * as JarvisPlaybook from "./JarvisPlaybook.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
 import { advertisedModel, requireAdvertisedModel } from "./providerModels.ts";
+import { hasGitEntry } from "./gitEntryProbe.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as ThreadNotifications from "./ThreadNotifications.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
@@ -1904,6 +1905,28 @@ const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => false),
     );
 
+  const confirmedNotARepository = (cwd: string) =>
+    gitDriver
+      .execute({
+        operation: "OrchestratorMcpService.confirmedNotARepository",
+        cwd,
+        args: ["rev-parse", "--is-inside-work-tree"],
+        env: { LC_ALL: "C" },
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+        maxOutputBytes: 4_096,
+      })
+      .pipe(
+        Effect.map(
+          (result) =>
+            result.exitCode !== 0 &&
+            result.stderr
+              .split(/\r?\n/u)
+              .some((line) => line.startsWith("fatal: not a git repository")),
+        ),
+        Effect.orElseSucceed(() => false),
+      );
+
   const resolveScheduledTaskBaseRef = Effect.fn(
     "OrchestratorMcpService.resolveScheduledTaskBaseRef",
   )(function* (cwd: string) {
@@ -1929,7 +1952,14 @@ const make = Effect.gen(function* () {
     for (const branch of conventional) {
       if (yield* refExists(cwd, `refs/heads/${branch}`)) return branch;
     }
-    return "main";
+    if (yield* refExists(cwd, "HEAD")) return "main";
+    // Only Git's own "not a git repository", with no `.git` entry anywhere above, proves there is
+    // nothing to start a worktree from. Anything else keeps a worktree, so runs fail during
+    // preparation instead of running in the shared checkout.
+    if (!(yield* confirmedNotARepository(cwd))) return "main";
+    // Git also says "not a git repository" for a repository it cannot open (an unreadable `.git`,
+    // a missing HEAD), so a `.git` entry here or in any parent still keeps a worktree.
+    return (yield* hasGitEntry(cwd)) ? "main" : null;
   });
 
   const scheduledTaskWorkspaceStrategy = Effect.fn(
@@ -1937,11 +1967,10 @@ const make = Effect.gen(function* () {
   )(function* (boundToThread: boolean, projectId: ProjectId) {
     if (boundToThread) return { type: "root" as const };
     const { workspaceRoot } = yield* requireProject(projectId);
-    return {
-      type: "worktree" as const,
-      baseRef: yield* resolveScheduledTaskBaseRef(workspaceRoot),
-      startFromOrigin: true,
-    };
+    const baseRef = yield* resolveScheduledTaskBaseRef(workspaceRoot);
+    // Every run would otherwise fail while provisioning a worktree.
+    if (baseRef === null) return { type: "root" as const };
+    return { type: "worktree" as const, baseRef, startFromOrigin: true };
   });
 
   const scheduledTaskRunModes = Effect.fn("OrchestratorMcpService.scheduledTaskRunModes")(
