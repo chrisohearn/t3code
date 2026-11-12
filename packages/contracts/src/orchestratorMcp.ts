@@ -360,8 +360,8 @@ export const OrchestratorMcpThreadPullRequest = Schema.Struct({
   url: TrimmedNonEmptyString,
   source: ThreadPullRequestLinkSource,
   state: Schema.NullOr(PullRequestState),
-  watching: Schema.Boolean,
-  watchStartedAt: Schema.NullOr(IsoDateTime),
+  watching: Schema.optional(Schema.Boolean),
+  watchStartedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
 });
 export type OrchestratorMcpThreadPullRequest = typeof OrchestratorMcpThreadPullRequest.Type;
 

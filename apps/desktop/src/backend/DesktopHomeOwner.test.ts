@@ -1,4 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - Synchronous marker reads keep the test clock deterministic.
 import * as NodeSqlite from "node:sqlite";
+import * as NodeFS from "node:fs";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -102,9 +104,31 @@ describe("DesktopHomeOwner.awaitHomeOwnershipRelease", () => {
       Effect.gen(function* () {
         assert.isTrue(yield* DesktopHomeOwner.awaitHomeOwnershipRelease());
 
+        const fs = yield* FileSystem.FileSystem;
+        // Synchronous marker reads keep the test clock from advancing while filesystem I/O is pending.
+        const ownershipCheck = DesktopHomeOwner.awaitHomeOwnershipRelease().pipe(
+          Effect.provideService(FileSystem.FileSystem, {
+            ...fs,
+            readFileString: (path) =>
+              Effect.sync(() => {
+                try {
+                  return NodeFS.readFileSync(path, "utf8");
+                } catch {
+                  return "";
+                }
+              }),
+            remove: (path) => Effect.sync(() => NodeFS.rmSync(path, { force: true })),
+          }),
+        );
         const lock = new NodeSqlite.DatabaseSync(`${userdata}/server-owner.sqlite`);
         lock.exec("BEGIN EXCLUSIVE;");
-        const released = yield* Effect.forkChild(DesktopHomeOwner.awaitHomeOwnershipRelease());
+        assert.isFalse(yield* ownershipCheck);
+        yield* fs.writeFileString(
+          `${userdata}/server-runtime.json`,
+          JSON.stringify({ pid: process.pid, port: 3790 }),
+        );
+        yield* DesktopHomeOwner.prepareHomeOwnerRelaunch();
+        const released = yield* Effect.forkChild(ownershipCheck);
         yield* TestClock.adjust("5 seconds");
         lock.close();
         yield* TestClock.adjust("1 second");
@@ -112,10 +136,19 @@ describe("DesktopHomeOwner.awaitHomeOwnershipRelease", () => {
 
         const held = new NodeSqlite.DatabaseSync(`${userdata}/server-owner.sqlite`);
         held.exec("BEGIN EXCLUSIVE;");
-        const owned = yield* Effect.forkChild(DesktopHomeOwner.awaitHomeOwnershipRelease());
+        yield* DesktopHomeOwner.prepareHomeOwnerRelaunch();
+        const owned = yield* Effect.forkChild(ownershipCheck);
         yield* TestClock.adjust("1 minute");
         assert.isFalse(yield* Fiber.join(owned));
         held.close();
+        const later = new NodeSqlite.DatabaseSync(`${userdata}/server-owner.sqlite`);
+        later.exec("BEGIN EXCLUSIVE;");
+        yield* DesktopHomeOwner.prepareHomeOwnerRelaunch();
+        yield* TestClock.adjust("2 minutes");
+        assert.isFalse(yield* ownershipCheck);
+        // A stale marker is consumed, so a subsequent normal launch cannot inherit it.
+        assert.isFalse(yield* ownershipCheck);
+        later.close();
       }),
     ),
   );

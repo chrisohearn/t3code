@@ -267,7 +267,10 @@ describe("DesktopLifecycle", () => {
         ]),
       );
 
-      assert.deepEqual(options, { execPath: "/opt/T3 Code/t3code", args: ["--no-sandbox"] });
+      assert.deepEqual(options, {
+        execPath: "/opt/T3 Code/t3code",
+        args: ["--no-sandbox", "--t3-home-owner-relaunch"],
+      });
     }),
   );
 

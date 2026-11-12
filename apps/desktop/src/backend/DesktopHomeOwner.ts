@@ -2,6 +2,7 @@
 import * as NodeSqlite from "node:sqlite";
 
 import * as Duration from "effect/Duration";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -61,19 +62,73 @@ const isHomeOwnershipLocked = Effect.fn("DesktopHomeOwner.isHomeOwnershipLocked"
 // A quitting app's backend holds the lock until it exits, which can outlast the relaunch of an update.
 const HOME_OWNERSHIP_RELEASE_GRACE = Duration.sum(BACKEND_QUIT_STOP_TIMEOUT, Duration.seconds(3));
 const HOME_OWNERSHIP_RELEASE_POLL_INTERVAL = Duration.millis(250);
+export const HOME_OWNER_RELAUNCH_ARGUMENT = "--t3-home-owner-relaunch";
 
-/** Whether the ownership lock is free, or frees within the grace a shutting-down server needs. */
-export const awaitHomeOwnershipRelease = Effect.fn("DesktopHomeOwner.awaitHomeOwnershipRelease")(
+const RelaunchOwner = Schema.Struct({ pid: Schema.Int, preparedAt: Schema.Number });
+const decodeRelaunchOwner = Schema.decodeUnknownOption(Schema.fromJsonString(RelaunchOwner));
+const encodeRelaunchOwner = Schema.encodeSync(Schema.fromJsonString(RelaunchOwner));
+const relaunchOwnerPath = Effect.gen(function* () {
+  const path = yield* Path.Path;
+  const { baseDir } = yield* DesktopEnvironment.DesktopEnvironment;
+  return path.join(baseDir, "runtime", "desktop-home-relaunch.json");
+});
+
+export const clearHomeOwnerRelaunch = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  yield* fs.remove(yield* relaunchOwnerPath, { force: true }).pipe(Effect.ignore);
+});
+
+export const prepareHomeOwnerRelaunch = Effect.fn("DesktopHomeOwner.prepareHomeOwnerRelaunch")(
   function* () {
-    while (yield* isHomeOwnershipLocked()) {
-      yield* Effect.sleep(HOME_OWNERSHIP_RELEASE_POLL_INTERVAL);
-    }
-    return true;
+    if (!(yield* isHomeOwnershipLocked())) return;
+    const owner = yield* readLiveHomeOwner();
+    if (Option.isNone(owner) || owner.value.serviceManaged) return;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const marker = yield* relaunchOwnerPath;
+    const preparedAt = yield* Clock.currentTimeMillis;
+    yield* fs
+      .makeDirectory(path.dirname(marker), { recursive: true })
+      .pipe(
+        Effect.andThen(
+          fs.writeFileString(marker, encodeRelaunchOwner({ pid: owner.value.pid, preparedAt })),
+        ),
+        Effect.ignore,
+      );
   },
-  Effect.timeoutOrElse({
-    duration: HOME_OWNERSHIP_RELEASE_GRACE,
-    orElse: () => Effect.succeed(false),
-  }),
+);
+
+/** Only a relaunch of an owner that was asked to stop gets the shutdown grace. */
+export const awaitHomeOwnershipRelease = Effect.fn("DesktopHomeOwner.awaitHomeOwnershipRelease")(
+  function* (relaunch = false) {
+    const fs = yield* FileSystem.FileSystem;
+    const marker = yield* fs.readFileString(yield* relaunchOwnerPath).pipe(Effect.option);
+    yield* clearHomeOwnerRelaunch;
+    if (!(yield* isHomeOwnershipLocked())) return true;
+    const prepared = Option.flatMap(marker, decodeRelaunchOwner);
+    const owner = yield* readLiveHomeOwner();
+    const now = yield* Clock.currentTimeMillis;
+    if (
+      !relaunch &&
+      (Option.isNone(prepared) ||
+        Option.isNone(owner) ||
+        prepared.value.pid !== owner.value.pid ||
+        now < prepared.value.preparedAt ||
+        now - prepared.value.preparedAt > 60_000)
+    )
+      return false;
+    return yield* Effect.gen(function* () {
+      while (yield* isHomeOwnershipLocked()) {
+        yield* Effect.sleep(HOME_OWNERSHIP_RELEASE_POLL_INTERVAL);
+      }
+      return true;
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: HOME_OWNERSHIP_RELEASE_GRACE,
+        orElse: () => Effect.succeed(false),
+      }),
+    );
+  },
 );
 
 /** The live server recorded as owning the desktop's T3 home. Only call once the ownership lock is known held: a live PID alone may be reused. */

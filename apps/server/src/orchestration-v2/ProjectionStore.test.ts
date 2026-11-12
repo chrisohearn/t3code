@@ -45,6 +45,7 @@ import * as Statement from "effect/sql/Statement";
 import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import ForkRunExclusions from "../persistence/ForkMigrations/011_ForkRunExclusions.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import {
@@ -281,6 +282,13 @@ it.effect("routes full projection reads to readers and retains uncommitted write
     const parent = yield* store.getThreadProjection(parentId);
     const threadId = ThreadId.make("thread:reader-routing:fork");
     yield* store.apply({
+      id: EventId.make("event:reader-routing:before-fork"),
+      type: "run.updated",
+      threadId: parentId,
+      occurredAt: parent.thread.createdAt,
+      payload: { ...parent.runs[0]!, status: "completed" },
+    });
+    yield* store.apply({
       id: EventId.make("event:reader-routing:fork"),
       type: "thread.created",
       threadId,
@@ -290,6 +298,13 @@ it.effect("routes full projection reads to readers and retains uncommitted write
         id: threadId,
         forkedFrom: { type: "run", threadId: parentId, runId: parent.runs[0]!.id },
       },
+    });
+    yield* store.apply({
+      id: EventId.make("event:reader-routing:after-fork"),
+      type: "run.updated",
+      threadId: parentId,
+      occurredAt: parent.thread.createdAt,
+      payload: parent.runs[0]!,
     });
     const messageId = MessageId.make("message:reader-routing");
     yield* store.apply({
@@ -9079,7 +9094,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
       const now = yield* DateTime.now;
       const rewoundAt = DateTime.add(now, { minutes: 1 });
-      const forkedAt = DateTime.add(now, { minutes: 2 });
+      const forkedAt = rewoundAt;
       const prefix = "projection-fork-after-rewind";
       const projectId = ProjectId.make(`project:${prefix}`);
       const sourceThreadId = ThreadId.make(`thread:${prefix}:source`);
@@ -9242,6 +9257,43 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         "prompt three",
         "reply three",
       ]);
+      // A later rewind at the exact same timestamp must not alter this fork's prefix.
+      yield* projectionStore.apply({
+        id: EventId.make(`event:${prefix}:run-1-rolled-back`),
+        type: "run.updated",
+        threadId: sourceThreadId,
+        runId: runIds[0]!,
+        occurredAt: rewoundAt,
+        payload: runPayload(0, "rolled_back"),
+      });
+      const sql = yield* SqlClient.SqlClient;
+      for (const [index, event] of [
+        {
+          threadId: sourceThreadId,
+          type: "run.updated",
+          payload: { id: runIds[1]!, status: "rolled_back" },
+        },
+        { threadId: targetThreadId, type: "thread.created", payload: { id: targetThreadId } },
+        {
+          threadId: sourceThreadId,
+          type: "run.updated",
+          payload: { id: runIds[0]!, status: "rolled_back" },
+        },
+      ].entries()) {
+        yield* sql`INSERT INTO orchestration_events
+          (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+           actor_kind, payload_json, metadata_json, application_event_version)
+          VALUES (${`${prefix}:backfill:${index}`}, 'thread', ${event.threadId}, ${index},
+            ${event.type}, ${DateTime.formatIso(forkedAt)}, 'server', ${JSON.stringify(event.payload)}, '{}', 2)`;
+      }
+      // Reconstruct legacy forks once, then retain the boundary independently of event-log pruning.
+      yield* sql`DROP TABLE fork_run_exclusions`;
+      yield* ForkRunExclusions;
+      assert.deepEqual(
+        yield* sql`SELECT run_ids_json FROM fork_run_exclusions WHERE thread_id = ${targetThreadId}`,
+        [{ run_ids_json: JSON.stringify([runIds[1]!]) }],
+      );
+      yield* sql`DELETE FROM orchestration_events WHERE event_id LIKE ${`${prefix}:backfill:%`}`;
       const expected = ["prompt one", "reply one", "prompt three", "reply three", "fork"];
       const target = yield* projectionStore.getThreadProjection(targetThreadId);
       assert.deepEqual(visibleTexts(target.visibleTurnItems), expected);
