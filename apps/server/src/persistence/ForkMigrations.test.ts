@@ -9,6 +9,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import { FORK_MIGRATIONS_TABLE, forkMigrationManifest, legacyForkRows } from "./ForkMigrations.ts";
 import McpEvents from "./ForkMigrations/001_McpEvents.ts";
+import McpBridgeStatus from "./ForkMigrations/004_McpBridgeStatus.ts";
+import McpSubscriptionRenewal from "./ForkMigrations/006_McpSubscriptionRenewal.ts";
 import { hasPendingMigrations, migrationManifest, runMigrations } from "./Migrations.ts";
 
 // The last upstream id before fork builds started taking upstream's ids for fork migrations.
@@ -47,6 +49,36 @@ const seedLegacyForkDatabase = Effect.gen(function* () {
 const pendingUpstream = migrationManifest.filter(([id]) => id > LAST_SHARED_ID);
 
 describe("fork migrations", () => {
+  it.effect("backfills legacy subscription lifetimes without altering secrets or cursors", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: migrationManifest.at(-1)![0] });
+      yield* McpEvents;
+      yield* McpBridgeStatus;
+      yield* sql`INSERT INTO auth_sessions (session_id, subject, scopes, method, issued_at, expires_at)
+        VALUES ('legacy', 'mcp-client', '[]', 'bearer-access-token', '2026-11-12', '2026-12-12')`;
+      yield* sql`INSERT INTO mcp_event_subscriptions
+        (id, principal, name, thread_id, callback_url, source_url, secret, previous_secret,
+         rotation_until, expires_at, active, scan_cursor, ack_cursor)
+        VALUES ('short', 'legacy', 'thread.run.result', 'thread:legacy', 'https://example.com/events',
+         'https://example.com', 'current', 'previous', 300000, 125000, 1, 5, 3),
+         ('untracked', 'legacy', 'thread.blocker', 'thread:legacy', 'https://example.com/events',
+         'https://example.com', 'current', NULL, 0, 86400000, 1, 5, 3)`;
+      yield* sql`INSERT INTO mcp_event_subscription_activity VALUES ('short', 5000)`;
+      const before = yield* sql`SELECT * FROM mcp_event_subscriptions ORDER BY id`;
+      yield* McpSubscriptionRenewal;
+      assert.deepStrictEqual(yield* sql`SELECT * FROM mcp_event_subscriptions ORDER BY id`, before);
+      assert.deepStrictEqual(
+        yield* sql`SELECT subscription_id, refreshed_at, renewal_ttl_ms
+        FROM mcp_event_subscription_activity ORDER BY subscription_id`,
+        [
+          { subscription_id: "short", refreshed_at: 5000, renewal_ttl_ms: 120000 },
+          { subscription_id: "untracked", refreshed_at: 0, renewal_ttl_ms: 86400000 },
+        ],
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
   it.effect("record in their own table on a new database", () =>
     Effect.gen(function* () {
       yield* runMigrations({ toMigrationInclusive: migrationManifest.at(-1)![0] });
@@ -113,6 +145,7 @@ describe("fork migrations", () => {
           [3, "McpClientThreads"],
           [4, "McpBridgeStatus"],
           [5, "McpOAuthRenewal"],
+          [6, "McpSubscriptionRenewal"],
           [7, "WorkLedgerPortfolio"],
         ],
       );
@@ -123,6 +156,10 @@ describe("fork migrations", () => {
       yield* sql`SELECT * FROM work_ledger`;
       yield* sql`SELECT * FROM mcp_client_threads`;
       yield* sql`SELECT * FROM mcp_bridge_status`;
+      assert.deepStrictEqual(
+        yield* sql`SELECT renewal_ttl_ms FROM mcp_event_subscription_activity WHERE subscription_id = 'preserved'`,
+        [{ renewal_ttl_ms: 86_400_000 }],
+      );
       const before = yield* forkHistory;
       assert.isFalse(yield* hasPendingMigrations());
       assert.deepStrictEqual(yield* runMigrations(), []);

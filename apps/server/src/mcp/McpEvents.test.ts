@@ -380,11 +380,11 @@ it.effect("does not let an out-of-order acknowledgement skip an earlier pending 
       });
       const due = yield* f.deliveries.due(0);
       expect(due).toHaveLength(3);
-      yield* f.deliveries.acknowledge(due[2]!);
+      yield* f.deliveries.acknowledge(due[2]!, 0);
       expect((yield* f.subscriptions.get(id))?.ackCursor).toBe(1);
-      yield* f.deliveries.acknowledge(due[0]!);
+      yield* f.deliveries.acknowledge(due[0]!, 0);
       expect((yield* f.subscriptions.get(id))?.ackCursor).toBe(4);
-      yield* f.deliveries.acknowledge(due[1]!);
+      yield* f.deliveries.acknowledge(due[1]!, 0);
       expect((yield* f.subscriptions.get(id))?.ackCursor).toBe(9);
       expect(yield* f.deliveries.count(id)).toBe(0);
     }),
@@ -1014,6 +1014,90 @@ it.effect.each(["reachable", "deadline"] as const)(
         expect((yield* f.call(f.service.bridgeStatus())).serviceStartedAt).toBe(
           "1970-01-01T00:00:00.000Z",
         );
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect(
+  "renews explicit subscriptions only after acknowledgement using a durable fixed lifetime",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const input = { ...inputFor(ThreadId.make("rolling-watch")), ttlMs: 120_000 };
+        const sub = yield* f.call(f.service.subscribe(input));
+        yield* TestClock.adjust("30 seconds");
+        yield* f.append([input.arguments.threadId]);
+        f.responses.set("event-0", 503);
+        yield* f.service.drain();
+        expect((yield* f.subscriptions.get(sub.id))?.expiresAt).toBe(120_000);
+        f.responses.delete("event-0");
+        yield* TestClock.adjust("1 second");
+        yield* f.service.drain();
+        expect((yield* f.subscriptions.get(sub.id))?.expiresAt).toBe(151_000);
+        const restarted = yield* f.build();
+        yield* TestClock.adjust("30 seconds");
+        yield* f.append([input.arguments.threadId], "-second");
+        yield* restarted.drain();
+        const renewed = yield* f.subscriptions.get(sub.id);
+        expect(renewed?.expiresAt).toBe(181_000);
+        expect(renewed?.refreshedAt).toBe(0);
+        expect(renewed?.previousSecret).toBeNull();
+        expect(renewed?.rotationUntil).toBe(0);
+        expect(yield* f.deliveries.count(sub.id)).toBe(0);
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("keeps notify-only expiry fixed while renewing its explicit source on delivery", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const input = inputFor(ThreadId.make("explicit-source"));
+      const source = yield* f.call(f.service.subscribe(input));
+      const prepared = yield* f.call(
+        f.service.prepareNotify({ events: ["thread.resource-released"] }),
+      );
+      if ("status" in prepared) throw new Error("Expected an active source");
+      const notifiedThread = ThreadId.make("notify-only");
+      const notified = yield* f.call(f.service.notifyThread(prepared, notifiedThread));
+      yield* TestClock.adjust("12 hours");
+      yield* f.append([input.arguments.threadId, notifiedThread]);
+      yield* f.service.drain();
+      expect((yield* f.subscriptions.get(source.id))?.expiresAt).toBe(129_600_000);
+      expect((yield* f.subscriptions.get(notified.subscriptionIds[0]!))?.expiresAt).toBe(
+        86_400_000,
+      );
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect(
+  "caps acknowledged renewal at current sign-in expiry without reactivating stale watches",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const input = { ...inputFor(ThreadId.make("bounded-renewal")), ttlMs: 120_000 };
+        const sub = yield* f.call(f.service.subscribe(input));
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`UPDATE auth_sessions SET expires_at = '1970-01-01T00:02:20.123Z' WHERE session_id = ${f.principal}`;
+        yield* TestClock.adjust("30 seconds");
+        yield* f.append([input.arguments.threadId]);
+        yield* f.service.drain();
+        expect((yield* f.subscriptions.get(sub.id))?.expiresAt).toBe(140_123);
+        yield* f.append([input.arguments.threadId], "-revoked");
+        f.responses.set("event-0-revoked", 503);
+        yield* f.service.drain();
+        const [delivery] = yield* f.deliveries.due(31_000);
+        expect(delivery).toBeDefined();
+        yield* sql`UPDATE auth_sessions SET expires_at = '1970-01-01T00:05:00.000Z' WHERE session_id = ${f.principal}`;
+        yield* f.sessions.revoke({
+          sessionId: f.principal,
+          revokedAt: DateTime.makeUnsafe(30_000),
+        });
+        yield* f.deliveries.acknowledge(delivery!, 31_000);
+        expect((yield* f.subscriptions.get(sub.id))?.expiresAt).toBe(140_123);
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );
