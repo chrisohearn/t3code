@@ -1,4 +1,6 @@
 import "vite-plus/test/config";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Embed the fork playbook in release bundles.
+import * as NodeFS from "node:fs";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- tsdown needs the asset path when it reads this config.
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
@@ -19,6 +21,14 @@ import {
 export { shouldBundleCliDependency };
 
 const repoEnv = loadRepoEnv();
+const jarvisRoot = NodeURL.fileURLToPath(new URL("../../docs/jarvis/", import.meta.url));
+const jarvisPlaybook = NodeFS.readdirSync(jarvisRoot, { recursive: true, encoding: "utf8" })
+  .filter((name) => name.endsWith(".md"))
+  .sort()
+  .map(
+    (name) => `<!-- ${name} -->\n${NodeFS.readFileSync(NodePath.join(jarvisRoot, name), "utf8")}`,
+  )
+  .join("\n\n");
 const cliBuildChannel = /^[^-+]+-(?:nightly|preview)\./.test(packageJson.version)
   ? "nightly"
   : "latest";
@@ -133,6 +143,7 @@ export default mergeConfig(
         js: "#!/usr/bin/env node\n",
       },
       define: {
+        __T3CODE_JARVIS_PLAYBOOK__: JSON.stringify(jarvisPlaybook),
         __T3CODE_BUILD_CHANNEL__: JSON.stringify(cliBuildChannel),
         __T3CODE_TELEMETRY_CHANNEL__: JSON.stringify(telemetryChannel),
         __T3CODE_BUILD_RELAY_URL__: JSON.stringify(repoEnv.T3CODE_RELAY_URL?.trim() ?? ""),

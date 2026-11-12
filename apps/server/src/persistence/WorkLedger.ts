@@ -17,6 +17,9 @@ import * as SqlClient from "effect/sql/SqlClient";
 export class WorkLedger extends Context.Service<
   WorkLedger,
   {
+    readonly forThread: (
+      threadId: string,
+    ) => Effect.Effect<ReadonlyArray<WorkLedgerItem>, OrchestratorMcpFailure>;
     readonly upsert: (
       input: WorkLedgerUpsertInput,
       updatedBy: string,
@@ -52,6 +55,12 @@ const make = Effect.gen(function* () {
       Effect.mapError(storage),
     );
   return WorkLedger.of({
+    forThread: Effect.fn("WorkLedger.forThread")((threadId) =>
+      sql`${select} WHERE owner_thread_id = ${threadId} AND status NOT IN ('done', 'cancelled') ORDER BY work_key LIMIT 26`.pipe(
+        Effect.flatMap(decode),
+        Effect.mapError(storage),
+      ),
+    ),
     upsert: Effect.fn("WorkLedger.upsert")((input, updatedBy) =>
       sql
         .withTransaction(
