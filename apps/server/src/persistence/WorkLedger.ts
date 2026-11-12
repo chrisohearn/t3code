@@ -48,6 +48,18 @@ const decode = Schema.decodeUnknownEffect(
     ),
   ),
 );
+const decodeHistory = Schema.decodeUnknownEffect(
+  Schema.Array(
+    WorkLedgerHistoryEntry.mapFields(
+      Struct.assign({
+        changes: Schema.fromJsonString(WorkLedgerHistoryEntry.fields.changes),
+      }),
+    ),
+  ),
+);
+const encodeChanges = Schema.encodeEffect(
+  Schema.fromJsonString(WorkLedgerHistoryEntry.fields.changes),
+);
 const encodeLinks = Schema.encodeEffect(Schema.fromJsonString(WorkLedgerItem.fields.links));
 const isFailure = Schema.is(OrchestratorMcpFailure);
 const decodeItem = Schema.decodeUnknownEffect(WorkLedgerItem);
@@ -196,9 +208,7 @@ const make = Effect.gen(function* () {
                   { before: current?.[field as keyof WorkLedgerItem] ?? null, after: value },
                 ]),
             );
-            const changesJson = yield* Schema.encodeEffect(
-              Schema.fromJsonString(WorkLedgerHistoryEntry.fields.changes),
-            )(changes);
+            const changesJson = yield* encodeChanges(changes);
             yield* sql`INSERT INTO work_ledger_history (work_key, changed_at, changed_by, changes_json)
               VALUES (${item.key}, ${now}, ${updatedBy}, ${changesJson})`;
             return { ...item, warnings };
@@ -213,15 +223,7 @@ const make = Effect.gen(function* () {
         yield* sql`SELECT id, work_key AS key, changed_at AS "changedAt", changed_by AS "changedBy", changes_json AS changes
         FROM work_ledger_history WHERE work_key = ${input.key} AND id > ${input.cursor ?? 0}
         ORDER BY id LIMIT ${limit + 1}`;
-      const decoded = yield* Schema.decodeUnknownEffect(
-        Schema.Array(
-          WorkLedgerHistoryEntry.mapFields(
-            Struct.assign({
-              changes: Schema.fromJsonString(WorkLedgerHistoryEntry.fields.changes),
-            }),
-          ),
-        ),
-      )(rows);
+      const decoded = yield* decodeHistory(rows);
       const items = decoded.slice(0, limit);
       return { items, nextCursor: decoded.length > limit ? items.at(-1)!.id : null };
     }, Effect.mapError(storage)),

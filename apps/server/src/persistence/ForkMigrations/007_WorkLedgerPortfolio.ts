@@ -9,9 +9,9 @@ export default Effect.gen(function* () {
   yield* sql`ALTER TABLE work_ledger ADD COLUMN last_run_status TEXT`;
   yield* sql`ALTER TABLE work_ledger ADD COLUMN last_run_at TEXT`;
   yield* sql`UPDATE work_ledger SET wait_reason = CASE
-    WHEN blocker LIKE 'WAIT_EXTERNAL%' THEN 'external'
-    WHEN blocker LIKE 'WAIT_NATURAL%' THEN 'natural'
-    WHEN blocker LIKE 'NEEDS_DECISION%' THEN 'decision' ELSE NULL END`;
+    WHEN blocker GLOB 'WAIT_EXTERNAL*' THEN 'external'
+    WHEN blocker GLOB 'WAIT_NATURAL*' THEN 'natural'
+    WHEN blocker GLOB 'NEEDS_DECISION*' THEN 'decision' ELSE NULL END`;
   yield* sql`CREATE INDEX work_ledger_due_idx ON work_ledger(next_check_at) WHERE next_check_at IS NOT NULL`;
   yield* sql`CREATE TABLE work_ledger_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT, work_key TEXT NOT NULL,

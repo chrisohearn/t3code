@@ -212,6 +212,7 @@ it.effect("backfills only recognized blocker prefixes during migration", () =>
       ["b", "WAIT_NATURAL event"],
       ["c", "NEEDS_DECISION: approve"],
       ["d", "Other"],
+      ["e", "WAITXEXTERNAL"],
     ]) {
       yield* sql`INSERT INTO work_ledger (work_key, title, owner_kind, owner_name, status, blocker, links_json, created_at, updated_at, updated_by)
         VALUES (${key!}, 'Title', 't3', 'worker', 'blocked', ${blocker!}, '[]', '1970-01-01', '1970-01-01', 'caller')`;
@@ -221,6 +222,7 @@ it.effect("backfills only recognized blocker prefixes during migration", () =>
       { wait_reason: "external" },
       { wait_reason: "natural" },
       { wait_reason: "decision" },
+      { wait_reason: null },
       { wait_reason: null },
     ]);
     expect(yield* sql`SELECT * FROM work_ledger_history`).toEqual([]);
