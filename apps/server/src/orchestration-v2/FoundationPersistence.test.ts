@@ -3474,6 +3474,8 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
   it.effect.each([
     { type: "terminal.cleanup" },
     { type: "provider-runtime.continue", sourceRunId: RunId.make("run:restart-replay") },
+    // A restart while a failover is scheduled still runs it; its dispatch is idempotent.
+    { type: "run.failover", sourceRunId: RunId.make("run:failover-replay") },
   ] as const)(
     "retires live provider effects and requeues $type after process loss",
     (replayRequest) =>

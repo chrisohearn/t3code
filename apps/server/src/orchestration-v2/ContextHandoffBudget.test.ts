@@ -179,6 +179,36 @@ describe("handoff budget", () => {
     assert.isAtMost(historyCost(selected.messages, selected.context), 3_000);
   });
 
+  it("keeps the standing first message ahead of recent work, cutting one too large to its head", () => {
+    const role = "You are the inbox. Reply only 'Queued for Jarvis: …' and never use tools.";
+    const recent = Array.from({ length: 40 }, (_, i) =>
+      message(`item:recent-${i}`, i % 2 ? "assistant" : "user", "r".repeat(400)),
+    );
+    for (const text of [role, role + "\n" + "detail ".repeat(2_000)]) {
+      const standing = {
+        ...message("item:role", "user", text),
+        standingInstructions: true as const,
+      };
+      const selected = selectHistory({
+        messages: [standing, ...recent],
+        coverage: "thread:handoff runs 1-41",
+        budget: 6_000,
+      });
+      const kept = selected.messages.find((candidate) => candidate.itemId === standing.itemId);
+      assert.isDefined(kept);
+      assert.isTrue(kept.text.startsWith(role));
+      assert.equal(kept.text === text, text === role);
+      const keptIds = selected.messages.map((candidate) => candidate.itemId);
+      assert.includeMembers(keptIds, [recent.at(-1)!.itemId, recent.at(-2)!.itemId]);
+      assert.include(selected.context, "standing-instructions is this thread's first message");
+      assert.include(
+        historyResponseItems(selected.messages, selected.context)[1]?.content[0]?.text,
+        "; standing-instructions]",
+      );
+      assert.isAtMost(historyCost(selected.messages, selected.context), 6_000);
+    }
+  });
+
   it("points history recovery at the omitted items instead of a read from the thread's start", () => {
     const omitted = message("item:omitted", "assistant", "o".repeat(4_000));
     const selected = selectHistory({

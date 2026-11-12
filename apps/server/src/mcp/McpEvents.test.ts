@@ -1013,6 +1013,59 @@ it("keeps helper completion distinct from a root run result and exports no task 
   ).toBeUndefined();
 });
 
+it.each([
+  [undefined, "thread.blocker"],
+  ["pending", undefined],
+  ["dispatched", undefined],
+  ["skipped", "thread.blocker"],
+] as const)("reports a failed run with a %s failover as %s", (failoverState, expected) => {
+  const threadId = ThreadId.make("failover-thread");
+  const instanceId = ProviderInstanceId.make("fixture");
+  const stored: OrchestrationV2StoredEvent = {
+    sequence: 9,
+    commandId: null,
+    event: {
+      id: EventId.make("failover-event"),
+      threadId,
+      runId: RunId.make("failover-run"),
+      occurredAt: DateTime.makeUnsafe(0),
+      type: "run.updated",
+      payload: {
+        id: RunId.make("failover-run"),
+        threadId,
+        ordinal: 1,
+        providerInstanceId: instanceId,
+        modelSelection: { instanceId, model: "fixture" },
+        providerThreadId: null,
+        userMessageId: MessageId.make("failover-message"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "failed",
+        requestedAt: DateTime.makeUnsafe(0),
+        startedAt: null,
+        completedAt: DateTime.makeUnsafe(0),
+        checkpointId: null,
+        contextHandoffId: null,
+        ...(failoverState === undefined
+          ? {}
+          : {
+              failover: {
+                state: failoverState,
+                reason: "usage_limit" as const,
+                modelSelection: { instanceId: ProviderInstanceId.make("claude"), model: "opus" },
+              },
+            }),
+      },
+    },
+  };
+  const shell = {
+    lineage: { rootThreadId: threadId, parentThreadId: null, relationshipToParent: null },
+  };
+  expect(McpEvents.observeEvent(stored, shell, "https://app.example.com/thread")?.name).toBe(
+    expected,
+  );
+});
+
 it.effect(
   "emits a minimal pending-decision observation without approval execution or resolved-request prose",
   () =>

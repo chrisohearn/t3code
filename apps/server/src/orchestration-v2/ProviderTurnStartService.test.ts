@@ -18,6 +18,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  TurnItemId,
   ProjectId,
   type OrchestrationV2ThreadProjection,
   OrchestrationV2DomainEvent,
@@ -284,6 +285,8 @@ function makeLocalCommandHarness(input: {
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
   readonly resumeFailure?: ProviderAdapter.ProviderAdapterV2Error;
+  /** An earlier run on this instance or the previous one last ran the resumed native thread. */
+  readonly nativeThreadLastRanOn?: "previous" | "current";
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -667,6 +670,39 @@ function makeLocalCommandHarness(input: {
       ),
     };
   }
+  const earlierRunId = RunId.make("earlier-native-run");
+  const roleText =
+    "You are the inbox. Reply only 'Queued for Jarvis: <summary>' and never use tools.";
+  if (input.nativeThreadLastRanOn !== undefined) {
+    const instanceId = input.nativeThreadLastRanOn === "previous" ? oldInstanceId : newInstanceId;
+    projection = {
+      ...projection,
+      runs: [
+        {
+          ...run,
+          id: earlierRunId,
+          ordinal: 1,
+          providerInstanceId: instanceId,
+          modelSelection: { instanceId, model: "gpt-5.4" },
+          status: "completed",
+          startedAt: now,
+          completedAt: now,
+        },
+        ...projection.runs,
+      ],
+      attempts: [
+        {
+          ...projection.attempts[0]!,
+          id: RunAttemptId.make("earlier-native-attempt"),
+          runId: earlierRunId,
+          providerInstanceId: instanceId,
+          nativeThreadId: "native-resume-thread",
+          status: "completed",
+        },
+        ...projection.attempts,
+      ],
+    };
+  }
   const previousTurnId = ProviderTurnId.make("previous-provider-turn");
   if (input.previousTurn !== undefined) {
     const previousRunId = RunId.make("previous-failed-run");
@@ -774,6 +810,7 @@ function makeLocalCommandHarness(input: {
           }),
       ),
     ensureThread: fallbackEnsureThread,
+    startTurn: (turn: ProviderAdapter.ProviderAdapterV2TurnInput) => startTurn(turn),
   };
   const providerSession = {
     id: providerSessionId,
@@ -819,7 +856,7 @@ function makeLocalCommandHarness(input: {
       : input.interruptOpen === true
         ? Effect.interrupt
         : "historyReadFailureAfterFallback" in input || "resumeFailure" in input
-          ? Effect.succeed(resumeFallbackSession as never)
+          ? Effect.succeed({ ...resumeFallbackSession, providerSession } as never)
           : "ensureThreadFailure" in input
             ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
             : "openFailure" in input
@@ -848,7 +885,7 @@ function makeLocalCommandHarness(input: {
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >((runInput) =>
-    input.sideChat !== undefined
+    input.sideChat !== undefined || input.nativeThreadLastRanOn !== undefined
       ? runInput.session.startTurn(runInput as never).pipe(Effect.orDie)
       : input.failReadsAfterRunning === true || input.previousTurn !== undefined
         ? Effect.suspend(() =>
@@ -944,20 +981,22 @@ function makeLocalCommandHarness(input: {
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
-        Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
-          prepareProviderHandoff: (handoff) =>
-            input.sideChat?.nativeForkFrom === undefined
-              ? Effect.die("history read must fail first")
-              : Effect.succeed({
-                  ...handoff,
-                  id: ContextHandoffId.make("side-chat-fork-context"),
-                  createdByProviderInstanceId: handoff.toProviderInstanceId,
-                  status: "ready",
-                  summaryMessageId: null,
-                  summaryText: "PARENT_HISTORY",
-                  updatedAt: handoff.createdAt,
-                }),
-        }),
+        input.nativeThreadLastRanOn !== undefined
+          ? ContextHandoffService.layer.pipe(Layer.provide(IdAllocator.layer))
+          : Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
+              prepareProviderHandoff: (handoff) =>
+                input.sideChat?.nativeForkFrom === undefined
+                  ? Effect.die("history read must fail first")
+                  : Effect.succeed({
+                      ...handoff,
+                      id: ContextHandoffId.make("side-chat-fork-context"),
+                      createdByProviderInstanceId: handoff.toProviderInstanceId,
+                      status: "ready",
+                      summaryMessageId: null,
+                      summaryText: "PARENT_HISTORY",
+                      updatedAt: handoff.createdAt,
+                    }),
+            }),
         Layer.mock(EventSink.EventSinkV2)({
           writeIfRunCurrent,
           write: ({ events: incoming }) =>
@@ -970,7 +1009,9 @@ function makeLocalCommandHarness(input: {
             }),
         }),
         IdAllocator.layer,
-        Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({}),
+        Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+          allocate: () => Effect.succeed(1),
+        }),
         layerWorktreeLocation(input.worktreesDir),
         input.fileSystem === undefined
           ? FileSystem.layerNoop({ exists: () => Effect.succeed(true) })
@@ -998,14 +1039,40 @@ function makeLocalCommandHarness(input: {
               projection.runs.find((candidate) => candidate.id === id),
             ),
           getTurnStartHistory: () =>
-            input.sideChat !== undefined
-              ? Effect.succeed([])
-              : Effect.fail(
-                  new ProjectionStore.ProjectionStoreReadError({
+            input.nativeThreadLastRanOn !== undefined
+              ? Effect.succeed([
+                  {
+                    id: TurnItemId.make("earlier-role-message"),
                     threadId,
-                    cause: input.historyReadFailureAfterFallback,
-                  }),
-                ),
+                    runId: earlierRunId,
+                    nodeId: null,
+                    providerThreadId,
+                    providerTurnId: null,
+                    nativeItemRef: null,
+                    parentItemId: null,
+                    ordinal: 1,
+                    status: "completed" as const,
+                    title: null,
+                    startedAt: now,
+                    completedAt: now,
+                    updatedAt: now,
+                    messageId: MessageId.make("earlier-role-message"),
+                    text: roleText,
+                    createdBy: "agent" as const,
+                    creationSource: "mcp" as const,
+                    type: "user_message" as const,
+                    inputIntent: "turn_start" as const,
+                    attachments: [],
+                  },
+                ])
+              : input.sideChat !== undefined
+                ? Effect.succeed([])
+                : Effect.fail(
+                    new ProjectionStore.ProjectionStoreReadError({
+                      threadId,
+                      cause: input.historyReadFailureAfterFallback,
+                    }),
+                  ),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
           open,
@@ -1859,6 +1926,37 @@ effectIt.effect("fails the run instead of replacing a native thread another clie
       },
     ]);
   }),
+);
+
+// The 2026-11-12 incident: after a switch between two Codex accounts, the previous account's
+// shared app-server still held the conversation's writer lock, and every start failed.
+effectIt.effect.each(["previous", "current"] as const)(
+  "starts fresh with the thread's role only when the %s instance last held the native thread",
+  (lastRanOn) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        nativeThreadLastRanOn: lastRanOn,
+        resumeFailure: new ProviderAdapter.ProviderAdapterThreadInUseError({
+          driver: ProviderDriverKind.make("codex"),
+          providerThreadId: ProviderThreadId.make("new-provider-thread"),
+          detail: "This conversation is open in another Codex client.",
+          cause: new Error("thread native-resume-thread already has an active writer"),
+        }),
+      });
+
+      yield* harness.start;
+
+      if (lastRanOn === "current") {
+        expect(harness.fallbackEnsureThread).not.toHaveBeenCalled();
+        expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+        return;
+      }
+      expect(harness.fallbackEnsureThread).toHaveBeenCalledOnce();
+      const delivered = JSON.stringify(harness.startTurn.mock.calls[0]?.[0]);
+      expect(delivered).toContain("You are the inbox.");
+      expect(delivered).toContain("; standing-instructions]");
+    }),
 );
 
 effectIt.effect("does not mistake a failed state read for a superseded run", () =>

@@ -6,6 +6,7 @@ import {
   CommandId,
   MessageId,
   NodeId,
+  type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2CheckpointScope,
   type OrchestrationV2DomainEvent,
@@ -3421,6 +3422,59 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
   }),
 );
 
+it.effect.each([
+  { name: "no work and an account cause", noWork: true, account: true, target: true, claim: true },
+  { name: "observed work", noWork: false, account: true, target: true, claim: false },
+  { name: "no account cause", noWork: true, account: false, target: true, claim: false },
+  { name: "no fallback target", noWork: true, account: true, target: false, claim: false },
+])("claims a failover with the failure only for $name", (scenario) =>
+  Effect.gen(function* () {
+    const fallback = { instanceId: ProviderInstanceId.make("claude"), model: "claude-opus-5-5" };
+    const key = `failover-claim:${scenario.name}`;
+    const { finalEvents, committedEffects } = yield* captureRootRunTermination({
+      key,
+      shouldFinalizeRun: () => Effect.succeed(true),
+      ...(scenario.target ? { failoverTarget: fallback } : {}),
+      events: (ids) => {
+        const terminal = rootTerminalEvent(ids, "failed");
+        return Stream.make(
+          terminal.type === "turn.terminal" && terminal.status === "failed"
+            ? {
+                ...terminal,
+                failure: { ...terminal.failure, class: "usage_limit" as const },
+                ...(scenario.noWork ? { noWorkObserved: true as const } : {}),
+                ...(scenario.account ? { accountFailure: "usage_limit" as const } : {}),
+              }
+            : terminal,
+        );
+      },
+    });
+    const failed = finalEvents.find(
+      (event) => event.type === "run.updated" && event.payload.status === "failed",
+    );
+    assert.equal(failed?.type, "run.updated");
+    if (failed?.type !== "run.updated") return;
+    const failoverEffects = committedEffects.filter(
+      (effect) => effect.request.type === "run.failover",
+    );
+    if (!scenario.claim) {
+      assert.isUndefined(failed.payload.failover);
+      assert.lengthOf(failoverEffects, 0);
+      return;
+    }
+    assert.deepEqual(failed.payload.failover, {
+      state: "pending",
+      reason: "usage_limit",
+      modelSelection: fallback,
+    });
+    // The effect commits in the same write as the failed run, so a restart cannot split them.
+    assert.deepEqual(
+      failoverEffects.map((effect) => effect.request),
+      [{ type: "run.failover", sourceRunId: RunId.make(`run:${key}`) }],
+    );
+  }),
+);
+
 function captureRootRunTermination(input: {
   readonly key: string;
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
@@ -3454,6 +3508,7 @@ function captureRootRunTermination(input: {
   readonly afterStart?: (
     closed: Deferred.Deferred<void>,
   ) => Effect.Effect<void, never, PreviewAgentActivity.PreviewAgentActivity>;
+  readonly failoverTarget?: ModelSelection;
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);
@@ -3637,6 +3692,7 @@ function captureRootRunTermination(input: {
           creationSource: "web",
         },
         modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+        ...(input.failoverTarget === undefined ? {} : { failoverTarget: input.failoverTarget }),
         runtimePolicy: {
           runtimeMode: "full-access",
           interactionMode: "default",

@@ -528,6 +528,11 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         ...input,
         threadId: input.sourceThreadId ?? input.threadId,
       });
+      // A full summary starts a new native conversation, which must keep the thread's standing role.
+      const standingItemId =
+        input.strategy === "full_thread_summary"
+          ? input.items.find((item) => item.type === "user_message")?.id
+          : undefined;
       const selected = selectHistory({
         messages: input.items.flatMap((item) => {
           const message = historicalMessage(item);
@@ -537,6 +542,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
                 {
                   ...message,
                   ...(item.runId === null ? {} : { runStatus: runStatuses.get(item.runId) }),
+                  ...(item.id === standingItemId ? { standingInstructions: true as const } : {}),
                 },
               ];
         }),

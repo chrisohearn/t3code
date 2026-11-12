@@ -16,7 +16,10 @@ import {
 } from "../../provider/CodexTurnTokenUsage.ts";
 import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapshot";
 import type { CodexEffectiveRuntime } from "../../provider/CodexManagedRuntime.ts";
-import { classifyCodexManagedError } from "../../provider/CodexManagedErrors.ts";
+import {
+  classifyCodexManagedError,
+  codexManagedAccountFailure,
+} from "../../provider/CodexManagedErrors.ts";
 import {
   buildCodexInitializeParams,
   codexAppServerEnvironment,
@@ -1205,8 +1208,21 @@ function failureResetAt(
     : codexUsageLimitResetAt(snapshot);
 }
 
+/** Account-side causes another provider can avoid; anything else keeps the failure local. */
+function codexAccountFailure(
+  failure: OrchestrationV2ProviderFailure,
+): "usage_limit" | "auth" | undefined {
+  const managed = codexManagedAccountFailure(failure.code);
+  if (managed !== undefined) return managed;
+  // Codex classes usage_limit only from usageLimitExceeded, rateLimitExceeded or an exhausted 429.
+  if (failure.class === "usage_limit") return "usage_limit";
+  return failure.code === "unauthorized" ? "auth" : undefined;
+}
+
 interface ActiveCodexTurnContext {
   hookStopReason?: string;
+  /** Set by any native output, item, plan or request; never cleared, so absence proves no work. */
+  workObserved?: true;
   capacityRetryAttempt?: number;
   capacityRetryPending?: Deferred.Deferred<ActiveCodexTurnContext | undefined>;
   closedCommandItemIds?: ReadonlySet<string>;
@@ -3647,6 +3663,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         ) {
           const context = yield* awaitActiveTurn(payload.turnId);
           if (context === undefined || payload.delta.length === 0) return;
+          context.workObserved = true;
           yield* completeProviderRetry(context, yield* DateTime.now);
           const itemId = reasoningPartKey(payload.turnId, payload.itemId, stream, index);
           // Reserve positions before delayed flushes so later tools stay after them.
@@ -4621,6 +4638,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           Effect.gen(function* () {
             const context = (yield* Ref.get(activeTurns)).get(payload.turnId);
             if (context !== undefined) {
+              context.workObserved = true;
               yield* completeProviderRetry(context, yield* DateTime.now);
             }
             yield* agentMessageDeltas.append({
@@ -4638,6 +4656,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               (yield* Ref.get(activeTurns)).get(payload.turnId) ??
               (yield* Ref.get(settledTurns)).get(payload.turnId);
             if (context === undefined) return;
+            context.workObserved = true;
             yield* emitProviderEvent({
               type: "command_output.delta",
               driver: CODEX_PROVIDER,
@@ -4664,6 +4683,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (context === undefined) {
               return;
             }
+            context.workObserved = true;
             yield* completeProviderRetry(context, yield* DateTime.now);
             yield* planDeltas.append({
               turnId: payload.turnId,
@@ -4679,6 +4699,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (context === undefined) {
               return;
             }
+            context.workObserved = true;
             yield* completeProviderRetry(context, yield* DateTime.now);
             const steps = payload.plan.map((step, index) => ({
               id: `step-${index + 1}`,
@@ -5122,6 +5143,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (context === undefined) {
               return;
             }
+            // Marked before the early returns below, which keep some starts out of the projection.
+            if (payload.item.type !== "userMessage" && payload.item.type !== "contextCompaction") {
+              context.workObserved = true;
+            }
 
             if (payload.item.type === "contextCompaction") {
               yield* emitCompactionItem(
@@ -5272,6 +5297,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerNotification("item/completed", (payload) =>
           Effect.gen(function* () {
+            // Child lifecycle arrives only as completions; any of them is work in this turn.
+            if (payload.item.type !== "userMessage" && payload.item.type !== "contextCompaction") {
+              const active = (yield* Ref.get(activeTurns)).get(payload.turnId);
+              if (active !== undefined) active.workObserved = true;
+            }
             if (payload.item.type === "contextCompaction")
               yield* Ref.update(threadsAwaitingContextRestore, (current) =>
                 new Set(current).add(payload.threadId),
@@ -5624,6 +5654,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 payload,
               );
             }
+            context.workObserved = true;
             const allowance = sessionAllowance(payload.threadId, context);
             if (allowance.has("command")) {
               return {
@@ -5695,6 +5726,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 payload,
               );
             }
+            context.workObserved = true;
             const allowance = sessionAllowance(payload.threadId, context);
             if (allowance.has("file-change")) {
               return {
@@ -5767,6 +5799,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 payload,
               );
             }
+            context.workObserved = true;
 
             const requestKind = providerRequestKindFromPermissions(payload.permissions);
             const artifacts = yield* buildApprovalRequestArtifacts({
@@ -5907,6 +5940,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 payload,
               );
             }
+            context.workObserved = true;
             const allowance = sessionAllowance(payload.conversationId, context);
             if (allowance.has("command")) {
               return {
@@ -5976,6 +6010,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 payload,
               );
             }
+            context.workObserved = true;
             const allowance = sessionAllowance(payload.conversationId, context);
             if (allowance.has("file-change")) {
               return {
@@ -6044,6 +6079,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 payload,
               );
             }
+            context.workObserved = true;
 
             const artifacts = yield* buildUserInputRequestArtifacts({
               context,
@@ -6104,6 +6140,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             readonly providerRetry?: ActiveCodexProviderRetry;
           }): Effect.fn.Return<CodexRootTerminalEvent> {
             const terminalStatus = providerTurnStatusToTerminal(input.status);
+            // A capacity retry continues the turn in new contexts; work in any of them counts.
+            const noWorkObserved = !(
+              continuedRuns.get(input.context.providerTurnId) ?? [input.context]
+            ).some((turn) => turn.workObserved === true);
             if (terminalStatus === "failed") {
               const previousFailure = input.context.latestProviderFailure ?? input.providerRetry;
               const failureCode =
@@ -6132,12 +6172,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       }),
                       input.failureMessage,
                     );
+              const accountFailure = codexAccountFailure(failure);
               return {
                 type: "turn.terminal",
                 driver: CODEX_PROVIDER,
                 providerThreadId: input.context.providerThread.id,
                 providerTurnId: input.context.providerTurnId,
                 runOrdinal: input.context.input.runOrdinal,
+                ...(noWorkObserved ? { noWorkObserved: true as const } : {}),
+                ...(accountFailure === undefined ? {} : { accountFailure }),
                 failureItemOrdinal: yield* resolveItemOrdinal(
                   input.context,
                   `terminal-failure:${input.context.providerTurnId}`,
@@ -6167,6 +6210,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               runOrdinal: input.context.input.runOrdinal,
               status: terminalStatus,
               failure: null,
+              ...(terminalStatus !== "completed" && noWorkObserved
+                ? { noWorkObserved: true as const }
+                : {}),
               ...(terminalStatus === "interrupted" && input.context.hookStopReason !== undefined
                 ? { reason: input.context.hookStopReason }
                 : {}),

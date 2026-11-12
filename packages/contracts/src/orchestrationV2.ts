@@ -695,6 +695,26 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
+export const OrchestrationV2ProviderFailoverReason = Schema.Literals([
+  "usage_limit",
+  "auth",
+  "billing",
+]);
+export type OrchestrationV2ProviderFailoverReason =
+  typeof OrchestrationV2ProviderFailoverReason.Type;
+
+/**
+ * Written with a run's failure when its provider proved the run did no work and failed for an
+ * account reason. Pending holds the queue and the parent until the failover run exists or is skipped.
+ */
+export const OrchestrationV2RunFailover = Schema.Struct({
+  state: Schema.Literals(["pending", "dispatched", "skipped"]),
+  reason: OrchestrationV2ProviderFailoverReason,
+  modelSelection: ModelSelection,
+  runId: Schema.optional(RunId),
+});
+export type OrchestrationV2RunFailover = typeof OrchestrationV2RunFailover.Type;
+
 export const OrchestrationV2Run = Schema.Struct({
   clientRequestId: Schema.optional(TrimmedNonEmptyString),
   id: RunId,
@@ -717,6 +737,8 @@ export const OrchestrationV2Run = Schema.Struct({
   contextHandoffId: Schema.NullOr(ContextHandoffId),
   restartContinuationOfRunId: Schema.optional(RunId),
   usageLimitContinuationOfRunId: Schema.optional(RunId),
+  failover: Schema.optional(OrchestrationV2RunFailover),
+  failoverOfRunId: Schema.optional(RunId),
   delegatedTaskId: Schema.optional(NodeId),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   restartCancelledBackgroundWork: Schema.optional(
@@ -1143,6 +1165,8 @@ export const OrchestrationV2HistoricalMessage = Schema.Struct({
   providerThreadId: Schema.NullOr(ProviderThreadId),
   status: Schema.String,
   kind: Schema.String,
+  /** The thread's first message: a role or rules it sets still apply after a handoff. */
+  standingInstructions: Schema.optional(Schema.Literal(true)),
 });
 export type OrchestrationV2HistoricalMessage = typeof OrchestrationV2HistoricalMessage.Type;
 
@@ -3302,6 +3326,9 @@ export const OrchestrationV2Command = Schema.Union([
     sourcePlanRef: Schema.optional(Schema.Struct({ threadId: ThreadId, planId: PlanId })),
     restartContinuationOfRunId: Schema.optional(RunId),
     usageLimitContinuationOfRunId: Schema.optional(RunId),
+    failoverOfRunId: Schema.optional(RunId),
+    /** Timeline notice for the switch; honored only with failoverOfRunId. */
+    failoverNotice: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(500))),
     manualContinuationOfRunId: Schema.optional(RunId),
     steerFollowUpOfRunId: Schema.optional(RunId),
     steerFollowUpAfterRunOrdinal: Schema.optional(NonNegativeInt),

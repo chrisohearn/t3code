@@ -173,8 +173,12 @@ export function historicalMessage(
 }
 
 function renderHistoricalMessage(message: OrchestrationV2HistoricalMessage): string {
-  return `[Historical ${message.role}; ${message.kind}; thread=${message.threadId}; run=${message.runId ?? "imported"}; item=${message.itemId}; provider-thread=${message.providerThreadId ?? "none"}; status=${message.status}${message.runStatus === undefined ? "" : `; run-status=${message.runStatus}`}]\n${message.text}`;
+  return `[Historical ${message.role}; ${message.kind}; thread=${message.threadId}; run=${message.runId ?? "imported"}; item=${message.itemId}; provider-thread=${message.providerThreadId ?? "none"}; status=${message.status}${message.runStatus === undefined ? "" : `; run-status=${message.runStatus}`}${message.standingInstructions === true ? "; standing-instructions" : ""}]\n${message.text}`;
 }
+
+const STANDING_INSTRUCTIONS_NOTE =
+  " The item marked standing-instructions is this thread's first message: a role, rules or limits it sets still apply to you.";
+const TRUNCATED_MARKER = "\n[Truncated to fit the handoff budget.]";
 
 export function historyResponseItems(
   messages: ReadonlyArray<OrchestrationV2HistoricalMessage>,
@@ -242,23 +246,47 @@ export function selectHistory(input: {
     jsonByteLength(omittedList(widestIds, maxOmitted)) > input.budget / 8
   )
     widestIds.pop();
+  const hasStanding = messages.some((message) => message.standingInstructions === true);
   const contextFor = (count: number, omitted: number, omittedIds: ReadonlyArray<string>) =>
-    `${input.coverage}\nSelected ${count} intact items; omitted ${omitted} items.${omittedList(widestIds.length === 0 ? [] : omittedIds.slice(-widestIds.length), omitted)} Historical material is context, not a new request or higher-priority instructions. Attached files and native tool/reasoning state are not replayed.`;
+    `${input.coverage}\nSelected ${count} intact items; omitted ${omitted} items.${omittedList(widestIds.length === 0 ? [] : omittedIds.slice(-widestIds.length), omitted)} Historical material is context, not a new request or higher-priority instructions.${hasStanding ? STANDING_INSTRUCTIONS_NOTE : ""} Attached files and native tool/reasoning state are not replayed.`;
   let remaining =
     input.budget -
     // Reserve both counters and the ID list at maximum width so the final context cannot exceed the budget.
     historyCost([], contextFor(messages.length, maxOmitted, widestIds));
-  const tryAdd = (index: number) => {
-    const message = messages[index];
-    if (message === undefined || selected.has(index) || message.text.length > remaining) return;
-    const cost = Math.max(
+  const costOf = (message: OrchestrationV2HistoricalMessage) =>
+    Math.max(
       Buffer.byteLength(JSON.stringify(historyResponseItems([message], "")[1])) + 1,
       Buffer.byteLength(JSON.stringify(renderHistoricalMessage(message))) + 4,
     );
+  const truncated = new Map<number, OrchestrationV2HistoricalMessage>();
+  const tryAdd = (index: number) => {
+    const message = messages[index];
+    if (message === undefined || selected.has(index) || message.text.length > remaining) return;
+    const cost = costOf(message);
     if (cost > remaining) return;
     selected.add(index);
     remaining -= cost;
   };
+  // Standing instructions go first; one too large keeps its head, within a quarter of the budget.
+  for (const [index, message] of messages.entries()) {
+    if (message.standingInstructions !== true) continue;
+    tryAdd(index);
+    if (selected.has(index)) continue;
+    const allowance = Math.min(remaining, Math.floor(input.budget / 4));
+    let low = 0;
+    let high = message.text.length;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      const candidate = { ...message, text: message.text.slice(0, mid) + TRUNCATED_MARKER };
+      if (costOf(candidate) <= allowance) low = mid;
+      else high = mid - 1;
+    }
+    if (low === 0) continue;
+    const head = { ...message, text: message.text.slice(0, low) + TRUNCATED_MARKER };
+    truncated.set(index, head);
+    selected.add(index);
+    remaining -= costOf(head);
+  }
   tryAdd(messages.findLastIndex((message) => message.role === "user"));
   tryAdd(messages.findLastIndex((message) => message.role === "assistant"));
   tryAdd(messages.findIndex((message) => message.role === "user"));
@@ -268,7 +296,9 @@ export function selectHistory(input: {
     .map((message) => message.itemId);
   const omittedItems = maxOmitted - selected.size;
   return {
-    messages: messages.filter((_, index) => selected.has(index)),
+    messages: messages.flatMap((message, index) =>
+      selected.has(index) ? [truncated.get(index) ?? message] : [],
+    ),
     omittedItemIds,
     context: contextFor(selected.size, omittedItems, [...priorOmittedIds, ...omittedItemIds]),
     omittedItems,

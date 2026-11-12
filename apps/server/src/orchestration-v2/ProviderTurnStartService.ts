@@ -8,6 +8,7 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
+  type OrchestrationV2RunFailover,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2TurnItem,
   isCompactionCommandMessage,
@@ -34,6 +35,7 @@ import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
+import * as ProviderFailover from "./ProviderFailover.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
@@ -187,6 +189,13 @@ export const layer: Layer.Layer<
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
+    const serverSettings = yield* ServerSettings.ServerSettingsService;
+    const resolveFailoverTarget = (
+      input: Parameters<typeof ProviderFailover.resolveProviderFailoverTarget>[0],
+    ) =>
+      ProviderFailover.resolveProviderFailoverTarget(input).pipe(
+        Effect.provideService(ServerSettings.ServerSettingsService, serverSettings),
+      );
 
     const resolveRecreateBase = Effect.fn("ProviderTurnStartService.resolveRecreateBase")(
       function* (cwd: string) {
@@ -464,8 +473,10 @@ export const layer: Layer.Layer<
                 "type" | "title" | "input" | "output" | "exitCode"
               >;
           readonly providerThreadUpdate?: OrchestrationV2ProviderThread;
+          readonly failover?: OrchestrationV2RunFailover;
         }) {
           const { now, status } = input;
+          const failover = input.failover === undefined ? {} : { failover: input.failover };
           const started = input.startedAt === undefined ? {} : { startedAt: input.startedAt };
           const item: OrchestrationV2TurnItem = {
             id: idAllocator.derive.runSignalTurnItem({ runId, signal: input.signal }),
@@ -491,7 +502,10 @@ export const layer: Layer.Layer<
           };
           const eventPayloads = [
             { type: "turn-item.updated", payload: item },
-            { type: "run.updated", payload: { ...run, status, ...started, completedAt: now } },
+            {
+              type: "run.updated",
+              payload: { ...run, status, ...started, completedAt: now, ...failover },
+            },
             {
               type: "run-attempt.updated",
               payload: { ...attempt, status, ...started, completedAt: now },
@@ -528,6 +542,11 @@ export const layer: Layer.Layer<
             activeAttemptId: attempt.id,
             expectedStatus: "starting",
             events,
+            ...(input.failover === undefined
+              ? {}
+              : {
+                  effects: [ProviderFailover.providerFailoverEffect(projection.thread.id, runId)],
+                }),
           });
           // A steering restart that cannot start still ends a run whose earlier turns counted.
           if (written.committed) {
@@ -546,6 +565,7 @@ export const layer: Layer.Layer<
           readonly title: string;
           readonly error: Error;
           readonly message?: string;
+          readonly failover?: OrchestrationV2RunFailover;
         }) {
           yield* settleRunBeforeStart({
             signal: failed.signal,
@@ -553,6 +573,7 @@ export const layer: Layer.Layer<
             now: yield* DateTime.now,
             providerInstanceId: run.providerInstanceId,
             itemProviderThreadId: providerThread.id,
+            ...(failed.failover === undefined ? {} : { failover: failed.failover }),
             item: {
               type: "error",
               title: failed.title,
@@ -726,6 +747,26 @@ export const layer: Layer.Layer<
         inheritedBackgroundTurnItems,
       });
       const { isCurrentAttemptInStatus } = runControls;
+      const firstAttempt = !projection.attempts.some(
+        (candidate) => candidate.runId === run.id && candidate.id !== attempt.id,
+      );
+      const runOrdinals = new Map(
+        projection.runs.map((candidate) => [candidate.id, candidate.ordinal]),
+      );
+      /** The latest attempt that ran this native conversation used another provider instance. */
+      const nativeThreadLastRanOnOtherInstance = (thread: OrchestrationV2ProviderThread) => {
+        const nativeId = thread.nativeThreadRef?.nativeId;
+        if (nativeId == null) return false;
+        const last = projection.attempts
+          .filter((candidate) => candidate.nativeThreadId === nativeId)
+          .toSorted(
+            (left, right) =>
+              (runOrdinals.get(left.runId) ?? 0) - (runOrdinals.get(right.runId) ?? 0) ||
+              left.attemptOrdinal - right.attemptOrdinal,
+          )
+          .at(-1);
+        return last !== undefined && last.providerInstanceId !== run.providerInstanceId;
+      };
 
       const resolvedPolicy = yield* runtimePolicy
         .resolve({
@@ -841,10 +882,23 @@ export const layer: Layer.Layer<
           isProviderAdapterOpenSessionError(failure.cause) &&
           failure.cause.requiresSignIn === true;
         if (input.willRetry === true && !requiresSignIn) return yield* failure;
+        // A session that never opened did no work, so a sign-in failure can fail over.
+        const failover = requiresSignIn
+          ? ProviderFailover.providerFailoverClaim(
+              yield* resolveFailoverTarget({
+                thread: projection.thread,
+                run,
+                message,
+                firstAttempt,
+              }),
+              { noWorkObserved: true, accountFailure: "auth" },
+            )
+          : undefined;
         yield* settleStartFailure({
           signal: "provider-session-open-failure",
           title: "Provider session failed to open",
           error: sessionResult.failure,
+          ...(failover === undefined ? {} : { failover }),
         });
         return;
       }
@@ -1423,12 +1477,13 @@ export const layer: Layer.Layer<
         resumedHandoffContext = undefined;
         resumedRetryHandoff = [];
         if (!(yield* isCurrentAttemptInStatus("starting"))) return undefined;
+        const inUse =
+          resumed._tag === "Failure" && resumed.failure._tag === "ProviderAdapterThreadInUseError";
         // Another client is still writing to the native thread. A fresh
         // session here would silently split the conversation from it.
-        if (
-          resumed._tag === "Failure" &&
-          resumed.failure._tag === "ProviderAdapterThreadInUseError"
-        ) {
+        // The exception is this thread's own previous provider instance: Codex's shared
+        // app-server keeps the writer lock after a detach, and nothing writes there any more.
+        if (inUse && !nativeThreadLastRanOnOtherInstance(providerThread)) {
           return yield* loadFromProvider(Effect.fail(resumed.failure));
         }
 
@@ -1438,9 +1493,11 @@ export const layer: Layer.Layer<
           runId,
           reason: uncertainDelivery
             ? "uncertain_history_delivery"
-            : resumed._tag === "Success"
-              ? "handoff_budget_exhausted"
-              : "resume_failed",
+            : inUse
+              ? "held_by_previous_instance"
+              : resumed._tag === "Success"
+                ? "handoff_budget_exhausted"
+                : "resume_failed",
           errorTag: resumed._tag === "Failure" ? resumed.failure._tag : "ContextHandoffBudgetError",
         });
         const replacement = yield* loadFromProvider(
@@ -1824,7 +1881,14 @@ export const layer: Layer.Layer<
         !noteContinuation
           ? session
           : makeDeliverySession(session, startWithHandoffs);
+      const failoverTarget = yield* resolveFailoverTarget({
+        thread: projection.thread,
+        run,
+        message,
+        firstAttempt,
+      });
       return runExecution.startRootRun({
+        ...(failoverTarget === undefined ? {} : { failoverTarget }),
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
         appThread: projection.thread,
         providerSessionId,

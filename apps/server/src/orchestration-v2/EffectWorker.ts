@@ -29,6 +29,8 @@ import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationServic
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
+import * as ProviderFailoverDispatch from "./ProviderFailoverDispatch.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlService.ProviderTurnControlError);
 
@@ -97,6 +99,8 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
+    // Optional so executor tests need no registry; the failover notice falls back to ids.
+    const providerRegistry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
     return OrchestrationEffectExecutorV2.of({
       execute: Effect.fn("OrchestrationEffectExecutorV2.execute")(function (effect, options) {
         const willRetry = options?.willRetry ?? false;
@@ -121,6 +125,26 @@ export const layerExecutor: Layer.Layer<
               ),
             );
           }
+          case "run.failover":
+            return ProviderFailoverDispatch.dispatchProviderFailover({
+              threadId: effect.threadId,
+              sourceRunId: effect.request.sourceRunId,
+              willRetry,
+              providers: Option.isSome(providerRegistry)
+                ? providerRegistry.value.getProviders
+                : Effect.succeed([]),
+            }).pipe(
+              Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
+              Effect.provideService(ServerSettings.ServerSettingsService, settings),
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
           case "provider-session.detach":
             return providerSessions
               .detach({

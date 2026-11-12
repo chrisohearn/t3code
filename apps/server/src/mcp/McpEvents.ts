@@ -83,6 +83,13 @@ export const observeEvent = (
       state = event.payload.status;
       if (!["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(state))
         return;
+      // A run failing over is not a blocker: its failover run reports the outcome. A skip is.
+      if (
+        event.type === "run.updated" &&
+        event.payload.failover !== undefined &&
+        event.payload.failover.state !== "skipped"
+      )
+        return;
       name = state === "failed" ? "thread.blocker" : "thread.run.result";
       resourceId = event.payload.id;
       break;

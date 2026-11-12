@@ -34,8 +34,10 @@ rolling renewal still needs an acknowledged delivery before an idle watch expire
 | 13     | T3-to-Jarvis inbox and event route, with a verified reply to the sender                                                         | Jarvis and audit owner                    | —                                                                                                          | live-verified |
 | 14     | Twelve-hour inbox keep-alive; first scheduled delivery remains pending                                                          | Audit owner                               | —                                                                                                          | planned       |
 
-Provider fallback is limited to a classified launch failure before a tool call or
-assistant message. Restart work verifies existing recovery; it adds no draining
+Provider fallback is automatic in T3: an account failure (usage or rate limit,
+sign-in or billing) that the Codex or Claude adapter proves happened before any
+assistant output, tool call or file change re-sends the message once on the
+fallback model. Jarvis must not also relaunch these itself, or one failure runs twice. Restart work verifies existing recovery; it adds no draining
 code. Adaptive scheduler backoff and cost guardrails were dropped.
 
 ## Round three
