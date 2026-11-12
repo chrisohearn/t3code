@@ -11,6 +11,25 @@ Upstream owns every id in `effect_sql_migrations`. Effect's migrator skips every
 - Never rename a fork migration. Startup (`repairForkMigrationHistory`) finds fork migrations that older fork builds recorded in `effect_sql_migrations` by name, moves them to `t3_fork_migrations` with their original `created_at`, and so lets upstream's migrations at those ids run. It runs in one transaction and does nothing once nothing is left to move.
 - A fork migration name must never equal an upstream migration name; a test enforces it.
 
+### Assigning fork migration ids
+
+Effect applies only migration ids above the highest applied id. Landing a higher
+id first can therefore prevent a lower migration from ever running.
+
+Assign the final id at merge time: fetch `origin/integration/mcp-events-20261109`,
+inspect its `ForkMigrations.ts`, and use the highest id on that tip plus one.
+Re-check the tip immediately before merging. A PR containing a migration merges
+only when every lower id is already on the tip; never merge it while a lower-id
+migration PR is unmerged. Earlier allocations are provisional. When the final id
+changes, update the unmerged candidate and repeat its migration checks and hosted
+gates. Never renumber a merged migration.
+
+Keep the existing registry test in
+[`ForkMigrations.test.ts`](apps/server/src/persistence/ForkMigrations.test.ts): it
+checks registration against migration files and requires unique, strictly
+increasing ids. It cannot enforce the order in which separate PRs merge; the tip
+check remains required.
+
 ## Upstream sync and releases
 
 `scripts/fork/upstream-sync.sh` runs hourly from a T3 scheduled task on Chris's machine (it needs Chris's `gh` login, Docker, and read access to the live database for the preflight). It:

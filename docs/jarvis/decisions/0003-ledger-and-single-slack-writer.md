@@ -6,9 +6,11 @@ Accepted 2026-11-12.
 
 The T3 fork's work ledger tracks all shared work. The Slack Bugs List mirrors the ledger and has one writer, the F01 thread.
 
+At Chris's request on November 12, the audit owner maintains the [upgrade register](../upgrades.md) as a dated view of approved scope, owners, PRs and status. The ledger and GitHub remain authoritative for current work and PR state. Update the register from those sources; it does not replace them.
+
 ## Alternatives
 
-Keep the hand-maintained registry, or allow each worker to update the Slack list independently.
+Use a separate registry as the authority for work state, omit the requested upgrade index, or allow each worker to update the Slack list independently.
 
 ## Why
 
