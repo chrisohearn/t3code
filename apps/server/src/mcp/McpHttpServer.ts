@@ -1084,82 +1084,79 @@ const withToolAnalytics =
               const startedAt = yield* Clock.currentTimeMillis;
               const startedMono = yield* Clock.monotonicTimeNanos;
               return yield* options.handle(payload).pipe(
-                Effect.onExit((exit) => {
-                  const result = exit._tag === "Success" ? exit.value : undefined;
-                  // A call that asks for input is retried with it, and that call is the one counted.
-                  if (result instanceof McpSchema.InputRequired) return Effect.void;
-                  const count = Effect.gen(function* () {
+                Effect.onExit((exit) =>
+                  Effect.gen(function* () {
+                    const result = exit._tag === "Success" ? exit.value : undefined;
+                    // A call that asks for input is retried with it, and that call is the one counted.
+                    if (result instanceof McpSchema.InputRequired) return;
                     const endedMono = yield* Clock.monotonicTimeNanos;
-                    const responseBytes =
-                      result === undefined
-                        ? 0
-                        : Buffer.byteLength(
-                            yield* encodeBridgeResult(result).pipe(Effect.orElseSucceed(() => "")),
-                          );
-                    const invocation = yield* Effect.serviceOption(
-                      McpInvocationContext.McpInvocationContext,
-                    );
-                    const session = Option.isSome(invocation)
-                      ? invocation.value.client?.sessionId
-                      : undefined;
-                    if (Option.isSome(invocation) && Option.isSome(requestLog)) {
-                      const scope = invocation.value;
-                      const outcome = toolOutcome(result);
-                      const identity = scope.client?.sessionId ?? scope.thread?.providerSessionId;
-                      if (identity !== undefined) {
-                        yield* requestLog.value
-                          .record({
-                            client: scope.client?.sessionId ?? scope.thread!.threadId,
-                            session: identity,
-                            tool: options.tool.name,
-                            startedAt,
-                            durationMs: Math.max(0, Number((endedMono - startedMono) / 1_000_000n)),
-                            requestBytes: Buffer.byteLength(
-                              yield* encodeBridgeResponse(payload).pipe(
+                    const durationMs = Math.max(0, Number((endedMono - startedMono) / 1_000_000n));
+                    const count = Effect.gen(function* () {
+                      const responseBytes =
+                        result === undefined
+                          ? 0
+                          : Buffer.byteLength(
+                              yield* encodeBridgeResult(result).pipe(
                                 Effect.orElseSucceed(() => ""),
                               ),
-                            ),
-                            responseBytes,
-                            errorClass:
-                              outcome.outcome === "ok"
-                                ? null
-                                : isRequestErrorCode(outcome.errorCode)
-                                  ? outcome.errorCode
-                                  : result === undefined
-                                    ? "execution_failure"
-                                    : "tool_error",
-                          })
-                          .pipe(Effect.ignoreCause);
-                      }
-                    }
-                    if (session !== undefined && Option.isSome(bridgeMetrics)) {
-                      yield* bridgeMetrics.value.record(
-                        session,
-                        options.tool.name,
-                        result === undefined || result.isError === true,
-                        responseBytes,
+                            );
+                      const invocation = yield* Effect.serviceOption(
+                        McpInvocationContext.McpInvocationContext,
                       );
-                    }
-                  });
-                  // Persist metadata before replying; thread lookups for analytics stay detached.
-                  return count.pipe(
-                    Effect.ignoreCause,
-                    Effect.andThen(
-                      Clock.monotonicTimeNanos.pipe(
-                        Effect.flatMap((endedMono) =>
-                          record(
-                            options.tool.name,
-                            payload,
-                            result,
-                            Number((endedMono - startedMono) / 1_000_000n),
-                          ),
+                      const session = Option.isSome(invocation)
+                        ? invocation.value.client?.sessionId
+                        : undefined;
+                      if (Option.isSome(invocation) && Option.isSome(requestLog)) {
+                        const scope = invocation.value;
+                        const outcome = toolOutcome(result);
+                        const identity = scope.client?.sessionId ?? scope.thread?.providerSessionId;
+                        if (identity !== undefined) {
+                          yield* requestLog.value
+                            .record({
+                              client: scope.client?.sessionId ?? scope.thread!.threadId,
+                              session: identity,
+                              tool: options.tool.name,
+                              startedAt,
+                              durationMs,
+                              requestBytes: Buffer.byteLength(
+                                yield* encodeBridgeResponse(payload).pipe(
+                                  Effect.orElseSucceed(() => ""),
+                                ),
+                              ),
+                              responseBytes,
+                              errorClass:
+                                outcome.outcome === "ok"
+                                  ? null
+                                  : isRequestErrorCode(outcome.errorCode)
+                                    ? outcome.errorCode
+                                    : result === undefined
+                                      ? "execution_failure"
+                                      : "tool_error",
+                            })
+                            .pipe(Effect.ignoreCause);
+                        }
+                      }
+                      if (session !== undefined && Option.isSome(bridgeMetrics)) {
+                        yield* bridgeMetrics.value.record(
+                          session,
+                          options.tool.name,
+                          result === undefined || result.isError === true,
+                          responseBytes,
+                        );
+                      }
+                    });
+                    // Persist metadata before replying; thread lookups for analytics stay detached.
+                    yield* count.pipe(
+                      Effect.ignoreCause,
+                      Effect.andThen(
+                        record(options.tool.name, payload, result, durationMs).pipe(
+                          Effect.forkDetach,
+                          Effect.asVoid,
                         ),
-                        Effect.forkDetach,
-                        Effect.asVoid,
                       ),
-                    ),
-                  );
-                }),
+                    );
+                  }),
+                ),
               );
             }),
         });
