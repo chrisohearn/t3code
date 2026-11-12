@@ -3986,13 +3986,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const blockingRequestExists = pendingRequests.some(
         (request) => request.kind !== "user_input" || request.responseCapability.type !== "message",
       );
+      const latestRun = latestExecutedRun(projection.runs);
+      if (
+        !runningRunExists &&
+        !blockingRequestExists &&
+        latestRun?.status === "failed" &&
+        latestRun.restartContinuationOfRunId !== undefined
+      ) {
+        // Settlement can win the thread lock before the failed-run subscriber schedules recovery.
+        yield* retryContinuationStart(command.threadId, latestRun.id).pipe(
+          mapDispatchError(command),
+        );
+      }
+      const restartContinuationPending =
+        !runningRunExists &&
+        !blockingRequestExists &&
+        (yield* effectOutbox
+          .hasUnsettled({
+            threadId: command.threadId,
+            effectTypes: ["provider-runtime.continue"],
+          })
+          .pipe(mapDispatchError(command)));
       const blocker = blockingRequestExists
         ? "is waiting on an approval or question. Answer it before settling."
         : runningRunExists
           ? "is still running. Stop it before settling."
-          : queuedMessageExists
-            ? "has a queued message. Send it or remove it from the queue before settling."
-            : null;
+          : restartContinuationPending
+            ? "has a restart continuation pending. Wait for recovery before settling."
+            : queuedMessageExists
+              ? "has a queued message. Send it or remove it from the queue before settling."
+              : null;
       if (blocker !== null) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -6512,6 +6535,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.senderClient === undefined ? {} : { senderClient: command.senderClient }),
           role: "user",
           posted: true,
+          postOnly: true,
           text: command.text,
           attachments: command.attachments,
           streaming: false,
@@ -6546,6 +6570,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             : { senderThreadId: command.senderThreadId }),
           ...(command.senderClient === undefined ? {} : { senderClient: command.senderClient }),
           inputIntent: "post",
+          postOnly: true,
           messageId: command.messageId,
           text: command.text,
           attachments: command.attachments,

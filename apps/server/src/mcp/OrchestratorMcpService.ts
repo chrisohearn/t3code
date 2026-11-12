@@ -1049,6 +1049,9 @@ function timelineItem(input: {
     creationSource: message?.creationSource ?? null,
     ...(message?.senderThreadId === undefined ? {} : { senderThreadId: message.senderThreadId }),
     ...(message?.senderClient === undefined ? {} : { senderClient: message.senderClient }),
+    ...(input.row.item.type === "user_message" && input.row.item.inputIntent === "post"
+      ? { postOnly: true }
+      : {}),
     type: input.row.item.type,
     status: input.row.item.status,
     title: input.row.item.title,
