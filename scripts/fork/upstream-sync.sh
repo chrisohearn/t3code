@@ -160,8 +160,11 @@ vp run typecheck >"$logs/typecheck.log" 2>&1 || fail "typecheck" typecheck.log
 (cd apps/server && vp test run --maxWorkers=50% --reporter=json --outputFile="$logs/server-tests.json") \
   >"$logs/server-tests.log" 2>&1 || fail "server tests" server-tests.log
 
-base_version=$(python3 -I -c 'import json; print(json.load(open("apps/server/package.json"))["version"])')
 day=$(date -u +%Y%m%d)
+# Match upstream's nightly train: the checked-in stable package previews the next patch.
+base_version=$(node scripts/resolve-nightly-release.ts --channel preview --date "$day" \
+  --run-number 1 --sha "$(git rev-parse HEAD)" | sed -n 's/^base_version=//p')
+[[ "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "could not resolve the upstream nightly core" install.log
 n=$(gh release list -R "$FORK" --limit 100 --json tagName --jq \
   "[.[] | select(.tagName | startswith(\"v$base_version-preview.$day.\"))] | length")
 version="$base_version-preview.$day.$((n + 1))"

@@ -1,6 +1,6 @@
 # Fork notes (chrisohearn/t3code)
 
-This fork follows `pingdotgg/t3code` `main`. Its integration branch is `integration/mcp-events-20261109`, and the live server on Chris's machine runs its `v0.1.9-preview.*` releases. Keep fork changes small and in fork-only files where possible, so upstream merges stay cheap.
+This fork follows `pingdotgg/t3code` `main`. Its integration branch is `integration/mcp-events-20261109`, and the live server on Chris's machine runs its fork preview releases. Keep fork changes small and in fork-only files where possible, so upstream merges stay cheap.
 
 ## Database migrations
 
@@ -19,7 +19,7 @@ Upstream owns every id in `effect_sql_migrations`. Effect's migrator skips every
 2. Merges it on a `sync/upstream-<UTC stamp>` branch, or re-checks an open `sync/upstream-*` PR (one a failed run opened, or an agent's conflict fix). `agentContextBudget.json` conflicts are taken from upstream and re-measured.
 3. Runs format, lint, typecheck and the server tests. Every test must pass; pre-existing failures still block publication.
 4. Builds the release in a container (`scripts/fork/build-release.sh`, the recipe every `v0.1.9-preview.*` release used) and smoke-tests it, then runs the built CLI's `__service-preflight` read-only against the live database for launcher protocols 3 and 4.
-5. When all of that and the hosted checks pass, it merges the PR and publishes `v<server version>-preview.<UTC date>.<n>` with the tarball and `SHA256SUMS` (`scripts/fork/publish-release.sh`). The host's update guard then installs it when no threads are running.
+5. When all of that and the hosted checks pass, it merges the PR and publishes `v<upstream nightly core>-preview.<UTC date>.<n>` with the tarball and `SHA256SUMS` (`scripts/fork/publish-release.sh`). The host's update guard then installs it when no threads are running.
 
 A conflict opens (or updates) an issue labelled `upstream-sync`, or comments on the open sync PR. A failed check opens a PR that says what failed. Neither publishes anything. Exit codes: 0 done or nothing to do, 3 conflict, 4 failed check, 2 environment problem.
 
@@ -31,3 +31,8 @@ newest published fork archive for the host platform; exact fork versions remain
 exact. Feed failures never fall back to npm or upstream archives. The service
 launcher and runtime must be upgraded together through `t3-service-update`, which
 waits for idle and snapshots the stopped database before changing it.
+
+Fork release cores use upstream's `scripts/resolve-nightly-release.ts`, which
+previews the next patch after the checked-in desktop version. Using the stable
+package core directly leaves nightly clients reporting version skew even after
+an upstream sync.
