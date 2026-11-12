@@ -6538,6 +6538,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ? {}
             : { senderThreadId: command.senderThreadId }),
           inputIntent: "post",
+          postOnly: true,
           messageId: command.messageId,
           text: command.text,
           attachments: command.attachments,

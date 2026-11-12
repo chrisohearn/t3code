@@ -1083,7 +1083,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         creationSource: "mcp",
         senderThreadId: "sender",
       });
-      expect(projection.turnItems.filter((item) => item.type === "user_message")).toHaveLength(1);
+      expect(projection.turnItems.filter((item) => item.type === "user_message")).toMatchObject([
+        { messageId: command.messageId, postOnly: true, inputIntent: "post" },
+      ]);
     }),
   );
 
