@@ -1,4 +1,8 @@
-import { McpEventSubscriptionsResult, OrchestratorMcpFailure } from "@t3tools/contracts";
+import {
+  EnvironmentConnectReachability,
+  McpEventSubscriptionsResult,
+  OrchestratorMcpFailure,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -7,6 +11,8 @@ import * as Invocation from "./McpInvocationContext.ts";
 import * as McpEvents from "./McpEvents.ts";
 import * as Metrics from "./McpBridgeMetrics.ts";
 export const BridgeStatusResult = Schema.Struct({
+  serviceStartedAt: Schema.String,
+  tunnel: Schema.NullOr(EnvironmentConnectReachability),
   daysUntilSessionExpires: Schema.Number,
   subscriptions: McpEventSubscriptionsResult.fields.subscriptions,
   lastSuccessfulEventDeliveryAt: Schema.NullOr(Schema.String),
