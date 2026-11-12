@@ -5618,7 +5618,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         ) {
           yield* closeTextStreams(context);
           const parsed = parsePermissionRequest(params);
-          const approvalOptions = flavor.approvalOptions?.(params);
+          const approvalOptions = flavor.approvalOptions?.(params) ?? [
+            ...(selectPermissionOptionId(params, "accept") === undefined
+              ? []
+              : [{ decision: "accept", label: "Allow once" } as const]),
+            ...(selectPermissionOptionId(params, "acceptForSession") === undefined
+              ? []
+              : [{ decision: "acceptForSession", label: "Always allow" } as const]),
+            { decision: "decline", label: "Deny" } as const,
+          ];
           const nativeRequestId = params.toolCall.toolCallId;
           const requestId = yield* idAllocator.allocate.runtimeRequest({
             driver,

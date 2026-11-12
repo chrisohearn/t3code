@@ -47,11 +47,15 @@ export class PeerMcpClient extends Context.Service<
       readonly limits: PeerCallLimits;
       /** The thread here the call is made for, sent as `T3-Sender-Thread`. */
       readonly sender?: OrchestrationV2LinkedSender;
+      readonly approvalOrigin?: typeof McpInvocationContext.McpApprovalOrigin.Type;
       readonly success: S;
     }) => Effect.Effect<S["Type"], OrchestratorMcpFailure>;
   }
 >()("t3/peer/PeerMcpClient") {}
 
+const encodeApprovalOrigin = Schema.encodeEffect(
+  Schema.fromJsonString(McpInvocationContext.McpApprovalOrigin),
+);
 const ToolCallResponse = Schema.Struct({
   result: Schema.optional(
     Schema.Struct({
@@ -164,7 +168,24 @@ const make = Effect.gen(function* () {
       const resolved = yield* links
         .resolve(input.environmentId)
         .pipe(Effect.mapError(fromLinkError));
+      const approvalOrigin =
+        input.approvalOrigin === undefined
+          ? undefined
+          : yield* encodeApprovalOrigin(input.approvalOrigin).pipe(
+              Effect.mapError(
+                () =>
+                  new OrchestratorMcpFailure({
+                    code: "invalid_request",
+                    message: "The approval origin cannot be forwarded.",
+                  }),
+              ),
+            );
       const limitHeader = {
+        ...(approvalOrigin === undefined
+          ? {}
+          : {
+              [McpInvocationContext.APPROVAL_ORIGIN_HEADER]: encodeURIComponent(approvalOrigin),
+            }),
         [McpInvocationContext.MODE_LIMIT_HEADER]: `${input.limits.runtimeMode}/${input.limits.interactionMode}`,
       };
       const senderHeader =

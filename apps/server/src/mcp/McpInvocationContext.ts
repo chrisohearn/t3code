@@ -1,6 +1,6 @@
 import {
   type AuthMcpClientAccess,
-  type EnvironmentId,
+  EnvironmentId,
   McpCapabilityUnavailableError,
   OrchestratorMcpFailure,
   PreviewAutomationUnavailableError,
@@ -12,6 +12,7 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Fiber from "effect/Fiber";
 import { formatThreadLink, hostedThreadLink } from "@t3tools/shared/threadLinks";
 
@@ -32,6 +33,13 @@ export interface McpThreadCaller {
   readonly subagent?: boolean;
 }
 
+export const APPROVAL_ORIGIN_HEADER = "t3-approval-origin";
+export const McpApprovalOrigin = Schema.Struct({
+  environmentId: EnvironmentId,
+  sessionId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+  clientLabel: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+});
+
 export interface McpClientCaller {
   readonly sessionId: string;
   readonly label: string;
@@ -41,6 +49,8 @@ export interface McpClientCaller {
    * session as `linkOrigin`, and it changes only that work (`linkOrigin.ts`).
    */
   readonly linked?: boolean | undefined;
+  /** Origin attested by the authenticated peer link, never a tool argument. */
+  readonly approvalOrigin?: typeof McpApprovalOrigin.Type;
   /**
    * Narrower modes the client asked for on this request (`T3-Mode-Limit`):
    * another environment passing on the limits of the agent it calls for.
@@ -142,6 +152,20 @@ export interface McpInvocationScope {
   /** False while the Linked environments beta is off here; `/mcp` reads it per request. */
   readonly linkedEnvironments?: boolean;
 }
+
+export const assertOutsideApprovalCaller = (scope: McpInvocationScope) =>
+  scope.thread === undefined &&
+  scope.client?.access === "full-access" &&
+  scope.capabilities.has("orchestration") &&
+  clientModeCeiling(scope.client).runtimeMode === "full-access" &&
+  clientModeCeiling(scope.client).interactionMode === "default"
+    ? Effect.void
+    : Effect.fail(
+        new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message: "Only an outside full-access sign-in may answer approvals over MCP.",
+        }),
+      );
 
 /**
  * T3 Code renders `t3-thread://` links as thread chips. Other MCP clients cannot open them, so

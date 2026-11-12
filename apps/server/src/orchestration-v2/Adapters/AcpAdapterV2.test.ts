@@ -4889,6 +4889,11 @@ describe("AcpAdapterV2", () => {
       ],
       optionId: "allow-once",
     },
+    {
+      label: "offers no allow-once choice when the agent only offers a standing grant",
+      options: [{ optionId: "always", name: "Always", kind: "allow_always" }],
+      optionId: "always",
+    },
   ] as const)("$label", ({ options, optionId }) =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -4972,20 +4977,25 @@ describe("AcpAdapterV2", () => {
         yield* runtime.events.pipe(
           Stream.filter(
             (event) =>
-              event.type === "runtime_request.updated" && event.runtimeRequest.status === "pending",
+              event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
           ),
           Stream.runHead,
         ),
       );
       if (
-        pending.type !== "runtime_request.updated" ||
-        pending.runtimeRequest.providerTurnId === null
+        pending.type !== "turn_item.updated" ||
+        pending.turnItem.type !== "approval_request" ||
+        pending.turnItem.providerTurnId === null
       ) {
         return yield* Effect.die("Expected an ACP approval request");
       }
+      assert.equal(
+        pending.turnItem.options?.some((option) => option.decision === "accept"),
+        options.some((option) => option.kind === "allow_once"),
+      );
       const responseFiber = yield* runtime
         .respondToRuntimeRequest({
-          requestId: pending.runtimeRequest.id,
+          requestId: pending.turnItem.requestId,
           decision: "acceptForSession",
         })
         .pipe(Effect.forkScoped);
@@ -4998,7 +5008,7 @@ describe("AcpAdapterV2", () => {
 
       yield* runtime.interruptTurn({
         providerThread,
-        providerTurnId: pending.runtimeRequest.providerTurnId,
+        providerTurnId: pending.turnItem.providerTurnId,
       });
       yield* Fiber.join(turnFiber);
       assert.deepEqual(outcome, { outcome: "selected", optionId });

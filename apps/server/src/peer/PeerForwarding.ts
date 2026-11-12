@@ -157,12 +157,26 @@ const make = Effect.gen(function* () {
             threadId: caller.id,
             title: caller.title,
           };
+    let approvalOrigin: typeof McpInvocationContext.McpApprovalOrigin.Type | undefined;
+    if (
+      toolName === "t3_pending_request" &&
+      args.action === "respond" &&
+      args.decision !== undefined
+    ) {
+      yield* McpInvocationContext.assertOutsideApprovalCaller(scope);
+      approvalOrigin = scope.client!.approvalOrigin ?? {
+        environmentId: scope.environmentId,
+        sessionId: scope.client!.sessionId,
+        clientLabel: scope.client!.label,
+      };
+    }
     return yield* peers.call({
       environmentId,
       tool: toolName,
       arguments: args,
       limits,
       ...(sender === undefined ? {} : { sender }),
+      ...(approvalOrigin === undefined ? {} : { approvalOrigin }),
       success: success as Schema.Decoder<A>,
     });
   });
