@@ -10,8 +10,11 @@ import {
   McpEventEnvelope,
   McpEventArguments,
   McpEventData,
+  McpEventWatch,
   McpEventsError,
   type McpEventSubscribe,
+  type McpEventHubInput,
+  type McpEventHubResult,
   type McpEventSubscriptionsResult,
   type McpEventUnsubscribe,
   type OrchestrationV2StoredEvent,
@@ -114,6 +117,7 @@ export const observeEvent = (
 
 export interface PreparedThreadNotify {
   readonly principal: string;
+  readonly routingReason: "via" | "pinned" | "newest_explicit";
   readonly subscriptionId: string;
   readonly cursor: string;
   readonly events: ReadonlyArray<McpEventName>;
@@ -122,6 +126,9 @@ export interface PreparedThreadNotify {
 export class McpEvents extends Context.Service<
   McpEvents,
   {
+    readonly setHub: (
+      input: McpEventHubInput,
+    ) => Effect.Effect<McpEventHubResult, McpEventsError, Invocation.McpInvocationContext>;
     readonly prepareNotify: (
       input: McpThreadNotify,
     ) => Effect.Effect<
@@ -139,6 +146,8 @@ export class McpEvents extends Context.Service<
         readonly tunnel: EnvironmentConnectReachability | null;
         readonly daysUntilSessionExpires: number;
         readonly subscriptions: McpEventSubscriptionsResult["subscriptions"];
+        readonly hubSubscriptionId: string | null;
+        readonly watches: ReadonlyArray<typeof McpEventWatch.Type>;
         readonly lastSuccessfulEventDeliveryAt: string | null;
         readonly deliveriesExhaustedRetries: number;
       },
@@ -416,32 +425,44 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const callbackGroup = Effect.fn("McpEvents.callbackGroup")(function* (url: string) {
+    const bytes = yield* digest.digest(Digest.sha256, Buffer.from(url));
+    return `watch_${Buffer.from(bytes).toString("hex")}`;
+  });
+
   const listSubscriptions = Effect.fn("McpEvents.listSubscriptions")(function* () {
     const { principal } = yield* caller();
     const now = yield* Clock.currentTimeMillis;
     const own = yield* subscriptions.forPrincipal(principal.sessionId);
     return {
-      subscriptions: own.map((sub) => ({
-        id: sub.id,
-        name: sub.name,
-        arguments: { threadId: sub.threadId },
-        // Callback paths and queries may be credentials. Management needs only the destination origin.
-        callbackOrigin: new URL(sub.url).origin,
-        status:
-          sub.expiresAt <= now
-            ? ("expired" as const)
-            : sub.active === 1
-              ? ("active" as const)
-              : ("stopped" as const),
-        expiresAt: DateTime.formatIso(DateTime.makeUnsafe(sub.expiresAt)),
-        cursor: String(sub.ackCursor),
-      })),
+      hubSubscriptionId: yield* subscriptions.hub(principal.sessionId),
+      subscriptions: yield* Effect.forEach(own, (sub) =>
+        Effect.gen(function* () {
+          return {
+            id: sub.id,
+            name: sub.name,
+            arguments: { threadId: sub.threadId },
+            // Callback paths and queries may be credentials. Management needs only the destination origin.
+            callbackOrigin: new URL(sub.url).origin,
+            callbackGroup: yield* callbackGroup(sub.url),
+            notifyDerived: sub.notifyDerived === 1,
+            status:
+              sub.expiresAt <= now
+                ? ("expired" as const)
+                : sub.active === 1
+                  ? ("active" as const)
+                  : ("stopped" as const),
+            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(sub.expiresAt)),
+            cursor: String(sub.ackCursor),
+          };
+        }),
+      ),
     };
   });
 
   const subscribe = Effect.fn("McpEvents.subscribe")(function* (
     input: McpEventSubscribe,
-    renewOnDelivery = true,
+    notifyDerived = false,
   ) {
     const { scope, principal } = yield* caller();
     yield* resource(input.arguments.threadId);
@@ -502,6 +523,7 @@ const make = Effect.gen(function* () {
         );
         yield* subscriptions.save({
           id,
+          notifyDerived: notifyDerived ? 1 : 0,
           principal: principal.sessionId,
           name: input.name,
           threadId: input.arguments.threadId,
@@ -511,7 +533,7 @@ const make = Effect.gen(function* () {
           active: 1,
           now,
           expiresAt,
-          renewalTtlMs: renewOnDelivery || (current?.renewalTtlMs ?? 0) > 0 ? ttlMs : 0,
+          renewalTtlMs: notifyDerived ? (current?.renewalTtlMs ?? 0) : ttlMs,
           scanCursor:
             current !== undefined && cursor === current.ackCursor ? current.scanCursor : cursor,
           ackCursor: cursor,
@@ -529,6 +551,21 @@ const make = Effect.gen(function* () {
   });
 
   return McpEvents.of({
+    setHub: Effect.fn("McpEvents.setHub")(function* (input) {
+      const { principal } = yield* caller();
+      if (input.id !== null) {
+        const sub = yield* subscriptions.get(input.id);
+        if (sub === undefined || sub.principal !== principal.sessionId) return yield* refused();
+        if (
+          sub.notifyDerived !== 0 ||
+          sub.active !== 1 ||
+          sub.expiresAt <= (yield* Clock.currentTimeMillis)
+        )
+          return yield* invalid();
+      }
+      yield* subscriptions.pin(principal.sessionId, input.id);
+      return { hubSubscriptionId: input.id };
+    }),
     prepareNotify: Effect.fn("McpEvents.prepareNotify")(function* (input) {
       const scope = yield* Invocation.McpInvocationContext;
       if (scope.client === undefined || scope.thread !== undefined || scope.client.linked === true)
@@ -539,19 +576,36 @@ const make = Effect.gen(function* () {
         };
       const { principal } = yield* caller();
       const now = yield* Clock.currentTimeMillis;
-      const source = (yield* subscriptions.forPrincipal(principal.sessionId)).find(
-        (sub) => sub.active === 1 && sub.expiresAt > now,
-      );
+      const own = yield* subscriptions.forPrincipal(principal.sessionId);
+      const pinned = yield* subscriptions.hub(principal.sessionId);
+      const selected = input.via ?? pinned;
+      const routingReason =
+        input.via !== undefined
+          ? ("via" as const)
+          : pinned !== null
+            ? ("pinned" as const)
+            : ("newest_explicit" as const);
+      const source = own
+        .filter(
+          (sub) =>
+            sub.active === 1 &&
+            sub.expiresAt > now &&
+            sub.notifyDerived === 0 &&
+            (selected === null ? sub.name === "thread.run.result" : sub.id === selected),
+        )
+        .sort((a, b) => b.createdOrder - a.createdOrder || a.id.localeCompare(b.id))[0];
       if (source === undefined)
         return {
           status: "unavailable" as const,
           subscriptionIds: [],
           reason: "no_active_subscription",
+          ...(selected === null ? {} : { sourceSubscriptionId: selected, routingReason }),
         };
       const cursor = String(yield* events.latestApplicationSequence.pipe(Effect.mapError(storage)));
       return {
         principal: principal.sessionId,
         subscriptionId: source.id,
+        routingReason,
         cursor,
         events: input.events ?? ["thread.run.result", "thread.needs-decision", "thread.blocker"],
       };
@@ -564,6 +618,7 @@ const make = Effect.gen(function* () {
       if (
         source === undefined ||
         source.principal !== principal.sessionId ||
+        source.notifyDerived !== 0 ||
         source.active !== 1 ||
         source.expiresAt <= now
       )
@@ -571,7 +626,10 @@ const make = Effect.gen(function* () {
           status: "unavailable" as const,
           subscriptionIds: [],
           reason: "no_active_subscription",
+          sourceSubscriptionId: prepared.subscriptionId,
+          routingReason: prepared.routingReason,
         };
+      const routing = { sourceSubscriptionId: source.id, routingReason: prepared.routingReason };
       const subscriptionIds: Array<string> = [];
       let refreshBefore: string | undefined;
       for (const name of new Set(prepared.events)) {
@@ -582,6 +640,12 @@ const make = Effect.gen(function* () {
           delivery,
         })).id;
         let existing = yield* subscriptions.get(existingId);
+        if (existing?.notifyDerived === 0 && existing.active === 1 && existing.expiresAt > now) {
+          subscriptionIds.push(existing.id);
+          const expiry = DateTime.formatIso(DateTime.makeUnsafe(existing.expiresAt));
+          if (refreshBefore === undefined || expiry < refreshBefore) refreshBefore = expiry;
+          continue;
+        }
         // A lapsed subscription would resume at its old cursor and replay old runs.
         if (existing !== undefined && (existing.active !== 1 || existing.expiresAt <= now)) {
           yield* withSubscription(
@@ -597,18 +661,25 @@ const make = Effect.gen(function* () {
             cursor: existing === undefined ? prepared.cursor : null,
             delivery,
             // Each active subscription scans the event log, so one made for a run lapses within a day.
-            // Not the source's own expiry: it may be an earlier notify subscription near its end.
+            // A hub near its expiry must not shorten a new worker subscription.
             ttlMs: 86_400_000,
           },
-          false,
+          true,
         ).pipe(Effect.result);
         if (result._tag === "Failure")
-          return { status: "failed" as const, subscriptionIds, reason: result.failure.reason };
+          return {
+            status: "failed" as const,
+            subscriptionIds,
+            reason: result.failure.reason,
+            ...routing,
+          };
         subscriptionIds.push(result.success.id);
-        refreshBefore = result.success.refreshBefore;
+        if (refreshBefore === undefined || result.success.refreshBefore < refreshBefore)
+          refreshBefore = result.success.refreshBefore;
       }
       return {
         status: "subscribed" as const,
+        ...routing,
         subscriptionIds,
         ...(refreshBefore === undefined ? {} : { refreshBefore }),
       };
@@ -617,6 +688,21 @@ const make = Effect.gen(function* () {
       const { principal } = yield* caller();
       const now = yield* Clock.currentTimeMillis;
       const status = yield* bridge.read(principal.sessionId);
+      const listing = yield* listSubscriptions();
+      const listed = listing.subscriptions;
+      const watches = new Map<string, typeof McpEventWatch.Type>();
+      for (const sub of listed.filter((sub) => sub.status === "active")) {
+        const watch = watches.get(sub.callbackGroup);
+        watches.set(sub.callbackGroup, {
+          callbackGroup: sub.callbackGroup,
+          callbackOrigin: sub.callbackOrigin,
+          subscriptionIds: [...(watch?.subscriptionIds ?? []), sub.id],
+          soonestExpiry:
+            watch === undefined || sub.expiresAt < watch.soonestExpiry
+              ? sub.expiresAt
+              : watch.soonestExpiry,
+        });
+      }
       return {
         serviceStartedAt: DateTime.formatIso(DateTime.makeUnsafe(serviceStartedAt)),
         tunnel: Option.getOrNull(yield* reachability.latest),
@@ -624,7 +710,9 @@ const make = Effect.gen(function* () {
           0,
           (principal.expiresAt.epochMilliseconds - now) / 86400_000,
         ),
-        subscriptions: (yield* listSubscriptions()).subscriptions,
+        hubSubscriptionId: listing.hubSubscriptionId,
+        subscriptions: listed,
+        watches: [...watches.values()],
         lastSuccessfulEventDeliveryAt:
           status.lastSuccessAt === null
             ? null
@@ -649,6 +737,9 @@ const make = Effect.gen(function* () {
     unsubscribe: Effect.fn("McpEvents.unsubscribe")(function* (input) {
       const { principal } = yield* caller();
       const id = "id" in input ? input.id : (yield* identity(principal.sessionId, input)).id;
+      const existing = yield* subscriptions.get(id);
+      if (existing !== undefined && existing.principal !== principal.sessionId)
+        return yield* refused();
       // Explicit unsubscribe forgets the transport backlog. Recovery after a
       // delivery failure still uses stop(), retaining the acknowledged cursor.
       yield* withSubscription(id, subscriptions.remove(id, principal.sessionId));

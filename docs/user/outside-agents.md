@@ -205,18 +205,38 @@ subscription made after a run ends does not replay that run's completion event.
 Check the thread once after subscribing to catch a result that arrived earlier.
 
 To monitor a new launch or send, include `notify: {}` in `t3_thread_launch` or
-`t3_thread_send`. T3 reuses this sign-in's most recently refreshed active
-subscription's callback and secret. It captures the event cursor before starting
-the run, so even an immediate completion is covered. The default events are
-`thread.run.result`, `thread.needs-decision`, and `thread.blocker`. Set
-`notify.events` to choose a subset. The response's `notify` field reports
-`subscribed`, `unavailable`, or `failed`, with subscription IDs and a reason when
-needed. Without an active subscription, the launch or send still succeeds and
-reports `no_active_subscription`. Check this field and read the thread once if
-notification setup fails. These subscriptions last up to a day, or less if the
-sign-in expires sooner, and `refreshBefore` gives the time. Another launch or
-send with `notify` renews them. A lapsed one restarts at the new run instead of
-replaying older events. Subscriptions are deleted a day after they expire.
+`t3_thread_send`. Pin an existing active explicit watch with
+`event_hub_set: { id: "<subscription-id>" }`; `event_subscriptions` lists the native
+ids. `notify.via` overrides the pin for one call. Without a pin, T3 uses this
+sign-in's newest-created active explicit `thread.run.result` subscription.
+Refreshing another watch does not move the pin. Clear it with
+`event_hub_set: { id: null }` or select another existing active explicit watch if
+the pinned one becomes unavailable. Notify-derived subscriptions cannot be hubs.
+Existing watches are classified by their callback group's creation order; no new
+ChatGPT watch is needed after upgrading.
+
+T3 captures the event cursor before starting the run, so even an immediate
+completion is covered. The default events are `thread.run.result`,
+`thread.needs-decision`, and `thread.blocker`; `notify.events` chooses a subset.
+The response's `notify` field reports `subscribed`, `unavailable`, or `failed`, with
+subscription ids and a reason when needed. `sourceSubscriptionId` identifies the
+selected watch, and `routingReason` is `via`, `pinned`, or `newest_explicit`.
+Without an eligible hub, the launch or send still succeeds and reports
+`no_active_subscription`. Read the thread once if notification setup fails.
+
+New notify subscriptions last up to a day, capped by the sign-in expiry. Another
+launch or send with notify refreshes those subscriptions. An existing active
+explicit subscription keeps its granted lifetime and rolling renewal when notify
+reuses it. `refreshBefore` reports the earliest expiry among the returned ids.
+A lapsed notify subscription starts at the new run instead of replaying older
+events. Subscriptions are deleted a day after they expire.
+
+`event_subscriptions` lists your hub pin, native subscription ids, threads, events,
+expiry and callback groups. `notifyDerived` distinguishes notify copies from
+explicit watches. Remove a particular duplicate with `event_unsubscribe` and its
+id; repeating a removal is safe. `bridge_status.watches` groups active
+subscriptions by callback and reports each watch's soonest expiry, while
+`hubSubscriptionId` shows the pin. Callback paths, queries and secrets stay private.
 
 For direct protocol clients, the T3 extension `events/subscriptions/list` lists
 this sign-in's subscriptions: event/thread, active/stopped/expired status, expiry,

@@ -210,7 +210,7 @@ it.effect(
             ThreadNotifications.finish(yield* invoke(ThreadNotifications.prepare({})), source),
           ),
         ).toMatchObject({ status: "unavailable", reason: "no_active_subscription" });
-        yield* f.call(f.service.subscribe(inputFor(source)));
+        yield* f.call(f.service.subscribe({ ...inputFor(source), name: "thread.run.result" }));
         let sendSubscriptions: ReadonlyArray<string> = [];
         for (const operation of ["launch", "send", "send-again"]) {
           const threadId = ThreadId.make(
@@ -287,6 +287,87 @@ it.effect(
         });
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("keeps notify on an explicit hub despite refreshes, duplicates and derived watches", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const input = { ...inputFor(ThreadId.make("hub")), name: "thread.run.result" as const };
+      const hub = yield* f.call(f.service.subscribe(input));
+      yield* TestClock.adjust("1 second");
+      const other = yield* f.call(
+        f.service.subscribe({
+          ...input,
+          arguments: { threadId: ThreadId.make("other") },
+          delivery: { ...input.delivery, url: "https://callbacks.example.com/new-watch" },
+        }),
+      );
+      expect(yield* f.call(f.service.prepareNotify({}))).toMatchObject({
+        subscriptionId: other.id,
+        routingReason: "newest_explicit",
+      });
+      expect(yield* f.call(f.service.setHub({ id: hub.id }))).toEqual({
+        hubSubscriptionId: hub.id,
+      });
+      expect((yield* f.call(f.service.listSubscriptions())).hubSubscriptionId).toBe(hub.id);
+      const rebuilt = yield* f.build();
+      const prepared = yield* f.call(rebuilt.prepareNotify({}));
+      expect(prepared).toMatchObject({ subscriptionId: hub.id, routingReason: "pinned" });
+      if (!("principal" in prepared)) throw new Error("expected prepared notify");
+      const derived = yield* f.call(f.service.notifyThread(prepared, ThreadId.make("worker")));
+      const resultId = derived.subscriptionIds[0]!;
+      expect((yield* f.subscriptions.get(resultId))?.notifyDerived).toBe(1);
+      expect(derived).toMatchObject({ sourceSubscriptionId: hub.id, routingReason: "pinned" });
+      expect((yield* f.call(f.service.setHub({ id: resultId })).pipe(Effect.flip)).reason).toBe(
+        "invalid_params",
+      );
+      expect(
+        (yield* f.call(f.service.setHub({ id: hub.id }), f.other).pipe(Effect.flip)).reason,
+      ).toBe("access_denied");
+      expect(yield* f.call(f.service.prepareNotify({ via: resultId }))).toMatchObject({
+        status: "unavailable",
+      });
+      expect(yield* f.call(f.service.prepareNotify({ via: hub.id }), f.other)).toMatchObject({
+        status: "unavailable",
+      });
+      expect(yield* f.call(f.service.prepareNotify({ via: other.id }))).toMatchObject({
+        subscriptionId: other.id,
+        routingReason: "via",
+      });
+      yield* f.call(f.service.subscribe({ ...input, ttlMs: 172800_000 }));
+      expect(yield* f.call(f.service.prepareNotify({}))).toMatchObject({ subscriptionId: hub.id });
+      yield* f.call(f.service.notifyThread(prepared, input.arguments.threadId));
+      expect((yield* f.subscriptions.get(hub.id))?.notifyDerived).toBe(0);
+      expect((yield* f.subscriptions.get(hub.id))?.expiresAt).toBe(172801000);
+      const listed = (yield* f.call(f.service.listSubscriptions())).subscriptions;
+      expect(listed.filter((sub) => sub.notifyDerived)).toHaveLength(5);
+      const status = yield* f.call(f.service.bridgeStatus());
+      expect(status.watches).toHaveLength(2);
+      expect(status.watches.find((watch) => watch.subscriptionIds.includes(hub.id))).toMatchObject({
+        subscriptionIds: expect.arrayContaining([hub.id, resultId]),
+        soonestExpiry: "1970-01-02T00:00:01.000Z",
+      });
+      yield* f.call(f.service.subscribe({ ...input, ttlMs: 60_000 }));
+      expect(
+        yield* f.call(f.service.notifyThread(prepared, input.arguments.threadId)),
+      ).toMatchObject({
+        refreshBefore: "1970-01-01T00:01:01.000Z",
+      });
+      expect(yield* f.call(f.service.setHub({ id: null }))).toEqual({ hubSubscriptionId: null });
+      expect(yield* f.call(f.service.prepareNotify({}))).toMatchObject({
+        subscriptionId: other.id,
+        routingReason: "newest_explicit",
+      });
+      yield* f.call(f.service.setHub({ id: hub.id }));
+      yield* f.call(f.service.unsubscribe({ id: hub.id }));
+      expect(yield* f.call(f.service.prepareNotify({}))).toMatchObject({
+        subscriptionId: other.id,
+      });
+      yield* f.call(f.service.unsubscribe({ id: other.id }));
+      expect(yield* f.call(f.service.prepareNotify({}))).toMatchObject({ status: "unavailable" });
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
 it.effect(
@@ -854,14 +935,26 @@ it.effect(
             name: input.name,
             arguments: input.arguments,
             callbackOrigin: "https://callbacks.example.com",
+            callbackGroup: expect.stringMatching(/^watch_[0-9a-f]{64}$/),
+            notifyDerived: false,
             status: "active",
             expiresAt: "1970-01-02T00:00:00.000Z",
             cursor: "0",
           },
         ]);
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`DELETE FROM mcp_event_subscription_routing WHERE subscription_id = ${own.id}`;
+        expect((yield* f.call(f.service.listSubscriptions())).subscriptions[0]?.notifyDerived).toBe(
+          false,
+        );
+        expect(yield* f.call(f.service.prepareNotify({ via: own.id }))).toMatchObject({
+          subscriptionId: own.id,
+        });
         expect(encode(listed)).not.toContain(Redacted.value(secret));
         expect(encode(listed)).not.toContain(input.delivery.url);
-        yield* f.call(f.service.unsubscribe({ id: own.id }), f.other);
+        expect(
+          (yield* f.call(f.service.unsubscribe({ id: own.id }), f.other).pipe(Effect.flip)).reason,
+        ).toBe("access_denied");
         expect(yield* f.subscriptions.get(own.id)).toBeDefined();
         yield* f.append([input.arguments.threadId]);
         f.responses.set("event-0", 503);
@@ -1056,7 +1149,7 @@ it.effect("keeps notify-only expiry fixed while renewing its explicit source on 
       const input = inputFor(ThreadId.make("explicit-source"));
       const source = yield* f.call(f.service.subscribe(input));
       const prepared = yield* f.call(
-        f.service.prepareNotify({ events: ["thread.resource-released"] }),
+        f.service.prepareNotify({ via: source.id, events: ["thread.resource-released"] }),
       );
       if ("status" in prepared) throw new Error("Expected an active source");
       const notifiedThread = ThreadId.make("notify-only");

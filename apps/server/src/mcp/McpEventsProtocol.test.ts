@@ -43,12 +43,15 @@ it.effect(
             ),
           listSubscriptions: () =>
             Effect.succeed({
+              hubSubscriptionId: null,
               subscriptions: [
                 {
                   id: "fixture-sub",
                   name: "thread.run.result",
                   arguments: { threadId: ThreadId.make("fixture-thread") },
                   callbackOrigin: "https://callbacks.example.com",
+                  callbackGroup: "watch_fixture",
+                  notifyDerived: false,
                   status: "active",
                   expiresAt: "2026-11-10T00:00:00.000Z",
                   cursor: "1",

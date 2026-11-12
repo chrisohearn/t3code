@@ -39,13 +39,22 @@ export const McpEventUnsubscribe = Schema.Union([
   McpEventUnsubscribeById,
 ]);
 export type McpEventUnsubscribe = typeof McpEventUnsubscribe.Type;
+export const McpEventHubInput = Schema.Struct({
+  id: Schema.NullOr(Schema.String.check(Schema.isMaxLength(128))),
+});
+export type McpEventHubInput = typeof McpEventHubInput.Type;
+export const McpEventHubResult = Schema.Struct({ hubSubscriptionId: Schema.NullOr(Schema.String) });
+export type McpEventHubResult = typeof McpEventHubResult.Type;
 export const McpEventSubscriptionsResult = Schema.Struct({
+  ...McpEventHubResult.fields,
   subscriptions: Schema.Array(
     Schema.Struct({
       id: Schema.String,
       name: McpEventName,
       arguments: McpEventArguments,
       callbackOrigin: Schema.String,
+      callbackGroup: Schema.String,
+      notifyDerived: Schema.Boolean,
       status: Schema.Literals(["active", "stopped", "expired"]),
       expiresAt: Schema.String,
       cursor: Schema.String,
@@ -53,6 +62,13 @@ export const McpEventSubscriptionsResult = Schema.Struct({
   ),
 });
 export type McpEventSubscriptionsResult = typeof McpEventSubscriptionsResult.Type;
+
+export const McpEventWatch = Schema.Struct({
+  callbackGroup: Schema.String,
+  callbackOrigin: Schema.String,
+  subscriptionIds: Schema.Array(Schema.String),
+  soonestExpiry: Schema.String,
+});
 
 export const McpEventSubscriptionResult = Schema.Struct({
   id: Schema.String,
@@ -91,6 +107,7 @@ export class McpEventsError extends Schema.TaggedError<McpEventsError>()("McpEve
 }
 
 export const McpThreadNotify = Schema.Struct({
+  via: Schema.optional(Schema.String.check(Schema.isMaxLength(128))),
   events: Schema.optional(
     Schema.Array(McpEventName).check(Schema.isMinLength(1), Schema.isMaxLength(4)),
   ),
@@ -98,6 +115,8 @@ export const McpThreadNotify = Schema.Struct({
 export type McpThreadNotify = typeof McpThreadNotify.Type;
 export const McpThreadNotifyResult = Schema.Struct({
   status: Schema.Literals(["subscribed", "unavailable", "failed"]),
+  sourceSubscriptionId: Schema.optional(Schema.String),
+  routingReason: Schema.optional(Schema.Literals(["via", "pinned", "newest_explicit"])),
   subscriptionIds: Schema.Array(Schema.String),
   refreshBefore: Schema.optional(Schema.String),
   reason: Schema.optional(Schema.String),

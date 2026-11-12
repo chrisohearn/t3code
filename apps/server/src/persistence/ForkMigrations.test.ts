@@ -132,7 +132,13 @@ describe("fork migrations", () => {
         (id, principal, name, thread_id, callback_url, source_url, secret, rotation_until,
          expires_at, active, scan_cursor, ack_cursor)
         VALUES ('preserved', 'fork-upgrade', 'thread.run.result', 'thread:test',
-          'https://example.com/events', 'https://example.com', 'test-secret', 0, 100, 1, 5, 3)`;
+          'https://example.com/events', 'https://example.com', 'test-secret', 0, 100, 1, 5, 3),
+          ('derived', 'fork-upgrade', 'thread.blocker', 'thread:worker',
+          'https://example.com/events', 'https://example.com', 'test-secret', 0, 100, 1, 5, 3),
+          ('inbox', 'fork-upgrade', 'thread.run.result', 'thread:inbox',
+          'https://example.com/inbox', 'https://example.com', 'test-secret', 0, 100, 1, 5, 3),
+          ('duplicate-inbox', 'fork-upgrade', 'thread.run.result', 'thread:inbox',
+          'https://example.com/duplicate', 'https://example.com', 'test-secret', 0, 100, 1, 5, 3)`;
       const subscriptions = yield* sql`SELECT * FROM mcp_event_subscriptions`;
       const sessions = yield* sql`SELECT * FROM auth_sessions`;
       assert.isTrue(yield* hasPendingMigrations());
@@ -146,6 +152,7 @@ describe("fork migrations", () => {
           [4, "McpBridgeStatus"],
           [5, "McpOAuthRenewal"],
           [6, "McpSubscriptionRenewal"],
+          [8, "McpEventRouting"],
         ],
       );
       assert.equal((yield* forkHistory)[0]?.[2], "2026-11-12 04:10:00");
@@ -155,6 +162,18 @@ describe("fork migrations", () => {
       yield* sql`SELECT * FROM work_ledger`;
       yield* sql`SELECT * FROM mcp_client_threads`;
       yield* sql`SELECT * FROM mcp_bridge_status`;
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM mcp_event_subscription_routing ORDER BY created_order`,
+        [
+          { subscription_id: "preserved", created_order: 1, notify_derived: 0 },
+          { subscription_id: "derived", created_order: 2, notify_derived: 1 },
+          { subscription_id: "inbox", created_order: 3, notify_derived: 0 },
+          { subscription_id: "duplicate-inbox", created_order: 4, notify_derived: 0 },
+        ],
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM mcp_event_run_context`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM mcp_event_observations`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM mcp_event_exhaustion_alerts`, []);
       assert.deepStrictEqual(
         yield* sql`SELECT renewal_ttl_ms FROM mcp_event_subscription_activity WHERE subscription_id = 'preserved'`,
         [{ renewal_ttl_ms: 86_400_000 }],
