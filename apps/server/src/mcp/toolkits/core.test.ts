@@ -17,6 +17,7 @@ import {
   ChatImageAttachment,
   CommandId,
   EnvironmentId,
+  MessageId,
   NodeId,
   OrchestrationV2McpApprovalAnswer,
   OrchestratorMcpThreadReadResult,
@@ -1451,6 +1452,94 @@ it.effect("discovers workflow stop targets and requires orchestration capability
         Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
         Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
         Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+      ),
+    ),
+  );
+});
+
+it.effect("attachment sends retain authenticated client attribution", () => {
+  const sent: ThreadManagement.ThreadManagementSendInput[] = [];
+  const shell = McpToolAccessTestkit.liveThreadShell(ThreadId.make("attachment-target"));
+  const attachment = {
+    type: "image",
+    id: "stored-image",
+    name: "shot.png",
+    mimeType: "image/png",
+    sizeBytes: 4,
+  } as const;
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    yield* server
+      .callTool({
+        name: "t3_thread_send_attachments",
+        arguments: {
+          threadId: shell.id,
+          attachments: [attachment],
+        },
+      })
+      .pipe(
+        Effect.provideService(
+          McpInvocationContext.McpInvocationContext,
+          clientScope("full-access"),
+        ),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.senderThreadId).toBeUndefined();
+    expect(sent[0]?.senderClient).toMatchObject({
+      clientLabel: "Claude Code",
+      kind: "outside-client",
+      access: "full-access",
+    });
+    expect(sent[0]?.senderClient?.sessionId).toBe("session-");
+  }).pipe(
+    Effect.provide(
+      McpHttpServer.layerAttachmentToolkit.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: () => Effect.succeed(shell),
+            getProjectThreadRecords: () =>
+              Effect.succeed({
+                ...McpToolAccessTestkit.idleThreadProjection(shell),
+                messages: [
+                  {
+                    id: MessageId.make("stored-message"),
+                    threadId: shell.id,
+                    runId: null,
+                    nodeId: null,
+                    role: "user",
+                    text: "",
+                    attachments: [attachment],
+                    streaming: false,
+                    createdAt: shell.createdAt,
+                    updatedAt: shell.updatedAt,
+                    createdBy: "user",
+                    creationSource: "web",
+                  },
+                ],
+              }),
+            sendToThread: (input) => {
+              sent.push(input);
+              return Effect.fail(
+                new OrchestratorCommandRejectedError({
+                  commandId: input.commandId,
+                  commandType: "message.dispatch",
+                }),
+              );
+            },
+          }),
+        ),
+        Layer.provide(AssetSigner.layer.pipe(Layer.provideMerge(ServerSecretStore.layer))),
+        Layer.provide(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-attachment-sender-" }),
+        ),
+        Layer.provide(
+          DocumentText.layer.pipe(
+            Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+          ),
+        ),
+        Layer.provide(NodeCrypto.layer),
       ),
     ),
   );

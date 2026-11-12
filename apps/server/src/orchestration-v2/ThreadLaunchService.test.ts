@@ -508,14 +508,26 @@ it.effect("retains automation and sender attribution while a message waits in th
   return Effect.gen(function* () {
     const launches = yield* ThreadLaunch.ThreadLaunchService;
     const threads = yield* ThreadManagement.ThreadManagementService;
-    const launched = yield* launches.launch(
-      launchInput({
-        command: "command:automation:queue",
-        thread: "thread:automation:queue",
-        message: "First message",
-        workspace: { type: "worktree", baseRef: "main" },
-      }),
-    );
+    const senderClient = {
+      kind: "outside-client",
+      sessionId: "01234567",
+      clientLabel: "ChatGPT",
+      access: "full-access",
+    } as const;
+    const initial = launchInput({
+      command: "command:automation:queue",
+      thread: "thread:automation:queue",
+      message: "First message",
+      workspace: { type: "worktree", baseRef: "main" },
+    });
+    const launched = yield* launches.launch({
+      ...initial,
+      createdBy: "agent",
+      creationSource: "mcp",
+      initialMessage: { ...initial.initialMessage!, senderClient },
+    });
+    const launchedProjection = yield* threads.getThreadProjection(launched.threadId);
+    assert.deepEqual(launchedProjection.messages[0]?.senderClient, senderClient);
     const scheduledTaskId = ScheduledTaskId.make("scheduled-task:queued");
     const senderThreadId = ThreadId.make("thread:agent-sender");
     const queued = yield* threads.sendToThread({

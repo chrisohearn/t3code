@@ -153,6 +153,21 @@ export interface McpInvocationScope {
   readonly linkedEnvironments?: boolean;
 }
 
+export const messageSenderFor = (scope: McpInvocationScope) => {
+  if (scope.client === undefined) return {};
+  return {
+    senderClient: {
+      sessionId: scope.client.sessionId.slice(0, 8),
+      clientLabel: scope.client.label,
+      kind: scope.client.linked === true ? ("linked-agent" as const) : ("outside-client" as const),
+      access:
+        scope.client.access === "full-access" || scope.client.access === "read-only"
+          ? scope.client.access
+          : ("approval-required" as const),
+    },
+  };
+};
+
 export const assertOutsideApprovalCaller = (scope: McpInvocationScope) =>
   scope.thread === undefined &&
   scope.client?.access === "full-access" &&

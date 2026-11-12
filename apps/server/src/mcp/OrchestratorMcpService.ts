@@ -13,6 +13,7 @@ import {
   NodeId,
   ORCHESTRATOR_MCP_RUNNING_TASK_NEXT,
   TurnItemId,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2Run,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
@@ -1057,6 +1058,7 @@ function timelineItem(input: {
     createdBy: message?.createdBy ?? null,
     creationSource: message?.creationSource ?? null,
     ...(message?.senderThreadId === undefined ? {} : { senderThreadId: message.senderThreadId }),
+    ...(message?.senderClient === undefined ? {} : { senderClient: message.senderClient }),
     ...(input.row.item.type === "user_message" && input.row.item.inputIntent === "post"
       ? { postOnly: true }
       : {}),
@@ -3116,21 +3118,36 @@ const make = Effect.gen(function* () {
                 providerTurnAttemptIds: [run.activeAttemptId],
               })
               .pipe(Effect.mapError(threadManagementFailure))).providerTurns;
-      const message = records?.messages[0];
-      const chars = Array.from(message?.text ?? "");
+      const latest = yield* threadManagement
+        .getThreadRecords(input.threadId, ["messages"], {
+          latestMessageOnly: true,
+          messageOrder: "created_at",
+          excludeSilentMaintenance: true,
+        })
+        .pipe(Effect.mapError(threadManagementFailure));
       const maxChars = input.maxChars ?? 4000;
+      const summarize = (message: OrchestrationV2ConversationMessage | undefined) => {
+        if (message === undefined) return null;
+        const chars = Array.from(message.text);
+        return {
+          messageId: message.id,
+          role: message.role,
+          text: chars.slice(0, maxChars).join(""),
+          truncated: chars.length > maxChars,
+          createdBy: message.createdBy,
+          creationSource: message.creationSource,
+          ...(message.senderThreadId === undefined
+            ? {}
+            : { senderThreadId: message.senderThreadId }),
+          ...(message.senderClient === undefined ? {} : { senderClient: message.senderClient }),
+        };
+      };
       return {
         threadId: input.threadId,
         status: shell.activityRunStatus ?? shell.status,
         run: run === undefined ? null : threadRun({ providerTurns }, run),
-        lastAssistantMessage:
-          message === undefined
-            ? null
-            : {
-                messageId: message.id,
-                text: chars.slice(0, maxChars).join(""),
-                truncated: chars.length > maxChars,
-              },
+        lastAssistantMessage: summarize(records?.messages[0]),
+        latestMessage: summarize(latest.messages[0]),
         pendingRequestIds: target.runtimeRequests
           .filter((request) => request.status === "pending")
           .map((request) => request.id),
@@ -3270,6 +3287,7 @@ const make = Effect.gen(function* () {
           commandId: stableCommandId({ scope, requestKey: key, operation }),
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+          ...Invocation.messageSenderFor(scope),
           messageId,
           text: input.message,
           attachments: [],
@@ -3370,6 +3388,7 @@ const make = Effect.gen(function* () {
           ...(parent === undefined && scope.client?.senderThread !== undefined
             ? { linkedSender: scope.client.senderThread }
             : {}),
+          ...Invocation.messageSenderFor(scope),
           messageId,
           text,
           attachments: [],
