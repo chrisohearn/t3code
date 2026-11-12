@@ -1039,6 +1039,17 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         branch: null,
         worktreePath: null,
       });
+      yield* orchestrator.dispatch({
+        type: "thread.settle",
+        commandId: CommandId.make("post-settle"),
+        threadId,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make("post-snooze"),
+        threadId,
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
       const command = {
         type: "message.dispatch",
         postOnly: true,
@@ -1056,6 +1067,10 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       yield* orchestrator.dispatch(command);
       yield* worker.drain();
       const projection = yield* orchestrator.getThreadProjection(threadId);
+      expect(projection.thread.settledOverride).toBeNull();
+      expect(projection.thread.snoozedUntil).toBeNull();
+      const shell = yield* orchestrator.getThreadShell(threadId);
+      expect(shell!.latestUserMessageAt).toBeNull();
       expect(projection.runs).toHaveLength(0);
       expect(projection.providerTurns).toHaveLength(0);
       expect(projection.messages).toHaveLength(1);

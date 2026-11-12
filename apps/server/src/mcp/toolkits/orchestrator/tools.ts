@@ -294,7 +294,7 @@ const ThreadUpdateTool = Tool.make("t3_thread_update", {
 
 const ThreadPostTool = Tool.make("t3_thread_post", {
   description:
-    "Add a message to a thread without starting, queueing or steering a run. Uses the same authorship and mode limits as t3_thread_send. Retry with the same clientRequestId to avoid duplicates.",
+    "Add a message to a thread without starting, queueing or steering a run. Uses the same authorship and mode limits as t3_thread_send. Read stored posts with t3_thread_read; they are not injected into a provider turn. Retry with the same clientRequestId to avoid duplicates.",
   parameters: OrchestratorMcpThreadPostInput,
   success: OrchestratorMcpThreadPostResult,
   failure: OrchestratorMcpFailure,
