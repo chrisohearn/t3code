@@ -3859,7 +3859,7 @@ describe("OrchestratorMcpService thread lookup", () => {
   );
 
   it.effect(
-    "seeds fresh coordinator sessions with owned work and the latest result while leaving normal sends alone",
+    "seeds coordinator rollover while leaving ordinary sends and clean resets unchanged",
     () =>
       Effect.gen(function* () {
         const sent = yield* Ref.make(0);
@@ -3890,10 +3890,16 @@ describe("OrchestratorMcpService thread lookup", () => {
           yield* mcp.sendToThread(client, {
             threadId: launched.id,
             message: "Continue",
-            freshContext: true,
+            coordinatorRollover: true,
           });
           yield* mcp.sendToThread(client, { threadId: launched.id, message: "Unchanged" });
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Clean reset",
+            freshContext: true,
+          });
           const messages = yield* Ref.get(received);
+          assert.deepEqual(messages[2], { text: "Clean reset", freshContext: true });
           assert.equal(messages[0]?.freshContext, true);
           assert.include(messages[0]!.text, '"key":"owned"');
           assert.notInclude(messages[0]!.text, '"key":"someone-else"');

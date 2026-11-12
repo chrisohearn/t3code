@@ -8,7 +8,7 @@ Jarvis reaches the Mac and Windows VM through Omarchy's existing T3 peer links, 
 
 MCP visibility records caller/session identity, tool, start time, duration, encoded argument/result byte counts and an error class. Retain up to 14 days and 100,000 calls, without request or response bodies. Outside sign-ins see usage for their own sign-in. Different accounts can share a client ID, so it cannot establish a private boundary across sign-ins.
 
-Coordinators can roll into fresh provider sessions in the same thread, carrying a short seed from their owned unfinished ledger work and latest result. Use this when context is crowded or stale, after updating the ledger. The seed is context, not approval. Serve the playbook from the running build through `t3://jarvis/playbook` so outside assistants can refresh their rules.
+With `t3_thread_send` and `coordinatorRollover: true`, coordinators can roll into fresh provider sessions in the same thread, carrying a short seed from their owned unfinished ledger work and latest result. Use this when context is crowded or stale, after updating the ledger. The seed is context, not approval. Plain `freshContext: true` retains its clean-reset behavior and adds no seed. Serve the playbook from the running build through `t3://jarvis/playbook` so outside assistants can refresh their rules.
 
 ## Forwarding verification
 

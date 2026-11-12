@@ -3284,7 +3284,7 @@ const make = Effect.gen(function* () {
         Effect.provideService(Invocation.McpInvocationContext, scope),
       );
       let text = input.message;
-      if (input.freshContext) {
+      if (input.coordinatorRollover) {
         const ledger = yield* Effect.serviceOption(WorkLedger.WorkLedger);
         if (Option.isNone(ledger))
           return yield* failure(
@@ -3328,7 +3328,7 @@ const make = Effect.gen(function* () {
           text,
           attachments: [],
           mode,
-          ...(input.freshContext ? { freshContext: true } : {}),
+          ...(input.freshContext || input.coordinatorRollover ? { freshContext: true } : {}),
           createdBy: "agent",
           creationSource: "mcp",
         })
