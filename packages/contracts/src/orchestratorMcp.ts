@@ -37,6 +37,7 @@ import { secretRequestPageUrl } from "./secretRequest.ts";
 import { hasOnlyPairedSurrogates } from "./threadMetadataMcp.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
+  OrchestrationV2SenderClient,
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
@@ -495,6 +496,7 @@ export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
   createdBy: Schema.NullOr(OrchestrationV2Actor),
   creationSource: Schema.NullOr(OrchestrationV2CreationSource),
   senderThreadId: Schema.optional(ThreadId),
+  senderClient: Schema.optional(OrchestrationV2SenderClient),
   type: Schema.String,
   status: OrchestrationV2TurnItemStatus,
   title: Schema.NullOr(Schema.String),
@@ -523,13 +525,22 @@ export const OrchestratorMcpThreadResultInput = Schema.Struct({
   maxChars: Schema.optional(clampedPositiveInt(50_000)),
 });
 export type OrchestratorMcpThreadResultInput = typeof OrchestratorMcpThreadResultInput.Type;
+const OrchestratorMcpMessageSummary = Schema.Struct({
+  messageId: MessageId,
+  role: Schema.optional(Schema.Literals(["user", "assistant", "system"])),
+  text: Schema.String,
+  truncated: Schema.Boolean,
+  createdBy: Schema.optional(Schema.NullOr(OrchestrationV2Actor)),
+  creationSource: Schema.optional(Schema.NullOr(OrchestrationV2CreationSource)),
+  senderThreadId: Schema.optional(ThreadId),
+  senderClient: Schema.optional(OrchestrationV2SenderClient),
+});
 export const OrchestratorMcpThreadResult = Schema.Struct({
   threadId: ThreadId,
   status: OrchestratorMcpThreadStatus,
   run: Schema.NullOr(OrchestratorMcpThreadRun),
-  lastAssistantMessage: Schema.NullOr(
-    Schema.Struct({ messageId: MessageId, text: Schema.String, truncated: Schema.Boolean }),
-  ),
+  lastAssistantMessage: Schema.NullOr(OrchestratorMcpMessageSummary),
+  latestMessage: Schema.optional(Schema.NullOr(OrchestratorMcpMessageSummary)),
   pendingRequestIds: Schema.Array(RuntimeRequestId),
   pullRequests: Schema.Array(OrchestratorMcpThreadPullRequest),
   revision: NonNegativeInt,
