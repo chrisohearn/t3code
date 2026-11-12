@@ -12,22 +12,7 @@ With `t3_thread_send` and `coordinatorRollover: true`, coordinators can roll int
 
 ## Forwarding verification
 
-The visibility worker used the outside-sign-in `t3_omarchy` connector on
-2026-11-12. The retained thread activity records these UTC start and completion
-times:
-
-| Call                                                                                                    | Started (UTC) | Completed (UTC) | Result                                                                                   |
-| ------------------------------------------------------------------------------------------------------- | ------------- | --------------- | ---------------------------------------------------------------------------------------- |
-| `t3_environment_links({})`                                                                              | 06:11:20.719  | 06:11:20.883    | Mac and Windows peers both reachable.                                                    |
-| `t3_thread_list({"environmentId":"f1df40cc-9f3d-4c89-a1bd-590cb5335979","allProjects":true,"limit":1})` | 06:11:29.939  | 06:11:30.020    | Mac returned one remote thread.                                                          |
-| `t3_thread_list({"environmentId":"4139168b-9272-4491-a953-aac872235af8","allProjects":true,"limit":1})` | 06:11:30.021  | 06:11:30.263    | Windows returned one remote thread.                                                      |
-| `bridge_status({})`                                                                                     | 06:11:40.185  | 06:11:40.201    | Outside sign-in had 29.575 days remaining; both forwarded calls recorded without errors. |
-
-Both thread-list responses had `currentThreadId: null`. The connector was an
-outside sign-in, rather than the worker's provider-thread credentials. The Mac
-peer was labelled “Chris’s MacBook Pro” and Windows “REVO-VM-008”. No pairing,
-grant or credential changed. This proves read-only forwarding through the
-existing Omarchy connector to both peers.
+Read-only calls from an outside sign-in reached both linked environments on November 12, 2026. No forwarding fix or access change was required. The [retained verification transcript](https://github.com/chrisohearn/t3code/pull/30#issuecomment-6817608194) records the exact calls, UTC start and completion times, and results for the audit. Deployment identifiers are evidence for that installation, not reusable targets; discover current targets with `t3_environment_links`.
 
 ## Alternatives
 
