@@ -1269,7 +1269,7 @@ it.effect(
         );
       expect(result.isError).toBe(false);
       expect(result.structuredContent).toMatchObject({
-        threads: [{ threadId: unsettled.id, settled: false }],
+        threads: [{ threadId: unsettled.id, settled: false, pendingRequestCount: 2 }],
         total: 1,
       });
     }).pipe(
@@ -1280,6 +1280,7 @@ it.effect(
           Layer.provide(
             Layer.mock(ThreadManagement.ThreadManagementService)({
               listProjectThreads: () => Effect.succeed([unsettled, settled]),
+              getPendingRuntimeRequestCounts: () => Effect.succeed({ [unsettled.id]: 2 }),
             }),
           ),
           Layer.provide(ServerSettings.layerTest()),

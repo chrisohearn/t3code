@@ -1416,4 +1416,9 @@ export const layerToolSearch = Layer.mergeAll(
 export const layer = Layer.merge(
   layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch)),
   McpEvents.layerDeliveryWorker,
-).pipe(Layer.provide(layerEvents), Layer.provide(WorkLedger.layer), Layer.provide(McpClientThreads.layer), Layer.provide(McpBridgeMetrics.layer));
+).pipe(
+  Layer.provide(layerEvents),
+  Layer.provide(WorkLedger.layer),
+  Layer.provide(McpClientThreads.layer),
+  Layer.provide(McpBridgeMetrics.layer),
+);
