@@ -696,6 +696,7 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
 export const OrchestrationV2Run = Schema.Struct({
+  clientRequestId: Schema.optional(TrimmedNonEmptyString),
   id: RunId,
   threadId: ThreadId,
   ordinal: PositiveInt,
@@ -3245,6 +3246,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
+    clientRequestId: Schema.optional(TrimmedNonEmptyString),
     postOnly: Schema.optional(Schema.Boolean),
     notification: Schema.optional(OrchestrationV2Notification),
     /** Sends this pending guest message; the server uses the guest's text, not `text`. */
@@ -3425,6 +3427,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("delegated_task.request"),
+    clientRequestId: Schema.optional(TrimmedNonEmptyString),
     ...OrchestrationV2CreationFields,
     commandId: CommandId,
     parentThreadId: ThreadId,

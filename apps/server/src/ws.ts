@@ -1,3 +1,4 @@
+import * as WorkLedger from "./persistence/WorkLedger.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -1471,6 +1472,7 @@ export const layerWsRpc = (
               ),
               Effect.orElseSucceed(() => null),
             );
+      const ledger = yield* WorkLedger.WorkLedger.pipe(Effect.provide(WorkLedger.layer));
       const usage = yield* UsageService.UsageService;
       const usageLimitSources = yield* UsageLimitSources.UsageLimitSources;
       const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
@@ -2634,6 +2636,7 @@ export const layerWsRpc = (
           processResourceMonitor.readHistory(input),
         [WS_METHODS.serverGetResourceTelemetryHistory]: (input) =>
           resourceTelemetry.readHistory(input),
+        [WS_METHODS.serverQueryWorkLedger]: (input) => ledger.query(input),
         [WS_METHODS.serverGetUsageSummary]: (input) => usage.readSummary(input),
         [WS_METHODS.serverRefreshUsageRates]: (_input) => usage.refreshRates,
         [WS_METHODS.serverRetryResourceTelemetry]: (_input) => resourceTelemetry.retry,
