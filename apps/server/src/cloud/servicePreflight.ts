@@ -12,7 +12,6 @@ import {
   historyAfterForkRepair,
 } from "../persistence/ForkMigrations.ts";
 import { migrationManifest, skippedV2Migrations } from "../persistence/Migrations.ts";
-
 import { reconciledV2PreviewHistory } from "../persistence/reconcileV2PreviewMigration.ts";
 
 export type ServicePreflightResult =

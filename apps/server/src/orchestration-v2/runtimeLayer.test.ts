@@ -17,7 +17,6 @@ import {
   ContextTransferId,
   EnvironmentId,
   EventId,
-  EnvironmentId,
   MessageId,
   NodeId,
   RuntimeRequestId,
