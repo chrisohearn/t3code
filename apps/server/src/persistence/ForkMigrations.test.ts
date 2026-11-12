@@ -204,6 +204,11 @@ describe("fork migrations", () => {
 
 it.effect("registers every fork migration file", () =>
   Effect.gen(function* () {
+    const ids = forkMigrationManifest.map(([id]) => id);
+    assert.deepStrictEqual(
+      ids,
+      [...new Set(ids)].toSorted((a, b) => a - b),
+    );
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const dir = path.join(import.meta.dirname, "ForkMigrations");
