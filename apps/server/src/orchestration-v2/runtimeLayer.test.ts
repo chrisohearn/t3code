@@ -3086,14 +3086,15 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
-  it.effect("keeps an owner's runtime-mode change from ending a running session", () =>
+  // A thread whose session, like Claude's, must end to take a new mode.
+  const seedOwnerModeThread = (name: string) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
       const now = yield* DateTime.now;
-      const threadId = ThreadId.make("owner-mode-thread");
+      const threadId = ThreadId.make(`${name}-thread`);
       yield* seedProject({
-        projectId: ProjectId.make("owner-mode-project"),
+        projectId: ProjectId.make(`${name}-project`),
         title: "Owner mode project",
         workspaceRoot: "/workspace/project",
         defaultModelSelection: null,
@@ -3103,9 +3104,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         type: "thread.create",
         createdBy: "user",
         creationSource: "web",
-        commandId: CommandId.make("owner-mode-create"),
+        commandId: CommandId.make(`${name}-create`),
         threadId,
-        projectId: ProjectId.make("owner-mode-project"),
+        projectId: ProjectId.make(`${name}-project`),
         title: "Owner mode test",
         modelSelection,
         runtimeMode: "full-access",
@@ -3113,17 +3114,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         branch: null,
         worktreePath: null,
       });
-      // Like Claude's, this session must end to take a new mode.
       yield* eventSink.write({
         events: [
           {
-            id: EventId.make("owner-mode-session"),
+            id: EventId.make(`${name}-session`),
             type: "provider-session.attached",
             threadId,
             driver,
             occurredAt: now,
             payload: {
-              id: ProviderSessionId.make("owner-mode-session"),
+              id: ProviderSessionId.make(`${name}-session`),
               driver,
               providerInstanceId: modelSelection.instanceId,
               status: "running",
@@ -3143,40 +3143,63 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           },
         ],
       });
+      return threadId;
+    });
 
-      const idleSequence = yield* orchestrator.getThreadEventSequence(threadId);
+  it.effect("commits nothing when an owner sets the thread's current mode", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = yield* seedOwnerModeThread("owner-mode-same");
+      const sequence = yield* orchestrator.getThreadEventSequence(threadId);
       yield* orchestrator.dispatch({
         type: "thread.runtime-mode.set",
-        commandId: CommandId.make("owner-mode-same"),
+        commandId: CommandId.make("owner-mode-same-set"),
         threadId,
         runtimeMode: "full-access",
       });
-      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), idleSequence);
+      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
+    }),
+  );
 
+  it.effect("refuses an owner's mode change that would end a running session, until it ends", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = yield* seedOwnerModeThread("owner-mode-running");
       yield* orchestrator.dispatch({
         type: "message.dispatch",
         createdBy: "user",
         creationSource: "web",
-        commandId: CommandId.make("owner-mode-send"),
+        commandId: CommandId.make("owner-mode-running-send"),
         threadId,
-        messageId: MessageId.make("owner-mode-message"),
+        messageId: MessageId.make("owner-mode-running-message"),
         text: "Start work",
         attachments: [],
         dispatchMode: { type: "start_immediately" },
       });
-      const failure = yield* orchestrator
-        .dispatch({
-          type: "thread.runtime-mode.set",
-          commandId: CommandId.make("owner-mode-running"),
-          threadId,
-          runtimeMode: "approval-required",
-        })
-        .pipe(Effect.flip);
+      const setMode = {
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("owner-mode-running-set"),
+        threadId,
+        runtimeMode: "approval-required",
+      } as const;
+      const failure = yield* orchestrator.dispatch(setMode).pipe(Effect.flip);
       assert.instanceOf(failure, Orchestrator.OrchestratorDispatchError);
-      assert.include(String(failure.cause), "while a run is active");
-      const projection = yield* orchestrator.getThreadProjection(threadId);
-      assert.equal(projection.thread.runtimeMode, "full-access");
-      assert.isTrue(projection.providerSessions.every((session) => session.status === "running"));
+      assert.equal(failure.cause, Orchestrator.RUNTIME_MODE_CHANGE_DURING_RUN_REFUSAL);
+      const refused = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(refused.thread.runtimeMode, "full-access");
+      assert.isTrue(refused.providerSessions.every((session) => session.status === "running"));
+
+      // No rejection is recorded, so a client retrying the same command succeeds after the run.
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("owner-mode-running-stop"),
+        threadId,
+      });
+      yield* orchestrator.dispatch(setMode);
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(threadId)).thread.runtimeMode,
+        "approval-required",
+      );
     }),
   );
 

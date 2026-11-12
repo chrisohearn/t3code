@@ -118,7 +118,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     }
     const runStatuses = [activeRuntime?.status, activeThread.runtime?.status];
     if (isWorking || runStatuses.some((status) => status !== undefined && isRunActive(status))) {
-      // Applying it would end a Claude session mid-run; the server refuses that too.
+      // Refused for every provider: some, like Claude, must end a running session to switch.
       toastManager.add(
         stackedThreadToast({
           type: "warning",
