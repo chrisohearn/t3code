@@ -11,6 +11,8 @@ const isMcpEventsError = Schema.is(McpEventsError);
 
 const SubscriptionRow = Schema.Struct({
   refreshedAt: Schema.Number,
+  createdOrder: Schema.Number,
+  notifyDerived: Schema.Number,
   renewalTtlMs: Schema.Number,
   id: Schema.String,
   principal: Schema.String,
@@ -39,7 +41,10 @@ export class McpEventSubscriptions extends Context.Service<
     ) => Effect.Effect<ReadonlyArray<Subscription>, McpEventsError>;
     readonly remove: (id: string, principal: string) => Effect.Effect<void, McpEventsError>;
     readonly save: (
-      input: Omit<Subscription, "previousSecret" | "rotationUntil" | "refreshedAt"> & {
+      input: Omit<
+        Subscription,
+        "previousSecret" | "rotationUntil" | "refreshedAt" | "createdOrder"
+      > & {
         readonly now: number;
       },
     ) => Effect.Effect<void, McpEventsError>;
@@ -49,7 +54,13 @@ export class McpEventSubscriptions extends Context.Service<
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const select = sql`SELECT COALESCE((SELECT refreshed_at FROM mcp_event_subscription_activity WHERE subscription_id = mcp_event_subscriptions.id), 0) AS "refreshedAt", COALESCE((SELECT renewal_ttl_ms FROM mcp_event_subscription_activity WHERE subscription_id = mcp_event_subscriptions.id), 0) AS "renewalTtlMs", id, principal, name, thread_id AS "threadId", callback_url AS url, source_url AS "sourceUrl",
+  const select = sql`SELECT
+    COALESCE((SELECT created_order FROM mcp_event_subscription_routing WHERE subscription_id = mcp_event_subscriptions.id), rowid) AS "createdOrder",
+    COALESCE((SELECT notify_derived FROM mcp_event_subscription_routing WHERE subscription_id = mcp_event_subscriptions.id),
+      CASE WHEN rowid = (SELECT MIN(first.rowid) FROM mcp_event_subscriptions AS first
+        WHERE first.principal = mcp_event_subscriptions.principal AND first.callback_url = mcp_event_subscriptions.callback_url)
+      THEN 0 ELSE 1 END) AS "notifyDerived",
+    COALESCE((SELECT refreshed_at FROM mcp_event_subscription_activity WHERE subscription_id = mcp_event_subscriptions.id), 0) AS "refreshedAt", COALESCE((SELECT renewal_ttl_ms FROM mcp_event_subscription_activity WHERE subscription_id = mcp_event_subscriptions.id), 0) AS "renewalTtlMs", id, principal, name, thread_id AS "threadId", callback_url AS url, source_url AS "sourceUrl",
     secret, previous_secret AS "previousSecret", rotation_until AS "rotationUntil", expires_at AS "expiresAt",
     active, scan_cursor AS "scanCursor", ack_cursor AS "ackCursor", truncated FROM mcp_event_subscriptions`;
   const decode = Schema.decodeUnknownEffect(Schema.Array(SubscriptionRow));
@@ -134,6 +145,9 @@ const make = Effect.gen(function* () {
         scan_cursor = MIN(scan_cursor, excluded.scan_cursor), ack_cursor = MIN(ack_cursor, excluded.ack_cursor),
         truncated = excluded.truncated
       `;
+            yield* sql`INSERT INTO mcp_event_subscription_routing (subscription_id, created_order, notify_derived)
+              VALUES (${input.id}, (SELECT rowid FROM mcp_event_subscriptions WHERE id = ${input.id}), ${input.notifyDerived})
+              ON CONFLICT(subscription_id) DO UPDATE SET notify_derived = MIN(notify_derived, excluded.notify_derived)`;
             yield* sql`INSERT INTO mcp_event_subscription_activity (subscription_id, refreshed_at, renewal_ttl_ms) VALUES (${input.id}, ${input.now}, ${input.renewalTtlMs}) ON CONFLICT(subscription_id) DO UPDATE SET refreshed_at = excluded.refreshed_at, renewal_ttl_ms = excluded.renewal_ttl_ms`;
             yield* sql`UPDATE mcp_event_deliveries SET body = json_set(body, '$.cursor', ${String(input.ackCursor)})
         WHERE subscription_id = ${input.id} AND CAST(json_extract(body, '$.cursor') AS INTEGER) > ${input.ackCursor}`;

@@ -29,7 +29,7 @@ The T3 thread where agents leave requests for Jarvis.
 An arrangement to receive notice when a selected kind of change happens in T3.
 
 **notify**:
-A request for event subscriptions when starting or sending work to a thread.
+A request to relay a source run's events as messages to the caller's pinned inbox.
 
 **coordinator thread**:
 A conversation that directs work across worker threads and follows their outcomes.

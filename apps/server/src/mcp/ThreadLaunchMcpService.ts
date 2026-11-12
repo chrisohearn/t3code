@@ -369,7 +369,12 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           .pipe(Effect.ignore({ log: true }));
       }
       const run = result.projection.runs.find((run) => run.userMessageId === messageId);
-      const notify = yield* ThreadNotifications.finish(notification, thread.id);
+      const notify = yield* ThreadNotifications.finish(
+        notification,
+        thread.id,
+        run?.id,
+        input.clientRequestId,
+      );
       return {
         ...(notify === undefined ? {} : { notify }),
         threadId: thread.id,
