@@ -484,6 +484,7 @@ export const OrchestratorMcpThreadRun = Schema.Struct({
 export type OrchestratorMcpThreadRun = typeof OrchestratorMcpThreadRun.Type;
 
 export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
+  postOnly: Schema.optional(Schema.Boolean),
   position: NonNegativeInt,
   visibility: Schema.Literals(["local", "inherited", "synthetic"]),
   sourceThreadId: ThreadId,

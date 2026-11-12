@@ -5999,7 +5999,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             : sql``
         }
         WHERE item.thread_id = ${threadId}
-        ORDER BY item.ordinal ASC, item.turn_item_id ASC`;
+        ORDER BY CASE
+          WHEN item.run_id IS NULL AND item.type = 'user_message'
+            AND json_extract(item.payload_json, '$.inputIntent') = 'post'
+            AND item.ordinal < 1000000
+          THEN COALESCE((
+            SELECT MAX(prior.ordinal) FROM orchestration_v2_projection_turn_items prior
+            WHERE prior.thread_id = item.thread_id AND prior.updated_at <= item.updated_at
+              AND (prior.type <> 'user_message' OR json_extract(prior.payload_json, '$.inputIntent') IS NOT 'post')
+          ), 0) + 0.5
+          ELSE item.ordinal END ASC, item.ordinal ASC, item.turn_item_id ASC`;
         const runStatuses = new Map(records.runs.map((run) => [String(run.id), run.status]));
         const items: Array<TimelineIndexItem> = rows.map((row) => ({
           id: TurnItemId.make(row.turn_item_id),

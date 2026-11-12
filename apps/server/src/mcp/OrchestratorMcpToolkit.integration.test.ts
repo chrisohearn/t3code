@@ -12,6 +12,7 @@ import {
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadSendResult,
+  OrchestratorMcpThreadReadResult,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -26,6 +27,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
+import * as SqlClient from "effect/sql/SqlClient";
 import { McpSchema, McpServer } from "effect/ai";
 
 import { CodexOrchestratorReplayHarness } from "../orchestration-v2/Adapters/CodexAdapterV2.testkit.ts";
@@ -55,6 +57,8 @@ import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../peer/PeerLinkRequests.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
+
+const decodeThreadRead = Schema.decodeUnknownSync(OrchestratorMcpThreadReadResult);
 
 const layerClientThreads = Layer.mock(McpClientThreads.McpClientThreads)({
   record: () => Effect.void,
@@ -262,6 +266,7 @@ describe("orchestrator MCP toolkit", () => {
         ]);
         const layerTest = layerOrchestratorToolkit.pipe(
           Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provideMerge(SqlitePersistence.layerMemory),
           Layer.provideMerge(layerOrchestration),
           Layer.provide(
             CodexOrchestratorReplayHarness.makeProviderAdapterRegistryLayer(transcript).pipe(
@@ -784,6 +789,80 @@ describe("orchestrator MCP toolkit", () => {
               )
               .map(({ threadId }) => threadId),
           ).toEqual([delegated.childThreadId]);
+          const outside = {
+            ...invocation,
+            thread: undefined,
+            client: {
+              sessionId: "post-reader-session",
+              label: "Post reader",
+              access: "full-access" as const,
+            },
+          };
+          const readPosts = (args: Record<string, unknown> = {}) =>
+            invoke(
+              "t3_thread_read",
+              {
+                threadId: delegated.childThreadId,
+                view: "activity",
+                limit: 100,
+                ...args,
+              },
+              outside,
+            ).pipe(Effect.map((response) => decodeThreadRead(response.structuredContent)));
+          const beforePost = yield* readPosts();
+          const postArgs = {
+            threadId: delegated.childThreadId,
+            message: "Posted without a run",
+            clientRequestId: "post-read-regression",
+          };
+          const posted = yield* invoke("t3_thread_post", postArgs, outside);
+          expect(posted.isError).not.toBe(true);
+          yield* invoke("t3_thread_post", postArgs, outside);
+          const sql = yield* SqlClient.SqlClient;
+          const postId = (posted.structuredContent as { messageId: string }).messageId;
+          yield* sql`UPDATE orchestration_v2_projection_turn_items SET ordinal = 1,
+            payload_json = json_remove(json_set(payload_json, '$.ordinal', 1), '$.postOnly')
+            WHERE thread_id = ${delegated.childThreadId} AND json_extract(payload_json, '$.messageId') = ${postId}`;
+          yield* sql`UPDATE orchestration_v2_turn_item_positions SET ordinal = 1
+            WHERE thread_id = ${delegated.childThreadId} AND turn_item_id IN (
+              SELECT turn_item_id FROM orchestration_v2_projection_turn_items
+              WHERE thread_id = ${delegated.childThreadId} AND json_extract(payload_json, '$.messageId') = ${postId})`;
+          const tail = yield* readPosts({
+            afterPosition: beforePost.thread.itemCount - 1,
+            sinceRevision: beforePost.revision,
+          });
+          expect(tail.items).toHaveLength(1);
+          expect(tail.items[0]).toMatchObject({
+            text: postArgs.message,
+            createdBy: "agent",
+            creationSource: "mcp",
+            runId: null,
+            postOnly: true,
+          });
+          expect(tail.thread.itemCount).toBe(beforePost.thread.itemCount + 1);
+          expect(tail.thread.runCount).toBe(beforePost.thread.runCount);
+          expect(tail.revision).not.toBe(beforePost.revision);
+          const second = yield* invoke(
+            "t3_thread_post",
+            { ...postArgs, message: "Another post", clientRequestId: "post-read-next" },
+            outside,
+          );
+          expect(second.isError).not.toBe(true);
+          const nextTail = yield* readPosts({
+            afterPosition: tail.nextPosition,
+            sinceRevision: tail.revision,
+          });
+          expect(nextTail.items).toHaveLength(1);
+          expect(nextTail.items[0]).toMatchObject({
+            text: "Another post",
+            postOnly: true,
+            createdBy: "agent",
+            creationSource: "mcp",
+          });
+          expect(nextTail.thread.itemCount).toBe(tail.thread.itemCount + 1);
+          const unchanged = yield* readPosts({ sinceRevision: nextTail.revision });
+          expect(unchanged.items).toEqual([]);
+          expect(unchanged.thread.itemCount).toBe(nextTail.thread.itemCount);
         }).pipe(Effect.provide(layerTest));
       }),
     ),
