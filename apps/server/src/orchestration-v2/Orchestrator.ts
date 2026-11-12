@@ -10347,7 +10347,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             startedAt: now,
             completedAt: now,
             updatedAt: now,
-            message: `MCP client "${answer.clientLabel}" ${answer.decision === "accept" ? "allowed once" : "denied"} approval ${command.requestId}.${answer.note === undefined ? "" : ` Caller note: ${answer.note}`}`,
+            message: `MCP client "${answer.clientLabel}" ${answer.decision === "accept" ? "allowed once" : "denied"} approval ${command.requestId}.${answer.forwardedBy === undefined ? "" : ` Forwarded by "${answer.forwardedBy.clientLabel}" (${answer.forwardedBy.sessionId}) from ${answer.originEnvironmentId}.`}${answer.note === undefined ? "" : ` Caller note: ${answer.note}`}`,
           },
         });
       }

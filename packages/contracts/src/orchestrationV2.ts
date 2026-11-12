@@ -1218,6 +1218,10 @@ export function latestProviderTurnForAttempt<
 export const OrchestrationV2McpApprovalAnswer = Schema.Struct({
   sessionId: Schema.String,
   clientLabel: Schema.String,
+  originEnvironmentId: Schema.optional(EnvironmentId),
+  forwardedBy: Schema.optional(
+    Schema.Struct({ sessionId: Schema.String, clientLabel: Schema.String }),
+  ),
   threadId: ThreadId,
   requestId: RuntimeRequestId,
   requested: Schema.Struct({

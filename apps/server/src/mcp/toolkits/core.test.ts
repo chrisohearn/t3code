@@ -273,8 +273,18 @@ it.effect("only outside full-access sign-ins answer approvals, with attribution"
       expect((yield* respond(outside("full-access"), decision)).isError).not.toBe(true);
     }
     expect(decisionContext).toEqual([
-      { sessionId: "outside-session", clientLabel: "Outside client", note: "Chris said yes." },
-      { sessionId: "outside-session", clientLabel: "Outside client", note: "Chris said yes." },
+      {
+        sessionId: "outside-session",
+        clientLabel: "Outside client",
+        originEnvironmentId: scope.environmentId,
+        note: "Chris said yes.",
+      },
+      {
+        sessionId: "outside-session",
+        clientLabel: "Outside client",
+        originEnvironmentId: scope.environmentId,
+        note: "Chris said yes.",
+      },
     ]);
     const log = (invocation: McpInvocationContext.McpInvocationScope) =>
       server

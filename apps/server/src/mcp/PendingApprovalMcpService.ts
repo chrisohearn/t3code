@@ -128,8 +128,18 @@ export const layer = Layer.effect(
           })
           .pipe(
             Effect.provideService(McpApprovalAnswerContext, {
-              sessionId: scope.client!.sessionId,
-              clientLabel: scope.client!.label,
+              sessionId: scope.client!.approvalOrigin?.sessionId ?? scope.client!.sessionId,
+              clientLabel: scope.client!.approvalOrigin?.clientLabel ?? scope.client!.label,
+              originEnvironmentId:
+                scope.client!.approvalOrigin?.environmentId ?? scope.environmentId,
+              ...(scope.client!.approvalOrigin === undefined
+                ? {}
+                : {
+                    forwardedBy: {
+                      sessionId: scope.client!.sessionId,
+                      clientLabel: scope.client!.label,
+                    },
+                  }),
               ...(input.note === undefined ? {} : { note: input.note }),
             }),
             Effect.mapError(dispatchFailure),

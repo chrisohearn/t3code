@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  EnvironmentId,
   MessageId,
   EventId,
   NodeId,
@@ -1972,13 +1973,14 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const outbox = yield* EffectOutbox.EffectOutboxV2;
     const now = yield* DateTime.now;
-    for (const [kind, decision] of [
+    for (const [kind, decision, standingOnly] of [
       ["user_input", "cancel"],
       ["command", "accept"],
       ["command", "decline"],
+      ["command", "accept", true],
     ] as const) {
       const sql = yield* SqlClient.SqlClient;
-      const suffix = `${kind}-${decision}`;
+      const suffix = `${kind}-${decision}${standingOnly ? "-standing-only" : ""}`;
       const threadId = ThreadId.make(`thread:snoozed-live-${suffix}`);
       const requestId = RuntimeRequestId.make(`request:snoozed-live-${suffix}`);
       const sessionId = ProviderSessionId.make(`session:snoozed-live-${suffix}`);
@@ -2062,6 +2064,9 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
             type: "approval_request",
             requestId,
             requestKind: "command",
+            ...(standingOnly
+              ? { options: [{ decision: "acceptForSession" as const, label: "Always allow" }] }
+              : {}),
             prompt: "Run project tests",
             reason: "Needs process access",
           },
@@ -2074,15 +2079,34 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
         requestId,
         decision,
       });
-      yield* kind === "command"
-        ? respond.pipe(
-            Effect.provideService(McpApprovalAnswerContext, {
-              sessionId: "outside-test-session",
-              clientLabel: "Outside test client",
-              note: "Chris said to answer this prompt.",
-            }),
-          )
-        : respond;
+      const attributedRespond =
+        kind === "command"
+          ? respond.pipe(
+              Effect.provideService(McpApprovalAnswerContext, {
+                sessionId: "outside-test-session",
+                clientLabel: "Outside test client",
+                originEnvironmentId: EnvironmentId.make("origin-env"),
+                forwardedBy: {
+                  sessionId: "authenticated-link-session",
+                  clientLabel: "Origin server",
+                },
+                note: "Chris said to answer this prompt.",
+              }),
+            )
+          : respond;
+      if (standingOnly) {
+        assert.isTrue(Result.isFailure(yield* attributedRespond.pipe(Effect.result)));
+        assert.equal(
+          (yield* projections.getRuntimeRequest(threadId, requestId))?.status,
+          "pending",
+        );
+        assert.equal(
+          (yield* sql`SELECT 1 FROM mcp_approval_answers WHERE thread_id = ${threadId}`).length,
+          0,
+        );
+        continue;
+      }
+      yield* attributedRespond;
       const after = yield* projections.getThread(threadId);
       assert.deepEqual(after.snoozedUntil, before.snoozedUntil);
       assert.deepEqual(after.snoozedAt, before.snoozedAt);
@@ -2096,6 +2120,8 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
         assert.deepInclude(request?.mcpApprovalAnswer, {
           sessionId: "outside-test-session",
           clientLabel: "Outside test client",
+          originEnvironmentId: EnvironmentId.make("origin-env"),
+          forwardedBy: { sessionId: "authenticated-link-session", clientLabel: "Origin server" },
           threadId,
           requestId,
           decision,
@@ -2120,6 +2146,8 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
             (item) =>
               item.type === "system_notice" &&
               item.message.includes("Outside test client") &&
+              item.message.includes("Origin server") &&
+              item.message.includes("origin-env") &&
               item.message.includes(decision === "accept" ? "allowed once" : "denied"),
           ),
         );

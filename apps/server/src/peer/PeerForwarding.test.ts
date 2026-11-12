@@ -11,6 +11,9 @@ import {
   ProjectId,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
+  NodeId,
+  TurnItemId,
   ThreadId,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
@@ -39,6 +42,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as RemoteDelegation from "./RemoteDelegation.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import { liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as PeerForwarding from "./PeerForwarding.ts";
 import * as PeerLinks from "./PeerLinks.ts";
@@ -57,6 +61,7 @@ const boxRun = RunId.make("run:box-auto");
 
 /** What B's thread service was asked to do. */
 interface Seen {
+  readonly approvalAnswers: ReadonlyArray<unknown>;
   readonly sends: ReadonlyArray<ThreadManagement.ThreadManagementSendInput>;
   readonly waits: ReadonlyArray<ThreadManagement.ThreadManagementWaitInput>;
   readonly launches: ReadonlyArray<ThreadLaunch.ThreadLaunchInput>;
@@ -66,6 +71,7 @@ interface Seen {
   readonly stops: ReadonlyArray<string>;
 }
 const nothingSeen: Seen = {
+  approvalAnswers: [],
   sends: [],
   waits: [],
   launches: [],
@@ -74,6 +80,7 @@ const nothingSeen: Seen = {
   stops: [],
 };
 
+const approvalRequest = RuntimeRequestId.make("approval:box");
 /** The box user's own thread, which no link started. */
 const usersThread = ThreadId.make("thread:box-users-own");
 
@@ -94,7 +101,48 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
     threadId === boxThread ? linked : Effect.succeed(threadId === usersThread ? users : null);
   const projectionOf = (threadId: ThreadId) =>
     shellOf(threadId).pipe(
-      Effect.map((thread) => ({ thread, runs: [run("running")], runtimeRequests: [] }) as never),
+      Effect.map(
+        (thread) =>
+          ({
+            thread,
+            runs: [run("running")],
+            runtimeRequests: [
+              {
+                id: approvalRequest,
+                nodeId: NodeId.make("approval-node"),
+                providerTurnId: null,
+                nativeRequestRef: null,
+                kind: "command",
+                status: "pending",
+                responseCapability: { type: "message" },
+                createdAt: users.createdAt,
+                resolvedAt: null,
+              },
+            ],
+            turnItems: [
+              {
+                id: TurnItemId.make("approval-item"),
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "waiting",
+                title: null,
+                startedAt: users.createdAt,
+                completedAt: null,
+                updatedAt: users.updatedAt,
+                type: "approval_request",
+                requestId: approvalRequest,
+                requestKind: "command",
+                prompt: "Run tests",
+              },
+            ],
+          }) as never,
+      ),
     );
   return Layer.mock(ThreadManagement.ThreadManagementService)({
     getThreadShell: shellOf,
@@ -107,32 +155,41 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
         Effect.as({ run: run("running"), delivery: "started" } as never),
       ),
     dispatch: (command) =>
-      Ref.update(seen, (current) => ({
-        ...current,
-        stops: [
-          ...current.stops,
-          `${command.type} ${"threadId" in command ? command.threadId : ""}`,
-        ],
-      })).pipe(
-        // The stop asks the provider to interrupt the thread's running turn.
-        Effect.as({
-          sequence: 0,
-          storedEvents: [
-            {
-              sequence: 1,
-              commandId: command.commandId,
-              event: {
-                type: "turn-item.updated",
-                runId: boxRun,
-                payload: {
-                  type: "run_interrupt_request",
-                  providerTurnId: "provider-turn:box-auto",
+      Effect.gen(function* () {
+        if (command.type === "runtime-request.respond") {
+          const answer = yield* Effect.serviceOption(McpApprovalAnswerContext);
+          yield* Ref.update(seen, (current) => ({
+            ...current,
+            approvalAnswers: [...current.approvalAnswers, Option.getOrUndefined(answer)],
+          }));
+        }
+        return yield* Ref.update(seen, (current) => ({
+          ...current,
+          stops: [
+            ...current.stops,
+            `${command.type} ${"threadId" in command ? command.threadId : ""}`,
+          ],
+        })).pipe(
+          // The stop asks the provider to interrupt the thread's running turn.
+          Effect.as({
+            sequence: 0,
+            storedEvents: [
+              {
+                sequence: 1,
+                commandId: command.commandId,
+                event: {
+                  type: "turn-item.updated",
+                  runId: boxRun,
+                  payload: {
+                    type: "run_interrupt_request",
+                    providerTurnId: "provider-turn:box-auto",
+                  },
                 },
               },
-            },
-          ],
-        } as never),
-      ),
+            ],
+          } as never),
+        );
+      }),
     stopDelegatedTasks: (input) =>
       Ref.update(seen, (current) => ({
         ...current,
@@ -383,13 +440,68 @@ const makeLaptop = Effect.gen(function* () {
         ),
         Effect.provideService(McpSchema.McpServerClient, mcpClient),
       );
-  return { links: Context.get(linking, PeerLinks.PeerLinks), call };
+  const callOutside = (
+    access: McpInvocationContext.McpClientCaller["access"],
+    args: Record<string, unknown>,
+    sessionId = "jarvis-session",
+  ) =>
+    server.callTool({ name: "t3_pending_request", arguments: args }).pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, {
+        ...scopeOf("outside"),
+        thread: undefined,
+        client: { sessionId, label: "Jarvis", access },
+      }),
+      Effect.provideService(McpSchema.McpServerClient, mcpClient),
+    );
+  return { links: Context.get(linking, PeerLinks.PeerLinks), call, callOutside };
 });
 
 const failureOf = (result: McpSchema.CallToolResult) => {
   const text = result.content[0];
   return result.isError === true && text?.type === "text" ? JSON.parse(text.text) : undefined;
 };
+
+it.effect("forwards outside approval answers with authenticated origin attribution", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const seen = yield* Ref.make<Seen>(nothingSeen);
+      const linkSession = yield* Ref.make("");
+      const b = yield* serveBox(seen, linkSession);
+      const a = yield* makeLaptop;
+      yield* linkTo(a.links, b, "full-access");
+      const peerSession = (yield* b.linkedSessions)[0]!;
+      const args = {
+        environmentId: box.environmentId,
+        threadId: usersThread,
+        requestId: approvalRequest,
+        action: "respond",
+        decision: "accept",
+        note: "Chris said to run tests.",
+      };
+      expect((yield* a.call("thread:laptop-full", "t3_pending_request", args)).isError).toBe(true);
+      expect((yield* a.callOutside("auto", args)).isError).toBe(true);
+      expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(0);
+      for (const [index, decision] of ["accept", "decline"].entries()) {
+        expect(
+          (yield* a.callOutside("full-access", { ...args, decision }, `jarvis-session-${index}`))
+            .isError,
+        ).not.toBe(true);
+      }
+      expect((yield* Ref.get(seen)).approvalAnswers).toEqual(
+        [0, 1].map((index) => ({
+          sessionId: `jarvis-session-${index}`,
+          clientLabel: "Jarvis",
+          originEnvironmentId: laptop.environmentId,
+          forwardedBy: { sessionId: peerSession.sessionId, clientLabel: "T3 Code · Laptop" },
+          note: "Chris said to run tests.",
+        })),
+      );
+      yield* linkTo(a.links, b, "auto");
+      expect((yield* a.callOutside("full-access", args)).isError).toBe(true);
+      expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(2);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
 
 it.effect("an agent here works on a linked environment's threads within its own modes", () =>
   Effect.scoped(
