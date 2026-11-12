@@ -3794,8 +3794,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             omitSettledLeafNodes: true,
           },
         );
+      const rolledBackRunIds = new Set(
+        runs.filter((run) => run.status === "rolled_back").map((run) => run.id),
+      );
       const hasBackgroundWork =
-        pendingBackgroundTurnItems({ runs, turnItems }).length > 0 ||
+        // Permission changes must also wait for persistent tools, which Stop leaves running.
+        turnItems.some((item) => item.runId === null || !rolledBackRunIds.has(item.runId)) ||
         providerThreads.some(
           (providerThread) =>
             (thread.activeProviderThreadId === null ||

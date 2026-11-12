@@ -3034,6 +3034,63 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           },
         ],
       });
+      const persistentItem = {
+        id: TurnItemId.make("mode-persistent-tool"),
+        threadId,
+        runId: stoppedProjection.runs[0]!.id,
+        nodeId: stoppedProjection.nodes[0]!.id,
+        providerThreadId: providerThread.id,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        type: "dynamic_tool" as const,
+        status: "running" as const,
+        title: null,
+        toolName: "monitor",
+        input: { persistent: true, command: "tail -f" },
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+      };
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-persistent-started"),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: now,
+            payload: persistentItem,
+          },
+        ],
+      });
+      const persistentSequence = yield* orchestrator.getThreadEventSequence(threadId);
+      const persistentFailure = yield* orchestrator
+        .dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("mode-persistent-refused"),
+          threadId,
+          runtimeMode: "approval-required",
+        })
+        .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"), Effect.flip);
+      assert.instanceOf(persistentFailure, Orchestrator.OrchestratorDispatchError);
+      assert.include(String(persistentFailure.cause), "background work is active");
+      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), persistentSequence);
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(threadId)).thread.runtimeMode,
+        "full-access",
+      );
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("mode-persistent-finished"),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...persistentItem, status: "completed", completedAt: now },
+          },
+        ],
+      });
       yield* orchestrator
         .dispatch({
           type: "thread.runtime-mode.set",
