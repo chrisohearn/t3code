@@ -3293,6 +3293,9 @@ const make = Effect.gen(function* () {
           commandId: stableCommandId({ scope, requestKey: key, operation }),
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+          ...(parent === undefined && scope.client?.senderThread !== undefined
+            ? { linkedSender: scope.client.senderThread }
+            : {}),
           ...Invocation.messageSenderFor(scope),
           messageId,
           text: input.message,

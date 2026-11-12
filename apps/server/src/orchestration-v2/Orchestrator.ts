@@ -11374,6 +11374,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const {
       senderClient: _senderClient,
       senderThreadId: _senderThreadId,
+      linkedSender: _linkedSender,
       ...unattributedMessage
     } = queuedMessage;
     yield* emitEvent({
@@ -11395,6 +11396,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const {
         senderClient: _itemSenderClient,
         senderThreadId: _itemSenderThreadId,
+        linkedSender: _itemLinkedSender,
         ...unattributedItem
       } = queuedTurnItem;
       yield* emitEvent({

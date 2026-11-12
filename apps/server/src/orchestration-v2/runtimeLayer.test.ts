@@ -6326,6 +6326,45 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         startedItem?.type === "user_message" ? startedItem.linkedSender : undefined,
         linkedSender,
       );
+      // Older projections can already hold a queued user-message turn item.
+      if (startedItem?.type !== "user_message") throw new Error("Missing started message item");
+      const queuedRun = projection.runs.find((run) => run.status === "queued")!;
+      const eventSink = yield* EventSink.EventSinkV2;
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("linked-queued-history"),
+            type: "turn-item.updated",
+            threadId,
+            runId: queuedRun.id,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...startedItem,
+              id: TurnItemId.make("linked-queued-history"),
+              runId: queuedRun.id,
+              type: "user_message",
+              messageId: queuedRun.userMessageId,
+              text: "Linked queued message",
+              ordinal: startedItem.ordinal + 1,
+            },
+          },
+        ],
+      });
+      yield* orchestrator.dispatch({
+        type: "queued-run.edit",
+        commandId: CommandId.make("linked-queued-edit"),
+        threadId,
+        runId: queuedRun.id,
+        text: "Locally edited message",
+      });
+      const edited = yield* orchestrator.getThreadProjection(threadId);
+      const message = edited.messages.find((entry) => entry.id === queuedRun.userMessageId);
+      const item = edited.turnItems.find((entry) => entry.id === "linked-queued-history");
+      assert.equal(message?.text, "Locally edited message");
+      assert.isUndefined(message?.linkedSender);
+      assert.isDefined(item);
+      assert.equal(item.type === "user_message" ? item.text : undefined, "Locally edited message");
+      assert.isUndefined(item.type === "user_message" ? item.linkedSender : undefined);
     }),
   );
 
@@ -8974,6 +9013,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const threadId = ThreadId.make("runtime-layer-queued-edit-thread");
+      const linkedSender = {
+        environmentId: EnvironmentId.make("queued-sender-environment"),
+        threadId: ThreadId.make("queued-linked-sender"),
+        title: "Original linked sender",
+      };
 
       yield* orchestrator.dispatch({
         type: "thread.create",
@@ -9009,6 +9053,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         threadId,
         messageId: MessageId.make("runtime-layer-queued-edit-queued-message"),
         senderThreadId: ThreadId.make("original-sender"),
+        linkedSender,
         senderClient: {
           kind: "outside-client",
           sessionId: "original",
@@ -9043,6 +9088,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       );
       assert.isUndefined(editedMessage?.senderClient);
       assert.isUndefined(editedMessage?.senderThreadId);
+      assert.isUndefined(editedMessage?.linkedSender);
       const editedItem = afterEdit.turnItems.find(
         (item) => item.type === "user_message" && item.messageId === queuedRun.userMessageId,
       );
