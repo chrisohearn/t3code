@@ -96,15 +96,23 @@ it.effect(
           ownerKind: "t3",
           ownerName: "worker",
           ownerThreadId: ThreadId.make("t3-thread://v1/missing"),
-          links: ["https://app.t3.codes/threads/env-1/also-missing"],
+          links: [
+            "https://app.t3.codes/threads/env-1/also-missing",
+            "[remote](<t3-thread://v2/remote/thread>)",
+            "[local](<t3-thread://v1/angle-missing>)",
+          ],
           waitReason: "external",
           nextCheckAt: "1970-01-01T01:00:00+01:00",
         },
         "caller-a",
       );
       expect(first.ownerThreadId).toBe("missing");
-      expect(first.links).toEqual(["t3-thread://v2/env-1/also-missing"]);
-      expect(first.warnings).toHaveLength(2);
+      expect(first.links).toEqual([
+        "t3-thread://v2/env-1/also-missing",
+        "t3-thread://v2/remote/thread",
+        "t3-thread://v1/angle-missing",
+      ]);
+      expect(first.warnings).toHaveLength(4);
       expect(
         (yield* ledger.query({ due: true, waitReason: "external" })).items.map((item) => item.key),
       ).toEqual(["wait"]);

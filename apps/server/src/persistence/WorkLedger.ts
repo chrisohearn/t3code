@@ -156,7 +156,7 @@ const make = Effect.gen(function* () {
               threadIds.add(candidate.ownerThreadId);
             }
             candidate.links = candidate.links.map((link) => {
-              const href = link.match(/^\[[^\]]*\]\((.*)\)$/)?.[1] ?? link.replace(/^<|>$/g, "");
+              const href = (link.match(/^\[[^\]]*\]\((.*)\)$/)?.[1] ?? link).replace(/^<|>$/g, "");
               const ref = parseThreadLinkHref(href);
               if (ref === null) return link;
               if (ref.environmentId === null) threadIds.add(ref.threadId);
