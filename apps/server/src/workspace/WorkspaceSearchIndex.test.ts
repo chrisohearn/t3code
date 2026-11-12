@@ -13,11 +13,22 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import { vi } from "vite-plus/test";
 
+import { WorkspaceFinderOpener } from "./WorkspaceFinderProcess.ts";
 import * as WorkspaceSearchIndex from "./WorkspaceSearchIndex.ts";
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+const withInProcessFinder = (finder: FileFinder) =>
+  Effect.provideService(WorkspaceFinderOpener, async () => ({
+    ok: true as const,
+    value: {
+      call: async (method, ...args) =>
+        (finder[method] as (...input: typeof args) => never)(...args),
+      close: async () => undefined,
+    },
+  }));
 
 function fileItem(relativePath: string): FileItem {
   return {
@@ -31,6 +42,37 @@ function fileItem(relativePath: string): FileItem {
     gitStatus: "clean",
   };
 }
+
+it.effect("runs file and content searches outside the server thread", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workspace = yield* fs.makeTempDirectoryScoped({ prefix: "t3-search-process-" });
+      yield* fs.writeFileString(path.join(workspace, "needle.txt"), "isolated finder\n");
+      const createInServer = vi.spyOn(FileFinder, "create").mockImplementation(() => {
+        throw new Error("Native finders must not run on the server thread.");
+      });
+
+      const paths = yield* WorkspaceSearchIndex.make(workspace);
+      yield* paths.refresh();
+      expect((yield* paths.list()).entries).toContainEqual({ kind: "file", path: "needle.txt" });
+      expect((yield* paths.search("needle", 10, "file", false)).entries).toEqual([
+        { kind: "file", path: "needle.txt" },
+      ]);
+      const contents = yield* WorkspaceSearchIndex.make(workspace, "content");
+      const result = yield* contents.searchContents({
+        query: "isolated",
+        limit: 10,
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: false,
+      });
+      expect(result.matches).toHaveLength(1);
+      expect(createInServer).not.toHaveBeenCalled();
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect("filters image searches before applying the result limit", () =>
   Effect.scoped(
@@ -53,9 +95,9 @@ it.effect("filters image searches before applying the result limit", () =>
         waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
         fileSearch,
       } as unknown as FileFinder;
-      vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
-
-      const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project");
+      const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project").pipe(
+        withInProcessFinder(finder),
+      );
       const resultWithoutKind = yield* searchIndex.search("", 200, undefined, true);
       const resultWithDirectoryKind = yield* searchIndex.search("", 200, "directory", true);
 
@@ -116,9 +158,9 @@ it.effect("continues whole-word searches after a filtered grep page", () =>
         waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
         grep,
       } as unknown as FileFinder;
-      vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
-
-      const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project", "content");
+      const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project", "content").pipe(
+        withInProcessFinder(finder),
+      );
       const result = yield* searchIndex.searchContents({
         query: "needle",
         limit: 1,
