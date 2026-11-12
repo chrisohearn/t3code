@@ -1622,6 +1622,120 @@ it.effect(
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("accepts approval origin only from an authenticated peer", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const origin = {
+        environmentId: "origin-env",
+        sessionId: "jarvis-session",
+        clientLabel: "Jarvis",
+      };
+      const originHeader = encodeURIComponent(JSON.stringify(origin));
+      const ApprovalToolkit = Toolkit.make(
+        Tool.make("approval", {
+          description: "Returns the authenticated approval origin.",
+          dependencies: [McpInvocationContext.McpInvocationContext],
+          success: McpInvocationContext.McpApprovalOrigin,
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+        }),
+      );
+      const serverLayer = McpHttpServer.layerMcpTransport(
+        McpHttpServer.toolkitRegistration(
+          ApprovalToolkit,
+          McpToolAccess.toLayer(ApprovalToolkit, {
+            approval: McpToolAccess.answersApprovals(() =>
+              McpInvocationContext.McpInvocationContext.pipe(
+                Effect.map((scope) => scope.client!.approvalOrigin!),
+              ),
+            ),
+          }),
+        ),
+      ).pipe(
+        Layer.provide(ServerSettings.layerTest({ linkedEnvironmentsEnabled: true })),
+        Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({ resolve: () => Effect.undefined }),
+        ),
+        Layer.provide(
+          Layer.succeed(McpHttpServer.McpClientAuthenticator, {
+            authenticate: (request) => {
+              const actor = request.headers.authorization?.slice("Bearer ".length);
+              return Effect.succeed({
+                ...invocation,
+                capabilities: new Set(["orchestration"] as const),
+                thread: actor === "thread" ? invocation.thread : undefined,
+                client: {
+                  sessionId: "authenticated-session",
+                  label: "Authenticated client",
+                  access: actor === "limited" ? ("auto" as const) : ("full-access" as const),
+                  linked: actor === "peer" || actor === "limited",
+                },
+              });
+            },
+          }),
+        ),
+      );
+      yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+        Layer.build,
+      );
+      const http = yield* HttpClient.HttpClient;
+      const call = (actor: string, header?: string) =>
+        Effect.gen(function* () {
+          const headers = {
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${actor}`,
+          };
+          const initialized = yield* http.post("/mcp", {
+            headers,
+            body: HttpBody.text(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "initialize",
+                params: {
+                  protocolVersion: "2025-06-18",
+                  capabilities: {},
+                  clientInfo: { name: "test", version: "1" },
+                },
+              }),
+              "application/json",
+            ),
+          });
+          const response = yield* http.post("/mcp", {
+            headers: {
+              ...headers,
+              "mcp-session-id": initialized.headers["mcp-session-id"]!,
+              ...(header === undefined ? {} : { "t3-approval-origin": header }),
+            },
+            body: HttpBody.text(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "tools/call",
+                params: { name: "approval", arguments: {} },
+              }),
+              "application/json",
+            ),
+          });
+          return {
+            status: response.status,
+            body: JSON.parse(yield* response.text) as {
+              result?: { isError?: boolean; structuredContent?: unknown };
+            },
+          };
+        });
+      expect((yield* call("direct", originHeader)).status).toBe(400);
+      expect((yield* call("thread", originHeader)).status).toBe(400);
+      for (const bad of ["%", encodeURIComponent("{}"), "x".repeat(4097)]) {
+        expect((yield* call("peer", bad)).status).toBe(400);
+      }
+      expect((yield* call("limited", originHeader)).body.result?.structuredContent).toEqual(origin);
+      expect((yield* call("peer", originHeader)).body.result?.structuredContent).toEqual(origin);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("lists optional tools to a deferring client only after tool_search loads them", () =>
   Effect.scoped(
     Effect.gen(function* () {

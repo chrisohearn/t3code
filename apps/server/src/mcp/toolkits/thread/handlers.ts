@@ -14,6 +14,7 @@ import { modelSelectionCommandType } from "@t3tools/shared/model";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
+import * as PendingApproval from "../../PendingApprovalMcpService.ts";
 import {
   dispatchFailure,
   newCommandId,
@@ -96,6 +97,12 @@ const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A,
 ) => McpToolAccess.writesThreads((params: P) => [params.threadId], handle);
 
 export const layer = McpToolAccess.toLayer(ThreadToolkit, {
+  t3_approval_log: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const service = yield* PendingApproval.PendingApprovalMcpService;
+      return yield* service.list(yield* McpInvocationContext.McpInvocationContext, input);
+    }),
+  ),
   run_scheduled_task_now: McpToolAccess.writesEnvironment((input) =>
     Effect.gen(function* () {
       const scheduler = yield* ScheduledTasks.ScheduledTaskService;
@@ -250,29 +257,66 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           return { requestIds: requests.map((request) => request.requestId), requests };
         }
         const requestId = yield* required(input.requestId, "requestId");
+        const context = yield* readThread(input.threadId, ["runtimeRequests"]);
+        if (
+          context.projection.runtimeRequests.some(
+            (request) => request.id === requestId && isApprovalKind(request.kind),
+          )
+        ) {
+          const service = yield* PendingApproval.PendingApprovalMcpService;
+          return yield* service.read(yield* McpInvocationContext.McpInvocationContext, {
+            ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+            requestId,
+          });
+        }
         const { item } = yield* readQuestion({ threadId: input.threadId, requestId });
         return { requestId, questions: item.questions };
       }),
     ),
-    writesThread((input) =>
-      Effect.gen(function* () {
-        const requestId = yield* required(input.requestId, "requestId");
-        const answers = yield* required(input.answers, "answers");
-        const { threads, projection } = yield* readQuestion({
-          threadId: input.threadId,
-          requestId,
-        });
-        const result = yield* threads
-          .dispatch({
-            type: "runtime-request.respond",
-            threadId: projection.thread.id,
-            commandId: yield* newCommandId(),
+    McpToolAccess.either(
+      (input) => input.decision !== undefined,
+      McpToolAccess.answersApprovals((input) =>
+        Effect.gen(function* () {
+          const requestId = yield* required(input.requestId, "requestId");
+          if (input.answers !== undefined)
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "Send a decision or question answers, not both.",
+            });
+          const service = yield* PendingApproval.PendingApprovalMcpService;
+          return yield* service.respond(yield* McpInvocationContext.McpInvocationContext, {
+            ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
             requestId,
-            answers,
-          })
-          .pipe(Effect.mapError(dispatchFailure));
-        return { sequence: result.sequence };
-      }),
+            decision: yield* required(input.decision, "decision"),
+            ...(input.note === undefined ? {} : { note: input.note }),
+          });
+        }),
+      ),
+      writesThread((input) =>
+        Effect.gen(function* () {
+          const requestId = yield* required(input.requestId, "requestId");
+          if (input.note !== undefined)
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "An approval note needs a decision.",
+            });
+          const answers = yield* required(input.answers, "answers");
+          const { threads, projection } = yield* readQuestion({
+            threadId: input.threadId,
+            requestId,
+          });
+          const result = yield* threads
+            .dispatch({
+              type: "runtime-request.respond",
+              threadId: projection.thread.id,
+              commandId: yield* newCommandId(),
+              requestId,
+              answers,
+            })
+            .pipe(Effect.mapError(dispatchFailure));
+          return { sequence: result.sequence };
+        }),
+      ),
     ),
   ),
   t3_queue: McpToolAccess.either(

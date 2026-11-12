@@ -29,6 +29,7 @@ import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as PendingApproval from "../../PendingApprovalMcpService.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
@@ -132,13 +133,15 @@ const question = Schema.Struct({
 const PendingRequestTool = Tool.make("t3_pending_request", {
   ...commandTool,
   description:
-    "Pending user questions in a thread. Omit `threadId` for this thread. list: question and approval ids with `kind`. read: one by `requestId`. respond: answer one with `answers`; this cannot approve a permission request.",
+    "Pending questions and approvals. list: ids with `kind`. read: details by `requestId`. respond: questions use `answers`. Only an outside full-access sign-in can answer an approval on any thread with `decision`: accept allows once, decline denies. Optional `note` records what the caller says Chris said. Answers are logged. Standing grants and permission modes stay in the app.",
   parameters: Schema.Struct({
     action: Schema.Literals(["list", "read", "respond"]),
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
     requestId: Schema.optional(RuntimeRequestId),
     answers: Schema.optional(ProviderUserInputAnswers),
+    decision: Schema.optional(Schema.Literals(["accept", "decline"])),
+    note: Schema.optional(Schema.String.pipe(Schema.check(Schema.isMaxLength(4000)))),
   }),
   success: Schema.Union([
     Schema.Struct({
@@ -154,11 +157,31 @@ const PendingRequestTool = Tool.make("t3_pending_request", {
       ),
     }),
     Schema.Struct({ requestId: RuntimeRequestId, questions: Schema.Array(question) }),
+    Schema.Struct({ requestId: RuntimeRequestId, approval: PendingApproval.ApprovalDetails }),
     OrchestrationV2DispatchCommandResult,
   ]),
+  dependencies: [...commandTool.dependencies, PendingApproval.PendingApprovalMcpService],
 })
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
+
+const ApprovalLogTool = Tool.make("t3_approval_log", {
+  ...commandTool,
+  description:
+    "Read durable MCP approval answers, including who answered, what was requested, decision, time and caller note. Requires full access. Optional threadId filters; cursor and limit page the log.",
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    threadId: Schema.optional(ThreadId),
+    cursor: Schema.optional(NonNegativeInt),
+    limit: Schema.optional(
+      Schema.Int.pipe(Schema.check(Schema.isBetween({ minimum: 1, maximum: 100 }))),
+    ),
+  }),
+  success: PendingApproval.ApprovalLogResult,
+  dependencies: [...commandTool.dependencies, PendingApproval.PendingApprovalMcpService],
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false);
 
 const threadConfiguration = Schema.Struct({
   threadId: ThreadId,
@@ -260,5 +283,6 @@ export const ThreadToolkit = Toolkit.make(
   ThreadTransferTool,
   ThreadOrganizeTool,
   PendingRequestTool,
+  ApprovalLogTool,
   QueueTool,
 );
