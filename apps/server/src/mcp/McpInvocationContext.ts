@@ -1,16 +1,18 @@
 import {
   type AuthMcpClientAccess,
-  type EnvironmentId,
+  EnvironmentId,
   McpCapabilityUnavailableError,
   OrchestratorMcpFailure,
   PreviewAutomationUnavailableError,
   type ProviderInstanceId,
   type ProviderInteractionMode,
+  type OrchestrationV2LinkedSender,
   type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Fiber from "effect/Fiber";
 import { formatThreadLink, hostedThreadLink } from "@t3tools/shared/threadLinks";
 
@@ -31,6 +33,13 @@ export interface McpThreadCaller {
   readonly subagent?: boolean;
 }
 
+export const APPROVAL_ORIGIN_HEADER = "t3-approval-origin";
+export const McpApprovalOrigin = Schema.Struct({
+  environmentId: EnvironmentId,
+  sessionId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+  clientLabel: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+});
+
 export interface McpClientCaller {
   readonly sessionId: string;
   readonly label: string;
@@ -40,11 +49,15 @@ export interface McpClientCaller {
    * session as `linkOrigin`, and it changes only that work (`linkOrigin.ts`).
    */
   readonly linked?: boolean | undefined;
+  /** Origin attested by the authenticated peer link, never a tool argument. */
+  readonly approvalOrigin?: typeof McpApprovalOrigin.Type;
   /**
    * Narrower modes the client asked for on this request (`T3-Mode-Limit`):
    * another environment passing on the limits of the agent it calls for.
    */
   readonly narrowedTo?: ClientModes | undefined;
+  /** A linked environment's thread this request is made for (`T3-Sender-Thread`). */
+  readonly senderThread?: OrchestrationV2LinkedSender | undefined;
   /** An outside client's thread links go through this hosted app, as Copy thread's do. */
   readonly hostedAppUrl?: string | undefined;
 }
@@ -56,6 +69,13 @@ export interface McpClientCaller {
  * `clientModeCeiling`), so a client gains nothing by sending a broad one.
  */
 export const MODE_LIMIT_HEADER = "t3-mode-limit";
+
+/**
+ * `T3-Sender-Thread: <environmentId>/<threadId>/<title>`, each URI-encoded: the
+ * thread another environment makes a request for, so what it sends here can name
+ * it. Read only from a linked client.
+ */
+export const SENDER_THREAD_HEADER = "t3-sender-thread";
 
 export interface ClientModes {
   readonly runtimeMode: RuntimeMode;
@@ -132,6 +152,35 @@ export interface McpInvocationScope {
   /** False while the Linked environments beta is off here; `/mcp` reads it per request. */
   readonly linkedEnvironments?: boolean;
 }
+
+export const messageSenderFor = (scope: McpInvocationScope) => {
+  if (scope.client === undefined) return {};
+  return {
+    senderClient: {
+      sessionId: scope.client.sessionId.slice(0, 8),
+      clientLabel: scope.client.label,
+      kind: scope.client.linked === true ? ("linked-agent" as const) : ("outside-client" as const),
+      access:
+        scope.client.access === "full-access" || scope.client.access === "read-only"
+          ? scope.client.access
+          : ("approval-required" as const),
+    },
+  };
+};
+
+export const assertOutsideApprovalCaller = (scope: McpInvocationScope) =>
+  scope.thread === undefined &&
+  scope.client?.access === "full-access" &&
+  scope.capabilities.has("orchestration") &&
+  clientModeCeiling(scope.client).runtimeMode === "full-access" &&
+  clientModeCeiling(scope.client).interactionMode === "default"
+    ? Effect.void
+    : Effect.fail(
+        new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message: "Only an outside full-access sign-in may answer approvals over MCP.",
+        }),
+      );
 
 /**
  * T3 Code renders `t3-thread://` links as thread chips. Other MCP clients cannot open them, so

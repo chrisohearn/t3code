@@ -1,7 +1,8 @@
+import * as WorkLedger from "../persistence/WorkLedger.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
   ContextTransferId,
@@ -31,13 +32,17 @@ import {
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
@@ -1279,6 +1284,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     "child run completion",
     "child question",
     "child approval",
+    "Node fetch's 300 s idle timeout",
   ] as const)("a task wait still returns on %s", (wake) =>
     Effect.gen(function* () {
       const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
@@ -1384,6 +1390,24 @@ describe("OrchestratorMcpService provider resolution", () => {
           .delegateTask(scope, { task: "Review the change.", mode: "wait" })
           .pipe(Effect.forkChild);
         yield* Deferred.await(subscribed);
+        if (wake === "Node fetch's 300 s idle timeout") {
+          // Nothing is written during the wait, so undici drops the call at 300 s, before any handle.
+          const beforeClientTimeout = yield* Fiber.join(waiting).pipe(
+            Effect.timeoutOption(Duration.seconds(299)),
+            Effect.forkChild,
+          );
+          yield* TestClock.adjust(Duration.seconds(299));
+          const result = yield* Fiber.join(beforeClientTimeout);
+          assert.isTrue(
+            Option.isSome(result),
+            "a wait without timeoutMs was still silent at 299 s, so a Node MCP client loses the taskId",
+          );
+          if (Option.isSome(result)) {
+            assert.equal(result.value.taskId, taskId);
+            assert.isTrue(result.value.waitTimedOut);
+          }
+          return;
+        }
         ready = true;
         if (wake === "parent completion") {
           yield* Queue.offer(events, {
@@ -1531,6 +1555,13 @@ describe("OrchestratorMcpService provider resolution", () => {
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const capabilities = yield* service.capabilities(scope);
+          assert.equal(capabilities.jarvisPlaybookResource, "t3://jarvis/playbook");
+          const peerCapabilities = yield* service.capabilities({
+            ...scope,
+            thread: undefined,
+            client: { sessionId: "peer", label: "Peer", access: "full-access", linked: true },
+          });
+          assert.isUndefined(peerCapabilities.jarvisPlaybookResource);
           const byId = new Map(
             capabilities.providers.map((provider) => [provider.providerInstanceId, provider]),
           );
@@ -3869,6 +3900,56 @@ describe("OrchestratorMcpService thread lookup", () => {
       }).pipe(Effect.provide(service(shells, sent)));
     });
 
+  it.effect("stamps authenticated outside and linked senders on sends and posts", () =>
+    Effect.gen(function* () {
+      const sent = yield* Ref.make(0);
+      const commands: unknown[] = [];
+      yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        for (const linked of [false, true]) {
+          const scope = {
+            ...client,
+            client: { ...client.client!, sessionId: "sign-in-private-id", linked },
+          };
+          const forged = { senderClient: { clientLabel: "Impersonator" } };
+          yield* mcp.postToThread(scope, { threadId: launched.id, message: "hello", ...forged });
+          yield* mcp.sendToThread(scope, { threadId: launched.id, message: "hello", ...forged });
+          for (const command of commands.splice(0)) {
+            expect(command).toMatchObject({
+              senderClient: {
+                sessionId: "sign-in-",
+                access: "full-access",
+                clientLabel: "Claude Code",
+                kind: linked ? "linked-agent" : "outside-client",
+              },
+            });
+            expect(JSON.stringify(command)).not.toContain(scope.client.sessionId);
+          }
+        }
+      }).pipe(
+        Effect.provide(
+          service([launched], sent, {
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(launched)),
+            getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(launched)),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command);
+                return { sequence: 1, storedEvents: [] };
+              }),
+            sendToThread: (command) =>
+              Effect.sync(() => {
+                commands.push(command);
+                return {
+                  delivery: "queued",
+                  run: { id: RunId.make("sender-run"), status: "queued" },
+                } as ThreadManagementService.ThreadManagementSendResult;
+              }),
+          }),
+        ),
+      );
+    }),
+  );
+
   it.effect(
     "reads a capped final reply directly without paging history or acknowledging delivery",
     () =>
@@ -3892,6 +3973,17 @@ describe("OrchestratorMcpService thread lookup", () => {
           const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
           const result = yield* mcp.threadResult(client, { threadId: launched.id });
           assert.equal(result.revision, 42);
+          assert.deepEqual(result.pullRequests, []);
+          expect(result.latestMessage).toMatchObject({
+            messageId: "inbox-post",
+            role: "user",
+            senderClient: {
+              sessionId: "01234567",
+              clientLabel: "Jarvis",
+              kind: "outside-client",
+              access: "full-access",
+            },
+          });
           assert.equal(Array.from(result.lastAssistantMessage?.text ?? "").length, 4000);
           assert.equal(result.lastAssistantMessage?.truncated, true);
           assert.equal(result.run?.runId, runId);
@@ -3921,6 +4013,25 @@ describe("OrchestratorMcpService thread lookup", () => {
                 });
               },
               getThreadRecords: (_id, _fields, filter) => {
+                if (filter?.messageRoles === undefined)
+                  return Effect.succeed({
+                    ...projection,
+                    messages: [
+                      {
+                        id: MessageId.make("inbox-post"),
+                        role: "user",
+                        text: "hello",
+                        createdBy: "agent",
+                        creationSource: "mcp",
+                        senderClient: {
+                          sessionId: "01234567",
+                          clientLabel: "Jarvis",
+                          kind: "outside-client",
+                          access: "full-access",
+                        },
+                      },
+                    ],
+                  } as unknown as OrchestrationV2ThreadProjection);
                 assert.deepEqual(filter, {
                   messageRoles: ["assistant"],
                   messageRunIds: [runId],
@@ -3935,6 +4046,120 @@ describe("OrchestratorMcpService thread lookup", () => {
               dispatch: () => Effect.die("must not acknowledge delivery"),
             }),
           ),
+        );
+      }),
+  );
+
+  it.effect(
+    "seeds coordinator rollover while leaving ordinary sends and clean resets unchanged",
+    () =>
+      Effect.gen(function* () {
+        const sent = yield* Ref.make(0);
+        const received = yield* Ref.make<
+          ReadonlyArray<{ readonly text: string; readonly freshContext?: boolean }>
+        >([]);
+        const latestResult = yield* Ref.make("Latest result" + "\n😀".repeat(10_000));
+        const projection = idleThreadProjection(launched);
+        const ledgerLayer = WorkLedger.layer.pipe(Layer.provide(SqlitePersistence.layerMemory));
+        yield* Effect.gen(function* () {
+          const ledger = yield* WorkLedger.WorkLedger;
+          for (const [key, ownerThreadId] of [
+            ["owned", launched.id],
+            ["someone-else", ThreadId.make("other")],
+          ] as const) {
+            yield* ledger.upsert(
+              {
+                key,
+                title: key,
+                ownerKind: "t3",
+                ownerName: "Coordinator",
+                ownerThreadId,
+                nextAction: "Check CI",
+              },
+              "test",
+            );
+          }
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Continue",
+            coordinatorRollover: true,
+          });
+          yield* mcp.sendToThread(client, { threadId: launched.id, message: "Unchanged" });
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Clean reset",
+            freshContext: true,
+          });
+          yield* Ref.set(latestResult, "a".repeat(4000));
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Check result budget",
+            coordinatorRollover: true,
+          });
+          const nearLimit = (yield* Ref.get(received)).at(-1)!.text;
+          assert.include(nearLimit, JSON.stringify("a".repeat(3998)));
+          for (let index = 0; index < 25; index++) {
+            yield* ledger.upsert(
+              {
+                key: `large-${index}`,
+                title: "😀".repeat(100),
+                ownerKind: "t3",
+                ownerName: "Coordinator",
+                ownerThreadId: launched.id,
+                blocker: "\n".repeat(400),
+                nextAction: "😀".repeat(200),
+              },
+              "test",
+            );
+          }
+          const currentRequest = "Keep this request intact. ".repeat(4000);
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: currentRequest,
+            coordinatorRollover: true,
+          });
+          const messages = yield* Ref.get(received);
+          assert.isAtMost(
+            Buffer.byteLength(messages[4]!.text) - Buffer.byteLength(currentRequest),
+            8192,
+          );
+          assert.isTrue(messages[4]!.text.endsWith(currentRequest));
+          assert.deepEqual(messages[2], { text: "Clean reset", freshContext: true });
+          assert.equal(messages[0]?.freshContext, true);
+          assert.include(messages[0]!.text, '"key":"owned"');
+          assert.notInclude(messages[0]!.text, '"key":"someone-else"');
+          assert.include(messages[0]!.text, "Latest result");
+          assert.isBelow(messages[0]!.text.length, 6000);
+          assert.isTrue(messages[0]!.text.endsWith("Continue"));
+          assert.deepEqual(messages[1], { text: "Unchanged" });
+        }).pipe(
+          Effect.provide([
+            service([launched], sent, {
+              getProjectThreadRecords: () => Effect.succeed(projection),
+              getThreadRecords: () =>
+                Ref.get(latestResult).pipe(
+                  Effect.map(
+                    (text) =>
+                      ({
+                        ...projection,
+                        messages: [{ text }],
+                      }) as unknown as OrchestrationV2ThreadProjection,
+                  ),
+                ),
+              sendToThread: (input) =>
+                Ref.update(received, (items) => [
+                  ...items,
+                  { text: input.text, ...(input.freshContext ? { freshContext: true } : {}) },
+                ]).pipe(
+                  Effect.as({
+                    delivery: "queued",
+                    run: { id: RunId.make("fresh-run"), status: "queued" },
+                  } as never),
+                ),
+            }),
+            ledgerLayer,
+          ]),
         );
       }),
   );
@@ -3969,6 +4194,74 @@ describe("OrchestratorMcpService thread lookup", () => {
       assert.equal(send.message, `Thread ${bareId} was not found.`);
       assert.equal(wait.message, send.message);
     }),
+  );
+
+  it.effect.each(["send", "post"] as const)(
+    "records the linked environment's thread on %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const target = liveThreadShell(ThreadId.make("thread:target"));
+        const sender = {
+          environmentId: EnvironmentId.make("environment:a"),
+          threadId: ThreadId.make("thread:orc"),
+          title: "orc lead",
+        };
+        const linked = (senderThread?: typeof sender): McpInvocationScope => ({
+          ...client,
+          client: {
+            sessionId: "link-a",
+            label: "A",
+            access: "full-access",
+            linked: true,
+            ...(senderThread === undefined ? {} : { senderThread }),
+          },
+        });
+        const sendAs = (scope: McpInvocationScope) =>
+          Effect.gen(function* () {
+            const inputs: Array<
+              | ThreadManagementService.ThreadManagementSendInput
+              | Extract<OrchestrationV2ServerCommand, { type: "message.dispatch" }>
+            > = [];
+            const sent = yield* Ref.make(0);
+            yield* Effect.gen(function* () {
+              const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+              if (mode === "send")
+                yield* mcp.sendToThread(scope, { threadId: target.id, message: "hello" });
+              else yield* mcp.postToThread(scope, { threadId: target.id, message: "hello" });
+            }).pipe(
+              Effect.provide(
+                service([target], sent, {
+                  getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(target)),
+                  dispatch: (command) => {
+                    if (command.type !== "message.dispatch")
+                      return Effect.die("Unexpected dispatch");
+                    inputs.push(command);
+                    return Effect.succeed({} as never);
+                  },
+                  sendToThread: (input) => {
+                    inputs.push(input);
+                    return Effect.succeed({
+                      run: { id: RunId.make("run:sent"), status: "running" },
+                      delivery: "started",
+                    } as never);
+                  },
+                }),
+              ),
+            );
+            return inputs[0];
+          });
+
+        const fromLink = yield* sendAs(linked(sender));
+        assert.deepStrictEqual(fromLink?.linkedSender, sender);
+        assert.deepStrictEqual(fromLink?.senderClient, {
+          sessionId: "link-a",
+          clientLabel: "A",
+          kind: "linked-agent",
+          access: "full-access",
+        });
+        assert.isUndefined(fromLink?.senderThreadId);
+        assert.isUndefined((yield* sendAs(linked()))?.linkedSender);
+      }),
   );
 
   it.effect("refuses waiting without orchestration capability before reading the target", () =>
@@ -4115,7 +4408,21 @@ describe("OrchestratorMcpService thread list", () => {
         Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
           list: () => Effect.succeed([]),
         }),
-        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(ProjectService.ProjectService)({
+          getById: (id) =>
+            shells.some((thread) => thread.projectId === id)
+              ? Effect.succeedSome({
+                  id,
+                  title: id,
+                  workspaceRoot: `/projects/${id}`,
+                  defaultModelSelection: null,
+                  scripts: [],
+                  createdAt: "2026-10-18T00:00:00.000Z",
+                  updatedAt: "2026-10-18T00:00:00.000Z",
+                  deletedAt: null,
+                })
+              : Effect.succeedNone,
+        }),
         Layer.mock(SecretRequests.SecretRequests)({}),
         Layer.mock(RemoteDelegation.RemoteDelegation)({}),
         Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
@@ -4151,6 +4458,20 @@ describe("OrchestratorMcpService thread list", () => {
           ["thread:b-snoozed", "project:b"],
         ],
       );
+    }).pipe(Effect.provide(service)),
+  );
+
+  it.effect("refuses a projectId that names no project", () =>
+    Effect.gen(function* () {
+      const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const listed = yield* mcp
+        .listThreads(client, { projectId: ProjectId.make("project:missing") })
+        .pipe(Effect.result);
+      if (Result.isSuccess(listed)) {
+        assert.fail(`listed threads for a missing project: ${JSON.stringify(listed.success)}`);
+      }
+      assert.equal(listed.failure.code, "invalid_request");
+      assert.include(listed.failure.message, "not found");
     }).pipe(Effect.provide(service)),
   );
 

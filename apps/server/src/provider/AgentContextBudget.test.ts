@@ -1,15 +1,19 @@
+import * as Sqlite from "../persistence/Sqlite.ts";
 import * as McpEvents from "../mcp/McpEvents.ts";
 import * as McpBridgeMetrics from "../mcp/McpBridgeMetrics.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
+import * as McpRequestLog from "../persistence/McpRequestLog.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import { ProviderInstanceId } from "@t3tools/contracts";
+import * as Invocation from "../mcp/McpInvocationContext.ts";
+import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 import { McpProviderSessions } from "@t3tools/provider-core/server/McpProviderSessions";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { McpServer } from "effect/ai";
+import { McpServer, McpSchema } from "effect/ai";
+import * as JarvisPlaybook from "../mcp/JarvisPlaybook.ts";
 
 import { AssetSigner } from "../assets/AssetSigner.ts";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
@@ -57,6 +61,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(McpBridgeMetrics.McpBridgeMetrics)({}),
   Layer.mock(McpClientThreads.McpClientThreads)({}),
   Layer.mock(WorkLedger.WorkLedger)({}),
+  Layer.mock(McpRequestLog.McpRequestLog)({}),
   Layer.mock(AssetSigner)({}),
   Layer.mock(DeviceService)({}),
   Layer.mock(DocumentText)({}),
@@ -120,6 +125,7 @@ const codexAdditionalContext = () =>
 
 const layerAdvertisedTools = McpHttpServer.layerTools.pipe(
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+  Layer.provide(Sqlite.layerMemory),
   Layer.provide(toolHandlerServices),
 );
 
@@ -131,6 +137,37 @@ it.effect("only request_secret asks Claude Code to load it up front", () =>
       .filter(({ tool }) => tool._meta?.["anthropic/alwaysLoad"] !== undefined)
       .map(({ tool }) => [tool.name, tool._meta]);
     expect(alwaysLoad).toEqual([["request_secret", { "anthropic/alwaysLoad": true }]]);
+    const resource = yield* mcp.findResource(JarvisPlaybook.URI).pipe(
+      Effect.provideService(Invocation.McpInvocationContext, {
+        environmentId: EnvironmentId.make("test"),
+        requestNamespace: "test",
+        thread: undefined,
+        client: { sessionId: "playbook", label: "test", access: "read-only" },
+        capabilities: new Set<Invocation.McpCapability>(),
+        issuedAt: 0,
+      }),
+      Effect.provideService(
+        McpSchema.McpServerClient,
+        McpSchema.McpServerClient.of({
+          clientId: 1,
+          protocolVersion: "2025-06-18",
+          clientCapabilities: {},
+          clientInfo: { name: "playbook-test", version: "1" },
+          initializePayload: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "playbook-test", version: "1" },
+          },
+          getClient: Effect.die("unused"),
+        }),
+      ),
+    );
+    expect(resource.contents).toEqual([
+      {
+        uri: JarvisPlaybook.URI,
+        text: yield* JarvisPlaybook.read().pipe(Effect.provide(NodeServices.layer)),
+      },
+    ]);
   }).pipe(Effect.provide(layerAdvertisedTools)),
 );
 

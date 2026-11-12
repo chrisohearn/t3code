@@ -315,8 +315,12 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           ? {}
           : {
               initialMessage: {
+                ...(input.clientRequestId === undefined
+                  ? {}
+                  : { clientRequestId: input.clientRequestId }),
                 messageId,
                 ...(caller === undefined ? {} : { senderThreadId: caller.id }),
+                ...McpInvocationContext.messageSenderFor(scope),
                 text: input.message ?? "",
                 attachments,
               },
@@ -366,7 +370,12 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           .pipe(Effect.ignore({ log: true }));
       }
       const run = result.projection.runs.find((run) => run.userMessageId === messageId);
-      const notify = yield* ThreadNotifications.finish(notification, thread.id);
+      const notify = yield* ThreadNotifications.finish(
+        notification,
+        thread.id,
+        run?.id,
+        input.clientRequestId,
+      );
       return {
         ...(notify === undefined ? {} : { notify }),
         threadId: thread.id,

@@ -2,14 +2,40 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 
 import {
+  OrchestratorMcpThreadResult,
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
 } from "./orchestratorMcp.ts";
+
+const decodeThreadResult = Schema.decodeUnknownSync(OrchestratorMcpThreadResult);
 
 const decodeDelegateTaskInput = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskInput);
 const decodeDelegateTaskResult = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskResult);
 
 describe("orchestrator MCP contracts", () => {
+  it("accepts thread results from peers that predate sender attribution", () => {
+    const legacy = {
+      threadId: "thread:old-peer",
+      status: "idle",
+      run: null,
+      lastAssistantMessage: { messageId: "message:old", text: "done", truncated: false },
+      pendingRequestIds: [],
+      pullRequests: [
+        {
+          host: "github.com",
+          repository: "chrisohearn/t3code",
+          number: 51,
+          url: "https://github.com/chrisohearn/t3code/pull/51",
+          source: "manual",
+          state: "open",
+        },
+      ],
+      revision: 1,
+    };
+    const decoded = decodeThreadResult(legacy);
+    expect(decoded.lastAssistantMessage?.text).toBe("done");
+    expect(decoded.pullRequests[0]).toEqual(legacy.pullRequests[0]);
+  });
   it("decodes cross-provider delegated task requests and durable results", () => {
     const request = decodeDelegateTaskInput({
       task: "Inspect the workspace and report the result.",

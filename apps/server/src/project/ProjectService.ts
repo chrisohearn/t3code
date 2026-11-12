@@ -211,10 +211,9 @@ export const make = Effect.gen(function* () {
   });
 
   const hydrate = Effect.fn("ProjectService.hydrate")(function* (row: ProjectStore.ProjectRow) {
+    // Deleted rows are tombstones; transient enrichment must not change a retried delete response.
     const enrichment =
-      row.deletedAt === null
-        ? yield* projectEnrichment.getAvailable(row.workspaceRoot)
-        : yield* projectEnrichment.peek(row.workspaceRoot);
+      row.deletedAt === null ? yield* projectEnrichment.getAvailable(row.workspaceRoot) : null;
     return toProject(row, enrichment);
   });
 
@@ -512,7 +511,10 @@ export const make = Effect.gen(function* () {
           (cause) => new ProjectOperationError({ operation: "list-threads", projectId, cause }),
         ),
       );
-    const projectThreads = [...snapshot.threads, ...snapshot.archivedThreads];
+    // Newest first: a source deleted while its fork lives keeps the pages that fork shows.
+    const projectThreads = [...snapshot.threads, ...snapshot.archivedThreads].sort(
+      (a, b) => DateTime.toEpochMillis(b.createdAt) - DateTime.toEpochMillis(a.createdAt),
+    );
     if (projectThreads.length > 0 && input.force !== true) {
       return yield* new ProjectNotEmptyError({ projectId });
     }

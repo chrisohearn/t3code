@@ -28,7 +28,11 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as VcsStatusBroadcaster from "../vcs/VcsStatusBroadcaster.ts";
-import type { McpInvocationScope, McpThreadInvocationScope } from "./McpInvocationContext.ts";
+import {
+  messageSenderFor,
+  type McpInvocationScope,
+  type McpThreadInvocationScope,
+} from "./McpInvocationContext.ts";
 
 export class WorktreeMcpService extends Context.Service<
   WorktreeMcpService,
@@ -337,6 +341,8 @@ const make = Effect.gen(function* () {
                     mode: "queue",
                     createdBy: "agent",
                     creationSource: "mcp",
+                    senderThreadId: scope.thread.threadId,
+                    ...messageSenderFor(scope),
                   })
                   .pipe(
                     Effect.map((sendResult): WorktreeMcpContinuationStatus => ({

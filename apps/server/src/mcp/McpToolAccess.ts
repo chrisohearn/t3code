@@ -145,6 +145,20 @@ export const reads = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>)
     () => Effect.void,
   );
 
+export const answersApprovals = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) => {
+  const check = McpInvocationContext.McpInvocationContext.pipe(
+    Effect.flatMap((scope) =>
+      scope.thread === undefined && scope.client?.linked === true
+        ? Effect.void
+        : McpInvocationContext.assertOutsideApprovalCaller(scope),
+    ),
+  );
+  return declare(
+    (params: P) => check.pipe(Effect.flatMap(() => handle(params))),
+    () => check,
+  );
+};
+
 export const readsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
   declare((params: P) => requireThreadCaller.pipe(Effect.flatMap(() => handle(params))), undefined);
 

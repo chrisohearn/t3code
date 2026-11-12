@@ -37,6 +37,7 @@ import { secretRequestPageUrl } from "./secretRequest.ts";
 import { hasOnlyPairedSurrogates } from "./threadMetadataMcp.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
+  OrchestrationV2SenderClient,
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
@@ -185,7 +186,7 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
     }),
   ),
   timeoutMs: Schema.optional(Schema.Finite).annotate({
-    description: "Mode 'wait' only. Default 10 min. A timeout does not cancel the child.",
+    description: "Mode 'wait' only. Default 4 min. A timeout does not cancel the child.",
   }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
   runtimeMode: Schema.optional(
@@ -359,6 +360,8 @@ export const OrchestratorMcpThreadPullRequest = Schema.Struct({
   url: TrimmedNonEmptyString,
   source: ThreadPullRequestLinkSource,
   state: Schema.NullOr(PullRequestState),
+  watching: Schema.optional(Schema.Boolean),
+  watchStartedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
 });
 export type OrchestratorMcpThreadPullRequest = typeof OrchestratorMcpThreadPullRequest.Type;
 
@@ -379,7 +382,9 @@ export const OrchestratorMcpThreadListItem = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   linkedPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
+  /** Linked pull requests not yet merged or closed; list_thread_pull_requests has all of them. */
   pullRequests: Schema.optional(Schema.Array(OrchestratorMcpThreadPullRequest)),
+  pullRequestCount: Schema.optional(NonNegativeInt),
   settled: Schema.Boolean,
   settledAt: Schema.NullOr(IsoDateTime),
   snoozed: Schema.Boolean,
@@ -451,7 +456,9 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   linkedPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
+  /** Open linked pull requests, on the first page only; list_thread_pull_requests has all of them. */
   pullRequests: Schema.optional(Schema.Array(OrchestratorMcpThreadPullRequest)),
+  pullRequestCount: Schema.optional(NonNegativeInt),
   titleRegeneration: Schema.NullOr(ThreadTitleRegeneration),
   branch: Schema.NullOr(Schema.String),
   worktreePath: Schema.NullOr(Schema.String),
@@ -484,6 +491,7 @@ export const OrchestratorMcpThreadRun = Schema.Struct({
 export type OrchestratorMcpThreadRun = typeof OrchestratorMcpThreadRun.Type;
 
 export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
+  postOnly: Schema.optional(Schema.Boolean),
   position: NonNegativeInt,
   visibility: Schema.Literals(["local", "inherited", "synthetic"]),
   sourceThreadId: ThreadId,
@@ -494,6 +502,7 @@ export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
   createdBy: Schema.NullOr(OrchestrationV2Actor),
   creationSource: Schema.NullOr(OrchestrationV2CreationSource),
   senderThreadId: Schema.optional(ThreadId),
+  senderClient: Schema.optional(OrchestrationV2SenderClient),
   type: Schema.String,
   status: OrchestrationV2TurnItemStatus,
   title: Schema.NullOr(Schema.String),
@@ -522,13 +531,22 @@ export const OrchestratorMcpThreadResultInput = Schema.Struct({
   maxChars: Schema.optional(clampedPositiveInt(50_000)),
 });
 export type OrchestratorMcpThreadResultInput = typeof OrchestratorMcpThreadResultInput.Type;
+const OrchestratorMcpMessageSummary = Schema.Struct({
+  messageId: MessageId,
+  role: Schema.optional(Schema.Literals(["user", "assistant", "system"])),
+  text: Schema.String,
+  truncated: Schema.Boolean,
+  createdBy: Schema.optional(Schema.NullOr(OrchestrationV2Actor)),
+  creationSource: Schema.optional(Schema.NullOr(OrchestrationV2CreationSource)),
+  senderThreadId: Schema.optional(ThreadId),
+  senderClient: Schema.optional(OrchestrationV2SenderClient),
+});
 export const OrchestratorMcpThreadResult = Schema.Struct({
   threadId: ThreadId,
   status: OrchestratorMcpThreadStatus,
   run: Schema.NullOr(OrchestratorMcpThreadRun),
-  lastAssistantMessage: Schema.NullOr(
-    Schema.Struct({ messageId: MessageId, text: Schema.String, truncated: Schema.Boolean }),
-  ),
+  lastAssistantMessage: Schema.NullOr(OrchestratorMcpMessageSummary),
+  latestMessage: Schema.optional(Schema.NullOr(OrchestratorMcpMessageSummary)),
   pendingRequestIds: Schema.Array(RuntimeRequestId),
   pullRequests: Schema.Array(OrchestratorMcpThreadPullRequest),
   revision: NonNegativeInt,
@@ -558,7 +576,13 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
   freshContext: Schema.optional(
     Schema.Boolean.annotate({
       description:
-        "Start a new provider session without the thread's earlier context, like /clear. Never steers.",
+        "Start a new provider session without earlier context, like /clear. Never steers.",
+    }),
+  ),
+  coordinatorRollover: Schema.optional(
+    Schema.Boolean.annotate({
+      description:
+        "Start a fresh provider session seeded with a compact summary of owned unfinished ledger work and the latest assistant result. Implies freshContext. Queue at a clean turn boundary.",
     }),
   ),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
@@ -691,6 +715,7 @@ export type OrchestratorMcpEnvironmentLinksResult =
   typeof OrchestratorMcpEnvironmentLinksResult.Type;
 
 export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
+  jarvisPlaybookResource: Schema.optional(Schema.String),
   parentThreadId: Schema.NullOr(ThreadId),
   inheritedProviderInstanceId: Schema.NullOr(ProviderInstanceId),
   inheritedModel: Schema.NullOr(Schema.String),
@@ -720,13 +745,14 @@ export const OrchestratorMcpScheduleTaskInput = Schema.Struct({
   enabled: Schema.optional(Schema.Boolean.annotate({ description: "Default true." })),
   bindToCurrentThread: Schema.optional(
     Schema.Boolean.annotate({
-      description: "Default true: runs post in this thread. False: new thread per run.",
+      description:
+        "Post here, else new thread per run. Unset: true in own project, else false; updates keep it.",
     }),
   ),
   freshSession: Schema.optional(
     Schema.Boolean.annotate({
       description:
-        "Runs share one thread but each starts a fresh session without earlier runs' context. Unbound: the first run makes the thread.",
+        "Runs share one thread but each starts a fresh session. Unbound: the first run makes the thread.",
     }),
   ),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),

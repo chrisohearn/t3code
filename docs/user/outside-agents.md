@@ -95,6 +95,10 @@ T3 Code.
   `projectId` or `threadId`.
 - To list threads across projects, call `t3_thread_list` with
   `allProjects: true`, or use `t3_thread_search`.
+- To reduce a stopped thread's permissions, call `t3_thread_configure` with
+  `runtimeMode` alone. It cannot raise permissions or change them during an active
+  run, and the thread must be within the calling agent's permission limits. The
+  change and caller appear in thread activity.
 
 ## Claude Code
 
@@ -133,15 +137,38 @@ Add the environment as a custom MCP app in ChatGPT's apps settings:
 
 Use `t3_thread_result` for a thread's latest run, or pass `runId` for a specific
 run. It returns status, the last assistant reply, pending request IDs, linked
-pull requests, and a revision. Replies default to 4,000 characters. Increase
+pull requests, and a revision. `latestMessage` also returns the thread’s most recent
+message, including inbox posts without a run. Replies default to 4,000 characters. Increase
 `maxChars` up to 50,000 when `truncated` is true. This read does not acknowledge
 a delegated child's result.
+
+Messages sent or posted by signed-in MCP clients include `senderClient`: the
+client label, the first eight characters of the sign-in session ID, its access
+tier, and whether it is an outside client or a linked T3 agent. The server records these fields;
+message text and tool arguments cannot supply them. Local T3 agents retain their
+`senderThreadId`. Older messages may have no sender record.
 
 For history, use `t3_thread_read`. Save its `revision` and pass it as
 `sinceRevision` on the next read. An unchanged thread returns an empty first
 page; reads with `afterPosition` or `itemId` still return items.
-`t3_pending_request` lists questions and approvals with a `kind` field. MCP can
-answer user-input questions, but approval responses still require the app.
+`t3_pending_request` lists questions and approvals with a `kind` field. Read an
+approval by its `requestId` before answering. An outside sign-in approved for
+**Full access** can answer on any thread with `action: "respond"` and
+`decision: "accept"` to allow once, or `decision: "decline"` to deny. Other
+sign-ins and agents running inside T3 threads cannot answer approvals over MCP.
+Standing grants and permission-mode changes stay in the app. Answer through a direct
+Full-access sign-in to the server that owns the thread. Forwarded answers are refused;
+a link to another environment does not authorize an answer there. Each target server
+needs a fork release that supports MCP approval answers.
+
+Every answer records the session, client label, thread, request, requested action,
+decision, and time. An optional `note` records the caller's statement of what the
+user said. The thread timeline identifies the MCP client that answered. A
+full-access caller can read the records with `t3_approval_log`; use `threadId`
+to filter and `cursor` and `limit` to page through them. The log also records refused
+forwarded attempts, including the attempted decision and any origin attested by the
+authenticated link. A refusal leaves the approval pending so a direct sign-in can
+answer it.
 
 `t3_thread_list` includes `launchedBy` and `pendingRequestCount`. Pass
 `launchedByMe: true` to find threads launched through this sign-in session.
@@ -151,7 +178,7 @@ filter works on the environment you signed in to, not through a linked one.
 
 `t3_thread_wait` returns when a run ends, asks a question, or raises an
 approval during the wait. An approval that was already pending does not end a
-new wait, because approvals are answered in the app.
+new wait. Use `t3_pending_request` to inspect existing pending approvals.
 Pass either `threadId` or `threadIds` to wait for the first ready thread.
 A specific `runId` works with a single thread. Prefer event notifications for
 ongoing monitoring.
@@ -167,9 +194,19 @@ ledger. Writing requires operate access and also works for agents inside T3.
 Use `status` to track `open`, `blocked`, `waiting_on_human`, `done`, or
 `cancelled` work. Record a blocker, next action, approval context, links, and an
 optional owning thread. An `approvalNote` records context and grants no approval.
-`ledger_query` filters by `status`, `ownerKind`, `ownerName`, or `updatedSince`, which is inclusive, so skip rows you have already seen.
-It returns up to 25 rows by default, ordered by key. Pass `nextCursor` as
-`cursor` for the next page, or set `limit` up to 100.
+Set `waitReason` to `external`, `natural`, or `decision` to distinguish a dependency,
+a real-world event, and a question for Chris. Use `nextCheckAt` for the next due check.
+
+`ledger_query` filters by `status`, `ownerKind`, `ownerName`, `waitReason`, `due`,
+or `updatedSince` (inclusive). It returns up to 25 rows by default, ordered by key.
+Pass `nextCursor` as `cursor` for the next page, or set `limit` up to 100.
+Read an item's changes with `ledger_history`, or check open work and its owners'
+latest activity with `portfolio_status`. A due check or a completed agent run does
+not mark the work done.
+
+Open **Settings → Work ledger** and choose an environment to read its items or
+open an owner's thread. The panel is read-only. Owner threads belong to the
+selected environment; references to other environments remain links.
 
 Use `bridge_status` to check this sign-in's remaining lifetime, subscription
 state, tunnel reachability, service start time, last successful webhook delivery,
@@ -192,7 +229,7 @@ subscription for its granted lifetime, up to the current sign-in expiry. Failed
 deliveries do not extend it. A quiet subscription still expires, so an inbox that
 must stay available needs activity before its lifetime ends. Client refreshes and
 signing-secret rotation remain supported. Existing watches adopt rolling renewal;
-new watches made by `notify` retain their fixed expiry. Updates
+legacy notify-only watches retain their existing grants. New `notify` calls use inbox relays. Updates
 can replay after a server restart, although older history may no longer be
 available. When T3 Connect is enabled, T3 holds startup notifications until its
 public address is reachable, for up to three minutes, so clients can call back. Delivery stops after eight failed attempts or a permanent callback
@@ -204,19 +241,40 @@ subscription starts at current events; provide a saved cursor to request replay.
 subscription made after a run ends does not replay that run's completion event.
 Check the thread once after subscribing to catch a result that arrived earlier.
 
-To monitor a new launch or send, include `notify: {}` in `t3_thread_launch` or
-`t3_thread_send`. T3 reuses this sign-in's most recently refreshed active
-subscription's callback and secret. It captures the event cursor before starting
-the run, so even an immediate completion is covered. The default events are
-`thread.run.result`, `thread.needs-decision`, and `thread.blocker`. Set
-`notify.events` to choose a subset. The response's `notify` field reports
-`subscribed`, `unavailable`, or `failed`, with subscription IDs and a reason when
-needed. Without an active subscription, the launch or send still succeeds and
-reports `no_active_subscription`. Check this field and read the thread once if
-notification setup fails. These subscriptions last up to a day, or less if the
-sign-in expires sooner, and `refreshBefore` gives the time. Another launch or
-send with `notify` renews them. A lapsed one restarts at the new run instead of
-replaying older events. Subscriptions are deleted a day after they expire.
+To receive notifications for a launch or send, first pin a writable inbox thread
+with `event_inbox_set: { threadId: "<thread-id>" }`. Then include `notify: {}` in
+`t3_thread_launch` or `t3_thread_send`. T3 queues a message to that inbox when the
+source run produces a matching event. This creates no event subscription or
+ChatGPT watch. Your existing inbox watch receives the inbox run's normal event.
+Keep the inbox's run-per-message acknowledger enabled.
+
+The response reports `bound` with the inbox thread id, or `unavailable` or `failed`
+with a reason. Without a pin it reports `no_pinned_inbox`; the launch or send still
+succeeds. Clear the pin with `event_inbox_set: { threadId: null }`. A pin belongs to
+one sign-in. A changed or cleared pin prevents pending deliveries to the old inbox.
+
+The default events are `thread.run.result`, `thread.needs-decision`, and
+`thread.blocker`; `notify.events` chooses a subset. Each source run outcome
+produces at most one inbox message. Messages include the source thread, run,
+request key, a bounded result excerpt, and PR links. Relay messages cannot relay
+their own inbox run. Read the source thread if setup or delivery fails.
+
+`event_subscriptions` lists your inbox pin, native subscription ids, threads,
+events, expiry, and callback groups. `notifyDerived` identifies legacy notify
+copies using creation order within each callback group. Remove a duplicate with
+`event_unsubscribe` and its native id; repeating a removal is safe.
+`bridge_status.watches` groups active subscriptions by callback and reports each
+watch's soonest expiry. `inboxThreadId`, `relayFailures`, `relayPending`, and
+`relayLastError` show relay state separately from webhook acknowledgements.
+Callback paths, queries, and secrets stay private.
+
+Exhausted webhook deliveries produce one inbox alert per subscription per day.
+Exhausted relay jobs also produce a daily inbox alert; alert failures do not create
+more alerts. Dispatch rechecks the sign-in, inbox, and permission limits. Revoked
+or insufficient authority stops delivery. Use `event_deliveries_replay` with a
+subscription id to copy up to 256 exhausted webhook deliveries into your pinned
+inbox. Repeating the call continues with remaining events and does not duplicate
+already queued messages. It does not reactivate the original callback.
 
 For direct protocol clients, the T3 extension `events/subscriptions/list` lists
 this sign-in's subscriptions: event/thread, active/stopped/expired status, expiry,
@@ -271,5 +329,9 @@ result that always includes the thread id.
 Approved agents appear under **Settings → Sharing & access** like other clients.
 Revoke one there to cut off its access immediately. New sign-ins renew with use
 and expire after 30 days without use. Clients receive a renewal token, which is
-replaced each time they use it. Reusing a replaced token cuts off the sign-in.
+replaced each time they use it. Duplicate renewal requests within 90 seconds return
+the same replacement tokens while the replacement is still current, including after
+a server restart. This window starts
+at the first renewal and retries do not extend it. Reusing a replaced token after
+that window cuts off the sign-in.
 Sign-ins created before rolling renewal keep their original expiry.

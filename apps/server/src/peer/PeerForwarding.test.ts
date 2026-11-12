@@ -11,6 +11,9 @@ import {
   ProjectId,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
+  NodeId,
+  TurnItemId,
   ThreadId,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
@@ -19,6 +22,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
+import * as PeerMcpClient from "./PeerMcpClient.ts";
+import { OrchestratorToolkit } from "../mcp/toolkits/orchestrator/tools.ts";
 import { McpSchema, McpServer } from "effect/ai";
 
 import * as ServerConfig from "../config.ts";
@@ -39,6 +45,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as RemoteDelegation from "./RemoteDelegation.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import { liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as PeerForwarding from "./PeerForwarding.ts";
 import * as PeerLinks from "./PeerLinks.ts";
@@ -57,6 +64,7 @@ const boxRun = RunId.make("run:box-auto");
 
 /** What B's thread service was asked to do. */
 interface Seen {
+  readonly approvalAnswers: ReadonlyArray<unknown>;
   readonly sends: ReadonlyArray<ThreadManagement.ThreadManagementSendInput>;
   readonly waits: ReadonlyArray<ThreadManagement.ThreadManagementWaitInput>;
   readonly launches: ReadonlyArray<ThreadLaunch.ThreadLaunchInput>;
@@ -66,6 +74,7 @@ interface Seen {
   readonly stops: ReadonlyArray<string>;
 }
 const nothingSeen: Seen = {
+  approvalAnswers: [],
   sends: [],
   waits: [],
   launches: [],
@@ -74,6 +83,7 @@ const nothingSeen: Seen = {
   stops: [],
 };
 
+const approvalRequest = RuntimeRequestId.make("approval:box");
 /** The box user's own thread, which no link started. */
 const usersThread = ThreadId.make("thread:box-users-own");
 
@@ -94,7 +104,48 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
     threadId === boxThread ? linked : Effect.succeed(threadId === usersThread ? users : null);
   const projectionOf = (threadId: ThreadId) =>
     shellOf(threadId).pipe(
-      Effect.map((thread) => ({ thread, runs: [run("running")], runtimeRequests: [] }) as never),
+      Effect.map(
+        (thread) =>
+          ({
+            thread,
+            runs: [run("running")],
+            runtimeRequests: [
+              {
+                id: approvalRequest,
+                nodeId: NodeId.make("approval-node"),
+                providerTurnId: null,
+                nativeRequestRef: null,
+                kind: "command",
+                status: "pending",
+                responseCapability: { type: "message" },
+                createdAt: users.createdAt,
+                resolvedAt: null,
+              },
+            ],
+            turnItems: [
+              {
+                id: TurnItemId.make("approval-item"),
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "waiting",
+                title: null,
+                startedAt: users.createdAt,
+                completedAt: null,
+                updatedAt: users.updatedAt,
+                type: "approval_request",
+                requestId: approvalRequest,
+                requestKind: "command",
+                prompt: "Run tests",
+              },
+            ],
+          }) as never,
+      ),
     );
   return Layer.mock(ThreadManagement.ThreadManagementService)({
     getThreadShell: shellOf,
@@ -107,32 +158,41 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
         Effect.as({ run: run("running"), delivery: "started" } as never),
       ),
     dispatch: (command) =>
-      Ref.update(seen, (current) => ({
-        ...current,
-        stops: [
-          ...current.stops,
-          `${command.type} ${"threadId" in command ? command.threadId : ""}`,
-        ],
-      })).pipe(
-        // The stop asks the provider to interrupt the thread's running turn.
-        Effect.as({
-          sequence: 0,
-          storedEvents: [
-            {
-              sequence: 1,
-              commandId: command.commandId,
-              event: {
-                type: "turn-item.updated",
-                runId: boxRun,
-                payload: {
-                  type: "run_interrupt_request",
-                  providerTurnId: "provider-turn:box-auto",
+      Effect.gen(function* () {
+        if (command.type === "runtime-request.respond") {
+          const answer = yield* Effect.serviceOption(McpApprovalAnswerContext);
+          yield* Ref.update(seen, (current) => ({
+            ...current,
+            approvalAnswers: [...current.approvalAnswers, Option.getOrUndefined(answer)],
+          }));
+        }
+        return yield* Ref.update(seen, (current) => ({
+          ...current,
+          stops: [
+            ...current.stops,
+            `${command.type} ${"threadId" in command ? command.threadId : ""}`,
+          ],
+        })).pipe(
+          // The stop asks the provider to interrupt the thread's running turn.
+          Effect.as({
+            sequence: 0,
+            storedEvents: [
+              {
+                sequence: 1,
+                commandId: command.commandId,
+                event: {
+                  type: "turn-item.updated",
+                  runId: boxRun,
+                  payload: {
+                    type: "run_interrupt_request",
+                    providerTurnId: "provider-turn:box-auto",
+                  },
                 },
               },
-            },
-          ],
-        } as never),
-      ),
+            ],
+          } as never),
+        );
+      }),
     stopDelegatedTasks: (input) =>
       Ref.update(seen, (current) => ({
         ...current,
@@ -383,13 +443,66 @@ const makeLaptop = Effect.gen(function* () {
         ),
         Effect.provideService(McpSchema.McpServerClient, mcpClient),
       );
-  return { links: Context.get(linking, PeerLinks.PeerLinks), call };
+  const callOutside = (
+    access: McpInvocationContext.McpClientCaller["access"],
+    args: Record<string, unknown>,
+    sessionId = "jarvis-session",
+  ) =>
+    server.callTool({ name: "t3_pending_request", arguments: args }).pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, {
+        ...scopeOf("outside"),
+        thread: undefined,
+        client: { sessionId, label: "Jarvis", access },
+      }),
+      Effect.provideService(McpSchema.McpServerClient, mcpClient),
+    );
+  return { links: Context.get(linking, PeerLinks.PeerLinks), call, callOutside };
 });
 
 const failureOf = (result: McpSchema.CallToolResult) => {
   const text = result.content[0];
   return result.isError === true && text?.type === "text" ? JSON.parse(text.text) : undefined;
 };
+
+it.effect("refuses forwarded approval answers without dispatching a response", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const seen = yield* Ref.make<Seen>(nothingSeen);
+      const linkSession = yield* Ref.make("");
+      const b = yield* serveBox(seen, linkSession);
+      const a = yield* makeLaptop;
+      yield* linkTo(a.links, b, "full-access");
+      const args = {
+        environmentId: box.environmentId,
+        threadId: usersThread,
+        requestId: approvalRequest,
+        action: "respond",
+        decision: "accept",
+        note: "Chris said to run tests.",
+      };
+      expect((yield* a.call("thread:laptop-full", "t3_pending_request", args)).isError).toBe(true);
+      expect((yield* a.callOutside("auto", args)).isError).toBe(true);
+      expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(0);
+      for (const [index, decision] of ["accept", "decline"].entries()) {
+        expect(
+          failureOf(
+            yield* a.callOutside("full-access", { ...args, decision }, `jarvis-session-${index}`),
+          ),
+        ).toMatchObject({
+          code: "capability_denied",
+          message: expect.stringContaining("direct sign-in to the target server"),
+        });
+      }
+      expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(0);
+      yield* linkTo(a.links, b, "auto");
+      expect(failureOf(yield* a.callOutside("full-access", args))).toMatchObject({
+        code: "capability_denied",
+        message: expect.stringContaining("direct sign-in to the target server"),
+      });
+      expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(0);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
 
 it.effect("an agent here works on a linked environment's threads within its own modes", () =>
   Effect.scoped(
@@ -429,6 +542,12 @@ it.effect("an agent here works on a linked environment's threads within its own 
       });
       expect(sent.isError).toBe(false);
       expect(sent.structuredContent).toMatchObject({ threadId: boxThread, delivery: "started" });
+      // The box records which thread here sent it.
+      expect((yield* Ref.get(seen)).sends[0]?.linkedSender).toEqual({
+        environmentId: laptop.environmentId,
+        threadId: "thread:laptop-full",
+        title: "thread:laptop-full",
+      });
 
       // A plan-mode agent here may not steer that thread there: the box
       // refuses it, because the call carries the agent's own modes.
@@ -728,4 +847,53 @@ it.effect("refuses what a linked environment cannot take before anything leaves"
       expect(yield* Ref.get(b.bearers)).toEqual([]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("clears provider context when a rollover reaches an older peer", () =>
+  Effect.gen(function* () {
+    const oldInput = Schema.Struct({
+      message: Schema.String,
+      freshContext: Schema.optional(Schema.Boolean),
+    });
+    const received = yield* Ref.make<ReadonlyArray<Schema.Schema.Type<typeof oldInput>>>([]);
+    const layer = PeerForwarding.layer.pipe(
+      Layer.provide([
+        NodeCrypto.layer,
+        Layer.mock(ThreadManagement.ThreadManagementService)({}),
+        Layer.mock(PeerLinks.PeerLinks)({ enabled: Effect.succeed(true) }),
+        Layer.mock(PeerMcpClient.PeerMcpClient)({
+          call: (input) =>
+            Ref.update(received, (items) => [
+              ...items,
+              Schema.decodeUnknownSync(oldInput)(input.arguments),
+            ]).pipe(Effect.as({} as never)),
+        }),
+      ]),
+    );
+    yield* Effect.gen(function* () {
+      const forwarding = yield* PeerForwarding.PeerForwarding;
+      const scope: McpInvocationContext.McpInvocationScope = {
+        environmentId: laptop.environmentId,
+        requestNamespace: "old-peer-rollover",
+        thread: undefined,
+        client: { sessionId: "caller", label: "Caller", access: "full-access" },
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      };
+      yield* forwarding.call(scope, OrchestratorToolkit.tools.t3_thread_send, box.environmentId, {
+        threadId: boxThread,
+        message: "Continue",
+        coordinatorRollover: true,
+        freshContext: false,
+      });
+      yield* forwarding.call(scope, OrchestratorToolkit.tools.t3_thread_send, box.environmentId, {
+        threadId: boxThread,
+        message: "Ordinary send",
+      });
+      expect(yield* Ref.get(received)).toEqual([
+        { message: "Continue", freshContext: true },
+        { message: "Ordinary send" },
+      ]);
+    }).pipe(Effect.provide(layer));
+  }),
 );

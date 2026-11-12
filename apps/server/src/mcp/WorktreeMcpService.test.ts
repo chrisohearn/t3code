@@ -638,6 +638,9 @@ describe("t3_worktree_handoff", () => {
 
       expect(harness.dispatch).toHaveBeenCalledTimes(1);
       expect(harness.sendToThread).toHaveBeenCalledTimes(1);
+      expect(harness.sendToThread).toHaveBeenCalledWith(
+        expect.objectContaining({ senderThreadId: threadId }),
+      );
       expect(harness.runForThread).toHaveBeenCalledTimes(1);
     }),
   );

@@ -17,9 +17,12 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SessionStore from "./SessionStore.ts";
+import * as PayloadSigner from "./PayloadSigner.ts";
 
 const IDLE_MS = 30 * 86400_000;
 const ACCESS_PREFIX = "t3mcp_a_";
+// Covers a retry across the observed roughly 80-second restart gap without extending on retry.
+const REFRESH_RETRY_MS = 90_000;
 
 interface TokenPair {
   readonly sessionId: AuthSessionId;
@@ -81,29 +84,59 @@ export const layer = Layer.effect(
     const random = yield* SecureRandom.SecureRandom;
     const digest = yield* Digest.Digest;
     const sessions = yield* SessionStore.SessionStore;
+    const signer = yield* PayloadSigner.make("mcp-oauth-refresh-retry-key");
     const hash = (token: string) =>
       digest
         .digest(Digest.sha256, new TextEncoder().encode(token))
         .pipe(Effect.map((bytes) => Buffer.from(bytes).toString("hex")));
     const storageError = (cause: unknown) => new McpOAuthSessionStorageError({ cause });
     // These helpers run inside the named operation's transaction and span.
+    const pair = Effect.fnUntraced(function* (
+      sessionId: AuthSessionId,
+      access: AuthMcpClientAccess,
+      offlineAccess: boolean,
+      now: DateTime.Utc,
+      predecessorToken?: Redacted.Redacted<string>,
+    ) {
+      // Domain-separated HMACs let restarts repeat a response without persisting credentials.
+      const credential = (kind: "access" | "refresh") =>
+        predecessorToken === undefined
+          ? random
+              .randomBytes(32)
+              .pipe(Effect.map((bytes) => Buffer.from(bytes).toString("base64url")))
+          : signer.sign(
+              JSON.stringify([
+                "mcp-refresh-v1",
+                kind,
+                sessionId,
+                Redacted.value(predecessorToken),
+                now.epochMilliseconds,
+              ]),
+            );
+      return {
+        sessionId,
+        token: ACCESS_PREFIX + (yield* credential("access")),
+        refreshToken: "t3mcp_r_" + (yield* credential("refresh")),
+        expiresAt: DateTime.add(now, { milliseconds: IDLE_MS }),
+        access,
+        offlineAccess,
+      };
+    });
     const mint = Effect.fnUntraced(function* (
       sessionId: AuthSessionId,
       access: AuthMcpClientAccess,
       offlineAccess: boolean,
       now: DateTime.Utc,
+      predecessorToken?: Redacted.Redacted<string>,
     ) {
-      const token =
-        ACCESS_PREFIX + Buffer.from(yield* random.randomBytes(32)).toString("base64url");
-      const refreshToken =
-        "t3mcp_r_" + Buffer.from(yield* random.randomBytes(32)).toString("base64url");
-      const expiresAt = DateTime.add(now, { milliseconds: IDLE_MS });
+      const minted = yield* pair(sessionId, access, offlineAccess, now, predecessorToken);
+      const { token, refreshToken, expiresAt } = minted;
       yield* sql`INSERT INTO mcp_oauth_tokens (token_hash, session_id, kind, expires_at)
       VALUES (${yield* hash(token)}, ${sessionId}, 'access', ${expiresAt.epochMilliseconds}),
              (${yield* hash(refreshToken)}, ${sessionId}, 'refresh', 0)`;
       yield* sql`DELETE FROM mcp_oauth_tokens WHERE session_id = ${sessionId}
       AND kind = 'access' AND expires_at <= ${now.epochMilliseconds}`;
-      return { sessionId, token, refreshToken, expiresAt, access, offlineAccess };
+      return minted;
     });
     const touch = (sessionId: AuthSessionId, now: DateTime.Utc) =>
       sql`UPDATE auth_sessions SET expires_at = ${DateTime.formatIso(DateTime.add(now, { milliseconds: IDLE_MS }))}
@@ -170,15 +203,19 @@ export const layer = Layer.effect(
               )
                 return undefined;
               const now = yield* DateTime.now;
-              if (row.usedAt !== null) {
-                yield* sessions.revoke(row.sessionId);
-                return undefined;
-              }
               if (
                 row.revokedAt !== null ||
                 DateTime.makeUnsafe(row.expiresAt).epochMilliseconds <= now.epochMilliseconds
               )
                 return undefined;
+              if (
+                row.usedAt !== null &&
+                (now.epochMilliseconds < row.usedAt ||
+                  now.epochMilliseconds - row.usedAt >= REFRESH_RETRY_MS)
+              ) {
+                yield* sessions.revoke(row.sessionId);
+                return undefined;
+              }
               const scopes = [
                 ...mcpClientScopes(row.access),
                 ...(row.offlineAccess === 1 ? ["offline_access"] : []),
@@ -190,9 +227,31 @@ export const layer = Layer.effect(
                   scopes.some((scope) => !requestedScopes.includes(scope)))
               )
                 return "invalid_scope" as const;
+              if (row.usedAt !== null) {
+                const repeated = yield* pair(
+                  row.sessionId,
+                  row.access,
+                  row.offlineAccess === 1,
+                  DateTime.makeUnsafe(row.usedAt),
+                  input.refreshToken,
+                );
+                const successor = (yield* find(yield* hash(repeated.refreshToken), "refresh"))[0];
+                if (successor?.sessionId === row.sessionId && successor.usedAt === null) {
+                  yield* touch(row.sessionId, now);
+                  return repeated;
+                }
+                // A random legacy successor cannot be reconstructed; a spent successor must not replace a current token.
+                return undefined;
+              }
               yield* sql`UPDATE mcp_oauth_tokens SET used_at = ${now.epochMilliseconds} WHERE token_hash = ${tokenHash}`;
               yield* touch(row.sessionId, now);
-              return yield* mint(row.sessionId, row.access, row.offlineAccess === 1, now);
+              return yield* mint(
+                row.sessionId,
+                row.access,
+                row.offlineAccess === 1,
+                now,
+                input.refreshToken,
+              );
             }),
           )
           .pipe(Effect.mapError(storageError));

@@ -98,15 +98,14 @@ const make = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
 
   /**
-   * The caller's own limits, which travel with every forwarded call: the peer sees only the
+   * The caller's own limits and thread, which travel with every forwarded call: the peer sees only the
    * link's credential, so a caller that may not control threads here is refused here. Work a
    * link started never uses this environment's links, since the peer would see this
    * environment's session instead of that link, and its fence could not hold.
    */
-  const callerLimits = (scope: Scope) =>
+  const forwardingCaller = (scope: Scope) =>
     readCaller().pipe(
       Effect.tap((caller) => assertNotLinked(caller, "use this environment's links")),
-      Effect.map((caller) => caller.limits),
       Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
       Effect.provideService(ThreadManagement.ThreadManagementService, threads),
     );
@@ -131,11 +130,14 @@ const make = Effect.gen(function* () {
     environmentId: EnvironmentId,
     params: unknown,
   ) {
-    const limits = yield* callerLimits(scope);
+    const { caller, limits } = yield* forwardingCaller(scope);
     const encoded = (yield* Schema.encodeUnknownEffect(parameters as Schema.Encoder<unknown>)(
       params,
     ).pipe(Effect.mapError(unavailable))) as Record<string, unknown>;
     const { environmentId: _target, ...args } = encoded;
+    // Older peers ignore coordinatorRollover but must still clear stale provider context.
+    if (toolName === "t3_thread_send" && args.coordinatorRollover === true)
+      args.freshContext = true;
     // A pending upload lives here, so it cannot go with the call.
     if (Array.isArray(args.attachments) && args.attachments.length > 0) {
       return yield* new OrchestratorMcpFailure({
@@ -146,11 +148,35 @@ const make = Effect.gen(function* () {
     if (typeof args.clientRequestId === "string") {
       args.clientRequestId = yield* scopedRequestId(scope.requestNamespace, args.clientRequestId);
     }
+    // So a message sent there names the thread that sent it, even to a client that cannot reach here.
+    const sender =
+      caller === undefined
+        ? undefined
+        : {
+            environmentId: scope.environmentId,
+            threadId: caller.id,
+            title: caller.title,
+          };
+    let approvalOrigin: typeof McpInvocationContext.McpApprovalOrigin.Type | undefined;
+    if (
+      toolName === "t3_pending_request" &&
+      args.action === "respond" &&
+      args.decision !== undefined
+    ) {
+      yield* McpInvocationContext.assertOutsideApprovalCaller(scope);
+      approvalOrigin = scope.client!.approvalOrigin ?? {
+        environmentId: scope.environmentId,
+        sessionId: scope.client!.sessionId,
+        clientLabel: scope.client!.label,
+      };
+    }
     return yield* peers.call({
       environmentId,
       tool: toolName,
       arguments: args,
       limits,
+      ...(sender === undefined ? {} : { sender }),
+      ...(approvalOrigin === undefined ? {} : { approvalOrigin }),
       success: success as Schema.Decoder<A>,
     });
   });
@@ -242,7 +268,7 @@ const make = Effect.gen(function* () {
 
   const listLinks: PeerForwarding["Service"]["links"] = Effect.fn("PeerForwarding.listLinks")(
     function* (scope) {
-      yield* callerLimits(scope);
+      yield* forwardingCaller(scope);
       yield* requireEnabled;
       const listed = yield* links.list.pipe(
         Effect.mapError(

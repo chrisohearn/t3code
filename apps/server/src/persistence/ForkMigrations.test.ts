@@ -49,6 +49,14 @@ const seedLegacyForkDatabase = Effect.gen(function* () {
 const pendingUpstream = migrationManifest.filter(([id]) => id > LAST_SHARED_ID);
 
 describe("fork migrations", () => {
+  it("registers unique fork ids in strictly increasing order", () => {
+    const ids = forkMigrationManifest.map(([id]) => id);
+    assert.deepEqual(
+      ids,
+      [...new Set(ids)].toSorted((a, b) => a - b),
+    );
+  });
+
   it.effect("backfills legacy subscription lifetimes without altering secrets or cursors", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -133,28 +141,33 @@ describe("fork migrations", () => {
          expires_at, active, scan_cursor, ack_cursor)
         VALUES ('preserved', 'fork-upgrade', 'thread.run.result', 'thread:test',
           'https://example.com/events', 'https://example.com', 'test-secret', 0, 100, 1, 5, 3)`;
+      yield* sql`INSERT INTO mcp_event_subscriptions
+        SELECT 'copy', principal, name, 'thread-copy', callback_url, source_url, secret, previous_secret,
+          rotation_until, expires_at, active, scan_cursor, ack_cursor, truncated
+        FROM mcp_event_subscriptions WHERE id = 'preserved'`;
       const subscriptions = yield* sql`SELECT * FROM mcp_event_subscriptions`;
       const sessions = yield* sql`SELECT * FROM auth_sessions`;
       assert.isTrue(yield* hasPendingMigrations());
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(
         (yield* forkHistory).map(([id, name]) => [id, name] as const),
-        [
-          [1, "McpEvents"],
-          [2, "WorkLedger"],
-          [3, "McpClientThreads"],
-          [4, "McpBridgeStatus"],
-          [5, "McpOAuthRenewal"],
-          [6, "McpSubscriptionRenewal"],
-        ],
+        forkMigrationManifest,
       );
       assert.equal((yield* forkHistory)[0]?.[2], "2026-11-12 04:10:00");
       assert.deepStrictEqual(yield* upstreamHistory, migrationManifest);
       assert.deepStrictEqual(yield* sql`SELECT * FROM mcp_event_subscriptions`, subscriptions);
       assert.deepStrictEqual(yield* sql`SELECT * FROM auth_sessions`, sessions);
       yield* sql`SELECT * FROM work_ledger`;
+      assert.deepStrictEqual(
+        yield* sql`SELECT subscription_id, notify_derived FROM mcp_event_subscription_routing ORDER BY created_order`,
+        [
+          { subscription_id: "preserved", notify_derived: 0 },
+          { subscription_id: "copy", notify_derived: 1 },
+        ],
+      );
       yield* sql`SELECT * FROM mcp_client_threads`;
       yield* sql`SELECT * FROM mcp_bridge_status`;
+      yield* sql`SELECT * FROM mcp_request_log`;
       assert.deepStrictEqual(
         yield* sql`SELECT renewal_ttl_ms FROM mcp_event_subscription_activity WHERE subscription_id = 'preserved'`,
         [{ renewal_ttl_ms: 86_400_000 }],
@@ -205,6 +218,10 @@ describe("fork migrations", () => {
 it.effect("registers every fork migration file", () =>
   Effect.gen(function* () {
     const ids = forkMigrationManifest.map(([id]) => id);
+    assert.deepStrictEqual(
+      ids,
+      ids.map((_, index) => index + 1),
+    );
     assert.deepStrictEqual(
       ids,
       [...new Set(ids)].toSorted((a, b) => a - b),
