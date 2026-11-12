@@ -6,6 +6,7 @@ import ForkMigration0001 from "./ForkMigrations/001_McpEvents.ts";
 import ForkMigration0002 from "./ForkMigrations/002_WorkLedger.ts";
 import ForkMigration0003 from "./ForkMigrations/003_McpClientThreads.ts";
 import ForkMigration0004 from "./ForkMigrations/004_McpBridgeStatus.ts";
+import ForkMigration0005 from "./ForkMigrations/005_McpOAuthRenewal.ts";
 
 import ForkMigration0009 from "./ForkMigrations/009_McpRequestLog.ts";
 
@@ -17,6 +18,7 @@ const forkMigrationEntries = [
   [2, "WorkLedger", ForkMigration0002],
   [3, "McpClientThreads", ForkMigration0003],
   [4, "McpBridgeStatus", ForkMigration0004],
+  [5, "McpOAuthRenewal", ForkMigration0005],
   [9, "McpRequestLog", ForkMigration0009],
 ] as const;
 

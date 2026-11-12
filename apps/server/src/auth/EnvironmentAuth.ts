@@ -2,6 +2,7 @@ import {
   AuthAccessTokenType,
   AuthAccessWriteScope,
   AuthMcpClientAccess,
+  type AuthMcpTokenError,
   AuthOrchestrationOperateScope,
   AuthStandardClientScopes,
   type AuthAccessTokenResult,
@@ -42,6 +43,7 @@ import * as EnvironmentAuthPolicy from "./EnvironmentAuthPolicy.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
+import * as McpOAuthSessions from "./McpOAuthSessions.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
 import { DESKTOP_RENDERER_ORIGINS } from "../httpCors.ts";
@@ -553,13 +555,35 @@ export class EnvironmentAuth extends Context.Service<
       readonly access: AuthMcpClientAccess;
       readonly peerLink: boolean;
       readonly client: AuthClientMetadata;
+      readonly oauth?: {
+        readonly clientId: string;
+        readonly resource: string;
+        readonly offlineAccess?: boolean;
+      };
     }) => Effect.Effect<
       {
         readonly sessionId: AuthSessionId;
         readonly token: string;
+        readonly refreshToken?: string;
         readonly expiresAt: DateTime.DateTime;
       },
       ServerAuthInternalError
+    >;
+    readonly refreshMcpClientSession: (input: {
+      readonly clientId: string;
+      readonly resource: string;
+      readonly refreshToken: Redacted.Redacted<string>;
+      readonly scope?: string;
+    }) => Effect.Effect<
+      {
+        readonly sessionId: AuthSessionId;
+        readonly token: string;
+        readonly refreshToken: string;
+        readonly expiresAt: DateTime.Utc;
+        readonly access: AuthMcpClientAccess;
+        readonly offlineAccess: boolean;
+      },
+      AuthMcpTokenError | ServerAuthInternalError
     >;
     /**
      * Spends a code covering all granted scopes and returns the level it approves. A level-bound
@@ -718,6 +742,7 @@ export const make = Effect.gen(function* () {
   const policy = yield* EnvironmentAuthPolicy.EnvironmentAuthPolicy;
   const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
   const sessions = yield* SessionStore.SessionStore;
+  const oauthSessions = yield* McpOAuthSessions.McpOAuthSessions;
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const digest = yield* Digest.Digest;
   const descriptor = yield* policy.getDescriptor();
@@ -1316,6 +1341,15 @@ export const make = Effect.gen(function* () {
   const authenticateMcpClient: EnvironmentAuth["Service"]["authenticateMcpClient"] = (request) => {
     const token = parseBearerToken(request);
     if (token === null) return Effect.fail(new ServerAuthMissingCredentialError({}));
+    if (McpOAuthSessions.isRollingAccessToken(token)) {
+      return oauthSessions.authenticate(token).pipe(
+        Effect.mapError((cause) => new ServerAuthSessionCredentialValidationError({ cause })),
+        Effect.filterOrFail(
+          (session) => session !== undefined,
+          () => new ServerAuthInvalidCredentialError({}),
+        ),
+      );
+    }
     return sessions.verify(token).pipe(
       mapSessionVerificationErrors,
       Effect.flatMap((session) =>
@@ -1339,25 +1373,37 @@ export const make = Effect.gen(function* () {
   };
 
   const issueMcpClientSession: EnvironmentAuth["Service"]["issueMcpClientSession"] = (input) =>
-    sessions
-      .issue({
-        subject: MCP_CLIENT_SUBJECT,
-        method: "bearer-access-token",
-        scopes: mcpClientScopes(input.access),
-        ttl: MCP_CLIENT_SESSION_TTL,
-        ...(input.access === "read-only" ? {} : { runtimeModeCeiling: input.access }),
-        peerLink: input.peerLink,
-        client: { ...input.client, label: input.label, deviceType: "bot" },
-      })
-      .pipe(
-        Effect.map((issued) => ({
-          sessionId: issued.sessionId,
-          token: issued.token,
-          expiresAt: issued.expiresAt,
-        })),
-        Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
-        Effect.withSpan("EnvironmentAuth.issueMcpClientSession"),
-      );
+    input.oauth !== undefined
+      ? oauthSessions
+          .issue({ ...input, ...input.oauth })
+          .pipe(Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })))
+      : sessions
+          .issue({
+            subject: MCP_CLIENT_SUBJECT,
+            method: "bearer-access-token",
+            scopes: mcpClientScopes(input.access),
+            ttl: MCP_CLIENT_SESSION_TTL,
+            ...(input.access === "read-only" ? {} : { runtimeModeCeiling: input.access }),
+            peerLink: input.peerLink,
+            client: { ...input.client, label: input.label, deviceType: "bot" },
+          })
+          .pipe(
+            Effect.map((issued) => ({
+              sessionId: issued.sessionId,
+              token: issued.token,
+              expiresAt: issued.expiresAt,
+            })),
+            Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
+            Effect.withSpan("EnvironmentAuth.issueMcpClientSession"),
+          );
+
+  const refreshMcpClientSession: EnvironmentAuth["Service"]["refreshMcpClientSession"] = (input) =>
+    oauthSessions.refresh(input).pipe(
+      Effect.catchTags({
+        McpOAuthSessionStorageError: (cause) =>
+          Effect.fail(new ServerAuthSessionTokenIssueError({ cause })),
+      }),
+    );
 
   const consumeMcpApprovalCode: EnvironmentAuth["Service"]["consumeMcpApprovalCode"] = (
     code,
@@ -1410,6 +1456,7 @@ export const make = Effect.gen(function* () {
     issueStartupPairingUrl,
     authenticateMcpClient,
     issueMcpClientSession,
+    refreshMcpClientSession,
     consumeMcpApprovalCode,
   });
 });
@@ -1474,6 +1521,7 @@ const revokePairedClientsThePolicyDisallows = Effect.fn(
 
 export const layer = Layer.effect(EnvironmentAuth, make).pipe(
   Layer.provideMerge(PairingGrantStore.layer),
+  Layer.provideMerge(McpOAuthSessions.layer),
   Layer.provideMerge(SessionStore.layer),
   Layer.provideMerge(EnvironmentAuthPolicy.layer),
 );

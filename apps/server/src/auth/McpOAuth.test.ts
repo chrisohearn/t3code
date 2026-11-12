@@ -210,6 +210,8 @@ it.live("derives discovery metadata from the origin the client reached", () =>
         token_endpoint: `${ORIGIN}/oauth/mcp/token`,
         registration_endpoint: `${ORIGIN}/oauth/mcp/register`,
         code_challenge_methods_supported: ["S256"],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        scopes_supported: ["orchestration:read", "orchestration:operate", "offline_access"],
       });
     }),
   ),
@@ -279,7 +281,7 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
     Effect.gen(function* () {
       const clientId = yield* registeredClientId(handler);
       const pairing = yield* auth.issuePairingCredential();
-      const params = authorizeParams(clientId);
+      const params = { ...authorizeParams(clientId), scope: "offline_access" };
 
       const wrongCode = yield* decide(handler, params, {
         _tag: "pairing-code",
@@ -319,9 +321,10 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
       expect(tokenResponse.status).toBe(200);
       const token = (yield* json<unknown>(tokenResponse)) as {
         access_token: string;
+        refresh_token: string;
         scope: string;
       };
-      expect(token.scope).toBe("orchestration:read orchestration:operate");
+      expect(token.scope).toBe("orchestration:read orchestration:operate offline_access");
 
       expect((yield* exchange(verifier)).status).toBe(400);
 
@@ -345,6 +348,44 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
         }),
       );
       expect(ticket.status).toBe(401);
+      const original = yield* auth.authenticateMcpClient(
+        HttpServerRequest.fromWeb(
+          at("/mcp", {
+            headers: { authorization: `Bearer ${token.access_token}` },
+          }),
+        ),
+      );
+      const refreshed = yield* handler(
+        at(
+          "/oauth/mcp/token",
+          form({
+            grant_type: "refresh_token",
+            client_id: clientId,
+            refresh_token: token.refresh_token,
+            resource: `${ORIGIN}/mcp`,
+          }),
+        ),
+      );
+      expect(refreshed.status).toBe(200);
+      expect(refreshed.headers.get("cache-control")).toBe("no-store");
+      const next = yield* json<{
+        access_token: string;
+        refresh_token: string;
+        expires_in: number;
+        scope: string;
+      }>(refreshed);
+      expect(next.refresh_token).not.toBe(token.refresh_token);
+      expect(next.expires_in).toBeGreaterThan(0);
+      expect(next.scope).toBe(token.scope);
+      expect(
+        yield* auth.authenticateMcpClient(
+          HttpServerRequest.fromWeb(
+            at("/mcp", {
+              headers: { authorization: `Bearer ${next.access_token}` },
+            }),
+          ),
+        ),
+      ).toEqual(original);
     }),
   ),
 );
