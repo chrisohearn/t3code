@@ -7,6 +7,8 @@ import ForkMigration0002 from "./ForkMigrations/002_WorkLedger.ts";
 import ForkMigration0003 from "./ForkMigrations/003_McpClientThreads.ts";
 import ForkMigration0004 from "./ForkMigrations/004_McpBridgeStatus.ts";
 
+import ForkMigration0005 from "./ForkMigrations/005_McpRequestLog.ts";
+
 // Fork-only migrations, recorded in their own table so upstream keeps every id in
 // effect_sql_migrations. They run after all upstream migrations. Add new ones here, never in
 // Migrations.ts, and never rename one: the repair below finds old rows by name. See FORK.md.
@@ -15,6 +17,7 @@ const forkMigrationEntries = [
   [2, "WorkLedger", ForkMigration0002],
   [3, "McpClientThreads", ForkMigration0003],
   [4, "McpBridgeStatus", ForkMigration0004],
+  [5, "McpRequestLog", ForkMigration0005],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";

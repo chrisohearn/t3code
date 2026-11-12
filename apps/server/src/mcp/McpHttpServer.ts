@@ -1,6 +1,7 @@
 import * as BridgeStatusService from "./BridgeStatusService.ts";
 import { BridgeToolkit } from "./toolkits/bridge/tools.ts";
 import * as BridgeHandlers from "./toolkits/bridge/handlers.ts";
+import * as McpRequestLog from "../persistence/McpRequestLog.ts";
 import * as McpBridgeMetrics from "./McpBridgeMetrics.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
@@ -955,12 +956,14 @@ const handoffTargetIds = (
 };
 
 /** Tool analytics must never include IDs, prompts or free text. */
+const isRequestErrorCode = Schema.is(OrchestratorMcpFailure.fields.code);
 const encodeBridgeResponse = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const withToolAnalytics =
   /* Request instrumentation already owns the span; keep this helper in that context. */
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
+    const requestLog = yield* Effect.serviceOption(McpRequestLog.McpRequestLog);
     const bridgeMetrics = yield* Effect.serviceOption(McpBridgeMetrics.McpBridgeMetrics);
     const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
     const threads = yield* Effect.serviceOption(ThreadManagementService.ThreadManagementService);
@@ -1084,12 +1087,50 @@ const withToolAnalytics =
                   // A call that asks for input is retried with it, and that call is the one counted.
                   if (result instanceof McpSchema.InputRequired) return Effect.void;
                   const count = Effect.gen(function* () {
+                    const endedAt = yield* Clock.currentTimeMillis;
                     const invocation = yield* Effect.serviceOption(
                       McpInvocationContext.McpInvocationContext,
                     );
                     const session = Option.isSome(invocation)
                       ? invocation.value.client?.sessionId
                       : undefined;
+                    if (Option.isSome(invocation) && Option.isSome(requestLog)) {
+                      const scope = invocation.value;
+                      const outcome = toolOutcome(result);
+                      const identity = scope.client?.sessionId ?? scope.thread?.providerSessionId;
+                      if (identity !== undefined) {
+                        yield* requestLog.value
+                          .record({
+                            client: scope.client?.sessionId ?? scope.thread!.threadId,
+                            session: identity,
+                            tool: options.tool.name,
+                            startedAt,
+                            durationMs: Math.max(0, endedAt - startedAt),
+                            requestBytes: Buffer.byteLength(
+                              yield* encodeBridgeResponse(payload).pipe(
+                                Effect.orElseSucceed(() => ""),
+                              ),
+                            ),
+                            responseBytes:
+                              result === undefined
+                                ? 0
+                                : Buffer.byteLength(
+                                    yield* encodeBridgeResponse(result).pipe(
+                                      Effect.orElseSucceed(() => ""),
+                                    ),
+                                  ),
+                            errorClass:
+                              outcome.outcome === "ok"
+                                ? null
+                                : isRequestErrorCode(outcome.errorCode)
+                                  ? outcome.errorCode
+                                  : result === undefined
+                                    ? "execution_failure"
+                                    : "tool_error",
+                          })
+                          .pipe(Effect.ignoreCause);
+                      }
+                    }
                     if (session !== undefined && Option.isSome(bridgeMetrics)) {
                       const bytes =
                         result === undefined
@@ -1107,17 +1148,18 @@ const withToolAnalytics =
                       );
                     }
                   });
-                  // Handoff tools look up threads, and byte counts re-encode the result; the response waits on neither.
-                  return Clock.currentTimeMillis.pipe(
-                    Effect.flatMap((endedAt) =>
-                      count.pipe(
-                        Effect.andThen(
+                  // Persist metadata before replying; thread lookups for analytics stay detached.
+                  return count.pipe(
+                    Effect.ignoreCause,
+                    Effect.andThen(
+                      Clock.currentTimeMillis.pipe(
+                        Effect.flatMap((endedAt) =>
                           record(options.tool.name, payload, result, endedAt - startedAt),
                         ),
+                        Effect.forkDetach,
+                        Effect.asVoid,
                       ),
                     ),
-                    Effect.forkDetach,
-                    Effect.asVoid,
                   );
                 }),
               );
@@ -1421,4 +1463,5 @@ export const layer = Layer.merge(
   Layer.provide(WorkLedger.layer),
   Layer.provide(McpClientThreads.layer),
   Layer.provide(McpBridgeMetrics.layer),
+  Layer.provide(McpRequestLog.layer),
 );

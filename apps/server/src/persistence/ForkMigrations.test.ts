@@ -111,6 +111,7 @@ describe("fork migrations", () => {
           [2, "WorkLedger"],
           [3, "McpClientThreads"],
           [4, "McpBridgeStatus"],
+          [5, "McpRequestLog"],
         ],
       );
       assert.equal((yield* forkHistory)[0]?.[2], "2026-11-12 04:10:00");
@@ -119,6 +120,7 @@ describe("fork migrations", () => {
       yield* sql`SELECT * FROM work_ledger`;
       yield* sql`SELECT * FROM mcp_client_threads`;
       yield* sql`SELECT * FROM mcp_bridge_status`;
+      yield* sql`SELECT * FROM mcp_request_log`;
       const before = yield* forkHistory;
       assert.isFalse(yield* hasPendingMigrations());
       assert.deepStrictEqual(yield* runMigrations(), []);
