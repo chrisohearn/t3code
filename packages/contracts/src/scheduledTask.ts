@@ -263,8 +263,21 @@ export const ScheduledTask = Schema.Struct({
   webhook: Schema.optional(ScheduledTaskWebhookEndpoint),
   /** Why the task cannot run regardless of `enabled`, such as a managed policy refusing webhooks. */
   blockedByPolicy: Schema.optionalKey(Schema.String),
+  /**
+   * When the run started at `lastRunAt` was accepted and has not finished yet. The `lastRun*` fields
+   * still describe the run before it until it ends. Never stored, so older clients and builds see
+   * only the statuses they know.
+   */
+  runInProgressSince: Schema.optionalKey(IsoDateTime),
 });
 export type ScheduledTask = typeof ScheduledTask.Type;
+
+/** What to show for the latest run: `running` until an accepted run's outcome is known. */
+export function scheduledTaskRunDisplayStatus(
+  task: Pick<ScheduledTask, "lastRunStatus" | "runInProgressSince">,
+): ScheduledTaskRunStatus {
+  return task.runInProgressSince === undefined ? task.lastRunStatus : "running";
+}
 
 export const ScheduledTaskListInput = Schema.Struct({});
 export type ScheduledTaskListInput = typeof ScheduledTaskListInput.Type;

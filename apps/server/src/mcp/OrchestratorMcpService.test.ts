@@ -3231,17 +3231,37 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
     );
 
-    it.effect("keeps the saved workspace when an unbound task stays unbound", () =>
+    it.effect.each([
+      {
+        name: "keeps a project folder chosen in Settings",
+        task: { ...existing, creationSource: "web" },
+        workspace: { type: "root" },
+      },
+      {
+        name: "keeps a saved worktree",
+        task: {
+          ...existing,
+          workspaceStrategy: { type: "worktree", baseRef: "develop", startFromOrigin: false },
+        },
+        workspace: { type: "worktree", baseRef: "develop", startFromOrigin: false },
+      },
+      {
+        // #69: saved as root while the folder was not a repository; it is one now.
+        name: "re-derives a project folder it saved, now that the folder is a repository",
+        task: existing,
+        workspace: { type: "worktree", baseRef: "origin/master", startFromOrigin: true },
+      },
+    ] as const)("an unbound task that stays unbound $name", ({ task, workspace }) =>
       Effect.gen(function* () {
         const saved = yield* Ref.make<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>([]);
         const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
-          Effect.provide(service(masterRepository, saved)),
+          Effect.provide(service(masterRepository, saved, task)),
         );
         yield* mcp.updateScheduledTask(client, {
           scheduledTaskId: existing.id,
           bindToCurrentThread: false,
         });
-        assert.deepEqual(yield* Ref.get(saved), [{ type: "root" }]);
+        assert.deepEqual(yield* Ref.get(saved), [workspace]);
       }),
     );
 

@@ -36,6 +36,7 @@ import {
   type OrchestratorMcpDeleteScheduledTaskResult,
   type OrchestratorMcpListScheduledTasksResult,
   type OrchestratorMcpScheduledTask,
+  orchestratorMcpScheduledTaskRunStatus,
   type OrchestratorMcpScheduleTaskInput,
   type OrchestratorMcpScheduleTaskResult,
   type OrchestratorMcpTarget,
@@ -293,7 +294,7 @@ function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): Orchestrato
     freshSession: scheduledTaskThreadMode(task) === "fresh_session",
     schedule: task.schedule,
     nextRunAt: task.nextRunAt,
-    lastRunStatus: task.lastRunStatus,
+    lastRunStatus: orchestratorMcpScheduledTaskRunStatus(task),
     ...(task.webhook?.url == null || !mayRun || task.blockedByPolicy !== undefined
       ? {}
       : { webhookUrl: task.webhook.url }),
@@ -2169,9 +2170,15 @@ const make = Effect.gen(function* () {
             : input.bindToCurrentThread && parent !== undefined
               ? parent.thread.id
               : null;
-        // Reset the workspace only when the binding flips, so unbinding cannot leave runs in the shared checkout.
+        // Reset the workspace when the binding flips, so unbinding cannot leave runs in the shared
+        // checkout. An unbound root it derived is re-derived too: the folder may be a repository now.
         const workspaceStrategy =
-          (threadId === null) === (existing.threadId === null)
+          (threadId === null) === (existing.threadId === null) &&
+          !(
+            threadId === null &&
+            existing.creationSource === "mcp" &&
+            existing.workspaceStrategy.type === "root"
+          )
             ? existing.workspaceStrategy
             : yield* scheduledTaskWorkspaceStrategy(threadId !== null, existing.projectId);
         const upsertInput: ScheduledTaskUpsertInput = {
