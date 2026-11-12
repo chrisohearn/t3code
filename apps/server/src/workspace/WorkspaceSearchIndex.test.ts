@@ -57,9 +57,10 @@ it.effect("runs file and content searches outside the server thread", () =>
       const paths = yield* WorkspaceSearchIndex.make(workspace);
       yield* paths.refresh();
       expect((yield* paths.list()).entries).toContainEqual({ kind: "file", path: "needle.txt" });
-      expect((yield* paths.search("needle", 10, "file", false)).entries).toEqual([
-        { kind: "file", path: "needle.txt" },
-      ]);
+      expect(yield* paths.search("needle", 10, "file", false)).toEqual({
+        entries: [{ kind: "file", path: "needle.txt" }],
+        truncated: false,
+      });
       const contents = yield* WorkspaceSearchIndex.make(workspace, "content");
       const result = yield* contents.searchContents({
         query: "isolated",
