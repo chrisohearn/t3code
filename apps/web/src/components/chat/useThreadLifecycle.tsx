@@ -130,7 +130,6 @@ interface ThreadLifecycleInput {
     threadId: ThreadId;
     createdAt: string;
     branch?: string;
-    runtimeMode: RuntimeMode;
     interactionMode: ProviderInteractionMode;
   }) => Promise<AtomCommandResult<void, unknown>>;
 }
@@ -536,7 +535,6 @@ export function useThreadLifecycle(input: ThreadLifecycleInput) {
       threadId,
       createdAt,
       ...(localCheckoutBranchMismatch ? { branch: localCheckoutBranchMismatch.currentBranch } : {}),
-      runtimeMode,
       interactionMode: DEFAULT_INTERACTION_MODE,
     });
     const result =

@@ -13,10 +13,12 @@ import {
   RuntimeMode,
 } from "@t3tools/contracts";
 import type { deriveThreadStructureRuntime } from "@t3tools/client-runtime/state/thread-execution";
-import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { type SetStateAction } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { toastManager } from "../ui/toast";
+import { stackedThreadToast, toastManager } from "../ui/toast";
+import { useRuntimeModePickStore } from "./runtimeModePickStore";
+import { useApplyThreadRuntimeMode } from "./useApplyThreadRuntimeMode";
 import { resolveAppModelSelectionForInstance } from "../../modelSelection";
 import { resolveNewDraftStartFromOrigin } from "../../lib/chatThreadActions";
 import { type DraftThreadEnvMode, useComposerDraftStore } from "../../composerDraftStore";
@@ -41,6 +43,8 @@ interface ComposerSelectionInput {
   readonly multipleModelSelections: ReadonlyArray<ModelSelection> | null;
   readonly runtimeMode: RuntimeMode;
   readonly isLocalDraftThread: boolean;
+  /** A send or run is under way; changing the mode now could end the run. */
+  readonly isWorking: boolean;
   readonly canOverrideServerThreadEnvMode: boolean;
   readonly setPendingServerThreadEnvModeEntry: Dispatch<
     SetStateAction<{ readonly threadId: ThreadId; readonly mode: DraftThreadEnvMode } | null>
@@ -50,6 +54,15 @@ interface ComposerSelectionInput {
   >;
   readonly scheduleComposerFocus: () => void;
 }
+
+// A queued run has no provider turn yet, so changing the mode cannot end one.
+const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "preparing",
+  "starting",
+  "running",
+  "waiting",
+]);
+const isRunActive = (status: string) => ACTIVE_RUN_STATUSES.has(status);
 
 /**
  * The composer's choices for the next turn: provider and model, runtime mode,
@@ -70,6 +83,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     multipleModelSelections,
     runtimeMode,
     isLocalDraftThread,
+    isWorking,
     canOverrideServerThreadEnvMode,
     setPendingServerThreadEnvModeEntry,
     setPendingServerThreadStartFromOriginByThreadId,
@@ -83,12 +97,37 @@ export function useComposerSelection(input: ComposerSelectionInput) {
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
   const applyThreadModelPick = useApplyThreadModelPick();
+  const applyThreadRuntimeMode = useApplyThreadRuntimeMode();
 
   const handleRuntimeModeChange = (mode: RuntimeMode) => {
-    if (mode === runtimeMode) return;
-    setComposerDraftRuntimeMode(composerDraftTarget, mode);
-    if (isLocalDraftThread) {
-      setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
+    if (isLocalDraftThread || !activeThread) {
+      if (mode === runtimeMode) return;
+      setComposerDraftRuntimeMode(composerDraftTarget, mode);
+      if (isLocalDraftThread) {
+        setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
+      }
+      scheduleComposerFocus();
+      return;
+    }
+    const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
+    const pick = useRuntimeModePickStore.getState().picks[scopedThreadKey(threadRef)];
+    // Unequal to a pick in flight, the server's own mode is sent too, so that pick cannot win.
+    if (mode === (pick?.mode ?? activeThread.runtimeMode)) {
+      scheduleComposerFocus();
+      return;
+    }
+    const runStatuses = [activeRuntime?.status, activeThread.runtime?.status];
+    if (isWorking || runStatuses.some((status) => status !== undefined && isRunActive(status))) {
+      // Refused for every provider: some, like Claude, must end a running session to switch.
+      toastManager.add(
+        stackedThreadToast({
+          type: "warning",
+          title: "Permissions not changed",
+          description: "Wait for the current run to finish, or stop it, then change permissions.",
+        }),
+      );
+    } else {
+      void applyThreadRuntimeMode(threadRef, mode);
     }
     scheduleComposerFocus();
   };

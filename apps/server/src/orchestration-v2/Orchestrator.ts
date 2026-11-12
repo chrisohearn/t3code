@@ -206,6 +206,14 @@ const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
 );
 
+/** Refuses an owner's mode change that would end a session mid-run; no receipt is kept. */
+export const RUNTIME_MODE_CHANGE_DURING_RUN_REFUSAL =
+  "Cannot change permissions while a run is active, because applying them ends the provider session. Wait for the run to finish, or stop it, then try again.";
+
+/** Refuses a change that would end a session's background work; no receipt is kept. */
+const SESSION_BACKGROUND_WORK_REFUSAL =
+  "The current session is still running background agents or commands, and this change would end them. Wait for them to finish, or press Stop, then try again.";
+
 export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDispatchError>()(
   "OrchestratorDispatchError",
   {
@@ -3943,6 +3951,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
     }
+    // Re-sending the current mode would still detach sessions that cannot switch in place.
+    if (command.type === "thread.runtime-mode.set" && command.runtimeMode === thread.runtimeMode) {
+      return;
+    }
     if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
@@ -4304,14 +4316,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         session.status !== "stopped" &&
         session.status !== "error",
     );
+    if (command.type === "thread.runtime-mode.set" && liveSessions.length > 0) {
+      const { runs } = yield* loadProjectionForCommand(command, ["runs"], { turnItemTypes: [] });
+      if (runs.some(isActiveRun)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: RUNTIME_MODE_CHANGE_DURING_RUN_REFUSAL,
+        });
+      }
+    }
     if (command.type !== "thread.archive" && command.type !== "thread.settle") {
       for (const session of liveSessions) {
         if (yield* sessionHasBackgroundWork(session, providerContext!.providerThreads)) {
           return yield* new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
-            cause:
-              "The current session is still running background agents or commands, and this change would end them. Wait for them to finish, or press Stop, then try again.",
+            cause: SESSION_BACKGROUND_WORK_REFUSAL,
           });
         }
       }
@@ -15194,6 +15215,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "subagent.stop" ||
           // Closing a share again, or after it ended, is not an error.
           command.type === "thread.guest-share.close" ||
+          // An owner setting the thread's current mode again returns early in dispatchThreadMutation.
+          command.type === "thread.runtime-mode.set" ||
           (command.type === "thread.delete" && command.onlyIfUnused === true),
         (_planned) =>
           new OrchestratorDispatchError({
@@ -15207,7 +15230,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           // Refusals depend on modes the user can change; a recorded rejection would block the retry.
           if (
             cause._tag === "OrchestratorThreadAboveModeLimitError" ||
-            cause._tag === "OrchestratorRuntimeModeAboveCeilingError"
+            cause._tag === "OrchestratorRuntimeModeAboveCeilingError" ||
+            // These clear once the work ends, and mobile retries under the same command id.
+            (cause._tag === "OrchestratorDispatchError" &&
+              (cause.cause === RUNTIME_MODE_CHANGE_DURING_RUN_REFUSAL ||
+                cause.cause === SESSION_BACKGROUND_WORK_REFUSAL))
           ) {
             return yield* cause;
           }
