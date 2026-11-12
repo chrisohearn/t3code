@@ -3902,7 +3902,7 @@ describe("OrchestratorMcpService thread lookup", () => {
           assert.isTrue(messages[0]!.text.endsWith("Continue"));
           assert.deepEqual(messages[1], { text: "Unchanged" });
         }).pipe(
-          Effect.provide(
+          Effect.provide([
             service([launched], sent, {
               getProjectThreadRecords: () => Effect.succeed(projection),
               getThreadRecords: () =>
@@ -3921,8 +3921,8 @@ describe("OrchestratorMcpService thread lookup", () => {
                   } as never),
                 ),
             }),
-          ),
-          Effect.provide(ledgerLayer),
+            ledgerLayer,
+          ]),
         );
       }),
   );
