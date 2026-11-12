@@ -5,7 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
-import LedgerMigration from "./ForkMigrations/007_WorkLedgerPortfolio.ts";
+import LedgerMigration from "./ForkMigrations/009_WorkLedgerPortfolio.ts";
 import BaseLedgerMigration from "./ForkMigrations/002_WorkLedger.ts";
 import * as TestClock from "effect/testing/TestClock";
 import * as Sqlite from "./Sqlite.ts";

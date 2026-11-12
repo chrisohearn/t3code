@@ -2,6 +2,7 @@ import * as JarvisPlaybook from "./JarvisPlaybook.ts";
 import * as BridgeStatusService from "./BridgeStatusService.ts";
 import { BridgeToolkit } from "./toolkits/bridge/tools.ts";
 import * as BridgeHandlers from "./toolkits/bridge/handlers.ts";
+import * as McpRequestLog from "../persistence/McpRequestLog.ts";
 import * as McpBridgeMetrics from "./McpBridgeMetrics.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
@@ -76,6 +77,7 @@ import * as AttachmentHandlers from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import * as ThreadHandlers from "./toolkits/thread/handlers.ts";
 import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
+import * as PendingApproval from "./PendingApprovalMcpService.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import * as OrchestratorHandlers from "./toolkits/orchestrator/handlers.ts";
@@ -208,6 +210,37 @@ const withModeLimit = (
     : { ...invocation, client: { ...invocation.client, narrowedTo: limit.value } };
 };
 
+const decodeApprovalOrigin = Schema.decodeUnknownOption(
+  Schema.fromJsonString(McpInvocationContext.McpApprovalOrigin),
+);
+const invalidApprovalOrigin = HttpServerResponse.jsonUnsafe(
+  {
+    error: "invalid_approval_origin",
+    message: "Approval origin requires a valid authenticated peer link.",
+  },
+  { status: 400, headers: { "cache-control": "no-store" } },
+);
+const withApprovalOrigin = (
+  invocation: McpInvocationContext.McpInvocationScope,
+  request: HttpServerRequest.HttpServerRequest,
+): McpInvocationContext.McpInvocationScope | undefined => {
+  const header = request.headers[McpInvocationContext.APPROVAL_ORIGIN_HEADER];
+  if (header === undefined) return invocation;
+  if (invocation.thread !== undefined || invocation.client?.linked !== true || header.length > 4096)
+    return undefined;
+  try {
+    const origin = decodeApprovalOrigin(decodeURIComponent(header));
+    return Option.isNone(origin)
+      ? undefined
+      : {
+          ...invocation,
+          client: { ...invocation.client, approvalOrigin: origin.value },
+        };
+  } catch {
+    return undefined;
+  }
+};
+
 // The Linked environments beta is off here: links wait until it is on again.
 const linkedEnvironmentsOff = HttpServerResponse.jsonUnsafe(
   {
@@ -255,7 +288,9 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     }
     const asked = withModeLimit(invocation, request);
     if (asked === undefined) return invalidModeLimit;
-    const limited = McpInvocationContext.withRuntimeModeCeiling(asked, runtimeModeCeiling);
+    const attributed = withApprovalOrigin(asked, request);
+    if (attributed === undefined) return invalidApprovalOrigin;
+    const limited = McpInvocationContext.withRuntimeModeCeiling(attributed, runtimeModeCeiling);
     const linkedEnvironments = yield* linksEnabled;
     if (limited.client?.linked === true && !linkedEnvironments) return linkedEnvironmentsOff;
     return { ...limited, linkedEnvironments };
@@ -957,12 +992,30 @@ const handoffTargetIds = (
 };
 
 /** Tool analytics must never include IDs, prompts or free text. */
+const isRequestErrorCode = Schema.is(OrchestratorMcpFailure.fields.code);
+const decodeDeclaredFailure = Schema.decodeUnknownOption(
+  Schema.fromJsonString(OrchestratorMcpFailure),
+);
+const requestErrorClass = (result: McpSchema.CallToolResult | undefined) => {
+  const outcome = toolOutcome(result);
+  if (outcome.outcome === "ok") return null;
+  if (isRequestErrorCode(outcome.errorCode)) return outcome.errorCode;
+  if (result === undefined) return "execution_failure";
+  for (const content of result.content) {
+    if (content.type !== "text") continue;
+    const failure = decodeDeclaredFailure(content.text);
+    if (Option.isSome(failure)) return failure.value.code;
+  }
+  return "tool_error";
+};
+const encodeBridgeResult = Schema.encodeEffect(Schema.fromJsonString(McpSchema.CallToolResult));
 const encodeBridgeResponse = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const withToolAnalytics =
   /* Request instrumentation already owns the span; keep this helper in that context. */
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
+    const requestLog = yield* Effect.serviceOption(McpRequestLog.McpRequestLog);
     const bridgeMetrics = yield* Effect.serviceOption(McpBridgeMetrics.McpBridgeMetrics);
     const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
     const threads = yield* Effect.serviceOption(ThreadManagementService.ThreadManagementService);
@@ -1080,48 +1133,73 @@ const withToolAnalytics =
             /* Request instrumentation already owns the span; keep this helper in that context. */
             Effect.fnUntraced(function* (payload) {
               const startedAt = yield* Clock.currentTimeMillis;
+              const startedMono = yield* Clock.monotonicTimeNanos;
               return yield* options.handle(payload).pipe(
-                Effect.onExit((exit) => {
-                  const result = exit._tag === "Success" ? exit.value : undefined;
-                  // A call that asks for input is retried with it, and that call is the one counted.
-                  if (result instanceof McpSchema.InputRequired) return Effect.void;
-                  const count = Effect.gen(function* () {
-                    const invocation = yield* Effect.serviceOption(
-                      McpInvocationContext.McpInvocationContext,
-                    );
-                    const session = Option.isSome(invocation)
-                      ? invocation.value.client?.sessionId
-                      : undefined;
-                    if (session !== undefined && Option.isSome(bridgeMetrics)) {
-                      const bytes =
+                Effect.onExit((exit) =>
+                  Effect.gen(function* () {
+                    const result = exit._tag === "Success" ? exit.value : undefined;
+                    // A call that asks for input is retried with it, and that call is the one counted.
+                    if (result instanceof McpSchema.InputRequired) return;
+                    const endedMono = yield* Clock.monotonicTimeNanos;
+                    const durationMs = Math.max(0, Number((endedMono - startedMono) / 1_000_000n));
+                    const count = Effect.gen(function* () {
+                      const responseBytes =
                         result === undefined
                           ? 0
                           : Buffer.byteLength(
-                              yield* encodeBridgeResponse(result).pipe(
+                              yield* encodeBridgeResult(result).pipe(
                                 Effect.orElseSucceed(() => ""),
                               ),
                             );
-                      yield* bridgeMetrics.value.record(
-                        session,
-                        options.tool.name,
-                        result === undefined || result.isError === true,
-                        bytes,
+                      const invocation = yield* Effect.serviceOption(
+                        McpInvocationContext.McpInvocationContext,
                       );
-                    }
-                  });
-                  // Handoff tools look up threads, and byte counts re-encode the result; the response waits on neither.
-                  return Clock.currentTimeMillis.pipe(
-                    Effect.flatMap((endedAt) =>
-                      count.pipe(
-                        Effect.andThen(
-                          record(options.tool.name, payload, result, endedAt - startedAt),
+                      const session = Option.isSome(invocation)
+                        ? invocation.value.client?.sessionId
+                        : undefined;
+                      if (Option.isSome(invocation) && Option.isSome(requestLog)) {
+                        const scope = invocation.value;
+                        const identity = scope.client?.sessionId ?? scope.thread?.providerSessionId;
+                        if (identity !== undefined) {
+                          yield* requestLog.value
+                            .record({
+                              client: scope.client?.sessionId ?? scope.thread!.threadId,
+                              session: identity,
+                              tool: options.tool.name,
+                              startedAt,
+                              durationMs,
+                              requestBytes: Buffer.byteLength(
+                                yield* encodeBridgeResponse(payload).pipe(
+                                  Effect.orElseSucceed(() => ""),
+                                ),
+                              ),
+                              responseBytes,
+                              errorClass: requestErrorClass(result),
+                            })
+                            .pipe(Effect.ignoreCause);
+                        }
+                      }
+                      if (session !== undefined && Option.isSome(bridgeMetrics)) {
+                        yield* bridgeMetrics.value.record(
+                          session,
+                          options.tool.name,
+                          result === undefined || result.isError === true,
+                          responseBytes,
+                        );
+                      }
+                    });
+                    // Persist metadata before replying; thread lookups for analytics stay detached.
+                    yield* count.pipe(
+                      Effect.ignoreCause,
+                      Effect.andThen(
+                        record(options.tool.name, payload, result, durationMs).pipe(
+                          Effect.forkDetach,
+                          Effect.asVoid,
                         ),
                       ),
-                    ),
-                    Effect.forkDetach,
-                    Effect.asVoid,
-                  );
-                }),
+                    );
+                  }),
+                ),
               );
             }),
         });
@@ -1261,7 +1339,9 @@ export const layerOrchestratorToolkit = toolkitRegistration(
 
 export const layerLedgerToolkit = toolkitRegistration(LedgerToolkit, LedgerHandlers.layer);
 
-export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
+export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer).pipe(
+  Layer.provide(PendingApproval.layer),
+);
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,
@@ -1430,4 +1510,5 @@ export const layer = Layer.merge(
   Layer.provide(WorkLedger.layer),
   Layer.provide(McpClientThreads.layer),
   Layer.provide(McpBridgeMetrics.layer),
+  Layer.provide(McpRequestLog.layer),
 );

@@ -49,6 +49,14 @@ const seedLegacyForkDatabase = Effect.gen(function* () {
 const pendingUpstream = migrationManifest.filter(([id]) => id > LAST_SHARED_ID);
 
 describe("fork migrations", () => {
+  it("registers unique fork ids in strictly increasing order", () => {
+    const ids = forkMigrationManifest.map(([id]) => id);
+    assert.deepEqual(
+      ids,
+      [...new Set(ids)].toSorted((a, b) => a - b),
+    );
+  });
+
   it.effect("backfills legacy subscription lifetimes without altering secrets or cursors", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -146,7 +154,9 @@ describe("fork migrations", () => {
           [4, "McpBridgeStatus"],
           [5, "McpOAuthRenewal"],
           [6, "McpSubscriptionRenewal"],
-          [7, "WorkLedgerPortfolio"],
+          [7, "McpRequestLog"],
+          [8, "McpApprovalAnswers"],
+          [9, "WorkLedgerPortfolio"],
         ],
       );
       assert.equal((yield* forkHistory)[0]?.[2], "2026-11-12 04:10:00");
@@ -156,6 +166,7 @@ describe("fork migrations", () => {
       yield* sql`SELECT * FROM work_ledger`;
       yield* sql`SELECT * FROM mcp_client_threads`;
       yield* sql`SELECT * FROM mcp_bridge_status`;
+      yield* sql`SELECT * FROM mcp_request_log`;
       assert.deepStrictEqual(
         yield* sql`SELECT renewal_ttl_ms FROM mcp_event_subscription_activity WHERE subscription_id = 'preserved'`,
         [{ renewal_ttl_ms: 86_400_000 }],

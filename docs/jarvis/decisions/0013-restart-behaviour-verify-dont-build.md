@@ -4,33 +4,34 @@ Accepted 2026-11-12.
 
 ## Decision
 
-Verify existing `RestartContinuation` during the audit-owned first forced update
-after round-two PRs 23, 24 and 25 are released. Add no drain or updater code.
-The guarded-update proposal remains deferred.
+Keep existing recovery. Refuse manual/automatic settlement during active runs or
+prepared/pending restart continuations. Settle afterwards only if eligible.
+No draining or updater changes.
 
-## Verification plan
+## Results
 
-Before the update, record version, continuation setting, and each
-active thread's run, provider instance/model, provider turn, pending interactions,
-and queued run/message ids in order.
+Update: 2026-11-12 07:36 UTC, to `0.1.10-preview.20261112.3`.
+Exit zero; serving 07:37:22; Connect HTTP 200 07:37:57.
 
-Codex continues its native thread without prompt text unless background work was
-lost; then it receives the restart note. Claude, Cursor, Grok, OpenCode,
-Antigravity and Kiro receive the shared continuation through their adapter. For each active provider, check that an
-eligible interrupted run continues once on the same provider/model and queued
-messages execute once in order. Inactive providers remain unobserved.
+`continueThreadsAfterServerUpdate` was unset (default true). No pending approval,
+secret or auth requests. Baseline: eight running, 59 queued, all with native references.
 
-Afterward, record the new version, continuation links, resumed and missing runs,
-duplicates, and eligibility exclusions.
-Check interrupted state-changing actions before repeating them. Record actual
-gaps under `r2/restart-gap/*`; keep this item open until results arrive.
+Continued once: Claude 2/2, Codex Revotech 4/4, Codex Pro 1/2.
+Seven retained provider, model/options, provider thread and restart notices.
+Codex used native empty input; Claude used shared prompts, one with lost-work notes.
 
-## Alternatives
+Queued group, zero duplicates:
 
-Build new draining and resumption machinery, or assume shared orchestration proves
-every adapter works.
+- 07:41:33: 5 completed + 1 running + 53 queued.
+- 07:47:57: 21 completed + 2 running + 36 queued.
 
-## Why
+Later completion/order remains unverified. Cursor, Grok, OpenCode, Antigravity and
+Kiro were unobserved.
 
-Existing recovery already handles restarts. One coordinated observation establishes
-which provider paths need repairs without adding an unverified deployment contract.
+Recovery prepared Codex Pro's continuation, shutdown cancelled its run, then
+auto-settle settled the thread before the effect ran. Recovery correctly skipped
+the settled thread ([#42](https://github.com/chrisohearn/t3code/issues/42)). Audit resumed it manually. Upgrade 30 blocks this race.
+
+## Alternatives and why
+
+Deferred settlement risks stale requests settling newer work; refusal is explicit.

@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  EnvironmentId,
   MessageId,
   EventId,
   NodeId,
@@ -24,6 +25,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -36,9 +38,14 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as DelegatedTaskQuestionReactor from "./DelegatedTaskQuestionReactor.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EffectWorker from "./EffectWorker.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -1888,6 +1895,261 @@ it.effect("replays a thread.create receipt without changing the thread", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect.each(
+  (["thread.settle", "thread.auto-settle"] as const).flatMap((type) =>
+    (
+      [
+        "running",
+        "restart-pending",
+        "restart-running",
+        "restart-finished",
+        "restart-retry-unscheduled",
+      ] as const
+    ).map((state) => ({ type, state })),
+  ),
+)("$type admission with $state work", ({ type, state }) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const threadId = ThreadId.make("thread:settlement-admission");
+    const runId = RunId.make("run:settlement-admission");
+    const now = yield* DateTime.now;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-settlement-admission"),
+      threadId,
+      projectId: ProjectId.make("project:settlement-admission"),
+      title: "Settlement admission",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* projections.apply({
+      id: EventId.make("event:settlement-admission-run"),
+      type: "run.created",
+      threadId,
+      occurredAt: now,
+      payload: {
+        id: runId,
+        threadId,
+        ordinal: 1,
+        providerInstanceId: instanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make("message:settlement-admission"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status:
+          state === "running"
+            ? "running"
+            : state === "restart-retry-unscheduled"
+              ? "failed"
+              : "cancelled",
+        ...(state === "restart-retry-unscheduled"
+          ? { restartContinuationOfRunId: RunId.make("run:original-before-retry") }
+          : {}),
+        requestedAt: now,
+        startedAt: now,
+        completedAt: state === "running" ? null : now,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    });
+    if (state !== "running" && state !== "restart-retry-unscheduled") {
+      const effectId = `effect:restart-continuation:${runId}`;
+      yield* outbox.enqueue([
+        {
+          id: effectId,
+          commandId: CommandId.make("prepare-settlement-admission-restart"),
+          threadId,
+          request: { type: "provider-runtime.continue", sourceRunId: runId },
+        },
+      ]);
+      if (state !== "restart-pending") {
+        const claimed = yield* outbox.claimNext({ workerId: "settlement-test" });
+        assert.equal(Option.getOrThrow(claimed).id, effectId);
+        if (state === "restart-finished") {
+          assert.isTrue(yield* outbox.succeed({ effectId, workerId: "settlement-test" }));
+        }
+      }
+    }
+    const thread = yield* projections.getThread(threadId);
+    const sequence = yield* orchestrator.getThreadEventSequence(threadId);
+    const result = yield* orchestrator
+      .dispatch({
+        commandId: CommandId.make("settle-with-work"),
+        threadId,
+        ...(type === "thread.auto-settle" ? { type, snapshotAt: thread.updatedAt } : { type }),
+      })
+      .pipe(Effect.result);
+    if (state === "restart-finished") {
+      assert.ok(Result.isSuccess(result));
+      assert.equal((yield* projections.getThread(threadId)).settledOverride, "settled");
+      return;
+    }
+    assert.ok(Result.isFailure(result));
+    assert.instanceOf(result.failure, Orchestrator.OrchestratorDispatchError);
+    assert.include(
+      String(result.failure.cause),
+      state === "running" ? "is still running" : "has a restart continuation pending",
+    );
+    assert.equal((yield* projections.getThread(threadId)).settledOverride, null);
+    assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
+    if (state !== "running") {
+      assert.equal(
+        Option.getOrThrow(yield* outbox.get(`effect:restart-continuation:${runId}`)).status,
+        state === "restart-pending" || state === "restart-retry-unscheduled"
+          ? "pending"
+          : "running",
+      );
+    }
+    if (state === "restart-retry-unscheduled") {
+      const retry = Option.getOrThrow(yield* outbox.get(`effect:restart-continuation:${runId}`));
+      assert.equal(retry.availableAt, DateTime.formatIso(DateTime.add(now, { seconds: 60 })));
+      yield* TestClock.adjust("1 second");
+      const repeated = yield* orchestrator
+        .dispatch({
+          type: "thread.settle",
+          commandId: CommandId.make("settle-again-before-retry"),
+          threadId,
+        })
+        .pipe(Effect.result);
+      assert.ok(Result.isFailure(repeated));
+      assert.deepEqual(Option.getOrThrow(yield* outbox.get(retry.id)), retry);
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("starts prepared restart recovery before an auto-settle tick can settle the thread", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const events = yield* EventSink.EventSinkV2;
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+    const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+      Effect.provide(Layer.merge(IdAllocator.layer, ServerSettings.layerTest())),
+    );
+    const threadId = ThreadId.make("thread:settle-during-restart");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-settle-during-restart"),
+      threadId,
+      projectId: ProjectId.make("project:settle-during-restart"),
+      title: "Restart recovery",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("start-before-restart"),
+      threadId,
+      messageId: MessageId.make("message:before-restart"),
+      text: "Continue working",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const before = yield* projections.getThreadProjection(threadId);
+    const run = before.runs[0]!;
+    const providerThread = before.providerThreads[0]!;
+    const now = yield* DateTime.now;
+    const runningEvents = [
+      {
+        type: "provider-session.attached",
+        payload: {
+          id: providerThread.providerSessionId!,
+          driver: adapter.driver,
+          providerInstanceId: instanceId,
+          status: "ready",
+          cwd: "/repo",
+          model: modelSelection.model,
+          capabilities: CodexProviderCapabilitiesV2,
+          createdAt: now,
+          updatedAt: now,
+          lastError: null,
+        },
+      },
+      {
+        type: "provider-thread.updated",
+        payload: {
+          ...providerThread,
+          status: "active",
+          nativeThreadRef: {
+            driver: adapter.driver,
+            nativeId: "native:restart",
+            strength: "strong",
+          },
+        },
+      },
+      { type: "run.updated", payload: { ...run, status: "running", startedAt: now } },
+      {
+        type: "provider-turn.updated",
+        payload: {
+          id: ProviderTurnId.make("provider-turn:before-restart"),
+          providerThreadId: providerThread.id,
+          nodeId: run.rootNodeId!,
+          runAttemptId: run.activeAttemptId!,
+          nativeTurnRef: { driver: adapter.driver, nativeId: "native:turn", strength: "strong" },
+          ordinal: 1,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
+      },
+    ] as const;
+    yield* events.write({
+      events: runningEvents.map((event, index) => ({
+        ...event,
+        id: EventId.make(`event:before-restart:${index}`),
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+      })),
+    });
+    yield* recovery.prepareForShutdown;
+    const effectId = `effect:restart-continuation:${run.id}`;
+    assert.equal(Option.getOrThrow(yield* outbox.get(effectId)).status, "pending");
+    yield* recovery.reconcile("shutdown");
+    const cancelled = yield* projections.getThreadProjection(threadId);
+    assert.equal(cancelled.runs[0]?.status, "cancelled");
+    assert.equal(cancelled.providerTurns[0]?.status, "cancelled");
+    const tick = yield* orchestrator
+      .dispatch({
+        type: "thread.auto-settle",
+        commandId: CommandId.make("auto-settle-after-shutdown"),
+        threadId,
+        snapshotAt: cancelled.thread.updatedAt,
+      })
+      .pipe(Effect.result);
+    assert.isTrue(yield* worker.runOnce());
+    assert.equal(Option.getOrThrow(yield* outbox.get(effectId)).status, "succeeded");
+    const resumed = yield* projections.getThreadProjection(threadId);
+    const continuation = resumed.runs.find(
+      (candidate) => candidate.restartContinuationOfRunId === run.id,
+    );
+    assert.ok(continuation, "auto-settle must not suppress the prepared continuation");
+    assert.ok(Result.isFailure(tick));
+    assert.include(String(tick.failure.cause), "has a restart continuation pending");
+    assert.equal(continuation.status, "starting");
+    assert.deepEqual(continuation.modelSelection, modelSelection);
+    assert.equal(continuation.providerThreadId, providerThread.id);
+    assert.equal(resumed.runs.length, 2);
+    assert.equal(resumed.thread.settledOverride, null);
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("explicit settle clears snooze atomically and stays idempotent after re-snoozing", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1971,13 +2233,20 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const outbox = yield* EffectOutbox.EffectOutboxV2;
     const now = yield* DateTime.now;
-    for (const kind of ["user_input", "command"] as const) {
-      const threadId = ThreadId.make(`thread:snoozed-live-${kind}`);
-      const requestId = RuntimeRequestId.make(`request:snoozed-live-${kind}`);
-      const sessionId = ProviderSessionId.make(`session:snoozed-live-${kind}`);
+    for (const [kind, decision, standingOnly] of [
+      ["user_input", "cancel"],
+      ["command", "accept"],
+      ["command", "decline"],
+      ["command", "accept", true],
+    ] as const) {
+      const sql = yield* SqlClient.SqlClient;
+      const suffix = `${kind}-${decision}${standingOnly ? "-standing-only" : ""}`;
+      const threadId = ThreadId.make(`thread:snoozed-live-${suffix}`);
+      const requestId = RuntimeRequestId.make(`request:snoozed-live-${suffix}`);
+      const sessionId = ProviderSessionId.make(`session:snoozed-live-${suffix}`);
       yield* orchestrator.dispatch({
         type: "thread.create",
-        commandId: CommandId.make(`create-snoozed-live-${kind}`),
+        commandId: CommandId.make(`create-snoozed-live-${suffix}`),
         threadId,
         projectId: ProjectId.make("project:snoozed-live"),
         title: "Deferred question",
@@ -1991,13 +2260,13 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
       });
       yield* orchestrator.dispatch({
         type: "thread.snooze",
-        commandId: CommandId.make(`snooze-live-${kind}`),
+        commandId: CommandId.make(`snooze-live-${suffix}`),
         threadId,
         snoozedUntil: "2099-07-25T09:00:00.000Z",
       });
       const before = yield* projections.getThread(threadId);
       yield* projections.apply({
-        id: EventId.make(`attach-snoozed-live-${kind}`),
+        id: EventId.make(`attach-snoozed-live-${suffix}`),
         type: "provider-session.attached",
         threadId,
         occurredAt: now,
@@ -2015,7 +2284,7 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
         },
       });
       yield* projections.apply({
-        id: EventId.make(`request-snoozed-live-${kind}`),
+        id: EventId.make(`request-snoozed-live-${suffix}`),
         type: "runtime-request.updated",
         threadId,
         occurredAt: now,
@@ -2031,14 +2300,69 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
           resolvedAt: null,
         },
       });
-      const commandId = CommandId.make(`respond-snoozed-live-${kind}`);
-      yield* orchestrator.dispatch({
+      if (kind === "command")
+        yield* projections.apply({
+          id: EventId.make(`approval-item-${suffix}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`approval-item-${suffix}`),
+            threadId,
+            runId: null,
+            nodeId: NodeId.make(`node:snoozed-live-${kind}`),
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 0,
+            status: "running",
+            title: null,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+            type: "approval_request",
+            requestId,
+            requestKind: "command",
+            ...(standingOnly
+              ? { options: [{ decision: "acceptForSession" as const, label: "Always allow" }] }
+              : { options: [{ decision, label: decision === "accept" ? "Run once" : "Reject" }] }),
+            prompt: "Run project tests",
+            reason: "Needs process access",
+          },
+        });
+      const commandId = CommandId.make(`respond-snoozed-live-${suffix}`);
+      const respond = orchestrator.dispatch({
         type: "runtime-request.respond",
         commandId,
         threadId,
         requestId,
-        decision: kind === "user_input" ? "cancel" : "accept",
+        decision,
       });
+      const attributedRespond =
+        kind === "command"
+          ? respond.pipe(
+              Effect.provideService(McpApprovalAnswerContext, {
+                sessionId: "outside-test-session",
+                clientLabel: "Outside test client",
+                originEnvironmentId: EnvironmentId.make("origin-env"),
+                note: "Chris said to answer this prompt.",
+              }),
+            )
+          : respond;
+      if (standingOnly) {
+        assert.isTrue(Result.isFailure(yield* attributedRespond.pipe(Effect.result)));
+        assert.equal(
+          (yield* projections.getRuntimeRequest(threadId, requestId))?.status,
+          "pending",
+        );
+        assert.equal(
+          (yield* sql`SELECT 1 FROM mcp_approval_answers WHERE thread_id = ${threadId}`).length,
+          0,
+        );
+        continue;
+      }
+      yield* attributedRespond;
       const after = yield* projections.getThread(threadId);
       assert.deepEqual(after.snoozedUntil, before.snoozedUntil);
       assert.deepEqual(after.snoozedAt, before.snoozedAt);
@@ -2047,6 +2371,58 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
         (yield* outbox.listByCommandId(commandId))[0]?.request.type,
         "runtime-request.respond",
       );
+      if (kind === "command") {
+        const request = yield* projections.getRuntimeRequest(threadId, requestId);
+        assert.deepInclude(request?.mcpApprovalAnswer, {
+          sessionId: "outside-test-session",
+          clientLabel: "Outside test client",
+          originEnvironmentId: EnvironmentId.make("origin-env"),
+          threadId,
+          requestId,
+          decision,
+          selectedOption: { decision, label: decision === "accept" ? "Run once" : "Reject" },
+          answeredAt: DateTime.formatIso(now),
+          note: "Chris said to answer this prompt.",
+          requested: {
+            requestKind: "command",
+            prompt: "Run project tests",
+            reason: "Needs process access",
+          },
+        });
+        const audit = yield* sql<{
+          answer_json: string;
+        }>`SELECT answer_json FROM mcp_approval_answers WHERE thread_id = ${threadId}`;
+        assert.deepEqual(
+          audit.map((row) => JSON.parse(row.answer_json)),
+          [request?.mcpApprovalAnswer],
+        );
+        const timeline = (yield* projections.getThreadProjection(threadId)).turnItems;
+        assert.isTrue(
+          timeline.some(
+            (item) =>
+              item.type === "system_notice" &&
+              item.message.includes("Outside test client") &&
+              item.message.includes(decision === "accept" ? "allowed once" : "denied"),
+          ),
+        );
+        assert.isTrue(
+          Result.isFailure(
+            yield* orchestrator
+              .dispatch({
+                type: "runtime-request.respond",
+                commandId: CommandId.make(`duplicate-${suffix}`),
+                threadId,
+                requestId,
+                decision,
+              })
+              .pipe(Effect.result),
+          ),
+        );
+        assert.equal(
+          (yield* sql`SELECT 1 FROM mcp_approval_answers WHERE thread_id = ${threadId}`).length,
+          1,
+        );
+      }
     }
   }).pipe(Effect.provide(layerTest)),
 );
