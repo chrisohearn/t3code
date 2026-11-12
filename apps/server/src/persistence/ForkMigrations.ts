@@ -168,3 +168,19 @@ export const runForkMigrations = Effect.fn("runForkMigrations")(function* () {
     ),
   });
 });
+
+/** Whether startup would write fork migration state: a legacy row to move or a fork migration to run. */
+export const hasPendingForkMigrations = Effect.fn("hasPendingForkMigrations")(function* (
+  upstreamManifest: ReadonlyArray<readonly [number, string]>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  if (yield* tableExists(sql, "effect_sql_migrations")) {
+    const recorded = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+      SELECT migration_id, name FROM effect_sql_migrations
+    `;
+    const rows = recorded.map((row) => ({ id: row.migration_id, name: row.name }));
+    if (legacyForkRows(rows, upstreamManifest).length > 0) return true;
+  }
+  const history = yield* readForkHistory;
+  return Math.max(0, ...history.map(({ id }) => id)) < FORK_MIGRATION_HEAD;
+});

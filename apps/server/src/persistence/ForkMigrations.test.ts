@@ -9,7 +9,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import { FORK_MIGRATIONS_TABLE, forkMigrationManifest, legacyForkRows } from "./ForkMigrations.ts";
 import McpEvents from "./ForkMigrations/001_McpEvents.ts";
-import { migrationManifest, runMigrations } from "./Migrations.ts";
+import { hasPendingMigrations, migrationManifest, runMigrations } from "./Migrations.ts";
 
 // The last upstream id before fork builds started taking upstream's ids for fork migrations.
 const LAST_SHARED_ID = 80;
@@ -49,7 +49,10 @@ const pendingUpstream = migrationManifest.filter(([id]) => id > LAST_SHARED_ID);
 describe("fork migrations", () => {
   it.effect("record in their own table on a new database", () =>
     Effect.gen(function* () {
+      yield* runMigrations({ toMigrationInclusive: migrationManifest.at(-1)![0] });
+      assert.isTrue(yield* hasPendingMigrations());
       yield* runMigrations();
+      assert.isFalse(yield* hasPendingMigrations());
       assert.deepStrictEqual(yield* upstreamHistory, migrationManifest);
       assert.deepStrictEqual(
         (yield* forkHistory).map(([id, name]) => [id, name] as const),
@@ -62,6 +65,7 @@ describe("fork migrations", () => {
     Effect.gen(function* () {
       yield* seedLegacyForkDatabase;
 
+      assert.isTrue(yield* hasPendingMigrations());
       // McpEvents is not run again: its CREATE TABLE would fail on the existing tables.
       assert.deepStrictEqual(yield* runMigrations(), pendingUpstream);
       assert.deepStrictEqual(yield* upstreamHistory, migrationManifest);
