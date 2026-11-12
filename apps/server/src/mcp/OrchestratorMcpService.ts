@@ -54,6 +54,8 @@ import {
   type OrchestratorMcpThreadReadInput,
   type OrchestratorMcpThreadReadResult,
   type OrchestratorMcpThreadRun,
+  type OrchestratorMcpThreadPostInput,
+  type OrchestratorMcpThreadPostResult,
   type OrchestratorMcpThreadSendInput,
   type OrchestratorMcpThreadSendResult,
   type OrchestratorMcpThreadTimelineItem,
@@ -218,6 +220,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadReadInput,
   ) => Effect.Effect<OrchestratorMcpThreadReadResult, OrchestratorMcpFailure>;
+  readonly postToThread: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpThreadPostInput,
+  ) => Effect.Effect<OrchestratorMcpThreadPostResult, OrchestratorMcpFailure>;
   readonly sendToThread: (
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadSendInput,
@@ -3231,6 +3237,35 @@ const make = Effect.gen(function* () {
         nextPosition: page.at(-1)?.position ?? null,
         hasMore: timeline.hasMore,
       } satisfies OrchestratorMcpThreadReadResult;
+    }),
+    postToThread: Effect.fn("OrchestratorMcpService.postToThread")(function* (scope, input) {
+      const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId, ["runs"]);
+      yield* assertLiveCallerForOtherThread(scope, parent, target);
+      yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
+      yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
+      const key = yield* requestKey(input.clientRequestId);
+      const operation = "thread-post";
+      const messageId = stableOperationMessageId({ scope, requestKey: key, operation });
+      yield* threadManagement
+        .dispatch({
+          type: "message.dispatch",
+          postOnly: true,
+          commandId: stableCommandId({ scope, requestKey: key, operation }),
+          threadId: input.threadId,
+          ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+          messageId,
+          text: input.message,
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "agent",
+          creationSource: "mcp",
+        })
+        .pipe(Effect.mapError((error) => failure("orchestration_error", errorMessage(error))));
+      return {
+        threadId: input.threadId,
+        link: threadLinkFor(scope, input.threadId, target.thread.title),
+        messageId,
+      };
     }),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
       const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId, ["runs"]);

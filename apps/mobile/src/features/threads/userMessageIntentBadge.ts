@@ -27,6 +27,7 @@ export function resolveUserMessageIntentBadge(
         label: "Steer",
         accessibilityLabel: "Originally queued, then promoted to steer the active turn",
       };
+    case "post":
     case "queued_turn":
     case "turn_start":
     case undefined:

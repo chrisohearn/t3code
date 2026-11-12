@@ -162,6 +162,7 @@ export function handoffSettings(tool: string, args: unknown, result: unknown): F
                 "existing_worktree",
               ]) ?? "root"),
       });
+    case "t3_thread_post":
     case "t3_thread_send":
       return defined({ delivery: stringField(output, "delivery") });
     case "t3_thread_send_attachments":
