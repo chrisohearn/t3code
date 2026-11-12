@@ -96,11 +96,11 @@ export const layer = Layer.effect(
       access: AuthMcpClientAccess,
       offlineAccess: boolean,
       now: DateTime.Utc,
-      predecessorHash?: string,
+      predecessorToken?: Redacted.Redacted<string>,
     ) {
       // Domain-separated HMACs let restarts repeat a response without persisting credentials.
       const credential = (kind: "access" | "refresh") =>
-        predecessorHash === undefined
+        predecessorToken === undefined
           ? random
               .randomBytes(32)
               .pipe(Effect.map((bytes) => Buffer.from(bytes).toString("base64url")))
@@ -109,7 +109,7 @@ export const layer = Layer.effect(
                 "mcp-refresh-v1",
                 kind,
                 sessionId,
-                predecessorHash,
+                Redacted.value(predecessorToken),
                 now.epochMilliseconds,
               ]),
             );
@@ -127,9 +127,9 @@ export const layer = Layer.effect(
       access: AuthMcpClientAccess,
       offlineAccess: boolean,
       now: DateTime.Utc,
-      predecessorHash?: string,
+      predecessorToken?: Redacted.Redacted<string>,
     ) {
-      const minted = yield* pair(sessionId, access, offlineAccess, now, predecessorHash);
+      const minted = yield* pair(sessionId, access, offlineAccess, now, predecessorToken);
       const { token, refreshToken, expiresAt } = minted;
       yield* sql`INSERT INTO mcp_oauth_tokens (token_hash, session_id, kind, expires_at)
       VALUES (${yield* hash(token)}, ${sessionId}, 'access', ${expiresAt.epochMilliseconds}),
@@ -208,6 +208,14 @@ export const layer = Layer.effect(
                 DateTime.makeUnsafe(row.expiresAt).epochMilliseconds <= now.epochMilliseconds
               )
                 return undefined;
+              if (
+                row.usedAt !== null &&
+                (now.epochMilliseconds < row.usedAt ||
+                  now.epochMilliseconds - row.usedAt >= REFRESH_RETRY_MS)
+              ) {
+                yield* sessions.revoke(row.sessionId);
+                return undefined;
+              }
               const scopes = [
                 ...mcpClientScopes(row.access),
                 ...(row.offlineAccess === 1 ? ["offline_access"] : []),
@@ -220,26 +228,19 @@ export const layer = Layer.effect(
               )
                 return "invalid_scope" as const;
               if (row.usedAt !== null) {
-                if (
-                  now.epochMilliseconds >= row.usedAt &&
-                  now.epochMilliseconds - row.usedAt < REFRESH_RETRY_MS
-                ) {
-                  const repeated = yield* pair(
-                    row.sessionId,
-                    row.access,
-                    row.offlineAccess === 1,
-                    DateTime.makeUnsafe(row.usedAt),
-                    tokenHash,
-                  );
-                  const successor = (yield* find(yield* hash(repeated.refreshToken), "refresh"))[0];
-                  if (successor?.sessionId === row.sessionId) {
-                    yield* touch(row.sessionId, now);
-                    return repeated;
-                  }
-                  // Older builds minted random successors; a hash cannot reconstruct their response.
-                  return undefined;
+                const repeated = yield* pair(
+                  row.sessionId,
+                  row.access,
+                  row.offlineAccess === 1,
+                  DateTime.makeUnsafe(row.usedAt),
+                  input.refreshToken,
+                );
+                const successor = (yield* find(yield* hash(repeated.refreshToken), "refresh"))[0];
+                if (successor?.sessionId === row.sessionId && successor.usedAt === null) {
+                  yield* touch(row.sessionId, now);
+                  return repeated;
                 }
-                yield* sessions.revoke(row.sessionId);
+                // A random legacy successor cannot be reconstructed; a spent successor must not replace a current token.
                 return undefined;
               }
               yield* sql`UPDATE mcp_oauth_tokens SET used_at = ${now.epochMilliseconds} WHERE token_hash = ${tokenHash}`;
@@ -249,7 +250,7 @@ export const layer = Layer.effect(
                 row.access,
                 row.offlineAccess === 1,
                 now,
-                tokenHash,
+                input.refreshToken,
               );
             }),
           )

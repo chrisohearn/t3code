@@ -272,7 +272,8 @@ Approved agents appear under **Settings → Sharing & access** like other client
 Revoke one there to cut off its access immediately. New sign-ins renew with use
 and expire after 30 days without use. Clients receive a renewal token, which is
 replaced each time they use it. Duplicate renewal requests within 90 seconds return
-the same replacement tokens, including after a server restart. This window starts
+the same replacement tokens while the replacement is still current, including after
+a server restart. This window starts
 at the first renewal and retries do not extend it. Reusing a replaced token after
 that window cuts off the sign-in.
 Sign-ins created before rolling renewal keep their original expiry.

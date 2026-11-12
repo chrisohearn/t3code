@@ -15,6 +15,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import * as McpOAuthSessions from "./McpOAuthSessions.ts";
+import * as PayloadSigner from "./PayloadSigner.ts";
 
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
@@ -118,6 +119,28 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
           }>`SELECT token_hash FROM mcp_oauth_tokens`;
           expect(tokens.every(({ token_hash }) => /^[a-f0-9]{64}$/.test(token_hash))).toBe(true);
           expect(JSON.stringify(yield* auth.listSessions())).not.toContain(issued.refreshToken);
+          const secrets = yield* ServerSecretStore.ServerSecretStore;
+          const key = yield* secrets.getOrCreateRandom("mcp-oauth-refresh-retry-key", 32);
+          const spent = (yield* sql<{
+            token_hash: string;
+            used_at: number;
+          }>`SELECT token_hash, used_at
+            FROM mcp_oauth_tokens WHERE used_at IS NOT NULL`)[0]!;
+          const guesser = yield* PayloadSigner.fromSecret(key);
+          const hashOnlyGuess =
+            "t3mcp_a_" +
+            (yield* guesser.sign(
+              JSON.stringify([
+                "mcp-refresh-v1",
+                "access",
+                issued.sessionId,
+                spent.token_hash,
+                spent.used_at,
+              ]),
+            ));
+          expect(
+            yield* auth.authenticateMcpClient(makeBearerRequest(hashOnlyGuess)).pipe(Effect.flip),
+          ).toMatchObject({ _tag: "ServerAuthInvalidCredentialError" });
           const independent = yield* auth.issueMcpClientSession({
             label: "Independent client",
             access: "full-access",
@@ -206,6 +229,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
           ).toBe(issued.sessionId);
           const sql = yield* SqlClient.SqlClient;
           expect(yield* sql`SELECT count(*) AS n FROM mcp_oauth_tokens`).toEqual([{ n: 4 }]);
+          const latest = yield* refresh(results[0]!.refreshToken);
+          expect(yield* refresh(issued.refreshToken!).pipe(Effect.flip)).toMatchObject({
+            error: "invalid_grant",
+          });
+          expect(
+            (yield* auth.authenticateMcpClient(makeBearerRequest(latest.token))).sessionId,
+          ).toBe(issued.sessionId);
+          yield* TestClock.adjust("90 seconds");
+          expect((yield* refresh(latest.refreshToken)).sessionId).toBe(issued.sessionId);
           return;
         }
         if (scenario === "legacy-rotation") {
@@ -275,7 +307,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
             { expires_at: DateTime.formatIso(DateTime.add(yield* DateTime.now, { days: 30 })) },
           ]);
           yield* TestClock.adjust("1 second");
-          expect(yield* refresh(issued.refreshToken!).pipe(Effect.flip)).toMatchObject({
+          expect(
+            yield* auth
+              .refreshMcpClientSession({ ...retry, scope: "orchestration:read" })
+              .pipe(Effect.flip),
+          ).toMatchObject({
             error: "invalid_grant",
           });
           expect(
