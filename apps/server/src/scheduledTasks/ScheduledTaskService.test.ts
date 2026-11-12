@@ -430,6 +430,13 @@ it.effect.each([
   { name: "ends interrupted", run: "interrupted", status: "failed", error: "The run was stopped." },
   { name: "ends cancelled", run: "cancelled", status: "failed", error: "The run was cancelled." },
   { name: "completes", run: "completed", status: "succeeded", error: null },
+  {
+    name: "is steered into the active run, which completes",
+    run: "cancelled",
+    status: "succeeded",
+    error: null,
+    joins: true,
+  },
   // The Jarvis inbox heartbeat failed this way on its first launch and still read as succeeded.
   {
     name: "fails workspace preparation on its first launch",
@@ -443,6 +450,7 @@ it.effect.each([
     const projectId = ProjectId.make("project:test");
     const threadId = ThreadId.make("thread:quota");
     const unbound = "unbound" in outcome;
+    const joins = "joins" in outcome;
     const ended = yield* Deferred.make<void>();
     const sent = yield* Ref.make("");
     const run = { id: "run:2", status: outcome.run, rootNodeId: "node:root" };
@@ -468,7 +476,7 @@ it.effect.each([
                       { id: "run:1", status: "completed", userMessageId: "message:earlier" },
                       { ...run, userMessageId },
                     ],
-                    messages: [{ id: userMessageId, runId: "run:2" }],
+                    messages: [{ id: userMessageId, runId: joins ? "run:3" : "run:2" }],
                     turnItems: [
                       {
                         type: "error",
@@ -486,7 +494,12 @@ it.effect.each([
               Deferred.await(ended).pipe(
                 Effect.as({
                   threadId: input.threadId,
-                  run: { ...run, id: input.runId, userMessageId: "" },
+                  run: {
+                    ...run,
+                    id: input.runId,
+                    status: joins && input.runId === "run:3" ? "completed" : run.status,
+                    userMessageId: "",
+                  },
                   timedOut: false,
                 } as never),
               ),

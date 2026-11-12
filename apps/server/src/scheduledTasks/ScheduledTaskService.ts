@@ -944,7 +944,13 @@ export const layer = Layer.effect(
             ["turnItems", "messages"],
           );
           const joined = current.find((message) => message.id === messageId)?.runId ?? null;
-          if (run.status === "cancelled" && joined !== null && joined !== run.id) {
+          // waitForThread answers with a restart's continuation, so compare against both ids.
+          if (
+            run.status === "cancelled" &&
+            joined !== null &&
+            joined !== runId &&
+            joined !== run.id
+          ) {
             runId = joined;
             continue;
           }
@@ -953,9 +959,12 @@ export const layer = Layer.effect(
             UNSUCCESSFUL_RUN_ERRORS[run.status];
           return yield* recordRunOutcome(taskId, startedAtIso, "failed", error);
         }
-        if (runId === null) {
-          yield* recordRunOutcome(taskId, startedAtIso, "failed", "The run never started.");
-        }
+        yield* recordRunOutcome(
+          taskId,
+          startedAtIso,
+          "failed",
+          runId === null ? "The run never started." : "The run was cancelled.",
+        );
       },
       (effect, taskId) =>
         effect.pipe(
