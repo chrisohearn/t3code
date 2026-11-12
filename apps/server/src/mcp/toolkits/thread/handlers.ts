@@ -1,3 +1,4 @@
+import { RuntimeModeChangeActor } from "../../../orchestration-v2/DispatchModeLimit.ts";
 import {
   ProviderRequestKind,
   type CommandId,
@@ -209,7 +210,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     ),
   ),
   t3_thread_configure: McpToolAccess.either(
-    (input) => input.modelSelection === undefined,
+    (input) => input.modelSelection === undefined && input.runtimeMode === undefined,
     McpToolAccess.reads((input) =>
       Effect.gen(function* () {
         const {
@@ -225,11 +226,38 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     ),
     writesThread((input) =>
       Effect.gen(function* () {
-        const modelSelection = yield* required(input.modelSelection, "modelSelection");
         const {
           threads,
           projection: { thread },
         } = yield* readThread(input.threadId);
+        if (input.runtimeMode !== undefined) {
+          if (input.modelSelection !== undefined) {
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "Set runtimeMode separately from modelSelection.",
+            });
+          }
+          const scope = yield* McpInvocationContext.McpInvocationContext;
+          const actor =
+            scope.thread !== undefined
+              ? `MCP thread ${scope.thread.threadId}`
+              : scope.client !== undefined
+                ? `MCP client "${scope.client.label}" (${scope.client.sessionId.slice(0, 8)})`
+                : "MCP caller";
+          const result = yield* threads
+            .dispatch({
+              type: "thread.runtime-mode.set",
+              threadId: thread.id,
+              commandId: yield* newCommandId(),
+              runtimeMode: input.runtimeMode,
+            })
+            .pipe(
+              Effect.provideService(RuntimeModeChangeActor, actor),
+              Effect.mapError(dispatchFailure),
+            );
+          return { sequence: result.sequence };
+        }
+        const modelSelection = yield* required(input.modelSelection, "modelSelection");
         const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
         const result = yield* threads
           .dispatch({ type, threadId: thread.id, commandId: yield* newCommandId(), modelSelection })

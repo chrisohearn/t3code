@@ -28,6 +28,12 @@ export const DispatchModeLimit = Context.Reference<DispatchModeLimitValue | unde
   { defaultValue: () => undefined },
 );
 
+/** Server-stamped identity for a lower-only MCP mode change, never a command argument. */
+export const RuntimeModeChangeActor = Context.Reference<string | undefined>(
+  "t3/orchestration-v2/RuntimeModeChangeActor",
+  { defaultValue: () => undefined },
+);
+
 const interactionModeRank: Record<ProviderInteractionMode, number> = { plan: 0, default: 1 };
 
 export const exceededDispatchModeLimit = (

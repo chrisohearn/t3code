@@ -121,7 +121,8 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
           turnItemId: item.id,
           runId: item.runId,
           ...(runOrdinal === undefined ? {} : { runOrdinal }),
-          ...(item.type === "user_message" && item.inputIntent === "post"
+          ...((item.type === "user_message" && item.inputIntent === "post") ||
+          (item.type === "system_notice" && item.runId === null)
             ? { placement: "thread_end" as const }
             : {}),
         }).pipe(Effect.map((ordinal) => (item.ordinal === ordinal ? item : { ...item, ordinal })));

@@ -1,3 +1,4 @@
+import { RuntimeModeChangeActor } from "../../orchestration-v2/DispatchModeLimit.ts";
 import * as McpEvents from "../McpEvents.ts";
 import * as McpRequestLog from "../../persistence/McpRequestLog.ts";
 import * as BridgeStatusService from "../BridgeStatusService.ts";
@@ -1045,6 +1046,30 @@ it.effect("a read-only client reads threads and is refused every write before it
     });
     expect(declaredFailure(configure)).toMatchObject({ code: "capability_denied" });
     expect(dispatched).toEqual([]);
+
+    const lowerMode = yield* call("t3_thread_configure", {
+      threadId: "other-project-thread",
+      runtimeMode: "approval-required",
+    });
+    expect(declaredFailure(lowerMode)).toMatchObject({ code: "capability_denied" });
+    expect(dispatched).toEqual([]);
+
+    const allowed = yield* server
+      .callTool({
+        name: "t3_thread_configure",
+        arguments: { threadId: "other-project-thread", runtimeMode: "approval-required" },
+      })
+      .pipe(
+        Effect.provideService(
+          McpInvocationContext.McpInvocationContext,
+          clientScope("full-access"),
+        ),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(allowed.isError).toBe(false);
+    expect(dispatched).toEqual([
+      'thread.runtime-mode.set:approval-required:MCP client "Claude Code" (session-)',
+    ]);
   }).pipe(
     Effect.provide(
       layerThreadToolkit.pipe(
@@ -1069,9 +1094,12 @@ it.effect("a read-only client reads threads and is refused every write before it
                   deletedAt: null,
                 },
               } as never),
-            dispatch: () =>
-              Effect.sync(() => {
-                dispatched.push("dispatch");
+            dispatch: (command) =>
+              Effect.gen(function* () {
+                const actor = yield* RuntimeModeChangeActor;
+                dispatched.push(
+                  `${command.type}:${command.type === "thread.runtime-mode.set" ? command.runtimeMode : ""}:${actor}`,
+                );
                 return { sequence: 7 } as never;
               }),
           }),

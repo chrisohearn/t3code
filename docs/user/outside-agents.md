@@ -95,6 +95,10 @@ T3 Code.
   `projectId` or `threadId`.
 - To list threads across projects, call `t3_thread_list` with
   `allProjects: true`, or use `t3_thread_search`.
+- To reduce a stopped thread's permissions, call `t3_thread_configure` with
+  `runtimeMode` alone. It cannot raise permissions or change them during an active
+  run, and the thread must be within the calling agent's permission limits. The
+  change and caller appear in thread activity.
 
 ## Claude Code
 

@@ -152,6 +152,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import {
   DispatchModeLimit,
+  RuntimeModeChangeActor,
   exceededDispatchModeLimit,
   narrowToCeiling,
   type RuntimeModeCeiling,
@@ -3772,6 +3773,59 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} is deleted.`,
       });
     }
+    const runtimeModeActor =
+      command.type === "thread.runtime-mode.set" ? yield* RuntimeModeChangeActor : undefined;
+    if (command.type === "thread.runtime-mode.set" && runtimeModeActor !== undefined) {
+      if (isRuntimeModeAbove(command.runtimeMode, thread.runtimeMode)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "MCP can only lower a thread's runtimeMode.",
+        });
+      }
+      if (command.runtimeMode === thread.runtimeMode) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread runtimeMode is already ${thread.runtimeMode}; MCP can only lower it.`,
+        });
+      }
+      const { runs, nodes, providerTurns, providerThreads, turnItems } =
+        yield* loadProjectionForCommand(
+          command,
+          ["runs", "nodes", "providerTurns", "providerThreads", "turnItems"],
+          {
+            turnItemTypes: ["command_execution", "dynamic_tool", "subagent"],
+            turnItemStatuses: ["pending", "running", "waiting"],
+            omitSettledLeafNodes: true,
+          },
+        );
+      const rolledBackRunIds = new Set(
+        runs.filter((run) => run.status === "rolled_back").map((run) => run.id),
+      );
+      const hasBackgroundWork =
+        // Permission changes must also wait for persistent tools, which Stop leaves running.
+        turnItems.some((item) => item.runId === null || !rolledBackRunIds.has(item.runId)) ||
+        providerThreads.some(
+          (providerThread) =>
+            (thread.activeProviderThreadId === null ||
+              providerThread.id === thread.activeProviderThreadId) &&
+            (providerThread.pendingBackgroundTasks?.length ?? 0) > 0,
+        );
+      if (
+        runs.some((run) => ["preparing", "starting", "running", "waiting"].includes(run.status)) ||
+        nodes.some((node) => node.runId === null && isOrchestrationV2WorkActive(node.status)) ||
+        providerTurns.some((turn) => isOrchestrationV2WorkActive(turn.status)) ||
+        hasBackgroundWork
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Cannot change runtimeMode while a run is active or background work is active. Stop the work first.",
+        });
+      }
+    }
     if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
@@ -4751,6 +4805,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: updatedThread,
     });
+    if (command.type === "thread.runtime-mode.set" && runtimeModeActor !== undefined) {
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`runtime-mode:${command.commandId}`),
+          threadId: command.threadId,
+          type: "system_notice",
+          runId: null,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: yield* projectionStore
+            .getNextTurnItemOrdinal(command.threadId)
+            .pipe(mapDispatchError(command)),
+          status: "completed",
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          message: `${runtimeModeActor} changed runtimeMode: ${thread.runtimeMode} → ${command.runtimeMode}.`,
+        },
+      });
+    }
     // Archiving ends the guest share, so its waiting files go too.
     yield* releaseGuestAttachments(command, thread.guestShare, updatedThread.guestShare, effects);
 
