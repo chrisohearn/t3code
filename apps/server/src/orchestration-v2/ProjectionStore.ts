@@ -6064,7 +6064,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     )(
       function* (threadId: ThreadId, seen: ReadonlySet<ThreadId>, includePersistentOutput = false) {
         const records = yield* getThreadRecords(threadId, ["runs", "attempts"]);
-        const rows = yield* sql<{
+        let rows = yield* sql<{
           turn_item_id: string;
           run_id: string | null;
           node_id: string | null;
@@ -6100,6 +6100,38 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         }
         WHERE item.thread_id = ${threadId}
         ORDER BY item.ordinal ASC, item.turn_item_id ASC`;
+        const legacyPosts = new Set(
+          rows
+            .filter(
+              (row) =>
+                row.run_id === null && row.input_intent === "post" && row.ordinal < 1_000_000,
+            )
+            .map((row) => row.turn_item_id),
+        );
+        if (legacyPosts.size > 0) {
+          // Old runless posts used the prefix bucket; only their first persisted event is immutable.
+          const firstEvents = yield* sql<{ item_id: string; sequence: number }>`
+            SELECT json_extract(payload_json, '$.id') AS item_id, MIN(sequence) AS sequence
+            FROM orchestration_events INDEXED BY idx_orchestration_events_agent_stream_sequence
+            WHERE application_event_version = 2 AND aggregate_kind = 'thread'
+              AND stream_id = ${threadId} AND event_type = 'turn-item.updated'
+            GROUP BY json_extract(payload_json, '$.id') ORDER BY sequence ASC`;
+          const ordinals = new Map(rows.map((row) => [row.turn_item_id, row.ordinal]));
+          const anchors = new Map<string, number>();
+          let priorOrdinal = 0;
+          for (const event of firstEvents) {
+            const ordinal = ordinals.get(event.item_id);
+            if (ordinal === undefined) continue;
+            if (legacyPosts.has(event.item_id)) anchors.set(event.item_id, priorOrdinal + 0.5);
+            else priorOrdinal = Math.max(priorOrdinal, ordinal);
+          }
+          const fallback = rows.reduce((max, row) => Math.max(max, row.ordinal), 0) + 0.5;
+          const position = (row: (typeof rows)[number]) =>
+            legacyPosts.has(row.turn_item_id)
+              ? (anchors.get(row.turn_item_id) ?? fallback)
+              : row.ordinal;
+          rows = rows.toSorted((left, right) => position(left) - position(right));
+        }
         const runStatuses = new Map(records.runs.map((run) => [String(run.id), run.status]));
         const items: Array<TimelineIndexItem> = rows.map((row) => ({
           id: TurnItemId.make(row.turn_item_id),

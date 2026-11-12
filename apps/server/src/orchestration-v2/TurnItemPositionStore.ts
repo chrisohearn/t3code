@@ -23,7 +23,7 @@ export interface TurnItemPositionStoreV2Shape {
     readonly runId: RunId | null;
     readonly runOrdinal?: number;
     // `run_start` takes the run's unused first slot, ahead of its items, and appends once it is taken.
-    readonly placement?: "append" | "run_start";
+    readonly placement?: "append" | "run_start" | "thread_end";
   }) => Effect.Effect<number, TurnItemPositionStoreError>;
   readonly normalize: (
     item: OrchestrationV2TurnItem,
@@ -83,8 +83,7 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
             }
           FROM orchestration_v2_turn_item_positions
           WHERE thread_id = ${threadId}
-            AND ordinal >= ${lowerBound}
-            AND ordinal <= ${upperBound}
+            ${placement === "thread_end" ? sql`` : sql`AND ordinal >= ${lowerBound} AND ordinal <= ${upperBound}`}
           ON CONFLICT(thread_id, turn_item_id) DO NOTHING
         `;
           const rows = yield* sql<{ readonly ordinal: number }>`
@@ -122,6 +121,9 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
           turnItemId: item.id,
           runId: item.runId,
           ...(runOrdinal === undefined ? {} : { runOrdinal }),
+          ...(item.type === "user_message" && item.inputIntent === "post"
+            ? { placement: "thread_end" as const }
+            : {}),
         }).pipe(Effect.map((ordinal) => (item.ordinal === ordinal ? item : { ...item, ordinal })));
       }),
     });

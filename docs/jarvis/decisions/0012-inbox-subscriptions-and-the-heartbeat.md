@@ -6,7 +6,8 @@ Accepted 2026-11-12.
 
 Keep the twelve-hour inbox heartbeat. Each acknowledged delivery renews an explicit
 subscription for its granted lifetime, bounded by the current sign-in expiry.
-Failed deliveries do not renew it. New notify-only watches keep their fixed expiry.
+Failed deliveries do not renew it. Legacy notify-only watches retain their existing grants.
+New notify calls use the [inbox relay](0014-event-routing-and-hub-watch.md).
 Existing watches adopt rolling renewal because their creation path was not recorded.
 Client refreshes and signing-secret rotation remain supported.
 

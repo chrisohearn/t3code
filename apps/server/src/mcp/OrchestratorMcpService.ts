@@ -1057,6 +1057,9 @@ function timelineItem(input: {
     createdBy: message?.createdBy ?? null,
     creationSource: message?.creationSource ?? null,
     ...(message?.senderThreadId === undefined ? {} : { senderThreadId: message.senderThreadId }),
+    ...(input.row.item.type === "user_message" && input.row.item.inputIntent === "post"
+      ? { postOnly: true }
+      : {}),
     type: input.row.item.type,
     status: input.row.item.status,
     title: input.row.item.title,
@@ -3385,9 +3388,12 @@ const make = Effect.gen(function* () {
                 ),
           ),
         );
-      const notify = yield* ThreadNotifications.finish(notification, input.threadId).pipe(
-        Effect.provideService(Invocation.McpInvocationContext, scope),
-      );
+      const notify = yield* ThreadNotifications.finish(
+        notification,
+        input.threadId,
+        result.run.id,
+        input.clientRequestId,
+      ).pipe(Effect.provideService(Invocation.McpInvocationContext, scope));
       return {
         ...(notify === undefined ? {} : { notify }),
         threadId: input.threadId,
