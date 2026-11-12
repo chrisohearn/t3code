@@ -17,6 +17,18 @@ export const layer = Access.toLayer(LedgerToolkit, {
       return yield* (yield* Ledger.WorkLedger).upsert(input, updatedBy);
     }),
   ),
+  ledger_history: Access.reads((input) =>
+    Effect.gen(function* () {
+      yield* readCaller();
+      return yield* (yield* Ledger.WorkLedger).history(input);
+    }),
+  ),
+  portfolio_status: Access.reads((input) =>
+    Effect.gen(function* () {
+      yield* readCaller();
+      return yield* (yield* Ledger.WorkLedger).portfolio(input);
+    }),
+  ),
   ledger_query: Access.reads((input) =>
     Effect.gen(function* () {
       yield* readCaller();

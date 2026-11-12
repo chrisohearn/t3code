@@ -315,6 +315,9 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           ? {}
           : {
               initialMessage: {
+                ...(input.clientRequestId === undefined
+                  ? {}
+                  : { clientRequestId: input.clientRequestId }),
                 messageId,
                 ...(caller === undefined ? {} : { senderThreadId: caller.id }),
                 ...McpInvocationContext.messageSenderFor(scope),

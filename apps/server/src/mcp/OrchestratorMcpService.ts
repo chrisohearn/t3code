@@ -2521,6 +2521,9 @@ const make = Effect.gen(function* () {
       const result = yield* threadManagement
         .dispatch({
           type: "delegated_task.request",
+          ...(input.clientRequestId === undefined
+            ? {}
+            : { clientRequestId: input.clientRequestId }),
           createdBy: "agent",
           creationSource: "mcp",
           commandId,
@@ -2899,6 +2902,9 @@ const make = Effect.gen(function* () {
                 yield* threadManagement
                   .dispatch({
                     type: "message.dispatch",
+                    ...(input.clientRequestId === undefined
+                      ? {}
+                      : { clientRequestId: input.clientRequestId }),
                     createdBy: "agent",
                     creationSource: "mcp",
                     commandId: stableCommandId({
@@ -3362,6 +3368,9 @@ const make = Effect.gen(function* () {
       }
       const result = yield* threadManagement
         .sendToThread({
+          ...(input.clientRequestId === undefined
+            ? {}
+            : { clientRequestId: input.clientRequestId }),
           projectId: target.thread.projectId,
           commandId: stableCommandId({
             scope,

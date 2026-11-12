@@ -190,9 +190,19 @@ ledger. Writing requires operate access and also works for agents inside T3.
 Use `status` to track `open`, `blocked`, `waiting_on_human`, `done`, or
 `cancelled` work. Record a blocker, next action, approval context, links, and an
 optional owning thread. An `approvalNote` records context and grants no approval.
-`ledger_query` filters by `status`, `ownerKind`, `ownerName`, or `updatedSince`, which is inclusive, so skip rows you have already seen.
-It returns up to 25 rows by default, ordered by key. Pass `nextCursor` as
-`cursor` for the next page, or set `limit` up to 100.
+Set `waitReason` to `external`, `natural`, or `decision` to distinguish a dependency,
+a real-world event, and a question for Chris. Use `nextCheckAt` for the next due check.
+
+`ledger_query` filters by `status`, `ownerKind`, `ownerName`, `waitReason`, `due`,
+or `updatedSince` (inclusive). It returns up to 25 rows by default, ordered by key.
+Pass `nextCursor` as `cursor` for the next page, or set `limit` up to 100.
+Read an item's changes with `ledger_history`, or check open work and its owners'
+latest activity with `portfolio_status`. A due check or a completed agent run does
+not mark the work done.
+
+Open **Settings → Work ledger** and choose an environment to read its items or
+open an owner's thread. The panel is read-only. Owner threads belong to the
+selected environment; references to other environments remain links.
 
 Use `bridge_status` to check this sign-in's remaining lifetime, subscription
 state, tunnel reachability, service start time, last successful webhook delivery,

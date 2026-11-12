@@ -140,6 +140,7 @@ export type ThreadManagementTerminalRunStatus = Extract<
 >;
 
 export interface ThreadManagementSendInput {
+  readonly clientRequestId?: string;
   readonly projectId: ProjectId;
   readonly commandId: CommandId;
   readonly threadId: ThreadId;
@@ -868,6 +869,7 @@ const make = Effect.gen(function* () {
 
     const dispatched = yield* dispatch({
       type: "message.dispatch",
+      ...(input.clientRequestId === undefined ? {} : { clientRequestId: input.clientRequestId }),
       commandId: input.commandId,
       threadId: input.threadId,
       messageId: input.messageId,

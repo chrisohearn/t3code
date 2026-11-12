@@ -70,6 +70,7 @@ export type ThreadLaunchWorkspaceStrategy =
     };
 
 export interface ThreadLaunchInitialMessage {
+  readonly clientRequestId?: string;
   readonly messageId?: MessageId;
   readonly scheduledTaskId?: ScheduledTaskId;
   readonly senderThreadId?: ThreadId;
@@ -1052,6 +1053,9 @@ const make = Effect.gen(function* () {
           const dispatched = yield* threads
             .dispatch({
               type: "message.dispatch",
+              ...(input.initialMessage.clientRequestId === undefined
+                ? {}
+                : { clientRequestId: input.initialMessage.clientRequestId }),
               commandId: messageCommandId,
               threadId,
               messageId,

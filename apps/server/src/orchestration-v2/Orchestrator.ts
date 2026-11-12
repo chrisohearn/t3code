@@ -7130,6 +7130,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         command.creationSource === "provider" &&
         !(yield* stopReachedRun(command, command.threadId, activeRun.id));
       const run: OrchestrationV2Run = {
+        ...(command.clientRequestId === undefined
+          ? {}
+          : { clientRequestId: command.clientRequestId }),
         id: runId,
         threadId: command.threadId,
         ordinal,
@@ -7533,6 +7536,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 mapDispatchError(command),
               );
       const run: OrchestrationV2Run = {
+        ...(command.clientRequestId === undefined
+          ? {}
+          : { clientRequestId: command.clientRequestId }),
         id: runId,
         threadId: command.threadId,
         ordinal,
@@ -8319,6 +8325,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
     const run: OrchestrationV2Run = {
+      ...(command.clientRequestId === undefined
+        ? {}
+        : { clientRequestId: command.clientRequestId }),
       id: runId,
       threadId: command.threadId,
       ordinal,
@@ -9030,6 +9039,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
       const childMessageCommand = {
         type: "message.dispatch",
+        ...(command.clientRequestId === undefined
+          ? {}
+          : { clientRequestId: command.clientRequestId }),
         createdBy: command.createdBy,
         creationSource: command.creationSource,
         commandId: command.commandId,
