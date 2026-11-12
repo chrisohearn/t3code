@@ -152,6 +152,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import {
   DispatchModeLimit,
+  RuntimeModeChangeActor,
   exceededDispatchModeLimit,
   narrowToCeiling,
   type RuntimeModeCeiling,
@@ -3766,6 +3767,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} is deleted.`,
       });
     }
+    const runtimeModeActor =
+      command.type === "thread.runtime-mode.set" ? yield* RuntimeModeChangeActor : undefined;
+    if (command.type === "thread.runtime-mode.set" && runtimeModeActor !== undefined) {
+      if (isRuntimeModeAbove(command.runtimeMode, thread.runtimeMode)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "MCP can only lower a thread's runtimeMode.",
+        });
+      }
+      const { runs } = yield* loadProjectionForCommand(command, ["runs"]);
+      if (
+        runs.some((run) => ["preparing", "starting", "running", "waiting"].includes(run.status))
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Cannot change runtimeMode while a run is active. Stop the run first.",
+        });
+      }
+    }
     if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
@@ -4745,6 +4767,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: updatedThread,
     });
+    if (command.type === "thread.runtime-mode.set" && runtimeModeActor !== undefined) {
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`runtime-mode:${command.commandId}`),
+          threadId: command.threadId,
+          type: "system_notice",
+          runId: null,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: yield* projectionStore
+            .getNextTurnItemOrdinal(command.threadId)
+            .pipe(mapDispatchError(command)),
+          status: "completed",
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          message: `${runtimeModeActor} changed runtimeMode: ${thread.runtimeMode} → ${command.runtimeMode}.`,
+        },
+      });
+    }
     // Archiving ends the guest share, so its waiting files go too.
     yield* releaseGuestAttachments(command, thread.guestShare, updatedThread.guestShare, effects);
 

@@ -1,3 +1,4 @@
+import { RuntimeModeChangeActor } from "./DispatchModeLimit.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
@@ -2932,6 +2933,75 @@ it.layer(layerLegacyImportTest)("OrchestrationV2 legacy import", (it) => {
 });
 
 it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
+  it.effect("refuses an MCP runtime-mode change while a run is active", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("mode-active-thread");
+      yield* seedProject({
+        projectId: ProjectId.make("mode-active-project"),
+        title: "Mode project",
+        workspaceRoot: "/workspace/project",
+        defaultModelSelection: null,
+        createdAt: "2026-09-07T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("mode-active-create"),
+        threadId,
+        projectId: ProjectId.make("mode-active-project"),
+        title: "Active mode test",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("mode-active-send"),
+        threadId,
+        messageId: MessageId.make("mode-active-message"),
+        text: "Start work",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      });
+      const failure = yield* orchestrator
+        .dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("mode-active-refused"),
+          threadId,
+          runtimeMode: "approval-required",
+        })
+        .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"), Effect.flip);
+      assert.instanceOf(failure, Orchestrator.OrchestratorDispatchError);
+      assert.include(String(failure.cause), "while a run is active");
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(projection.thread.runtimeMode, "full-access");
+      assert.isFalse(projection.turnItems.some((item) => item.type === "system_notice"));
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("mode-active-stop"),
+        threadId,
+      });
+      yield* orchestrator
+        .dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("mode-stopped-lower"),
+          threadId,
+          runtimeMode: "approval-required",
+        })
+        .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"));
+      const stopped = yield* orchestrator.getThreadProjection(threadId);
+      const notice = stopped.turnItems.find((item) => item.type === "system_notice");
+      const message = stopped.turnItems.find((item) => item.type === "user_message");
+      assert.isDefined(notice);
+      assert.isAbove(notice!.ordinal, message!.ordinal);
+    }),
+  );
   it.effect("applies lifecycle commands idempotently and emits archive/removal shell deltas", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -3051,12 +3121,32 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         })
         .pipe(Effect.flip);
       assert.instanceOf(stalePullRequestSync, Orchestrator.OrchestratorDispatchError);
-      yield* orchestrator.dispatch({
+      const lowerMode = {
         type: "thread.runtime-mode.set",
         commandId: CommandId.make("runtime-layer-lifecycle-runtime"),
         threadId,
         runtimeMode: "approval-required",
-      });
+      } as const;
+      const lowered = yield* orchestrator
+        .dispatch(lowerMode)
+        .pipe(Effect.provideService(RuntimeModeChangeActor, 'MCP client "ChatGPT" (01234567)'));
+      const auditNotice = lowered.storedEvents
+        .map((stored) => stored.event)
+        .find((event) => event.type === "turn-item.updated");
+      assert.equal(auditNotice?.payload.type, "system_notice");
+      if (auditNotice?.payload.type === "system_notice") {
+        assert.include(auditNotice.payload.message, 'MCP client "ChatGPT" (01234567)');
+        assert.include(auditNotice.payload.message, "full-access → approval-required");
+      }
+      const raised = yield* orchestrator
+        .dispatch({
+          ...lowerMode,
+          commandId: CommandId.make("runtime-layer-lifecycle-raise-refused"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.provideService(RuntimeModeChangeActor, "MCP thread caller"), Effect.flip);
+      assert.instanceOf(raised, Orchestrator.OrchestratorDispatchError);
+      assert.include(String(raised.cause), "only lower");
       yield* orchestrator.dispatch({
         type: "thread.interaction-mode.set",
         commandId: CommandId.make("runtime-layer-lifecycle-interaction"),
