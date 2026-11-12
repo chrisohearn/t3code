@@ -370,6 +370,7 @@ const linkedProbe = {
   }),
 };
 const LinkedProbeToolkit = Toolkit.make(
+  Tool.make("answers_approvals", linkedProbe),
   Tool.make("reads", linkedProbe),
   Tool.make("writes", linkedProbe),
   Tool.make("writes_with_capability", linkedProbe),
@@ -384,6 +385,7 @@ const ranHere = <P extends object>(params: P) =>
 const linkedProbeServer = McpHttpServer.toolkitRegistration(
   LinkedProbeToolkit,
   McpToolAccess.toLayer(LinkedProbeToolkit, {
+    answers_approvals: McpToolAccess.answersApprovals(ranHere),
     reads: McpToolAccess.reads(ranHere),
     writes: McpToolAccess.writes(ranHere),
     writes_with_capability: McpToolAccess.writesWithCapability(ranHere),
@@ -408,6 +410,28 @@ const linkedProbeServer = McpHttpServer.toolkitRegistration(
 );
 
 it.effect.each([
+  ["answers_approvals", fullAccess, { environmentId: box }, "capability_denied"],
+  ["answers_approvals", fullAccess, { environmentId: here }, "capability_denied"],
+  ["answers_approvals", clientCaller("auto"), { environmentId: box }, "capability_denied"],
+  [
+    "answers_approvals",
+    clientCaller("full-access"),
+    { environmentId: box },
+    "answers_approvals in environment-box",
+  ],
+  ["answers_approvals", clientCaller("full-access"), { environmentId: here }, "here"],
+  [
+    "answers_approvals",
+    {
+      ...clientCaller("full-access"),
+      client: {
+        ...clientCaller("full-access").client!,
+        narrowedTo: { runtimeMode: "auto", interactionMode: "default" },
+      },
+    },
+    { environmentId: box },
+    "capability_denied",
+  ],
   ["reads", supervised, { environmentId: box }, "reads in environment-box"],
   ["reads", supervised, { environmentId: here }, "here"],
   ["reads", supervised, {}, "here"],

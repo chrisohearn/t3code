@@ -49,6 +49,14 @@ const seedLegacyForkDatabase = Effect.gen(function* () {
 const pendingUpstream = migrationManifest.filter(([id]) => id > LAST_SHARED_ID);
 
 describe("fork migrations", () => {
+  it("registers unique fork ids in strictly increasing order", () => {
+    const ids = forkMigrationManifest.map(([id]) => id);
+    assert.deepEqual(
+      ids,
+      [...new Set(ids)].toSorted((a, b) => a - b),
+    );
+  });
+
   it.effect("backfills legacy subscription lifetimes without altering secrets or cursors", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -147,6 +155,7 @@ describe("fork migrations", () => {
           [5, "McpOAuthRenewal"],
           [6, "McpSubscriptionRenewal"],
           [7, "McpRequestLog"],
+          [8, "McpApprovalAnswers"],
         ],
       );
       assert.equal((yield* forkHistory)[0]?.[2], "2026-11-12 04:10:00");
