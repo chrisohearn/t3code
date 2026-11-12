@@ -22,6 +22,7 @@ import { loadRepoEnv } from "../../scripts/lib/public-config";
 import { thirdPartyLicensesPlugin } from "../../scripts/lib/third-party-licenses";
 import { tailwindPlugins } from "./vite/tailwind";
 import { warmBundledDevPlugin } from "./vite/warmBundledDev";
+import { formatAppDisplayName, resolveWebAppStageLabel } from "./src/branding.logic";
 
 const repoEnv = loadRepoEnv();
 Object.assign(process.env, repoEnv);
@@ -68,6 +69,9 @@ const sourcemapEnv = process.env.T3CODE_WEB_SOURCEMAP?.trim().toLowerCase();
 // `vp run dev --share --built` rebuilds on every change. The license manifest
 // is about 2 s of each build, and nothing in that mode reads it.
 const builtDev = process.env.T3CODE_BUILT_DEV === "1";
+
+// Vitest sets VITEST before it loads this config.
+const isVitest = process.env.VITEST !== undefined;
 
 const bundledDevEnv = process.env.T3CODE_BUNDLED_DEV?.trim().toLowerCase();
 const bundledDev = bundledDevEnv === "1" || bundledDevEnv === "true";
@@ -246,6 +250,28 @@ function chunkCycleGuardPlugin(): Plugin {
   };
 }
 
+// Stamps index.html's title with the name branding.ts resolves once the app
+// loads, so a tab opens on the right channel instead of flashing another's.
+// Desktop swaps in its injected branding from an inline script in index.html.
+function bootstrapTitlePlugin(): Plugin {
+  let development = false;
+  return {
+    name: "t3code:bootstrap-title",
+    configResolved(config) {
+      // The same flag Vite exposes to the app as import.meta.env.DEV.
+      development = !config.isProduction;
+    },
+    transformIndexHtml(html) {
+      const stageLabel = resolveWebAppStageLabel({
+        hostedAppChannel: configuredHostedAppChannel,
+        development,
+      });
+      const title = formatAppDisplayName({ baseName: "T3 Code", stageLabel });
+      return html.replace(/<title>[^<]*<\/title>/, `<title>${title}</title>`);
+    },
+  };
+}
+
 // Allow Tailnet hosts for sharing; Tailscale-controlled DNS prevents attacker rebinding.
 const configuredAllowedHosts = (process.env.T3CODE_DEV_ALLOWED_HOSTS ?? "")
   .split(",")
@@ -266,6 +292,7 @@ export default defineConfig(() => {
     },
     assetsInclude: ["**/*.wasm"],
     plugins: [
+      bootstrapTitlePlugin(),
       devCompressionPlugin(),
       chunkCycleGuardPlugin(),
       builtDev
@@ -323,12 +350,6 @@ export default defineConfig(() => {
     },
     resolve: {
       tsconfigPaths: true,
-      alias: {
-        "@betteroffice/fonts-cjk": new URL(
-          "./src/components/files/office/fonts-cjk.ts",
-          import.meta.url,
-        ).pathname,
-      },
       dedupe: ["react", "react-dom"],
     },
     experimental: {
@@ -341,9 +362,9 @@ export default defineConfig(() => {
       allowedHosts,
       // Warm the module graph before first request to avoid serial import transforms over tailnet.
       // Bundled dev ignores this; warmBundledDevPlugin handles it there.
-      warmup: {
-        clientFiles: ["./src/main.tsx"],
-      },
+      // Not under Vitest: warming main.tsx starts a Tailwind scanner per web test project, even
+      // for server-only runs, and Tailwind's native scanner can segfault with more than one.
+      ...(isVitest ? {} : { warmup: { clientFiles: ["./src/main.tsx"] } }),
       ...(devProxyTarget
         ? {
             // Share prefixes with the backend catch-all so the proxy and 404 lists cannot drift.

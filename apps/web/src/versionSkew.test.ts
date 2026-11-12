@@ -70,6 +70,9 @@ describe("versionSkew", () => {
 
     branding.APP_VERSION = "0.0.34-nightly.20260818.1124";
     expect(resolveVersionMismatch("0.0.34")).toBeNull();
+    expect(
+      resolveVersionMismatch("0.1.10-preview.20261112.1", "0.1.10-nightly.20261111.4544"),
+    ).toBeNull();
   });
 
   it.each(["0.0.34-nightly.20260823.1124", "0.0.34-nightly.20260824.1124"])(

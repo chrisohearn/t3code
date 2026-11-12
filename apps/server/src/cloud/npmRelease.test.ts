@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { ServerNpmReleaseError } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -195,4 +196,75 @@ it.effect.each(["--registry=https://example.com", "../other", "other-package@lat
       const service = yield* makeService(() => Effect.die("invalid specs must not spawn npm"));
       expect(Result.isFailure(yield* service.get({ spec }).pipe(Effect.result))).toBe(true);
     }),
+);
+
+// The desktop requests its own nightly version even when the host runs a fork.
+it.effect("uses the fork feed and resolves exact versions outside the newest release page", () =>
+  Effect.gen(function* () {
+    const releases = ["0.1.9-preview.20261112.2", "0.1.9-preview.20261112.10"].map((version) => ({
+      tag_name: `v${version}`,
+      draft: false,
+      assets: [{ name: "SHA256SUMS" }, { name: `t3-${version}-linux-x64.tar.gz` }],
+    }));
+    const urls: string[] = [];
+    const service = yield* makeService(
+      () => Effect.die("must not query npm for a fork"),
+      HttpClient.make((request) => {
+        urls.push(request.url);
+        const tag = request.url.split("/tags/")[1];
+        const release = releases.find((release) => release.tag_name === tag);
+        return Effect.succeed(
+          HttpClientResponse.fromWeb(
+            request,
+            new Response(JSON.stringify(tag === undefined ? [releases[1]] : (release ?? {})), {
+              status: tag === undefined || release !== undefined ? 200 : 404,
+            }),
+          ),
+        );
+      }),
+    ).pipe(
+      Effect.provide(
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({
+            env: {
+              T3CODE_RELEASE_BASE_URL: "https://github.com/chrisohearn/t3code/releases/download",
+            },
+          }),
+        ),
+      ),
+      Effect.provideService(HostProcess.Platform, "linux"),
+      Effect.provideService(HostProcess.Architecture, "x64"),
+    );
+    expect(yield* service.get({ spec: "nightly" })).toEqual({
+      version: "0.1.9-preview.20261112.10",
+    });
+    expect(yield* service.get({ spec: version })).toEqual({ version: "0.1.9-preview.20261112.10" });
+    expect(yield* service.get({ spec: "0.1.9-preview.20261112.2" })).toEqual({
+      version: "0.1.9-preview.20261112.2",
+    });
+    expect(yield* service.get({ spec: "0.1.9-preview.20261112.99" })).toBeNull();
+    expect(urls).toContain(
+      "https://api.github.com/repos/chrisohearn/t3code/releases/tags/v0.1.9-preview.20261112.2",
+    );
+  }),
+);
+
+it.effect.each([503, 200])("fails closed on an unavailable or malformed fork feed (%s)", (status) =>
+  NpmRelease.lookupForkRelease(
+    "https://github.com/chrisohearn/t3code/releases/download",
+    "nightly",
+  ).pipe(
+    Effect.flip,
+    Effect.tap((error) => Effect.sync(() => expect(error).toBeInstanceOf(ServerNpmReleaseError))),
+    Effect.provideService(
+      HttpClient.HttpClient,
+      HttpClient.make((request) =>
+        Effect.succeed(
+          HttpClientResponse.fromWeb(request, new Response("not release metadata", { status })),
+        ),
+      ),
+    ),
+    Effect.provideService(HostProcess.Platform, "linux"),
+    Effect.provideService(HostProcess.Architecture, "x64"),
+  ),
 );
