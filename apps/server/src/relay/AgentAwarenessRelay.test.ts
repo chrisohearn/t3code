@@ -229,6 +229,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
     listActiveShellIndex: () => Effect.succeed([]),
     listOlderSettledThreads: unused,
     readShellSnapshot: unused,
+    getPendingRuntimeRequestCounts: unused,
     getThreadTitles: unused,
     getThreadLinkMetadata: unused,
     ensureLegacyTranscript: unused,

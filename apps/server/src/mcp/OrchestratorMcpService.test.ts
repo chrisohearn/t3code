@@ -3827,7 +3827,17 @@ describe("OrchestratorMcpService thread lookup", () => {
           Effect.provide(
             service([{ ...launched, latestRunId: runId }], sent, {
               getThreadEventSequence: () => Effect.succeed(42),
-              getProjectThreadRecords: () => Effect.succeed(projection),
+              getProjectThreadRecords: (_input, fields, filter) => {
+                assert.deepEqual<ReadonlyArray<string>>(fields, ["runs", "runtimeRequests"]);
+                assert.deepEqual(filter, {
+                  runIds: filter?.runIds?.includes(runId) ? [runId] : [RunId.make("wrong-run")],
+                  runtimeRequestStatuses: ["pending"],
+                });
+                return Effect.succeed({
+                  ...projection,
+                  runs: projection.runs.filter((run) => filter?.runIds?.includes(run.id)),
+                });
+              },
               getThreadRecords: (_id, _fields, filter) => {
                 assert.deepEqual(filter, {
                   messageRoles: ["assistant"],
@@ -4010,6 +4020,7 @@ describe("OrchestratorMcpService thread list", () => {
             Effect.succeed({
               runtimeRequests: [{ status: "pending" }, { status: "pending" }],
             } as unknown as OrchestrationV2ThreadProjection),
+          getPendingRuntimeRequestCounts: () => Effect.succeed({}),
           listProjectThreads: (input) =>
             Effect.succeed(
               shells.filter(

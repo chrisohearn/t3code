@@ -575,6 +575,9 @@ export interface ProjectionStoreV2Shape {
   readonly getThreadLinkMetadata: (
     threadIds: ReadonlyArray<ThreadId>,
   ) => Effect.Effect<Record<ThreadId, OrchestrationV2ThreadLinkMetadata>, ProjectionStoreV2Error>;
+  readonly getPendingRuntimeRequestCounts: (
+    threadIds: ReadonlyArray<ThreadId>,
+  ) => Effect.Effect<Record<ThreadId, number>, ProjectionStoreV2Error>;
   readonly getThreadTitles: (
     threadIds: ReadonlyArray<ThreadId>,
   ) => Effect.Effect<Record<ThreadId, string>, ProjectionStoreV2Error>;
@@ -3813,13 +3816,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ? Effect.succeed([])
             : window === undefined
               ? sql<PayloadRow>`
-                SELECT payload_json FROM orchestration_v2_projection_messages
+                SELECT message.payload_json FROM orchestration_v2_projection_messages AS message
                 WHERE ${threadColumn(filter?.messageIds)} = ${threadId}
                   ${filter?.messageIds === undefined ? sql`` : sql`AND message_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageIds)}))`}
                   ${filter?.messageRoles === undefined ? sql`` : sql`AND role IN (SELECT value FROM json_each(${encodeIdList(filter.messageRoles)}))`}
                   ${filter?.monitorNotificationsOnly === true ? sql`AND json_extract(payload_json, '$.notification.source.kind') = 'monitor'` : sql``}
                   ${filter?.messageRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageRunIds)}))`}
-                ${filter?.latestMessageOnly === true ? sql`ORDER BY created_at DESC, message_id DESC LIMIT 1` : sql`ORDER BY created_at ASC, message_id ASC`}
+                ${
+                  filter?.latestMessageOnly === true
+                    ? sql`ORDER BY (
+                    SELECT MIN(item.ordinal) FROM orchestration_v2_projection_turn_items AS item
+                    WHERE item.thread_id = message.thread_id
+                      AND item.type IN ('user_message', 'assistant_message')
+                      AND json_extract(item.payload_json, '$.messageId') = message.message_id
+                  ) DESC, created_at DESC, message_id DESC LIMIT 1`
+                    : sql`ORDER BY created_at ASC, message_id ASC`
+                }
               `
               : sql<PayloadRow>`
                 -- Look the window's messages up by key and the live runs' by run. One filter
@@ -7631,6 +7643,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       );
     }, Effect.mapError(shellSnapshotReadError));
 
+    const getPendingRuntimeRequestCounts = Effect.fn(
+      "ProjectionStore.getPendingRuntimeRequestCounts",
+    )(function* (threadIds: ReadonlyArray<ThreadId>) {
+      if (threadIds.length === 0) return {};
+      const rows = yield* sql<{ readonly thread_id: ThreadId; readonly count: number }>`
+        SELECT thread_id, COUNT(*) AS count
+        FROM orchestration_v2_projection_runtime_requests
+        WHERE thread_id IN (SELECT value FROM json_each(${encodeIdList(threadIds)})) AND status = 'pending'
+        GROUP BY thread_id
+      `;
+      return Object.fromEntries(rows.map((row) => [row.thread_id, row.count]));
+    }, Effect.mapError(shellSnapshotReadError));
+
     const getThreadTitles = Effect.fn("ProjectionStore.getThreadTitles")(function* (
       threadIds: ReadonlyArray<ThreadId>,
     ) {
@@ -7810,6 +7835,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getSettlementCandidates: readOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadTitles: readOnReader(getThreadTitles),
+      getPendingRuntimeRequestCounts: readOnReader(getPendingRuntimeRequestCounts),
       getThreadLinkMetadata: readOnReader(getThreadLinkMetadata),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
       getOpenRemoteDelegatedTasks: getOpenRemoteDelegatedTasks.pipe(NodeSqliteClient.readOnly),

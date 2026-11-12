@@ -71,7 +71,7 @@ describe("fork migrations", () => {
       assert.deepStrictEqual(yield* upstreamHistory, migrationManifest);
       assert.deepStrictEqual((yield* forkHistory)[0], [1, "McpEvents", "2026-11-10 10:32:04"]);
       assert.deepStrictEqual(
-        (yield* forkHistory).map(([id, name]) => [id, name]),
+        (yield* forkHistory).map(([id, name]) => [id, name] as const),
         forkMigrationManifest,
       );
 
@@ -105,7 +105,7 @@ describe("fork migrations", () => {
       assert.isTrue(yield* hasPendingMigrations());
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(
-        (yield* forkHistory).map(([id, name]) => [id, name]),
+        (yield* forkHistory).map(([id, name]) => [id, name] as const),
         [
           [1, "McpEvents"],
           [2, "WorkLedger"],

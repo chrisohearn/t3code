@@ -3027,38 +3027,48 @@ const make = Effect.gen(function* () {
           row,
         ]),
       );
+      const pendingCounts = yield* threadManagement
+        .getPendingRuntimeRequestCounts(page.map((shell) => shell.id))
+        .pipe(Effect.mapError(threadManagementFailure));
       return {
         projectId,
         currentThreadId: parent?.thread.id ?? null,
-        threads: yield* Effect.forEach(
-          page,
-          (shell) =>
-            Effect.gen(function* () {
-              const records =
-                shell.pendingRuntimeRequest === null
-                  ? undefined
-                  : yield* threadManagement
-                      .getThreadRecords(shell.id, ["runtimeRequests"], {
-                        runtimeRequestStatuses: ["pending"],
-                      })
-                      .pipe(Effect.mapError(threadManagementFailure));
-              return {
-                ...listItemFromShell(scope, shell, nowMs),
-                pendingRequestCount: records?.runtimeRequests.length ?? 0,
-                launchedBy: provenance.get(shell.id)?.clientLabel ?? null,
-              };
-            }),
-          { concurrency: 8 },
-        ),
+        threads: page.map((shell) => ({
+          ...listItemFromShell(scope, shell, nowMs),
+          pendingRequestCount: pendingCounts[shell.id] ?? 0,
+          launchedBy: provenance.get(shell.id)?.clientLabel ?? null,
+        })),
         nextCursor,
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
     }),
     threadResult: Effect.fn("OrchestratorMcpService.threadResult")(function* (scope, input) {
-      const { target, shell, revision } = yield* loadReadableThread(scope, input.threadId);
-      // The shell's latest run skips silent maintenance runs such as idle compaction.
+      yield* loadCaller(scope, []);
+      const shell = yield* threadManagement
+        .getThreadShell(input.threadId)
+        .pipe(Effect.mapError(threadManagementFailure));
+      if (shell === null || shell.deletedAt !== null)
+        return yield* threadNotFound(
+          threadManagement,
+          input.threadId,
+          `Thread ${input.threadId} is no longer available.`,
+        );
+      const revision = yield* threadManagement
+        .getThreadEventSequence(input.threadId)
+        .pipe(Effect.mapError(threadManagementFailure));
+      // The shell skips silent maintenance runs such as idle compaction.
       const runId = input.runId ?? shell.latestRunId;
-      const run = runId === null ? undefined : target.runs.find((run) => run.id === runId);
+      const target = yield* threadManagement
+        .getProjectThreadRecords(
+          { projectId: shell.projectId, threadId: input.threadId },
+          ["runs", "runtimeRequests"],
+          {
+            runIds: runId === null ? [] : [runId],
+            runtimeRequestStatuses: ["pending"],
+          },
+        )
+        .pipe(Effect.mapError(threadManagementFailure));
+      const run = target.runs[0];
       if (input.runId !== undefined && run === undefined)
         return yield* failure("invalid_request", "The run was not found in this thread.");
       const records =
@@ -3071,13 +3081,21 @@ const make = Effect.gen(function* () {
                 latestMessageOnly: true,
               })
               .pipe(Effect.mapError(threadManagementFailure));
+      const providerTurns =
+        run?.activeAttemptId == null
+          ? []
+          : (yield* threadManagement
+              .getThreadRecords(input.threadId, ["providerTurns"], {
+                providerTurnAttemptIds: [run.activeAttemptId],
+              })
+              .pipe(Effect.mapError(threadManagementFailure))).providerTurns;
       const message = records?.messages[0];
       const chars = Array.from(message?.text ?? "");
       const maxChars = input.maxChars ?? 4000;
       return {
         threadId: input.threadId,
         status: shell.activityRunStatus ?? shell.status,
-        run: run === undefined ? null : threadRun(target, run),
+        run: run === undefined ? null : threadRun({ providerTurns }, run),
         lastAssistantMessage:
           message === undefined
             ? null

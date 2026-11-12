@@ -2532,6 +2532,20 @@ it.effect("SQL snapshot windows keep cards for requests still pending", () =>
       plan[1],
       "SEARCH item USING INDEX orchestration_v2_projection_turn_items_node_ordinal_idx",
     );
+    const countsTrace = traceSqlStatements();
+    const pendingCounts = yield* store
+      .getPendingRuntimeRequestCounts([
+        threadId,
+        threadId,
+        ThreadId.make("thread:without-requests"),
+      ])
+      .pipe(Effect.withTracer(countsTrace.tracer));
+    assert.deepEqual(pendingCounts, { [threadId]: 2 });
+    assert.lengthOf(
+      countsTrace.statements.filter((query) => query.includes("runtime_requests")),
+      1,
+    );
+    assert.deepEqual(yield* store.getPendingRuntimeRequestCounts([]), {});
     const bounded = buildBoundedThreadProjection({
       projection: snapshot.projection,
       snapshotSequence: snapshot.snapshotSequence,
@@ -3257,7 +3271,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         assert.deepEqual(yield* readMessageIds(filter), [lastMessageId, firstMessageId]);
       }
       assert.deepEqual(yield* readMessageIds({ messageRoles: ["user"], latestMessageOnly: true }), [
-        lastMessageId,
+        firstMessageId,
       ]);
       assert.deepEqual(yield* readMessageIds({ messageIds: [] }), []);
       assert.deepEqual(yield* readMessageIds({ messageIds: [firstMessageId] }), [firstMessageId]);
