@@ -39,11 +39,13 @@ import { act, fakeTimers, render } from "./render";
 // in-process session. A string path, since a typed import pulls client-runtime's sources
 // into this project, and imports inside, since the factory runs before this file's own.
 vi.mock("../../../packages/client-runtime/src/connection/driver.ts", async (importOriginal) => {
-  const [actual, { fakeDriver }, Layer] = await Promise.all([
+  const [actual, { fakeDriver, installFakeEnvironment }, Layer] = await Promise.all([
     importOriginal<{ readonly ConnectionDriver: Context.Key<unknown, FakeDriver> }>(),
     import("./fakeEnvironment"),
     import("effect/Layer"),
   ]);
+  // Discovery can start before the test installs its threads.
+  installFakeEnvironment([]);
   return { ...actual, layer: Layer.succeed(actual.ConnectionDriver, fakeDriver) };
 });
 

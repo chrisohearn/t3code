@@ -6697,7 +6697,13 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         yield* git(cwd, ["add", "upstream.txt"]);
         yield* git(cwd, ["commit", "-m", "source advance"]);
         const remoteHead = yield* git(cwd, ["rev-parse", "HEAD"]);
-        yield* git(source, ["--git-dir=.", "fetch", cwd, "stable:refs/heads/release"]);
+        yield* git(source, [
+          "--git-dir=.",
+          "fetch",
+          "--no-prune",
+          cwd,
+          "stable:refs/heads/release",
+        ]);
         yield* git(cwd, ["reset", "--hard", localHead]);
         const driver = yield* GitVcsDriver.GitVcsDriver;
 
