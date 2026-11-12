@@ -4,35 +4,34 @@ Accepted 2026-11-12.
 
 ## Decision
 
-Verify existing recovery during audit-owned updates. Add no draining or updater code.
+Keep existing recovery. Refuse manual/automatic settlement during active runs or
+prepared/pending restart continuations. Settle afterwards only if eligible.
+No draining or updater changes.
 
 ## Results
 
 Update: 2026-11-12 07:36 UTC, to `0.1.10-preview.20261112.3`.
-Exit zero; serving 07:37:22; Connect HTTP 200 07:37:57; migrations 5/6 applied 07:36:23.
+Exit zero; serving 07:37:22; Connect HTTP 200 07:37:57.
 
-`continueThreadsAfterServerUpdate` was unset; default is true. No pending approval,
-secret or auth requests. Baseline: eight running, 59 queued; all had native references.
+`continueThreadsAfterServerUpdate` was unset (default true). No pending approval,
+secret or auth requests. Baseline: eight running, 59 queued, all with native references.
 
-| Provider       | Running | Continued once |
-| -------------- | ------- | -------------- |
-| Claude         | 2       | 2              |
-| Codex Revotech | 4       | 4              |
-| Codex Pro      | 2       | 1              |
+Continued once: Claude 2/2, Codex Revotech 4/4, Codex Pro 1/2.
+Seven retained provider, model/options, provider thread and restart notices.
+Codex used native empty input; Claude used shared prompts, one with lost-work notes.
 
-Seven retained provider instance, model/options and provider thread, with a
-visible restart notice. Code path: native empty input for five Codex continuations;
-shared prompts for both Claude, one including cancelled-background-work notes.
+Queued group, zero duplicates:
 
-By 07:47:57, no duplicates; queued-origin runs: 21 completed, two running, 36 queued.
-Later queue completion and ordering remain unverified.
-Cursor, Grok, OpenCode, Antigravity and Kiro were unobserved.
+- 07:41:33: 5 completed + 1 running + 53 queued.
+- 07:47:57: 21 completed + 2 running + 36 queued.
 
-Codex Pro's thread auto-settled after run 457's shutdown cancellation, before its
-prepared continuation completed. Audit resumed run 458. Gap:
-`r2/restart-gap/codex-pro-run-not-resumed`, [#42](https://github.com/chrisohearn/t3code/issues/42).
-Restart observation complete; repair open.
+Later completion/order remains unverified. Cursor, Grok, OpenCode, Antigravity and
+Kiro were unobserved.
+
+Recovery prepared Codex Pro's continuation, shutdown cancelled its run, then
+auto-settle settled the thread before the effect ran. Recovery correctly skipped
+the settled thread ([#42](https://github.com/chrisohearn/t3code/issues/42)). Audit resumed it manually. Upgrade 30 blocks this race.
 
 ## Alternatives and why
 
-Build new recovery instead. Observation avoids untested changes.
+Deferred settlement risks stale requests settling newer work; refusal is explicit.
