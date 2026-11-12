@@ -197,8 +197,14 @@ optional owning thread. An `approvalNote` records context and grants no approval
 Set `waitReason` to `external`, `natural`, or `decision` to distinguish a dependency,
 a real-world event, and a question for Chris. Use `nextCheckAt` for the next due check.
 
+To record your approval on an item, an agent passes `approval: { source: { threadId,
+itemId, questionId? } }` naming a message you typed in a T3 client or your answer to
+a question dialog there. T3 checks that you, not an agent or an MCP sign-in, wrote
+it, and stores a quote of it with the item. Answers to dialogs from before this
+check existed cannot be verified. Pass `approval: null` to revoke it.
+
 `ledger_query` filters by `status`, `ownerKind`, `ownerName`, `waitReason`, `due`,
-or `updatedSince` (inclusive). It returns up to 25 rows by default, ordered by key.
+`approved`, or `updatedSince` (inclusive). It returns up to 25 rows by default, ordered by key.
 Pass `nextCursor` as `cursor` for the next page, or set `limit` up to 100.
 Read an item's changes with `ledger_history`, or check open work and its owners'
 latest activity with `portfolio_status`. A due check or a completed agent run does

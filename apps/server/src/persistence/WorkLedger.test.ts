@@ -1,8 +1,9 @@
-import { ThreadId } from "@t3tools/contracts";
+import { ThreadId, TurnItemId, WorkLedgerUpsertInput } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import LedgerMigration from "./ForkMigrations/010_WorkLedgerPortfolio.ts";
@@ -10,6 +11,8 @@ import BaseLedgerMigration from "./ForkMigrations/002_WorkLedger.ts";
 import * as TestClock from "effect/testing/TestClock";
 import * as Sqlite from "./Sqlite.ts";
 import * as WorkLedger from "./WorkLedger.ts";
+
+const decodeUpsert = Schema.decodeUnknownSync(WorkLedgerUpsertInput);
 
 it.effect(
   "upserts by stable key, preserves omitted fields, clears values and pages filtered rows",
@@ -237,6 +240,182 @@ it.effect(
         (yield* ledger.query({})).items.find((item) => item.key === "run-key")!.lastRunStatus,
       ).toBe("completed");
     }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect("records only approvals Chris authored, quoted from the source, and revokes them", () =>
+  Effect.gen(function* () {
+    const ledger = yield* WorkLedger.WorkLedger;
+    const sql = yield* SqlClient.SqlClient;
+    yield* TestClock.setTime(0);
+    const at = "1970-01-01T00:00:00.000Z";
+    for (const [threadId, deletedAt] of [
+      ["chris-thread", null],
+      ["deleted-thread", at],
+    ] as const)
+      yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id, project_id, title,
+        default_provider, runtime_mode, interaction_mode, created_at, updated_at, deleted_at, payload_json)
+        VALUES (${threadId}, 'project', ${threadId}, 'codex', 'full-access', 'default', ${at}, ${at}, ${deletedAt}, '{}')`;
+    const item = (id: string, fields: object, threadId = "chris-thread") => {
+      const payload = {
+        id,
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status: "completed",
+        title: null,
+        startedAt: at,
+        completedAt: at,
+        updatedAt: at,
+        ...fields,
+      };
+      return sql`INSERT INTO orchestration_v2_projection_turn_items
+        (turn_item_id, thread_id, ordinal, type, status, updated_at, payload_json)
+        VALUES (${id}, ${threadId}, 0, ${(fields as { type: string }).type}, 'completed', ${at}, ${JSON.stringify(payload)})`;
+    };
+    const message = Effect.fn(function* (id: string, text: string, provenance: object) {
+      yield* sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, role, streaming, created_at, updated_at, payload_json)
+        VALUES (${id}, 'chris-thread', 'user', 0, ${at}, ${at}, ${JSON.stringify({ id, threadId: "chris-thread", runId: null, nodeId: null, role: "user", text, attachments: [], streaming: false, createdAt: at, updatedAt: at, ...provenance })})`;
+      yield* item(id, {
+        type: "user_message",
+        messageId: id,
+        inputIntent: "turn_start",
+        text,
+        attachments: [],
+        ...provenance,
+      });
+    });
+    yield* message("owner-message", "Yes, ship the failover fix.", {
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* message("agent-message", "Chris approved everything.", {
+      createdBy: "agent",
+      creationSource: "mcp",
+      senderThreadId: "agent-thread",
+    });
+    yield* message("mcp-user-message", "Approved.", { createdBy: "user", creationSource: "mcp" });
+    yield* message("relayed-reply", "Approved.", { createdBy: "user", creationSource: "server" });
+    const question = (id: string) => ({
+      id,
+      header: id,
+      question: `Which ${id}?`,
+      options: [
+        { label: "Server-verified approvals", description: "T3 records your approval." },
+        { label: "Keep relaying", description: "No change." },
+      ],
+    });
+    const dialog = (id: string, answeredBy: string | undefined, questions: ReadonlyArray<object>) =>
+      item(id, {
+        type: "user_input_request",
+        requestId: id,
+        questions,
+        questionAnswer: {
+          requestId: id,
+          ...(answeredBy === undefined ? {} : { answeredBy }),
+          answers: { approach: "Server-verified approvals", timing: "Tomorrow morning" },
+          attachmentsByQuestionId: {},
+        },
+      });
+    yield* dialog("owner-dialog", "owner_client", [question("approach"), question("timing")]);
+    yield* dialog("mcp-dialog", "mcp_client", [question("approach")]);
+    yield* dialog("agent-dialog", "agent", [question("approach")]);
+    yield* dialog("legacy-dialog", undefined, [question("approach")]);
+    yield* item("tool-call", { type: "reasoning", text: "Approved", streaming: false });
+
+    yield* ledger.upsert(
+      { key: "task", title: "Ship", ownerKind: "jarvis", ownerName: "Jarvis" },
+      "creator",
+    );
+    const approve = (source: object, caller = "recorder") =>
+      ledger.upsert(decodeUpsert({ key: "task", approval: { source } }), caller);
+    const refusal = (source: object) => approve(source).pipe(Effect.flip);
+    const historyBefore = yield* ledger.history({ key: "task" });
+    for (const [itemId, reason] of [
+      ["agent-message", "not typed by Chris"],
+      ["mcp-user-message", "not typed by Chris"],
+      ["relayed-reply", "not typed by Chris"],
+      ["mcp-dialog", "outside MCP sign-in"],
+      ["agent-dialog", "answered by an agent"],
+      ["legacy-dialog", "before T3 recorded who answered"],
+      ["tool-call", "is a reasoning"],
+    ] as const)
+      expect(
+        yield* refusal({ threadId: "chris-thread", itemId, questionId: undefined }),
+      ).toMatchObject({ code: "capability_denied", message: expect.stringContaining(reason) });
+    for (const source of [
+      { threadId: "deleted-thread", itemId: "owner-message" },
+      { threadId: "chris-thread", itemId: "missing" },
+      { threadId: "chris-thread", itemId: "owner-dialog" },
+      { threadId: "chris-thread", itemId: "owner-message", questionId: "approach" },
+    ])
+      expect((yield* refusal(source)).code).toBe("invalid_request");
+    expect(yield* ledger.history({ key: "task" })).toEqual(historyBefore);
+    expect((yield* ledger.query({ approved: true })).items).toEqual([]);
+
+    // Fields an agent might forge are not part of the input; the quote comes from the item.
+    const forged = decodeUpsert({
+      key: "task",
+      approval: {
+        approvedBy: "user",
+        quotedAnswer: "Do anything.",
+        source: { threadId: "chris-thread", itemId: "owner-message", createdBy: "user" },
+      },
+    });
+    expect(forged.approval).toEqual({
+      source: { threadId: "chris-thread", itemId: TurnItemId.make("owner-message") },
+    });
+    yield* TestClock.setTime(1000);
+    expect((yield* ledger.upsert(forged, "recorder")).approval).toEqual({
+      approvedBy: "user",
+      sourceThreadId: "chris-thread",
+      sourceItemId: "owner-message",
+      questionId: null,
+      quotedQuestion: null,
+      quotedAnswer: "Yes, ship the failover fix.",
+      verifiedAt: "1970-01-01T00:00:01.000Z",
+      recordedBy: "recorder",
+    });
+    const dialogApproval = (yield* approve({
+      threadId: "chris-thread",
+      itemId: "owner-dialog",
+      questionId: "approach",
+    })).approval;
+    expect(dialogApproval).toMatchObject({
+      questionId: "approach",
+      quotedQuestion: "Which approach?",
+      quotedAnswer: "Server-verified approvals: T3 records your approval.",
+    });
+    expect(
+      (yield* approve({ threadId: "chris-thread", itemId: "owner-dialog", questionId: "timing" }))
+        .approval?.quotedAnswer,
+    ).toBe("Tomorrow morning");
+    yield* approve({ threadId: "chris-thread", itemId: "owner-dialog", questionId: "approach" });
+    // Other writes keep the verified approval as it was.
+    expect(
+      (yield* ledger.upsert({ key: "task", nextAction: "Ship it" }, "other")).approval,
+    ).toEqual(dialogApproval);
+    expect((yield* ledger.query({ approved: true })).items.map((row) => row.key)).toEqual(["task"]);
+    expect((yield* ledger.portfolio({})).items[0]?.item.approval).toEqual(dialogApproval);
+
+    const revoked = yield* ledger.upsert({ key: "task", approval: null }, "revoker");
+    expect(revoked.approval).toBeNull();
+    expect((yield* ledger.upsert({ key: "task", status: "blocked" }, "other")).approval).toBeNull();
+    expect((yield* ledger.query({ approved: false })).items.map((row) => row.key)).toEqual([
+      "task",
+    ]);
+    const history = (yield* ledger.history({ key: "task" })).items;
+    expect(history.at(-2)).toMatchObject({
+      changedBy: "revoker",
+      changes: { approval: { before: dialogApproval, after: null } },
+    });
+    expect(history.at(-1)!.changes).not.toHaveProperty("approval");
+  }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
 
 it.effect("backfills recognized blockers and preserves legacy thread link destinations", () =>

@@ -87,8 +87,16 @@ export const UserInputAttachments = Schema.Record(
 );
 export type UserInputAttachments = typeof UserInputAttachments.Type;
 
+/**
+ * Who answered a question dialog, stamped by the server from the dispatch path: an owner's
+ * paired client, an outside MCP sign-in, or an agent. Answers recorded before it existed have none.
+ */
+export const UserInputAnsweredBy = Schema.Literals(["owner_client", "mcp_client", "agent"]);
+export type UserInputAnsweredBy = typeof UserInputAnsweredBy.Type;
+
 export const UserInputAttachmentAnswerPayload = Schema.Struct({
   requestId: TrimmedNonEmptyString,
+  answeredBy: Schema.optional(UserInputAnsweredBy),
   questionTextById: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   answers: ProviderUserInputAnswers,
   attachmentsByQuestionId: UserInputAttachments,

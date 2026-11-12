@@ -122,6 +122,7 @@ import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
+import { CommandActor } from "./orchestration-v2/CommandActor.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
@@ -1972,7 +1973,11 @@ export const layerWsRpc = (
                             "creationSource" in command ? command.creationSource : "web",
                         }),
                       )
-                  ).pipe(Effect.provide(intakeContext)),
+                  ).pipe(
+                    // Only the owner's paired web, desktop and mobile clients dispatch here.
+                    Effect.provideService(CommandActor, { kind: "owner_client" }),
+                    Effect.provide(intakeContext),
+                  ),
                 )
                 .pipe(
                   Effect.tap((result) =>

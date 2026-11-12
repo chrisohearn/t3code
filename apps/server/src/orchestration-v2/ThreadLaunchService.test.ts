@@ -8,6 +8,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as ServerConfig from "../config.ts";
 import { createPendingAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ThreadMessageIntake from "./ThreadMessageIntake.ts";
+import { CommandActor } from "./CommandActor.ts";
 import { assert, it, vi } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
@@ -2199,7 +2200,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
       runId: queuedRun.id,
       text: "Edited with a file",
       attachments: [...queuedMessage.attachments, file],
-    });
+    }).pipe(Effect.provideService(CommandActor, { kind: "owner_client" }));
     yield* edit;
     yield* edit;
     const editedProjection = yield* threads.getThreadProjection(input.threadId);
@@ -2207,6 +2208,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
       (message) => message.id === queuedRun.userMessageId,
     );
     assert.isDefined(editedMessage);
+    assert.equal(editedMessage.createdBy, "user");
     assert.equal(editedMessage.attachments.length, 2);
     assert.deepEqual(editedMessage.attachments[0], queuedMessage.attachments[0]);
     assert.notEqual(editedMessage.attachments[1]?.id, file.id);
@@ -2217,6 +2219,19 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
     assert.isNotNull(durableFilePath);
     assert.deepEqual(yield* fs.readFile(durableFilePath), new Uint8Array([5, 6, 7, 8]));
     assert.deepEqual(yield* fs.readFile(filePath), new Uint8Array([5, 6, 7, 8]));
+    yield* ThreadMessageIntake.dispatchCommand({
+      type: "queued-run.edit",
+      commandId: CommandId.make("intake-edit-by-agent"),
+      threadId: input.threadId,
+      runId: queuedRun.id,
+      text: "Rewritten by an agent",
+    }).pipe(Effect.provideService(CommandActor, { kind: "agent" }));
+    // The owner's words no longer stand once an agent rewrites them.
+    const rewritten = (yield* threads.getThreadProjection(input.threadId)).messages.find(
+      (message) => message.id === queuedRun.userMessageId,
+    );
+    assert.equal(rewritten?.createdBy, "agent");
+    assert.equal(rewritten?.creationSource, "mcp");
     const beforeRejectedEdit = (yield* claimedFiles).length;
     const rejectedEdit = yield* ThreadMessageIntake.dispatchCommand({
       type: "queued-run.edit",

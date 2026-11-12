@@ -1,5 +1,9 @@
 import {
   WorkLedgerItem,
+  WorkLedgerApproval,
+  type WorkLedgerApprovalSource,
+  OrchestrationV2ConversationMessageJson,
+  OrchestrationV2TurnItemJson,
   RunId,
   type WorkLedgerHistoryResult,
   WorkLedgerHistoryEntry,
@@ -44,13 +48,54 @@ export class WorkLedger extends Context.Service<
   }
 >()("t3/persistence/WorkLedger") {}
 
+const approvalJson = Schema.fromJsonString(WorkLedgerApproval);
 const decode = Schema.decodeUnknownEffect(
   Schema.Array(
     WorkLedgerItem.mapFields(
-      Struct.assign({ links: Schema.fromJsonString(WorkLedgerItem.fields.links) }),
+      Struct.assign({
+        links: Schema.fromJsonString(WorkLedgerItem.fields.links),
+        approval: Schema.NullOr(approvalJson),
+      }),
     ),
   ),
 );
+const encodeApproval = Schema.encodeEffect(approvalJson);
+const decodeTurnItem = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationV2TurnItemJson),
+);
+const decodeMessage = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
+);
+const QUOTE_LIMIT = 8000;
+const refuse = (message: string) =>
+  new OrchestratorMcpFailure({
+    code: "capability_denied",
+    message: `Not recorded as Chris's approval: ${message}`,
+  });
+const unknownSource = (message: string) =>
+  new OrchestratorMcpFailure({ code: "invalid_request", message });
+// Only what the owner typed or chose in a paired T3 client; MCP, agents, guests and server
+// stand-ins (scheduled tasks, relayed dialog replies) never qualify.
+const isOwnerAuthored = (entry: {
+  readonly createdBy: string;
+  readonly creationSource: string;
+  readonly senderClient?: unknown;
+  readonly senderThreadId?: unknown;
+  readonly linkedSender?: unknown;
+  readonly scheduledTaskId?: unknown;
+  readonly context?: { readonly guest?: unknown } | undefined;
+}) =>
+  entry.createdBy === "user" &&
+  (entry.creationSource === "web" || entry.creationSource === "mobile") &&
+  entry.senderClient === undefined &&
+  entry.senderThreadId === undefined &&
+  entry.linkedSender === undefined &&
+  entry.scheduledTaskId === undefined &&
+  entry.context?.guest === undefined;
+const answeredByRefusal = {
+  mcp_client: "the dialog was answered by an outside MCP sign-in, not by Chris in a T3 client.",
+  agent: "the dialog was answered by an agent, not by Chris.",
+} as const;
 const decodeHistory = Schema.decodeUnknownEffect(
   Schema.Array(
     WorkLedgerHistoryEntry.mapFields(
@@ -73,13 +118,120 @@ const storage = () =>
   });
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const select = sql`SELECT work_key AS key, title, owner_kind AS "ownerKind", owner_name AS "ownerName", owner_thread_id AS "ownerThreadId", status, wait_reason AS "waitReason", next_check_at AS "nextCheckAt", last_run_id AS "lastRunId", last_run_status AS "lastRunStatus", last_run_at AS "lastRunAt", blocker, next_action AS "nextAction", approval_note AS "approvalNote", links_json AS links, created_at AS "createdAt", updated_at AS "updatedAt", updated_by AS "updatedBy" FROM work_ledger`;
+  const select = sql`SELECT work_key AS key, title, owner_kind AS "ownerKind", owner_name AS "ownerName", owner_thread_id AS "ownerThreadId", status, wait_reason AS "waitReason", next_check_at AS "nextCheckAt", last_run_id AS "lastRunId", last_run_status AS "lastRunStatus", last_run_at AS "lastRunAt", blocker, next_action AS "nextAction", approval_note AS "approvalNote", approval_json AS approval, links_json AS links, created_at AS "createdAt", updated_at AS "updatedAt", updated_by AS "updatedBy" FROM work_ledger`;
   const read = (key: string) =>
     sql`${select} WHERE work_key = ${key}`.pipe(
       Effect.flatMap(decode),
       Effect.map((rows) => rows[0]),
       Effect.mapError(storage),
     );
+  const verifyApproval = Effect.fn("WorkLedger.verifyApproval")(function* (
+    source: WorkLedgerApprovalSource,
+    recordedBy: string,
+    verifiedAt: string,
+  ) {
+    const [thread] = yield* sql<{
+      deleted_at: string | null;
+    }>`SELECT deleted_at FROM orchestration_v2_projection_threads WHERE thread_id = ${source.threadId}`;
+    if (thread === undefined || thread.deleted_at !== null)
+      return yield* unknownSource(`Thread ${source.threadId} was not found in this environment.`);
+    const [row] = yield* sql<{
+      payload_json: string;
+    }>`SELECT payload_json FROM orchestration_v2_projection_turn_items
+      WHERE turn_item_id = ${source.itemId} AND thread_id = ${source.threadId}`;
+    if (row === undefined)
+      return yield* unknownSource(
+        `Item ${source.itemId} is not in thread ${source.threadId}. Use the item's sourceThreadId from t3_thread_read.`,
+      );
+    const item = yield* decodeTurnItem(row.payload_json);
+    const base = {
+      approvedBy: "user" as const,
+      sourceThreadId: source.threadId,
+      sourceItemId: source.itemId,
+      verifiedAt,
+      recordedBy,
+    };
+    if (item.type === "user_message") {
+      if (source.questionId !== undefined)
+        return yield* unknownSource("questionId applies only to a question dialog.");
+      const [messageRow] = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_projection_messages
+        WHERE message_id = ${item.messageId} AND thread_id = ${source.threadId}`;
+      const message =
+        messageRow === undefined ? undefined : yield* decodeMessage(messageRow.payload_json);
+      if (
+        message === undefined ||
+        message.role !== "user" ||
+        message.notification !== undefined ||
+        message.delegatedCompletion !== undefined ||
+        !isOwnerAuthored(item) ||
+        !isOwnerAuthored(message)
+      )
+        return yield* refuse(
+          "the message was not typed by Chris in a T3 web, desktop or mobile client.",
+        );
+      if (message.text.length > QUOTE_LIMIT)
+        return yield* refuse(`the message is longer than ${QUOTE_LIMIT} characters to quote.`);
+      return {
+        ...base,
+        questionId: null,
+        quotedQuestion: null,
+        quotedAnswer: message.text,
+      };
+    }
+    if (item.type !== "user_input_request")
+      return yield* refuse(
+        `item ${source.itemId} is a ${item.type}. Only Chris's own message or his answer to a question dialog can approve.`,
+      );
+    const answer = item.questionAnswer;
+    if (answer === undefined) return yield* refuse("the question dialog has no recorded answer.");
+    if (answer.answeredBy === undefined)
+      return yield* refuse(
+        "the answer was recorded before T3 recorded who answered dialogs, so it cannot be verified. Ask Chris again.",
+      );
+    if (answer.answeredBy !== "owner_client")
+      return yield* refuse(answeredByRefusal[answer.answeredBy]);
+    const question =
+      source.questionId === undefined
+        ? item.questions.length === 1
+          ? item.questions[0]
+          : undefined
+        : item.questions.find((candidate) => candidate.id === source.questionId);
+    if (question === undefined)
+      return yield* unknownSource(
+        source.questionId === undefined
+          ? `The dialog asked ${item.questions.length} questions. Pass questionId.`
+          : `The dialog has no question ${source.questionId}.`,
+      );
+    const raw = answer.answers[question.id];
+    const chosen =
+      typeof raw === "string"
+        ? [raw]
+        : Array.isArray(raw)
+          ? raw.filter((value): value is string => typeof value === "string")
+          : [];
+    if (chosen.length === 0)
+      return yield* refuse(`Chris gave no answer to question ${question.id}.`);
+    const quotedAnswer = chosen
+      .map((value) => {
+        const option = question.options.find(
+          (candidate) => candidate.label === value || candidate.value === value,
+        );
+        return option === undefined ? value : `${option.label}: ${option.description}`;
+      })
+      .join("\n");
+    if (quotedAnswer.length > QUOTE_LIMIT || question.question.length > QUOTE_LIMIT)
+      return yield* refuse(
+        `the question or answer is longer than ${QUOTE_LIMIT} characters to quote.`,
+      );
+    return {
+      ...base,
+      questionId: question.id,
+      quotedQuestion: question.question,
+      quotedAnswer,
+    };
+  });
   const query = Effect.fn("WorkLedger.query")(function* (input: WorkLedgerQueryInput) {
     const limit = input.limit ?? 25;
     const now = DateTime.formatIso(yield* DateTime.now);
@@ -97,6 +249,7 @@ const make = Effect.gen(function* () {
         ${input.waitReason === undefined ? sql`` : input.waitReason === null ? sql`AND wait_reason IS NULL` : sql`AND wait_reason = ${input.waitReason}`}
         ${input.due === undefined ? sql`` : input.due ? sql`AND next_check_at <= ${now}` : sql`AND (next_check_at IS NULL OR next_check_at > ${now})`}
         ${input.status === undefined ? sql`` : sql`AND status = ${input.status}`}
+        ${input.approved === undefined ? sql`` : input.approved ? sql`AND approval_json IS NOT NULL` : sql`AND approval_json IS NULL`}
         ${input.ownerKind === undefined ? sql`` : sql`AND owner_kind = ${input.ownerKind}`}
         ${input.ownerName === undefined ? sql`` : sql`AND owner_name = ${input.ownerName}`}
         ${since === undefined ? sql`` : sql`AND updated_at >= ${Option.getOrThrow(since)}`}
@@ -121,9 +274,17 @@ const make = Effect.gen(function* () {
           Effect.gen(function* () {
             const current = yield* read(input.key);
             const now = DateTime.formatIso(yield* DateTime.now);
+            const { approval: approvalInput, ...fieldsInput } = input;
             const patch = Object.fromEntries(
-              Object.entries(input).filter(([, value]) => value !== undefined),
+              Object.entries(fieldsInput).filter(([, value]) => value !== undefined),
             );
+            // Omitted keeps the verified approval; null revokes it; a source is verified now.
+            const approval =
+              approvalInput === undefined
+                ? (current?.approval ?? null)
+                : approvalInput === null
+                  ? null
+                  : yield* verifyApproval(approvalInput.source, updatedBy, now);
             const candidate = {
               ownerThreadId: null,
               waitReason: null,
@@ -138,6 +299,7 @@ const make = Effect.gen(function* () {
               links: [],
               ...current,
               ...patch,
+              approval,
               createdAt: current?.createdAt ?? now,
               updatedAt: now,
               updatedBy,
@@ -188,6 +350,10 @@ const make = Effect.gen(function* () {
               ),
             );
             const linksJson = yield* encodeLinks(item.links).pipe(Effect.mapError(storage));
+            const approvalJsonText =
+              item.approval === null
+                ? null
+                : yield* encodeApproval(item.approval).pipe(Effect.mapError(storage));
             const row = {
               work_key: item.key,
               title: item.title,
@@ -200,6 +366,7 @@ const make = Effect.gen(function* () {
               next_check_at: item.nextCheckAt,
               next_action: item.nextAction,
               approval_note: item.approvalNote,
+              approval_json: approvalJsonText,
               links_json: linksJson,
               created_at: item.createdAt,
               updated_at: item.updatedAt,
@@ -209,7 +376,8 @@ const make = Effect.gen(function* () {
               title=excluded.title, owner_kind=excluded.owner_kind, owner_name=excluded.owner_name,
               owner_thread_id=excluded.owner_thread_id, status=excluded.status, blocker=excluded.blocker,
               wait_reason=excluded.wait_reason, next_check_at=excluded.next_check_at,
-              next_action=excluded.next_action, approval_note=excluded.approval_note, links_json=excluded.links_json,
+              next_action=excluded.next_action, approval_note=excluded.approval_note,
+              approval_json=excluded.approval_json, links_json=excluded.links_json,
               updated_at=excluded.updated_at, updated_by=excluded.updated_by`;
             const changes = Object.fromEntries(
               Object.entries(item)
