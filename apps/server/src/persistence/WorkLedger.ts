@@ -216,7 +216,7 @@ const make = Effect.gen(function* () {
                 .filter(
                   ([field, value]) =>
                     !["createdAt", "updatedAt", "updatedBy"].includes(field) &&
-                    JSON.stringify(current?.[field as keyof WorkLedgerItem]) !==
+                    JSON.stringify(current?.[field as keyof WorkLedgerItem] ?? null) !==
                       JSON.stringify(value),
                 )
                 .map(([field, value]) => [

@@ -131,6 +131,8 @@ it.effect(
         changedBy: "caller-a",
         changes: { title: { before: null, after: "Wait" } },
       });
+      expect(page.items[0]!.changes).not.toHaveProperty("lastRunId");
+      expect(page.items[0]!.changes).not.toHaveProperty("approvalNote");
       const rest = yield* ledger.history({ key: "wait", cursor: page.nextCursor! });
       expect(rest.items[0]).toMatchObject({
         changedBy: "caller-b",
@@ -188,6 +190,11 @@ it.effect(
         (yield* ledger.query({})).items.find((item) => item.key === "run-key")!.lastRunId,
       ).toBeNull();
       yield* sql`UPDATE orchestration_v2_projection_runs SET status = 'completed', completed_at = '1970-01-01T00:00:01.000Z' WHERE run_id = 'run-1'`;
+      expect(
+        (yield* ledger.query({ updatedSince: "1970-01-01T00:00:01.000Z" })).items.map(
+          (item) => item.key,
+        ),
+      ).toEqual(["run-key"]);
       yield* sql`INSERT INTO orchestration_v2_projection_messages
       (message_id, thread_id, run_id, role, streaming, created_at, updated_at, payload_json)
       VALUES ('result-1', 'worker-thread', 'run-1', 'assistant', 0, '1970-01-01T00:00:01.000Z', '1970-01-01T00:00:01.000Z', '{"text":"Completed the batch"}')`;
@@ -215,6 +222,11 @@ it.effect(
         "caller",
       );
       const page = yield* ledger.portfolio({ limit: 1 });
+      yield* ledger.upsert({ key: "run-key" }, "caller");
+      yield* sql`UPDATE orchestration_v2_projection_runs SET completed_at = '1970-01-01T00:00:02.000Z' WHERE run_id = 'run-1'`;
+      expect(
+        (yield* ledger.query({})).items.find((item) => item.key === "run-key")!.updatedAt,
+      ).toBe("1970-01-02T01:00:00.000Z");
       expect(page.nextCursor).toBe("run-key");
       expect((yield* ledger.portfolio({ cursor: page.nextCursor! })).items[0]).toMatchObject({
         item: { key: "z" },

@@ -49,7 +49,8 @@ export default Effect.gen(function* () {
           THEN json_extract(NEW.payload_json, '$.clientRequestId') IS NOT NULL ELSE 0 END
       BEGIN
         UPDATE work_ledger SET last_run_id = NEW.run_id, last_run_status = NEW.status,
-          last_run_at = COALESCE(NEW.completed_at, NEW.requested_at)
+          last_run_at = COALESCE(NEW.completed_at, NEW.requested_at),
+          updated_at = MAX(updated_at, COALESCE(NEW.completed_at, NEW.requested_at))
         WHERE work_key = json_extract(NEW.payload_json, '$.clientRequestId')
           AND (last_run_at IS NULL OR last_run_at <= COALESCE(NEW.completed_at, NEW.requested_at));
       END`);
