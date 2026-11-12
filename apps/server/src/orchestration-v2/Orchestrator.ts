@@ -127,6 +127,7 @@ import {
 import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
 import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import { CommandActor } from "./CommandActor.ts";
+import { quoteUserInputAnswers } from "./userInputAnswerQuotes.ts";
 import {
   cancelledBeforeStart,
   continuationFailedBeforePrompt,
@@ -10612,7 +10613,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
 
       const approvalTurnItem = context.item;
-      const answeredBy = Option.map(yield* Effect.serviceOption(CommandActor), (a) => a.kind);
+      const answerActor = yield* Effect.serviceOption(CommandActor);
       const mcpAnswer = yield* Effect.serviceOption(McpApprovalAnswerContext);
       if (
         Option.isSome(mcpAnswer) &&
@@ -10884,7 +10885,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ? {
                   questionAnswer: {
                     requestId: command.requestId,
-                    ...(Option.isSome(answeredBy) ? { answeredBy: answeredBy.value } : {}),
+                    ...(Option.isSome(answerActor)
+                      ? {
+                          answeredBy: answerActor.value.kind,
+                          ...(answerActor.value.client === undefined
+                            ? {}
+                            : { answeringClient: answerActor.value.client }),
+                        }
+                      : {}),
+                    quotesById: quoteUserInputAnswers(approvalTurnItem.questions, answers),
                     answers,
                     attachmentsByQuestionId: command.attachmentsByQuestionId ?? {},
                     questionTextById: Object.fromEntries(
@@ -11549,12 +11558,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const emitEvent = emit(events, command);
     const editedAttachments =
       command.attachments === undefined ? {} : { attachments: command.attachments };
-    // Text an agent or MCP client rewrote is no longer the owner's words.
-    const editor = yield* Effect.serviceOption(CommandActor);
-    const editedBy =
-      Option.isSome(editor) && editor.value.kind === "owner_client"
-        ? {}
-        : { createdBy: "agent" as const, creationSource: "mcp" as const };
     const {
       senderClient: _senderClient,
       senderThreadId: _senderThreadId,
@@ -11570,7 +11573,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: withoutGuestAttribution({
         ...unattributedMessage,
-        ...editedBy,
         text: command.text,
         ...editedAttachments,
         ...(command.context ? { context: command.context } : {}),
@@ -11593,7 +11595,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: withoutGuestAttribution({
           ...unattributedItem,
-          ...editedBy,
           text: command.text,
           ...editedAttachments,
           ...(command.context ? { context: command.context } : {}),

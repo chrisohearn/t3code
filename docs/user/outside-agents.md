@@ -197,11 +197,12 @@ optional owning thread. An `approvalNote` records context and grants no approval
 Set `waitReason` to `external`, `natural`, or `decision` to distinguish a dependency,
 a real-world event, and a question for Chris. Use `nextCheckAt` for the next due check.
 
-To record your approval on an item, an agent passes `approval: { source: { threadId,
-itemId, questionId? } }` naming a message you typed in a T3 client or your answer to
-a question dialog there. T3 checks that you, not an agent or an MCP sign-in, wrote
-it, and stores a quote of it with the item. Answers to dialogs from before this
-check existed cannot be verified. Pass `approval: null` to revoke it.
+To record your approval on an item, an agent asks you in a question dialog whose
+question includes `Ledger key: <key>`. It then passes `approval: { source: { threadId,
+itemId, questionId? } }` naming that dialog. T3 checks that you answered it from one
+of your paired devices and that the question names the item. It stores a quote of the
+question and your answer with the item. Changing the item's title, next action or
+owner withdraws the approval, as does `approval: null`.
 
 `ledger_query` filters by `status`, `ownerKind`, `ownerName`, `waitReason`, `due`,
 `approved`, or `updatedSince` (inclusive). It returns up to 25 rows by default, ordered by key.

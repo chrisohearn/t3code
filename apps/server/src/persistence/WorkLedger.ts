@@ -2,7 +2,6 @@ import {
   WorkLedgerItem,
   WorkLedgerApproval,
   type WorkLedgerApprovalSource,
-  OrchestrationV2ConversationMessageJson,
   OrchestrationV2TurnItemJson,
   RunId,
   type WorkLedgerHistoryResult,
@@ -25,6 +24,8 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
 import * as SqlClient from "effect/sql/SqlClient";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- the row hash is a plain comparison key.
+import * as NodeCrypto from "node:crypto";
 
 export class WorkLedger extends Context.Service<
   WorkLedger,
@@ -63,10 +64,7 @@ const encodeApproval = Schema.encodeEffect(approvalJson);
 const decodeTurnItem = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2TurnItemJson),
 );
-const decodeMessage = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
-);
-const QUOTE_LIMIT = 8000;
+const QUOTE_LIMIT = 2000;
 const refuse = (message: string) =>
   new OrchestratorMcpFailure({
     code: "capability_denied",
@@ -74,28 +72,27 @@ const refuse = (message: string) =>
   });
 const unknownSource = (message: string) =>
   new OrchestratorMcpFailure({ code: "invalid_request", message });
-// Only what the owner typed or chose in a paired T3 client; MCP, agents, guests and server
-// stand-ins (scheduled tasks, relayed dialog replies) never qualify.
-const isOwnerAuthored = (entry: {
-  readonly createdBy: string;
-  readonly creationSource: string;
-  readonly senderClient?: unknown;
-  readonly senderThreadId?: unknown;
-  readonly linkedSender?: unknown;
-  readonly scheduledTaskId?: unknown;
-  readonly context?: { readonly guest?: unknown } | undefined;
-}) =>
-  entry.createdBy === "user" &&
-  (entry.creationSource === "web" || entry.creationSource === "mobile") &&
-  entry.senderClient === undefined &&
-  entry.senderThreadId === undefined &&
-  entry.linkedSender === undefined &&
-  entry.scheduledTaskId === undefined &&
-  entry.context?.guest === undefined;
 const answeredByRefusal = {
   mcp_client: "the dialog was answered by an outside MCP sign-in, not by Chris in a T3 client.",
   agent: "the dialog was answered by an agent, not by Chris.",
 } as const;
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** The question must name this row as `Ledger key: <key>`, with nothing appended to the key. */
+const namesLedgerKey = (question: string, key: string) =>
+  new RegExp(`(^|[^\\w])[Ll]edger [Kk]ey:[*\\s\`]*${escapeRegExp(key)}[*\`]*[.,;]?(?=\\s|$)`).test(
+    question,
+  );
+/** What an approval is bound to; changing any of it withdraws the approval. */
+const ledgerRowHash = (row: {
+  readonly key: string;
+  readonly title: string;
+  readonly nextAction: string | null;
+  readonly ownerKind: string;
+  readonly ownerName: string;
+}) =>
+  NodeCrypto.createHash("sha256")
+    .update(JSON.stringify([row.key, row.title, row.nextAction, row.ownerKind, row.ownerName]))
+    .digest("hex");
 const decodeHistory = Schema.decodeUnknownEffect(
   Schema.Array(
     WorkLedgerHistoryEntry.mapFields(
@@ -127,6 +124,7 @@ const make = Effect.gen(function* () {
     );
   const verifyApproval = Effect.fn("WorkLedger.verifyApproval")(function* (
     source: WorkLedgerApprovalSource,
+    row: WorkLedgerItem,
     recordedBy: string,
     verifiedAt: string,
   ) {
@@ -135,63 +133,34 @@ const make = Effect.gen(function* () {
     }>`SELECT deleted_at FROM orchestration_v2_projection_threads WHERE thread_id = ${source.threadId}`;
     if (thread === undefined || thread.deleted_at !== null)
       return yield* unknownSource(`Thread ${source.threadId} was not found in this environment.`);
-    const [row] = yield* sql<{
+    const [itemRow] = yield* sql<{
       payload_json: string;
     }>`SELECT payload_json FROM orchestration_v2_projection_turn_items
       WHERE turn_item_id = ${source.itemId} AND thread_id = ${source.threadId}`;
-    if (row === undefined)
+    if (itemRow === undefined)
       return yield* unknownSource(
         `Item ${source.itemId} is not in thread ${source.threadId}. Use the item's sourceThreadId from t3_thread_read.`,
       );
-    const item = yield* decodeTurnItem(row.payload_json);
-    const base = {
-      approvedBy: "user" as const,
-      sourceThreadId: source.threadId,
-      sourceItemId: source.itemId,
-      verifiedAt,
-      recordedBy,
-    };
-    if (item.type === "user_message") {
-      if (source.questionId !== undefined)
-        return yield* unknownSource("questionId applies only to a question dialog.");
-      const [messageRow] = yield* sql<{
-        payload_json: string;
-      }>`SELECT payload_json FROM orchestration_v2_projection_messages
-        WHERE message_id = ${item.messageId} AND thread_id = ${source.threadId}`;
-      const message =
-        messageRow === undefined ? undefined : yield* decodeMessage(messageRow.payload_json);
-      if (
-        message === undefined ||
-        message.role !== "user" ||
-        message.notification !== undefined ||
-        message.delegatedCompletion !== undefined ||
-        !isOwnerAuthored(item) ||
-        !isOwnerAuthored(message)
-      )
-        return yield* refuse(
-          "the message was not typed by Chris in a T3 web, desktop or mobile client.",
-        );
-      if (message.text.length > QUOTE_LIMIT)
-        return yield* refuse(`the message is longer than ${QUOTE_LIMIT} characters to quote.`);
-      return {
-        ...base,
-        questionId: null,
-        quotedQuestion: null,
-        quotedAnswer: message.text,
-      };
-    }
+    const item = yield* decodeTurnItem(itemRow.payload_json);
     if (item.type !== "user_input_request")
       return yield* refuse(
-        `item ${source.itemId} is a ${item.type}. Only Chris's own message or his answer to a question dialog can approve.`,
+        `item ${source.itemId} is a ${item.type}. Only Chris's answer to a question dialog can approve; ask him in one whose question includes "Ledger key: ${row.key}".`,
       );
     const answer = item.questionAnswer;
-    if (answer === undefined) return yield* refuse("the question dialog has no recorded answer.");
-    if (answer.answeredBy === undefined)
-      return yield* refuse(
-        "the answer was recorded before T3 recorded who answered dialogs, so it cannot be verified. Ask Chris again.",
-      );
+    if (item.status !== "completed" || answer === undefined)
+      return yield* refuse("the question dialog was not answered.");
+    if (answer.answeredBy === undefined || answer.answeringClient === undefined)
+      return yield* refuse("T3 has no record of who answered this dialog. Ask Chris again.");
     if (answer.answeredBy !== "owner_client")
       return yield* refuse(answeredByRefusal[answer.answeredBy]);
+    const [run] =
+      item.runId === null
+        ? []
+        : yield* sql<{
+            status: string;
+          }>`SELECT status FROM orchestration_v2_projection_runs WHERE run_id = ${item.runId}`;
+    if (item.runId === null || run === undefined || run.status === "rolled_back")
+      return yield* refuse("the turn that asked the question was rolled back.");
     const question =
       source.questionId === undefined
         ? item.questions.length === 1
@@ -204,32 +173,55 @@ const make = Effect.gen(function* () {
           ? `The dialog asked ${item.questions.length} questions. Pass questionId: ${item.questions.map((candidate) => candidate.id).join(", ")}.`
           : `The dialog has no question ${source.questionId}.`,
       );
-    const raw = answer.answers[question.id];
-    const chosen =
-      typeof raw === "string"
-        ? [raw]
-        : Array.isArray(raw)
-          ? raw.filter((value): value is string => typeof value === "string")
-          : [];
-    if (chosen.length === 0)
+    // Quote the dialog as it read when Chris answered, not as it reads now.
+    const quotedQuestion = answer.questionTextById?.[question.id];
+    const quotes = answer.quotesById?.[question.id];
+    if (quotedQuestion === undefined || quotes === undefined)
+      return yield* refuse("T3 has no record of how the dialog read when it was answered.");
+    if (!namesLedgerKey(quotedQuestion, row.key))
+      return yield* refuse(`the question does not name this row as "Ledger key: ${row.key}".`);
+    const parts: string[] = [];
+    for (const quote of quotes) {
+      if (quote.kind === "unmatched")
+        return yield* refuse("an answer matches no single option the dialog offered.");
+      if (quote.kind === "text" && quote.prefilled)
+        return yield* refuse("the answer is the text the agent prefilled, not Chris's own.");
+      if (quote.kind === "text" && quote.text.length === 0)
+        return yield* refuse("the answer is blank.");
+      parts.push(quote.kind === "option" ? `${quote.label}: ${quote.description}` : quote.text);
+    }
+    if (parts.length === 0)
       return yield* refuse(`Chris gave no answer to question ${question.id}.`);
-    const quotedAnswer = chosen
-      .map((value) => {
-        const option = question.options.find(
-          (candidate) => candidate.label === value || candidate.value === value,
-        );
-        return option === undefined ? value : `${option.label}: ${option.description}`;
-      })
-      .join("\n");
-    if (quotedAnswer.length > QUOTE_LIMIT || question.question.length > QUOTE_LIMIT)
+    const quotedAnswer = parts.join("\n");
+    if (quotedAnswer.length > QUOTE_LIMIT || quotedQuestion.length > QUOTE_LIMIT)
       return yield* refuse(
         `the question or answer is longer than ${QUOTE_LIMIT} characters to quote.`,
       );
+    const [revoked] =
+      yield* sql`SELECT 1 FROM work_ledger_revoked_approvals WHERE work_key = ${row.key}
+        AND source_thread_id = ${source.threadId} AND source_item_id = ${source.itemId}
+        AND question_id = ${question.id}`;
+    if (revoked !== undefined)
+      return yield* refuse("this answer's approval of this row was withdrawn. Ask Chris again.");
+    const [other] = yield* sql<{ work_key: string }>`SELECT work_key FROM work_ledger
+      WHERE work_key != ${row.key} AND approval_json IS NOT NULL
+        AND json_extract(approval_json, '$.sourceThreadId') = ${source.threadId}
+        AND json_extract(approval_json, '$.sourceItemId') = ${source.itemId}
+        AND json_extract(approval_json, '$.questionId') = ${question.id}`;
+    if (other !== undefined)
+      return yield* refuse(`this answer already approves row ${other.work_key}.`);
     return {
-      ...base,
+      approvedBy: "user" as const,
+      sourceThreadId: source.threadId,
+      sourceItemId: source.itemId,
+      sourceRunId: item.runId,
       questionId: question.id,
-      quotedQuestion: question.question,
+      quotedQuestion,
       quotedAnswer,
+      answeringClient: answer.answeringClient,
+      rowHash: ledgerRowHash(row),
+      verifiedAt,
+      recordedBy,
     };
   });
   const query = Effect.fn("WorkLedger.query")(function* (input: WorkLedgerQueryInput) {
@@ -278,13 +270,6 @@ const make = Effect.gen(function* () {
             const patch = Object.fromEntries(
               Object.entries(fieldsInput).filter(([, value]) => value !== undefined),
             );
-            // Omitted keeps the verified approval; null revokes it; a source is verified now.
-            const approval =
-              approvalInput === undefined
-                ? (current?.approval ?? null)
-                : approvalInput === null
-                  ? null
-                  : yield* verifyApproval(approvalInput.source, updatedBy, now);
             const candidate = {
               ownerThreadId: null,
               waitReason: null,
@@ -299,7 +284,7 @@ const make = Effect.gen(function* () {
               links: [],
               ...current,
               ...patch,
-              approval,
+              approval: null,
               createdAt: current?.createdAt ?? now,
               updatedAt: now,
               updatedBy,
@@ -349,6 +334,38 @@ const make = Effect.gen(function* () {
                   }),
               ),
             );
+            // An approval stays only while the row it was given for is unchanged. Every approval
+            // retired here is recorded, so the same answer cannot be attached to the row again.
+            let approval = current?.approval ?? null;
+            const retire = Effect.fn("WorkLedger.retireApproval")(function* (
+              retired: WorkLedgerApproval,
+            ) {
+              yield* sql`INSERT OR IGNORE INTO work_ledger_revoked_approvals ${sql.insert({
+                work_key: item.key,
+                source_thread_id: retired.sourceThreadId,
+                source_item_id: retired.sourceItemId,
+                question_id: retired.questionId,
+                revoked_at: now,
+                revoked_by: updatedBy,
+              })}`;
+              approval = null;
+            });
+            if (
+              approval !== null &&
+              (approvalInput === null || approval.rowHash !== ledgerRowHash(item))
+            )
+              yield* retire(approval);
+            if (approvalInput !== undefined && approvalInput !== null) {
+              const verified = yield* verifyApproval(approvalInput.source, item, updatedBy, now);
+              if (
+                approval !== null &&
+                (approval.sourceThreadId !== verified.sourceThreadId ||
+                  approval.sourceItemId !== verified.sourceItemId ||
+                  approval.questionId !== verified.questionId)
+              )
+                yield* retire(approval);
+              approval = verified;
+            }
             const linksJson = yield* encodeLinks(item.links).pipe(Effect.mapError(storage));
             const approvalJsonText =
               approval === null
@@ -380,7 +397,7 @@ const make = Effect.gen(function* () {
               approval_json=excluded.approval_json, links_json=excluded.links_json,
               updated_at=excluded.updated_at, updated_by=excluded.updated_by`;
             const changes = Object.fromEntries(
-              Object.entries(item)
+              Object.entries({ ...item, approval })
                 .filter(
                   ([field, value]) =>
                     !["createdAt", "updatedAt", "updatedBy"].includes(field) &&
@@ -395,7 +412,7 @@ const make = Effect.gen(function* () {
             const changesJson = yield* encodeChanges(changes);
             yield* sql`INSERT INTO work_ledger_history (work_key, changed_at, changed_by, changes_json)
               VALUES (${item.key}, ${now}, ${updatedBy}, ${changesJson})`;
-            return { ...item, warnings };
+            return { ...item, approval, warnings };
           }),
         )
         .pipe(Effect.mapError((error) => (isFailure(error) ? error : storage()))),

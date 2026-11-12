@@ -2162,9 +2162,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         requestId,
         answers: { color: "  Blue  ", sizes: ["Small", "Large"], note: "" },
       };
-      const accepted = yield* orchestrator
-        .dispatch(command)
-        .pipe(Effect.provideService(CommandActor, { kind: "owner_client" }));
+      const accepted = yield* orchestrator.dispatch(command).pipe(
+        Effect.provideService(CommandActor, {
+          kind: "owner_client",
+          client: { sessionId: "session1", clientLabel: "Chris's Mac" },
+        }),
+      );
       const repeated = yield* orchestrator.dispatch(command);
       assert.equal(repeated.sequence, accepted.sequence);
       const answered = yield* orchestrator.getThreadProjection(threadId);
@@ -2178,6 +2181,15 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         assert.deepEqual(answeredItem.questionAnswer, {
           requestId,
           answeredBy: "owner_client",
+          answeringClient: { sessionId: "session1", clientLabel: "Chris's Mac" },
+          quotesById: {
+            color: [{ kind: "text", text: "Blue", prefilled: false }],
+            sizes: [
+              { kind: "text", text: "Small", prefilled: false },
+              { kind: "text", text: "Large", prefilled: false },
+            ],
+            note: [{ kind: "text", text: "", prefilled: false }],
+          },
           answers: command.answers,
           attachmentsByQuestionId: {},
           questionTextById: {

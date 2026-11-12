@@ -8,6 +8,7 @@ import {
   TrimmedNonEmptyString,
   TurnItemId,
 } from "./baseSchemas.ts";
+import { UserInputAnsweringClient } from "./providerPolicy.ts";
 
 const text = Schema.String.check(Schema.isMaxLength(8000));
 const name = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
@@ -38,22 +39,26 @@ const fields = {
   approvalNote: Schema.NullOr(text),
   links: Schema.Array(Schema.String.check(Schema.isMaxLength(4096))).check(Schema.isMaxLength(100)),
 };
-/** The item that holds Chris's answer: his own message, or his answer to a question dialog. */
+/** Chris's answer to a question dialog whose question names the row as `Ledger key: <key>`. */
 export const WorkLedgerApprovalSource = Schema.Struct({
   threadId: ThreadId,
   itemId: TurnItemId,
-  /** Which question of a dialog; needed when the dialog asked more than one. */
+  /** Which question of the dialog; needed when the dialog asked more than one. */
   questionId: Schema.optional(TrimmedNonEmptyString),
 });
 export type WorkLedgerApprovalSource = typeof WorkLedgerApprovalSource.Type;
-/** Written only by the server after it verifies the source; the quotes come from that item. */
+/** Written only by the server after it verifies the source; the quotes come from the dialog. */
 export const WorkLedgerApproval = Schema.Struct({
   approvedBy: Schema.Literal("user"),
   sourceThreadId: ThreadId,
   sourceItemId: TurnItemId,
-  questionId: Schema.NullOr(TrimmedNonEmptyString),
-  quotedQuestion: Schema.NullOr(text),
+  sourceRunId: RunId,
+  questionId: TrimmedNonEmptyString,
+  quotedQuestion: text,
   quotedAnswer: text,
+  answeringClient: UserInputAnsweringClient,
+  /** Hash of the row's key, title, nextAction, ownerKind and ownerName when verified. */
+  rowHash: TrimmedNonEmptyString,
   verifiedAt: IsoDateTime,
   recordedBy: TrimmedNonEmptyString,
 });
