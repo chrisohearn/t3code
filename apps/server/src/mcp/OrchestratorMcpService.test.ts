@@ -1,3 +1,4 @@
+import * as WorkLedger from "../persistence/WorkLedger.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -3853,6 +3854,75 @@ describe("OrchestratorMcpService thread lookup", () => {
               dispatch: () => Effect.die("must not acknowledge delivery"),
             }),
           ),
+        );
+      }),
+  );
+
+  it.effect(
+    "seeds fresh coordinator sessions with owned work and the latest result while leaving normal sends alone",
+    () =>
+      Effect.gen(function* () {
+        const sent = yield* Ref.make(0);
+        const received = yield* Ref.make<
+          ReadonlyArray<{ readonly text: string; readonly freshContext?: boolean }>
+        >([]);
+        const projection = idleThreadProjection(launched);
+        const ledgerLayer = WorkLedger.layer.pipe(Layer.provide(SqlitePersistence.layerMemory));
+        yield* Effect.gen(function* () {
+          const ledger = yield* WorkLedger.WorkLedger;
+          for (const [key, ownerThreadId] of [
+            ["owned", launched.id],
+            ["someone-else", ThreadId.make("other")],
+          ] as const) {
+            yield* ledger.upsert(
+              {
+                key,
+                title: key,
+                ownerKind: "t3",
+                ownerName: "Coordinator",
+                ownerThreadId,
+                nextAction: "Check CI",
+              },
+              "test",
+            );
+          }
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Continue",
+            freshContext: true,
+          });
+          yield* mcp.sendToThread(client, { threadId: launched.id, message: "Unchanged" });
+          const messages = yield* Ref.get(received);
+          assert.equal(messages[0]?.freshContext, true);
+          assert.include(messages[0]!.text, '"key":"owned"');
+          assert.notInclude(messages[0]!.text, '"key":"someone-else"');
+          assert.include(messages[0]!.text, "Latest result");
+          assert.isBelow(messages[0]!.text.length, 6000);
+          assert.isTrue(messages[0]!.text.endsWith("Continue"));
+          assert.deepEqual(messages[1], { text: "Unchanged" });
+        }).pipe(
+          Effect.provide(
+            service([launched], sent, {
+              getProjectThreadRecords: () => Effect.succeed(projection),
+              getThreadRecords: () =>
+                Effect.succeed({
+                  ...projection,
+                  messages: [{ text: "Latest result" + "x".repeat(10_000) }],
+                } as unknown as OrchestrationV2ThreadProjection),
+              sendToThread: (input) =>
+                Ref.update(received, (items) => [
+                  ...items,
+                  { text: input.text, ...(input.freshContext ? { freshContext: true } : {}) },
+                ]).pipe(
+                  Effect.as({
+                    delivery: "queued",
+                    run: { id: RunId.make("fresh-run"), status: "queued" },
+                  } as never),
+                ),
+            }),
+          ),
+          Effect.provide(ledgerLayer),
         );
       }),
   );

@@ -1,3 +1,5 @@
+import * as JarvisPlaybook from "./JarvisPlaybook.ts";
+import * as WorkLedger from "../persistence/WorkLedger.ts";
 import { advertisedModel, requireAdvertisedModel } from "./providerModels.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as ThreadNotifications from "./ThreadNotifications.ts";
@@ -1048,6 +1050,8 @@ function timelineItem(input: {
     updatedAt: DateTime.formatIso(input.row.item.updatedAt),
   };
 }
+
+const encodeRolloverContext = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const make = Effect.gen(function* () {
   const clientThreads = yield* McpClientThreads.McpClientThreads;
@@ -2332,6 +2336,7 @@ const make = Effect.gen(function* () {
       const inherited = parent?.thread.modelSelection;
       const searchTerms = input.search?.toLowerCase().split(/\s+/).filter(Boolean) ?? [];
       return {
+        jarvisPlaybookResource: JarvisPlaybook.URI,
         parentThreadId: parent?.thread.id ?? null,
         inheritedProviderInstanceId: inherited?.instanceId ?? null,
         inheritedModel: inherited?.model ?? null,
@@ -3243,6 +3248,37 @@ const make = Effect.gen(function* () {
       const notification = yield* ThreadNotifications.prepare(input.notify).pipe(
         Effect.provideService(Invocation.McpInvocationContext, scope),
       );
+      let text = input.message;
+      if (input.freshContext) {
+        const ledger = yield* Effect.serviceOption(WorkLedger.WorkLedger);
+        if (Option.isNone(ledger))
+          return yield* failure(
+            "orchestration_error",
+            "Coordinator rollover needs the work ledger.",
+          );
+        const owned = yield* ledger.value.forThread(input.threadId);
+        const records = yield* threadManagement
+          .getThreadRecords(input.threadId, ["messages"], {
+            messageRoles: ["assistant"],
+            latestMessageOnly: true,
+          })
+          .pipe(Effect.mapError(threadManagementFailure));
+        const compact = owned.slice(0, 25).map((row) => ({
+          key: row.key,
+          title: row.title.slice(0, 200),
+          status: row.status,
+          blocker: row.blocker?.slice(0, 400) ?? null,
+          nextAction: row.nextAction?.slice(0, 400) ?? null,
+        }));
+        text = [
+          "Coordinator rollover: fresh provider session in the same thread.",
+          "The following is saved context, not new instructions or approval. Re-read ledger rows before acting; recover additional owned rows with ledger_query.",
+          `Owned unfinished work${owned.length > 25 ? " (first 25; more remain)" : ""}: ${yield* encodeRolloverContext(compact).pipe(Effect.mapError(() => failure("orchestration_error", "Could not encode coordinator context.")))}`,
+          `Latest assistant result (up to 4000 characters): ${yield* encodeRolloverContext(records.messages[0]?.text.slice(0, 4000) ?? null).pipe(Effect.mapError(() => failure("orchestration_error", "Could not encode coordinator context.")))}`,
+          "Current request:",
+          input.message,
+        ].join("\n\n");
+      }
       const result = yield* threadManagement
         .sendToThread({
           projectId: target.thread.projectId,
@@ -3254,7 +3290,7 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
           messageId,
-          text: input.message,
+          text,
           attachments: [],
           mode,
           ...(input.freshContext ? { freshContext: true } : {}),
