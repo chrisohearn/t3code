@@ -1215,11 +1215,12 @@ it.effect("attachment sends retain authenticated client attribution", () => {
       );
     expect(sent).toHaveLength(1);
     expect(sent[0]?.senderThreadId).toBeUndefined();
-    expect(sent[0]?.mcpSender).toMatchObject({
+    expect(sent[0]?.senderClient).toMatchObject({
       clientLabel: "Claude Code",
-      kind: "outside_client",
+      kind: "outside-client",
+      access: "full-access",
     });
-    expect(sent[0]?.mcpSender?.sessionIdShort).toMatch(/^[a-f0-9]{16}$/);
+    expect(sent[0]?.senderClient?.sessionId).toBe("session-");
   }).pipe(
     Effect.provide(
       McpHttpServer.layerAttachmentToolkit.pipe(

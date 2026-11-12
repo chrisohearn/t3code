@@ -1056,10 +1056,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         createdBy: "agent",
         creationSource: "mcp",
         senderThreadId: ThreadId.make("sender"),
-        mcpSender: {
-          sessionIdShort: "0123456789abcdef",
+        senderClient: {
+          sessionId: "01234567",
           clientLabel: "Jarvis",
-          kind: "outside_client",
+          kind: "outside-client",
+          access: "full-access",
         },
         commandId: CommandId.make("post-message"),
         threadId,
@@ -1085,7 +1086,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         createdBy: "agent",
         creationSource: "mcp",
         senderThreadId: "sender",
-        mcpSender: command.mcpSender,
+        senderClient: command.senderClient,
       });
       expect(projection.turnItems.filter((item) => item.type === "user_message")).toHaveLength(1);
     }),
@@ -1685,10 +1686,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         commandId: steerCommandId,
         threadId,
         messageId: steerMessageId,
-        mcpSender: {
-          sessionIdShort: "0123456789abcdef",
+        senderClient: {
+          sessionId: "01234567",
           clientLabel: "Jarvis",
-          kind: "outside_client",
+          kind: "outside-client",
+          access: "full-access",
         },
         text: "Include this in the active work.",
         attachments: [],
@@ -1696,10 +1698,13 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         deliveryIntent: "auto",
       });
       const steered = yield* orchestrator.getThreadProjection(threadId);
-      expect(steered.messages.find((message) => message.id === steerMessageId)?.mcpSender).toEqual({
-        sessionIdShort: "0123456789abcdef",
+      expect(
+        steered.messages.find((message) => message.id === steerMessageId)?.senderClient,
+      ).toEqual({
+        sessionId: "01234567",
         clientLabel: "Jarvis",
-        kind: "outside_client",
+        kind: "outside-client",
+        access: "full-access",
       });
       assert.lengthOf(steered.runs, 1);
       assert.equal(
@@ -6086,10 +6091,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           commandId: CommandId.make(`runtime-layer-serialized-queue-first-${automatic}`),
           threadId,
           messageId: MessageId.make(`runtime-layer-serialized-queue-first-${automatic}`),
-          mcpSender: {
-            sessionIdShort: "0123456789abcdef",
+          senderClient: {
+            sessionId: "01234567",
             clientLabel: "Jarvis",
-            kind: "outside_client",
+            kind: "outside-client",
+            access: "full-access",
           },
           text: "First queued",
           attachments: [],
@@ -6179,11 +6185,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         expect(
           afterFirstPromotion.messages.find(
             (message) => message.id === firstQueuedRun.userMessageId,
-          )?.mcpSender,
+          )?.senderClient,
         ).toEqual({
-          sessionIdShort: "0123456789abcdef",
+          sessionId: "01234567",
           clientLabel: "Jarvis",
-          kind: "outside_client",
+          kind: "outside-client",
+          access: "full-access",
         });
         assert.isDefined(promotedMessageItem);
         if (automatic) {

@@ -37,7 +37,7 @@ import { secretRequestPageUrl } from "./secretRequest.ts";
 import { hasOnlyPairedSurrogates } from "./threadMetadataMcp.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
-  OrchestrationV2McpSender,
+  OrchestrationV2SenderClient,
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
@@ -495,7 +495,7 @@ export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
   createdBy: Schema.NullOr(OrchestrationV2Actor),
   creationSource: Schema.NullOr(OrchestrationV2CreationSource),
   senderThreadId: Schema.optional(ThreadId),
-  mcpSender: Schema.optional(OrchestrationV2McpSender),
+  senderClient: Schema.optional(OrchestrationV2SenderClient),
   type: Schema.String,
   status: OrchestrationV2TurnItemStatus,
   title: Schema.NullOr(Schema.String),
@@ -532,7 +532,7 @@ const OrchestratorMcpMessageSummary = Schema.Struct({
   createdBy: Schema.optional(Schema.NullOr(OrchestrationV2Actor)),
   creationSource: Schema.optional(Schema.NullOr(OrchestrationV2CreationSource)),
   senderThreadId: Schema.optional(ThreadId),
-  mcpSender: Schema.optional(OrchestrationV2McpSender),
+  senderClient: Schema.optional(OrchestrationV2SenderClient),
 });
 export const OrchestratorMcpThreadResult = Schema.Struct({
   threadId: ThreadId,

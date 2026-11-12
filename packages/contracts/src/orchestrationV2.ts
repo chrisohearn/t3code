@@ -1309,12 +1309,13 @@ export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Typ
 export const OrchestrationV2IdleCompaction = Schema.Literals(["beforeCacheExpires", "onReturn"]);
 export type OrchestrationV2IdleCompaction = typeof OrchestrationV2IdleCompaction.Type;
 
-export const OrchestrationV2McpSender = Schema.Struct({
-  sessionIdShort: Schema.String.check(Schema.isPattern(/^[a-f0-9]{16}$/)),
+export const OrchestrationV2SenderClient = Schema.Struct({
+  sessionId: TrimmedNonEmptyString.check(Schema.isMaxLength(8)),
   clientLabel: Schema.String,
-  kind: Schema.Literals(["outside_client", "linked_t3_agent"]),
+  kind: Schema.Literals(["outside-client", "linked-agent"]),
+  access: Schema.Literals(["full-access", "approval-required", "read-only"]),
 });
-export type OrchestrationV2McpSender = typeof OrchestrationV2McpSender.Type;
+export type OrchestrationV2SenderClient = typeof OrchestrationV2SenderClient.Type;
 
 export const OrchestrationV2ConversationMessage = Schema.Struct({
   posted: Schema.optional(Schema.Boolean),
@@ -1322,7 +1323,7 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
   senderThreadId: Schema.optional(ThreadId),
-  mcpSender: Schema.optional(OrchestrationV2McpSender),
+  senderClient: Schema.optional(OrchestrationV2SenderClient),
   idleCompaction: Schema.optional(OrchestrationV2IdleCompaction),
   /**
    * The message is the script a provider-native workflow run executes, not prose. Clients show
@@ -1643,7 +1644,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     messageId: MessageId,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
     senderThreadId: Schema.optional(ThreadId),
-    mcpSender: Schema.optional(OrchestrationV2McpSender),
+    senderClient: Schema.optional(OrchestrationV2SenderClient),
     idleCompaction: Schema.optional(OrchestrationV2IdleCompaction),
     workflowScript: OrchestrationV2ConversationMessage.fields.workflowScript,
     freshContext: OrchestrationV2Run.fields.freshContext,
@@ -2493,7 +2494,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     messageId: MessageId,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
     senderThreadId: Schema.optional(ThreadId),
-    mcpSender: Schema.optional(OrchestrationV2McpSender),
+    senderClient: Schema.optional(OrchestrationV2SenderClient),
     idleCompaction: Schema.optional(OrchestrationV2IdleCompaction),
     workflowScript: OrchestrationV2ConversationMessage.fields.workflowScript,
     freshContext: OrchestrationV2Run.fields.freshContext,
@@ -3210,7 +3211,7 @@ export const OrchestrationV2Command = Schema.Union([
     ...OrchestrationV2CreationFields,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
     senderThreadId: Schema.optional(ThreadId),
-    mcpSender: Schema.optional(OrchestrationV2McpSender),
+    senderClient: Schema.optional(OrchestrationV2SenderClient),
     idleCompaction: Schema.optional(OrchestrationV2IdleCompaction),
     /** Start a new provider session without the thread's earlier context. Never steers. */
     freshContext: Schema.optional(Schema.Boolean),

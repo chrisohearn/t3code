@@ -138,9 +138,9 @@ message, including inbox posts without a run. Replies default to 4,000 character
 `maxChars` up to 50,000 when `truncated` is true. This read does not acknowledge
 a delegated child's result.
 
-Messages sent or posted by signed-in MCP clients include `mcpSender`: the approved
-client label, a short SHA-256 fingerprint of the sign-in session ID, and whether
-it is an outside client or a linked T3 agent. The server records these fields;
+Messages sent or posted by signed-in MCP clients include `senderClient`: the
+client label, the first eight characters of the sign-in session ID, its access
+tier, and whether it is an outside client or a linked T3 agent. The server records these fields;
 message text and tool arguments cannot supply them. Local T3 agents retain their
 `senderThreadId`. Older messages may have no sender record.
 

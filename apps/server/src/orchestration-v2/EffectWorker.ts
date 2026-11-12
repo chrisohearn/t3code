@@ -333,9 +333,9 @@ export const layerExecutor: Layer.Layer<
                         ...(message.senderThreadId === undefined
                           ? {}
                           : { senderThreadId: message.senderThreadId }),
-                        ...(message.mcpSender === undefined
+                        ...(message.senderClient === undefined
                           ? {}
-                          : { mcpSender: message.mcpSender }),
+                          : { senderClient: message.senderClient }),
                       })
                       .pipe(
                         // A disabled instance cannot retry this completed turn; its result stands.

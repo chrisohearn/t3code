@@ -87,7 +87,6 @@ import {
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
-import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -1047,7 +1046,7 @@ function timelineItem(input: {
     createdBy: message?.createdBy ?? null,
     creationSource: message?.creationSource ?? null,
     ...(message?.senderThreadId === undefined ? {} : { senderThreadId: message.senderThreadId }),
-    ...(message?.mcpSender === undefined ? {} : { mcpSender: message.mcpSender }),
+    ...(message?.senderClient === undefined ? {} : { senderClient: message.senderClient }),
     type: input.row.item.type,
     status: input.row.item.status,
     title: input.row.item.title,
@@ -1061,7 +1060,6 @@ function timelineItem(input: {
 const make = Effect.gen(function* () {
   const clientThreads = yield* McpClientThreads.McpClientThreads;
   const random = yield* SecureRandom.SecureRandom;
-  const senderDigest = yield* Digest.Digest;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
@@ -3119,7 +3117,7 @@ const make = Effect.gen(function* () {
           ...(message.senderThreadId === undefined
             ? {}
             : { senderThreadId: message.senderThreadId }),
-          ...(message.mcpSender === undefined ? {} : { mcpSender: message.mcpSender }),
+          ...(message.senderClient === undefined ? {} : { senderClient: message.senderClient }),
         };
       };
       return {
@@ -3266,7 +3264,7 @@ const make = Effect.gen(function* () {
           commandId: stableCommandId({ scope, requestKey: key, operation }),
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
-          ...(yield* Invocation.messageSenderFor(scope, senderDigest)),
+          ...Invocation.messageSenderFor(scope),
           messageId,
           text: input.message,
           attachments: [],
@@ -3307,7 +3305,7 @@ const make = Effect.gen(function* () {
           }),
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
-          ...(yield* Invocation.messageSenderFor(scope, senderDigest)),
+          ...Invocation.messageSenderFor(scope),
           messageId,
           text: input.message,
           attachments: [],
@@ -3507,7 +3505,6 @@ export const layer: Layer.Layer<
   never,
   | McpClientThreads.McpClientThreads
   | SecureRandom.SecureRandom
-  | Digest.Digest
   | ThreadManagementService.ThreadManagementService
   | ThreadLaunchService.ThreadLaunchService
   | GitVcsDriver.GitVcsDriver

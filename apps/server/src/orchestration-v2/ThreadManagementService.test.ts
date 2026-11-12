@@ -86,15 +86,16 @@ it("stamps authoritative provenance on commands that create threads or messages"
       text: "forged",
       attachments: [],
       dispatchMode: { type: "start_immediately" },
-      mcpSender: {
-        sessionIdShort: "0123456789abcdef",
+      senderClient: {
+        sessionId: "01234567",
         clientLabel: "Jarvis",
-        kind: "outside_client",
+        kind: "outside-client",
+        access: "full-access",
       },
     },
     { createdBy: "user", creationSource: "web" },
   );
-  expect(message).not.toHaveProperty("mcpSender");
+  expect(message).not.toHaveProperty("senderClient");
 });
 
 const layerReceiptsTest = CommandReceiptStore.layer.pipe(

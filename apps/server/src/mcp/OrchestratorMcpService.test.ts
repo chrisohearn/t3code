@@ -3794,19 +3794,23 @@ describe("OrchestratorMcpService thread lookup", () => {
       yield* Effect.gen(function* () {
         const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
         for (const linked of [false, true]) {
-          const scope = { ...client, client: { ...client.client!, linked } };
-          const forged = { mcpSender: { clientLabel: "Impersonator" } };
+          const scope = {
+            ...client,
+            client: { ...client.client!, sessionId: "sign-in-private-id", linked },
+          };
+          const forged = { senderClient: { clientLabel: "Impersonator" } };
           yield* mcp.postToThread(scope, { threadId: launched.id, message: "hello", ...forged });
           yield* mcp.sendToThread(scope, { threadId: launched.id, message: "hello", ...forged });
           for (const command of commands.splice(0)) {
             expect(command).toMatchObject({
-              mcpSender: {
-                sessionIdShort: "e11fdfccaf06a2df",
+              senderClient: {
+                sessionId: "sign-in-",
+                access: "full-access",
                 clientLabel: "Claude Code",
-                kind: linked ? "linked_t3_agent" : "outside_client",
+                kind: linked ? "linked-agent" : "outside-client",
               },
             });
-            expect(JSON.stringify(command)).not.toContain('"sessionId":');
+            expect(JSON.stringify(command)).not.toContain(scope.client.sessionId);
           }
         }
       }).pipe(
@@ -3859,10 +3863,11 @@ describe("OrchestratorMcpService thread lookup", () => {
           expect(result.latestMessage).toMatchObject({
             messageId: "inbox-post",
             role: "user",
-            mcpSender: {
-              sessionIdShort: "0123456789abcdef",
+            senderClient: {
+              sessionId: "01234567",
               clientLabel: "Jarvis",
-              kind: "outside_client",
+              kind: "outside-client",
+              access: "full-access",
             },
           });
           assert.equal(Array.from(result.lastAssistantMessage?.text ?? "").length, 4000);
@@ -3904,10 +3909,11 @@ describe("OrchestratorMcpService thread lookup", () => {
                         text: "hello",
                         createdBy: "agent",
                         creationSource: "mcp",
-                        mcpSender: {
-                          sessionIdShort: "0123456789abcdef",
+                        senderClient: {
+                          sessionId: "01234567",
                           clientLabel: "Jarvis",
-                          kind: "outside_client",
+                          kind: "outside-client",
+                          access: "full-access",
                         },
                       },
                     ],

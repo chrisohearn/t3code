@@ -11,8 +11,6 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
-import * as Digest from "effect/crypto/Digest";
-import * as Hex from "effect/encoding/Hex";
 import * as Fiber from "effect/Fiber";
 import { formatThreadLink, hostedThreadLink } from "@t3tools/shared/threadLinks";
 
@@ -135,31 +133,20 @@ export interface McpInvocationScope {
   readonly linkedEnvironments?: boolean;
 }
 
-export const messageSenderFor = Effect.fn("McpInvocationContext.messageSenderFor")(function* (
-  scope: McpInvocationScope,
-  digest: Digest.Digest["Service"],
-) {
+export const messageSenderFor = (scope: McpInvocationScope) => {
   if (scope.client === undefined) return {};
-  const bytes = yield* digest
-    .digest(Digest.sha256, new TextEncoder().encode(scope.client.sessionId))
-    .pipe(
-      Effect.mapError(
-        () =>
-          new OrchestratorMcpFailure({
-            code: "orchestration_error",
-            message: "Unable to identify the signed-in sender.",
-          }),
-      ),
-    );
   return {
-    mcpSender: {
-      sessionIdShort: Hex.encode(bytes).slice(0, 16),
+    senderClient: {
+      sessionId: scope.client.sessionId.slice(0, 8),
       clientLabel: scope.client.label,
-      kind:
-        scope.client.linked === true ? ("linked_t3_agent" as const) : ("outside_client" as const),
+      kind: scope.client.linked === true ? ("linked-agent" as const) : ("outside-client" as const),
+      access:
+        scope.client.access === "full-access" || scope.client.access === "read-only"
+          ? scope.client.access
+          : ("approval-required" as const),
     },
   };
-});
+};
 
 /**
  * T3 Code renders `t3-thread://` links as thread chips. Other MCP clients cannot open them, so
