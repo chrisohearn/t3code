@@ -61,7 +61,7 @@ behind=$(git -C "$SOURCE" rev-list --count "origin/$BRANCH..$upstream_sha")
 open_pr=""
 if [[ "$release_only" == 0 ]]; then
   open_pr=$(gh pr list -R "$FORK" --base "$BRANCH" --state open --json number,headRefName \
-    --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] | "\(.number) \(.headRefName)" // empty')
+    --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] // empty | "\(.number) \(.headRefName)"')
 fi
 stamp=$(date -u +%Y%m%d-%H%M)
 wt="$WORKTREES/upstream-sync-$stamp"
@@ -191,7 +191,10 @@ n=$(gh release list -R "$FORK" --limit 100 --json tagName --jq \
   "[.[] | select(.tagName | startswith(\"v$base_version-preview.$day.\"))] | length")
 version="$base_version-preview.$day.$((n + 1))"
 # The guard installs the newest release by `sort -V`; refuse a version that would not be newest.
-latest=$(gh release list -R "$FORK" --limit 100 --json tagName --jq '.[].tagName' | sed 's/^v//' | sort -V | tail -1)
+latest=$(gh release list -R "$FORK" --limit 100 --json tagName,isDraft --jq '
+  .[] | select(.isDraft | not) | .tagName
+  | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-(preview|nightly)\\.[0-9]{8}\\.[0-9]+)?$"))' |
+  sed 's/^v//' | sort -V | tail -1)
 [[ "$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -1)" == "$version" ]] ||
   fail "version $version would not sort above $latest" install.log
 

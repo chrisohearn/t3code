@@ -431,6 +431,68 @@ it.effect.each(["sqlite"] as const)(
         "message-file",
         recordingId,
       ]);
+      yield* putRun({ ...run, id: oldRunId, ordinal: 1, status: "rolled_back" });
+      yield* store.apply({
+        id: EventId.make("attachment:rewound-message-event"),
+        type: "message.updated",
+        threadId,
+        runId: oldRunId,
+        occurredAt: now,
+        payload: {
+          ...message,
+          id: MessageId.make("attachment:rewound-message"),
+          runId: oldRunId,
+          attachments: [{ ...file, id: "rewound-message-file" }],
+        },
+      });
+      const excludedAttachments = [
+        "answer-document",
+        "answer-image",
+        "rewound-message-file",
+        recordingId,
+      ];
+      const forkId = ThreadId.make("attachment:fork");
+      const nestedId = ThreadId.make("attachment:nested-fork");
+      const forkRunId = RunId.make("attachment:fork-run");
+      const fork = {
+        ...thread,
+        id: forkId,
+        forkedFrom: { type: "run" as const, threadId, runId },
+      };
+      yield* putThread(fork);
+      yield* store.apply({
+        id: EventId.make("attachment:fork-run-event"),
+        type: "run.created",
+        threadId: forkId,
+        runId: forkRunId,
+        occurredAt: now,
+        payload: { ...run, id: forkRunId, threadId: forkId },
+      });
+      const nested = {
+        ...thread,
+        id: nestedId,
+        forkedFrom: { type: "run" as const, threadId: forkId, runId: forkRunId },
+      };
+      yield* putThread(nested);
+      assert.deepEqual(
+        (yield* store.getThreadAttachmentIds(threadId)).toSorted(),
+        excludedAttachments,
+      );
+      yield* putThread({ ...thread, deletedAt: now });
+      // The nested fork still shows the source even after the intermediate fork is removed.
+      assert.deepEqual(
+        (yield* store.getThreadAttachmentIds(forkId)).toSorted(),
+        excludedAttachments,
+      );
+      yield* putThread({ ...fork, deletedAt: now });
+      assert.deepEqual((yield* store.getThreadAttachmentIds(nestedId)).toSorted(), [
+        "answer-document",
+        "answer-image",
+        "attachment:old",
+        "message-file",
+        "rewound-message-file",
+        recordingId,
+      ]);
     }).pipe(Effect.provide(layerDatabase)),
 );
 

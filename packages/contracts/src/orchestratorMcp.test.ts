@@ -20,10 +20,21 @@ describe("orchestrator MCP contracts", () => {
       run: null,
       lastAssistantMessage: { messageId: "message:old", text: "done", truncated: false },
       pendingRequestIds: [],
-      pullRequests: [],
+      pullRequests: [
+        {
+          host: "github.com",
+          repository: "chrisohearn/t3code",
+          number: 51,
+          url: "https://github.com/chrisohearn/t3code/pull/51",
+          source: "manual",
+          state: "open",
+        },
+      ],
       revision: 1,
     };
-    expect(decodeThreadResult(legacy).lastAssistantMessage?.text).toBe("done");
+    const decoded = decodeThreadResult(legacy);
+    expect(decoded.lastAssistantMessage?.text).toBe("done");
+    expect(decoded.pullRequests[0]).toEqual(legacy.pullRequests[0]);
   });
   it("decodes cross-provider delegated task requests and durable results", () => {
     const request = decodeDelegateTaskInput({

@@ -12,6 +12,7 @@ import type * as Electron from "electron";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopHomeOwner from "../backend/DesktopHomeOwner.ts";
 import { makeComponentLogger } from "./DesktopObservability.ts";
 import * as DesktopShutdown from "./DesktopShutdown.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
@@ -231,7 +232,16 @@ export const make = DesktopLifecycle.of({
       const args = yield* HostProcess.Arguments;
       yield* electronApp.relaunch({
         execPath: yield* HostProcess.ExecutablePath,
-        args: args.slice(1).filter((arg) => !arg.toLowerCase().startsWith(appLinkPrefix)),
+        args: [
+          ...args
+            .slice(1)
+            .filter(
+              (arg) =>
+                !arg.toLowerCase().startsWith(appLinkPrefix) &&
+                arg !== DesktopHomeOwner.HOME_OWNER_RELAUNCH_ARGUMENT,
+            ),
+          DesktopHomeOwner.HOME_OWNER_RELAUNCH_ARGUMENT,
+        ],
       });
       yield* electronApp.exit(0);
     }).pipe(

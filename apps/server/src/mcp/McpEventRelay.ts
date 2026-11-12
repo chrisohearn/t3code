@@ -31,6 +31,10 @@ import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import { resolveRuntimeMode, resolveInteractionMode } from "./delegatedTaskModes.ts";
 
+// Durable message ids keep loop protection independent of the bounded outbox history.
+const RELAY_MESSAGE_ID_PREFIX = "message:mcp-relay:";
+const DELIVERED_RETENTION_MS = 86400_000;
+
 const denied = () => new McpEventsError({ code: -32001, reason: "access_denied" });
 const storage = () => new McpEventsError({ code: -32603, reason: "storage" });
 const encode = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -183,7 +187,7 @@ const make = Effect.gen(function* () {
     const inserted = yield* sql`INSERT INTO mcp_event_relay_outbox
       (id, principal, source_key, source_thread_id, inbox_thread_id, message_id, client_request_id, runtime_mode, interaction_mode, body, alert)
       VALUES (${id}, ${input.principal}, ${input.sourceKey}, ${input.sourceThreadId}, ${input.inboxThreadId},
-        ${`message:mcp-relay:${id}`}, ${`relay:${id}`}, ${input.runtimeMode}, ${input.interactionMode}, ${input.body}, ${input.alert})
+        ${`${RELAY_MESSAGE_ID_PREFIX}${id}`}, ${`relay:${id}`}, ${input.runtimeMode}, ${input.interactionMode}, ${input.body}, ${input.alert})
       ON CONFLICT DO NOTHING RETURNING id`.pipe(Effect.mapError(storage));
     return inserted.length;
   });
@@ -252,13 +256,11 @@ const make = Effect.gen(function* () {
         through = stored.sequence;
         if (!("event" in stored) || stored.event.threadId !== binding.threadId) continue;
         const event = stored.event;
-        if (event.type === "run.updated") {
-          const relayed =
-            yield* sql`SELECT 1 FROM mcp_event_relay_outbox WHERE message_id = ${event.payload.userMessageId}`.pipe(
-              Effect.mapError(storage),
-            );
-          if (relayed.length > 0) continue;
-        }
+        if (
+          event.type === "run.updated" &&
+          event.payload.userMessageId.startsWith(RELAY_MESSAGE_ID_PREFIX)
+        )
+          continue;
         const runId = event.type === "run.updated" ? event.payload.id : event.runId;
         const threadLevelRelease =
           event.type === "provider-session.detached" && runId === undefined;
@@ -353,7 +355,7 @@ const make = Effect.gen(function* () {
         .pipe(
           Effect.mapError(() => new McpEventsError({ code: -32603, reason: "inbox_send_failed" })),
         );
-      yield* sql`UPDATE mcp_event_relay_outbox SET status = 'delivered', last_error = NULL, body = '' WHERE id = ${job.id}`.pipe(
+      yield* sql`UPDATE mcp_event_relay_outbox SET status = 'delivered', last_error = NULL, body = '', next_attempt_at = ${yield* Clock.currentTimeMillis} WHERE id = ${job.id}`.pipe(
         Effect.mapError(storage),
       );
     },
@@ -416,14 +418,8 @@ const make = Effect.gen(function* () {
         .getThreadRecords(threadId, ["runs"], { runIds: [runId] })
         .pipe(Effect.mapError(storage));
       const run = records.runs.find((candidate) => candidate.id === runId);
-      if (run !== undefined) {
-        const generated =
-          yield* sql`SELECT 1 FROM mcp_event_relay_outbox WHERE message_id = ${run.userMessageId}`.pipe(
-            Effect.mapError(storage),
-          );
-        if (generated.length > 0)
-          return yield* new McpEventsError({ code: -32602, reason: "relay_loop" });
-      }
+      if (run?.userMessageId.startsWith(RELAY_MESSAGE_ID_PREFIX))
+        return yield* new McpEventsError({ code: -32602, reason: "relay_loop" });
       const [start] = yield* sql<{
         firstSequence: number | null;
       }>`SELECT MIN(sequence) AS "firstSequence" FROM orchestration_events
@@ -495,6 +491,10 @@ const make = Effect.gen(function* () {
       return { replayed };
     }),
     drain: Effect.fn("McpEventRelay.drain")(function* () {
+      yield* sql`DELETE FROM mcp_event_relay_outbox WHERE status = 'delivered'
+        AND next_attempt_at < ${(yield* Clock.currentTimeMillis) - DELIVERED_RETENTION_MS}`.pipe(
+        Effect.mapError(storage),
+      );
       const behind = yield* collect();
       const day = Math.floor((yield* Clock.currentTimeMillis) / 86400_000);
       const exhausted = yield* sql<{ principal: string; sourceKey: string; threadId: ThreadId }>`

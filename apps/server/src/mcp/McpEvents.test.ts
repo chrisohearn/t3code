@@ -446,6 +446,14 @@ it.effect(
         expect(f.inboxSends).toHaveLength(2);
         expect(f.inboxSends[1]?.commandId).toBe(f.inboxSends[0]?.commandId);
         expect(f.inboxSends[1]?.messageId).toBe(f.inboxSends[0]?.messageId);
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        expect(yield* sql`SELECT status FROM mcp_event_relay_outbox`).toEqual([
+          { status: "delivered" },
+        ]);
+        yield* TestClock.adjust("2 days");
+        yield* rebuilt.drain();
+        expect(yield* sql`SELECT status FROM mcp_event_relay_outbox`).toEqual([]);
+        // A relay message remains loop-protected after its delivery receipt expires.
         const inboxRun = RunId.make("relay-generated-run");
         yield* f.call(rebuilt.notifyThread(prepared, inbox, inboxRun));
         yield* f.outcome(inbox, inboxRun, "", f.inboxSends[0]!.messageId);
