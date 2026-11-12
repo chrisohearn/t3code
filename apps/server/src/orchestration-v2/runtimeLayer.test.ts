@@ -3086,6 +3086,123 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  // A thread whose session, like Claude's, must end to take a new mode.
+  const seedOwnerModeThread = (name: string) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make(`${name}-thread`);
+      yield* seedProject({
+        projectId: ProjectId.make(`${name}-project`),
+        title: "Owner mode project",
+        workspaceRoot: "/workspace/project",
+        defaultModelSelection: null,
+        createdAt: "2026-09-07T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${name}-create`),
+        threadId,
+        projectId: ProjectId.make(`${name}-project`),
+        title: "Owner mode test",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${name}-session`),
+            type: "provider-session.attached",
+            threadId,
+            driver,
+            occurredAt: now,
+            payload: {
+              id: ProviderSessionId.make(`${name}-session`),
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              status: "running",
+              cwd: "/workspace/project",
+              model: modelSelection.model,
+              capabilities: {
+                ...CodexProviderCapabilitiesV2,
+                sessions: {
+                  ...CodexProviderCapabilitiesV2.sessions,
+                  supportsRuntimeModeSwitchInSession: false,
+                },
+              },
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+          },
+        ],
+      });
+      return threadId;
+    });
+
+  it.effect("commits nothing when an owner sets the thread's current mode", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = yield* seedOwnerModeThread("owner-mode-same");
+      const sequence = yield* orchestrator.getThreadEventSequence(threadId);
+      yield* orchestrator.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("owner-mode-same-set"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
+    }),
+  );
+
+  it.effect("refuses an owner's mode change that would end a running session, until it ends", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = yield* seedOwnerModeThread("owner-mode-running");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("owner-mode-running-send"),
+        threadId,
+        messageId: MessageId.make("owner-mode-running-message"),
+        text: "Start work",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      });
+      const setMode = {
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("owner-mode-running-set"),
+        threadId,
+        runtimeMode: "approval-required",
+      } as const;
+      const failure = yield* orchestrator.dispatch(setMode).pipe(Effect.flip);
+      assert.instanceOf(failure, Orchestrator.OrchestratorDispatchError);
+      assert.equal(failure.cause, Orchestrator.RUNTIME_MODE_CHANGE_DURING_RUN_REFUSAL);
+      const refused = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(refused.thread.runtimeMode, "full-access");
+      assert.isTrue(refused.providerSessions.every((session) => session.status === "running"));
+
+      // No rejection is recorded, so a client retrying the same command succeeds after the run.
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("owner-mode-running-stop"),
+        threadId,
+      });
+      yield* orchestrator.dispatch(setMode);
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(threadId)).thread.runtimeMode,
+        "approval-required",
+      );
+    }),
+  );
+
   it.effect("refuses an MCP runtime-mode change while a run is active", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
