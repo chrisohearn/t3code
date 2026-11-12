@@ -3273,6 +3273,19 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.deepEqual(yield* readMessageIds({ messageRoles: ["user"], latestMessageOnly: true }), [
         firstMessageId,
       ]);
+      const queuedMessageId = MessageId.make("message:bounded-sql-history:queued");
+      yield* sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+        SELECT ${queuedMessageId}, thread_id, NULL, NULL, role, streaming,
+          '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z',
+          json_set(payload_json, '$.id', ${queuedMessageId}, '$.runId', NULL,
+            '$.createdAt', '2099-01-01T00:00:00.000Z', '$.updatedAt', '2099-01-01T00:00:00.000Z')
+        FROM orchestration_v2_projection_messages WHERE message_id = ${firstMessageId}`;
+      assert.deepEqual(
+        yield* readMessageIds({ latestMessageOnly: true, messageOrder: "created_at" }),
+        [queuedMessageId],
+      );
+      yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE message_id = ${queuedMessageId}`;
       assert.deepEqual(yield* readMessageIds({ messageIds: [] }), []);
       assert.deepEqual(yield* readMessageIds({ messageIds: [firstMessageId] }), [firstMessageId]);
       yield* sql`

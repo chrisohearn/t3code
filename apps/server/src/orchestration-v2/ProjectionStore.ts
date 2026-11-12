@@ -344,6 +344,7 @@ export interface ProjectionRecordFilter {
   readonly providerThreadIds?: ReadonlyArray<ProviderThreadId>;
   readonly providerTurnAttemptIds?: ReadonlyArray<RunAttemptId>;
   readonly latestMessageOnly?: true;
+  readonly messageOrder?: "created_at";
   readonly messageRoles?: ReadonlyArray<OrchestrationV2ConversationMessage["role"]>;
   readonly monitorNotificationsOnly?: boolean;
   readonly turnItemRunId?: RunId;
@@ -3824,7 +3825,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   ${filter?.messageRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageRunIds)}))`}
                 ${
                   filter?.latestMessageOnly === true
-                    ? sql`ORDER BY (
+                    ? filter.messageOrder === "created_at"
+                      ? sql`ORDER BY created_at DESC, message_id DESC LIMIT 1`
+                      : sql`ORDER BY (
                     SELECT MIN(item.ordinal) FROM orchestration_v2_projection_turn_items AS item
                     WHERE item.thread_id = message.thread_id
                       AND item.type IN ('user_message', 'assistant_message')

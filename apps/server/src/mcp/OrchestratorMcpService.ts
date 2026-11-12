@@ -3100,7 +3100,10 @@ const make = Effect.gen(function* () {
               })
               .pipe(Effect.mapError(threadManagementFailure))).providerTurns;
       const latest = yield* threadManagement
-        .getThreadRecords(input.threadId, ["messages"], { latestMessageOnly: true })
+        .getThreadRecords(input.threadId, ["messages"], {
+          latestMessageOnly: true,
+          messageOrder: "created_at",
+        })
         .pipe(Effect.mapError(threadManagementFailure));
       const maxChars = input.maxChars ?? 4000;
       const summarize = (message: OrchestrationV2ConversationMessage | undefined) => {
