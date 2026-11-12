@@ -751,7 +751,11 @@ function cancelledAppOwnedTask(
 function mayStartSubagentFollowup(
   command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
 ): boolean {
-  if (command.scheduledTaskId !== undefined || command.restartContinuationOfRunId !== undefined)
+  if (
+    command.postOnly ||
+    command.scheduledTaskId !== undefined ||
+    command.restartContinuationOfRunId !== undefined
+  )
     return false;
   if (command.notification !== undefined) return command.notification.source.kind !== "monitor";
   return (
@@ -6257,6 +6261,71 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    if (command.postOnly) {
+      if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Cannot post to an archived or deleted thread.",
+        });
+      }
+      const now = yield* DateTime.now;
+      const emitEvent = emit(events, command);
+      yield* emitEvent({
+        type: "message.updated",
+        threadId: command.threadId,
+        occurredAt: now,
+        payload: {
+          id: command.messageId,
+          threadId: command.threadId,
+          runId: null,
+          nodeId: null,
+          createdBy: command.createdBy,
+          creationSource: command.creationSource,
+          ...(command.senderThreadId === undefined
+            ? {}
+            : { senderThreadId: command.senderThreadId }),
+          role: "user",
+          text: command.text,
+          attachments: command.attachments,
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      yield* emitEvent({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        occurredAt: now,
+        payload: {
+          id: idAllocator.derive.userTurnItem({ messageId: command.messageId }),
+          threadId: command.threadId,
+          runId: null,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: yield* nextTurnItemOrdinal(projection),
+          status: "completed",
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "user_message",
+          createdBy: command.createdBy,
+          creationSource: command.creationSource,
+          ...(command.senderThreadId === undefined
+            ? {}
+            : { senderThreadId: command.senderThreadId }),
+          inputIntent: "post",
+          messageId: command.messageId,
+          text: command.text,
+          attachments: command.attachments,
+        },
+      });
+      return;
+    }
     if (yield* isStaleQuestionWake(projection, command.messageId, command.notification)) {
       yield* emit(
         events,

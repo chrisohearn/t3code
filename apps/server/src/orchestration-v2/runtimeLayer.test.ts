@@ -6,7 +6,7 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { assert, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import { McpSchema, McpServer } from "effect/ai";
 import {
@@ -1020,6 +1020,56 @@ const layerSharedApplicationDataPlaneTest = Layer.mergeAll(
 );
 
 it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
+  it.effect("posts durable messages idempotently without a run or provider effects", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const threadId = ThreadId.make("thread-post-only");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("post-create"),
+        threadId,
+        projectId: ProjectId.make("post-project"),
+        title: "Inbox",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      const command = {
+        type: "message.dispatch",
+        postOnly: true,
+        createdBy: "agent",
+        creationSource: "mcp",
+        senderThreadId: ThreadId.make("sender"),
+        commandId: CommandId.make("post-message"),
+        threadId,
+        messageId: MessageId.make("post-message"),
+        text: "A durable inbox request",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      } as const;
+      yield* orchestrator.dispatch(command);
+      yield* orchestrator.dispatch(command);
+      yield* worker.drain();
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      expect(projection.runs).toHaveLength(0);
+      expect(projection.providerTurns).toHaveLength(0);
+      expect(projection.messages).toHaveLength(1);
+      expect(projection.messages[0]).toMatchObject({
+        text: command.text,
+        runId: null,
+        createdBy: "agent",
+        creationSource: "mcp",
+        senderThreadId: "sender",
+      });
+      expect(projection.turnItems.filter((item) => item.type === "user_message")).toHaveLength(1);
+    }),
+  );
+
   const seedFailingRollbackThread = (name: string) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
