@@ -4,12 +4,13 @@ import type { OrchestrationV2Command } from "@t3tools/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
 import type * as Context from "effect/Context";
 import { expect, it, vi } from "vite-plus/test";
-import { page } from "vite-plus/test/browser";
+import { page, userEvent } from "vite-plus/test/browser";
 
 import { AppRoot } from "~/AppRoot";
 // The route loads ChatView lazily, and its first transform (React Compiler over ~4k lines)
 // takes 6-11s; importing it here keeps that out of the test's timeout.
 import "~/components/ChatView";
+import { useRuntimeModePickStore } from "~/components/chat/runtimeModePickStore";
 import { useComposerDraftStore } from "~/composerDraftStore";
 import { __setClientSettingsForTests } from "~/hooks/useSettings";
 import { getRouter } from "~/router";
@@ -46,15 +47,23 @@ vi.mock(import("~/rpc/requestLatencyState"), async (original) => ({
 const idleThread = threadWithHistory("thread-mode-pick", 1);
 const refusedThread = threadWithHistory("thread-mode-refused", 1);
 const revertedThread = threadWithHistory("thread-mode-reverted", 1);
-const runningThread = (() => {
-  const idle = threadWithHistory("thread-mode-running", 1);
-  return {
-    ...idle,
-    runs: [...idle.runs, runningRun(idle.id, "thread-mode-running-live", 2, "live-user")],
-  };
-})();
+const sendingThread = threadWithHistory("thread-mode-sending", 1);
+const savedDraftThread = threadWithHistory("thread-mode-saved-draft", 1);
+const ACTIVE_STATUSES = ["preparing", "starting", "running", "waiting"] as const;
+const activeThreads = ACTIVE_STATUSES.map((status) => {
+  const idle = threadWithHistory(`thread-mode-${status}`, 1);
+  const live = runningRun(idle.id, `thread-mode-${status}-live`, 2, "live-user");
+  return { ...idle, runs: [...idle.runs, { ...live, status }] };
+});
 // The app's shell subscription outlives a test, so every test lists every thread.
-const allThreads = [idleThread, refusedThread, revertedThread, runningThread];
+const allThreads = [
+  idleThread,
+  refusedThread,
+  revertedThread,
+  sendingThread,
+  savedDraftThread,
+  ...activeThreads,
+];
 
 async function openThread(
   thread: FakeThread,
@@ -91,10 +100,23 @@ async function pickSupervised() {
 const runtimeModeCommands = () =>
   dispatchedCommands().filter((command) => command.type === "thread.runtime-mode.set");
 
-const draftRuntimeMode = (thread: FakeThread) =>
-  useComposerDraftStore.getState().draftsByThreadKey[
-    scopedThreadKey(scopeThreadRef(ENVIRONMENT_ID, thread.id))
-  ]?.runtimeMode ?? null;
+const threadRef = (thread: FakeThread) => scopeThreadRef(ENVIRONMENT_ID, thread.id);
+
+const pendingPick = (thread: FakeThread) =>
+  useRuntimeModePickStore.getState().picks[scopedThreadKey(threadRef(thread))]?.mode ?? null;
+
+const holdRuntimeModeCommands = (command: OrchestrationV2Command) =>
+  command.type === "thread.runtime-mode.set";
+
+async function typeAndSend(text: string) {
+  await userEvent.click(page.getByTestId("composer-editor"));
+  await userEvent.keyboard(`${text}{Enter}`);
+}
+
+const messageSent = () =>
+  vi.waitFor(() =>
+    expect(dispatchedCommands().map((command) => command.type)).toContain("message.dispatch"),
+  );
 
 it("a permissions pick on an idle thread reaches the server before any message is sent", async () => {
   const thread = idleThread;
@@ -107,9 +129,9 @@ it("a permissions pick on an idle thread reaches the server before any message i
     ]),
   );
   // The pick holds until the shell shows it, then the server's value takes over.
-  expect(draftRuntimeMode(thread)).toBe("approval-required");
+  expect(pendingPick(thread)).toBe("approval-required");
   await emitThreadShellUpdate(thread.id, { runtimeMode: "approval-required" });
-  await vi.waitFor(() => expect(draftRuntimeMode(thread)).toBeNull());
+  await vi.waitFor(() => expect(pendingPick(thread)).toBeNull());
   await expect
     .element(page.getByRole("button", { name: "Permissions: Supervised" }).first())
     .toBeVisible();
@@ -117,9 +139,7 @@ it("a permissions pick on an idle thread reaches the server before any message i
 
 it("a refused permissions change shows the server's reason and the server's mode", async () => {
   const thread = refusedThread;
-  await using _app = await openThread(thread, {
-    holdCommand: (command) => command.type === "thread.runtime-mode.set",
-  });
+  await using _app = await openThread(thread, { holdCommand: holdRuntimeModeCommands });
 
   await pickSupervised();
   await vi.waitFor(() => expect(runtimeModeCommands()).toHaveLength(1));
@@ -133,7 +153,7 @@ it("a refused permissions change shows the server's reason and the server's mode
   await expect
     .element(page.getByText("The current session is still running background agents."))
     .toBeVisible();
-  expect(draftRuntimeMode(thread)).toBeNull();
+  expect(pendingPick(thread)).toBeNull();
   // The model picker stays open after the permissions pick.
   await expect
     .element(page.getByRole("button", { name: "Permissions: Full access" }))
@@ -142,9 +162,7 @@ it("a refused permissions change shows the server's reason and the server's mode
 
 it("returning to the server's mode before a pick lands sends that mode too", async () => {
   const thread = revertedThread;
-  await using _app = await openThread(thread, {
-    holdCommand: (command) => command.type === "thread.runtime-mode.set",
-  });
+  await using _app = await openThread(thread, { holdCommand: holdRuntimeModeCommands });
 
   await pickSupervised();
   await page.getByRole("button", { name: "Permissions: Supervised" }).first().click();
@@ -158,14 +176,45 @@ it("returning to the server's mode before a pick lands sends that mode too", asy
       "full-access",
     ]),
   );
+  // The older pick's refusal neither toasts nor takes over the newer pick.
+  expect(pendingPick(thread)).toBe("full-access");
+  await expect.element(page.getByText("Could not change permissions")).not.toBeInTheDocument();
 });
 
-it("a permissions pick during a run is refused without reaching the server", async () => {
-  const thread = runningThread;
+it("a send while a pick is pending does not set the mode again", async () => {
+  const thread = sendingThread;
+  await using _app = await openThread(thread, { holdCommand: holdRuntimeModeCommands });
+
+  await pickSupervised();
+  await vi.waitFor(() => expect(runtimeModeCommands()).toHaveLength(1));
+  await userEvent.keyboard("{Escape}");
+  await typeAndSend("Go");
+  // The send queues behind the pick; releasing the pick lets only the message through.
+  await rejectPendingCommand("Refused.");
+  await messageSent();
+  expect(runtimeModeCommands()).toHaveLength(1);
+});
+
+it("a mode saved in an older draft neither shows nor reaches the server", async () => {
+  const thread = savedDraftThread;
+  useComposerDraftStore.getState().setRuntimeMode(threadRef(thread), "approval-required");
+  await using _app = await openThread(thread);
+
+  await page.getByRole("button", { name: "GPT-5.4", exact: true }).click();
+  await expect
+    .element(page.getByRole("button", { name: "Permissions: Full access" }))
+    .toBeVisible();
+  await userEvent.keyboard("{Escape}");
+  await typeAndSend("Go");
+  await messageSent();
+  expect(runtimeModeCommands()).toEqual([]);
+});
+
+it.each(activeThreads)("a permissions pick is refused while $id works", async (thread) => {
   await using _app = await openThread(thread);
 
   await pickSupervised();
   await expect.element(page.getByText("Permissions not changed")).toBeVisible();
   expect(runtimeModeCommands()).toEqual([]);
-  expect(draftRuntimeMode(thread)).toBeNull();
+  expect(pendingPick(thread)).toBeNull();
 });

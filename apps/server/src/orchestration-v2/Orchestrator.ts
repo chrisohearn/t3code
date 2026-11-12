@@ -3943,6 +3943,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
     }
+    // Re-sending the current mode would still detach sessions that cannot switch in place.
+    if (command.type === "thread.runtime-mode.set" && command.runtimeMode === thread.runtimeMode) {
+      return;
+    }
     if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
@@ -4304,6 +4308,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         session.status !== "stopped" &&
         session.status !== "error",
     );
+    if (command.type === "thread.runtime-mode.set" && liveSessions.length > 0) {
+      const { runs } = yield* loadProjectionForCommand(command, ["runs"], { turnItemTypes: [] });
+      if (runs.some(isActiveRun)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Cannot change permissions while a run is active, because applying them ends the provider session. Wait for the run to finish, or stop it, then try again.",
+        });
+      }
+    }
     if (command.type !== "thread.archive" && command.type !== "thread.settle") {
       for (const session of liveSessions) {
         if (yield* sessionHasBackgroundWork(session, providerContext!.providerThreads)) {
@@ -15194,6 +15209,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "subagent.stop" ||
           // Closing a share again, or after it ended, is not an error.
           command.type === "thread.guest-share.close" ||
+          // An owner setting the thread's current mode again.
+          command.type === "thread.runtime-mode.set" ||
           (command.type === "thread.delete" && command.onlyIfUnused === true),
         (_planned) =>
           new OrchestratorDispatchError({
