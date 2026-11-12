@@ -34,6 +34,7 @@ import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
+import * as ProviderFailover from "./ProviderFailover.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
@@ -187,6 +188,13 @@ export const layer: Layer.Layer<
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
+    const serverSettings = yield* ServerSettings.ServerSettingsService;
+    const resolveFailoverTarget = (
+      input: Parameters<typeof ProviderFailover.resolveProviderFailoverTarget>[0],
+    ) =>
+      ProviderFailover.resolveProviderFailoverTarget(input).pipe(
+        Effect.provideService(ServerSettings.ServerSettingsService, serverSettings),
+      );
 
     const resolveRecreateBase = Effect.fn("ProviderTurnStartService.resolveRecreateBase")(
       function* (cwd: string) {
@@ -726,6 +734,26 @@ export const layer: Layer.Layer<
         inheritedBackgroundTurnItems,
       });
       const { isCurrentAttemptInStatus } = runControls;
+      const firstAttempt = !projection.attempts.some(
+        (candidate) => candidate.runId === run.id && candidate.id !== attempt.id,
+      );
+      const runOrdinals = new Map(
+        projection.runs.map((candidate) => [candidate.id, candidate.ordinal]),
+      );
+      /** The latest attempt that ran this native conversation used another provider instance. */
+      const nativeThreadLastRanOnOtherInstance = (thread: OrchestrationV2ProviderThread) => {
+        const nativeId = thread.nativeThreadRef?.nativeId;
+        if (nativeId == null) return false;
+        const last = projection.attempts
+          .filter((candidate) => candidate.nativeThreadId === nativeId)
+          .toSorted(
+            (left, right) =>
+              (runOrdinals.get(left.runId) ?? 0) - (runOrdinals.get(right.runId) ?? 0) ||
+              left.attemptOrdinal - right.attemptOrdinal,
+          )
+          .at(-1);
+        return last !== undefined && last.providerInstanceId !== run.providerInstanceId;
+      };
 
       const resolvedPolicy = yield* runtimePolicy
         .resolve({
@@ -1106,6 +1134,37 @@ export const layer: Layer.Layer<
             type: "provider_resume_fallback",
           });
           const createdAt = yield* DateTime.now;
+          // Runs before a fresh-context run never reach a provider again.
+          const boundary = ContextHandoffService.contextBoundaryOrdinal(projection.runs);
+          const items = (yield* projectionStore.getTurnStartHistory(input.threadId)).filter(
+            (item) =>
+              item.runId === null
+                ? boundary === 0
+                : projection.runs.some(
+                    (source) =>
+                      source.id === item.runId &&
+                      // A failover re-sends its source's prompt as this turn.
+                      source.id !== run.failoverOfRunId &&
+                      source.ordinal >= boundary &&
+                      source.ordinal < run.ordinal,
+                  ),
+          );
+          const standingRunId = ContextHandoffService.firstConversationRunId(projection.runs);
+          const standingRun =
+            standingRunId === run.id || standingRunId === run.failoverOfRunId
+              ? undefined
+              : projection.runs.find((candidate) => candidate.id === standingRunId);
+          const standingItemId =
+            standingRun === undefined
+              ? undefined
+              : ContextHandoffService.standingInstructionsItemId({
+                  thread: projection.thread,
+                  run: standingRun,
+                  message: (yield* projectionStore.getThreadRecords(input.threadId, ["messages"], {
+                    messageIds: [standingRun.userMessageId],
+                  })).messages.find((candidate) => candidate.id === standingRun.userMessageId),
+                  items,
+                });
           const handoff = yield* contextHandoffService.prepareProviderHandoff({
             threadId: projection.thread.id,
             targetRunId: run.id,
@@ -1114,16 +1173,11 @@ export const layer: Layer.Layer<
             toProviderThreadId: providerThread.id,
             fromProviderInstanceId: providerThread.providerInstanceId,
             toProviderInstanceId: run.providerInstanceId,
-            coveredRunOrdinals: { from: 1, to: Math.max(1, run.ordinal - 1) },
+            coveredRunOrdinals: { from: Math.max(1, boundary), to: Math.max(1, run.ordinal - 1) },
             strategy: "full_thread_summary",
             runs: projection.runs,
-            items: (yield* projectionStore.getTurnStartHistory(input.threadId)).filter(
-              (item) =>
-                item.runId === null ||
-                projection.runs.some(
-                  (source) => source.id === item.runId && source.ordinal < run.ordinal,
-                ),
-            ),
+            items,
+            ...(standingItemId === undefined ? {} : { standingItemId }),
             createdAt,
           });
           return { handoff, transferId, createdAt };
@@ -1423,12 +1477,13 @@ export const layer: Layer.Layer<
         resumedHandoffContext = undefined;
         resumedRetryHandoff = [];
         if (!(yield* isCurrentAttemptInStatus("starting"))) return undefined;
+        const inUse =
+          resumed._tag === "Failure" && resumed.failure._tag === "ProviderAdapterThreadInUseError";
         // Another client is still writing to the native thread. A fresh
         // session here would silently split the conversation from it.
-        if (
-          resumed._tag === "Failure" &&
-          resumed.failure._tag === "ProviderAdapterThreadInUseError"
-        ) {
+        // The exception is this thread's own previous provider instance: Codex's shared
+        // app-server keeps the writer lock after a detach, and nothing writes there any more.
+        if (inUse && !nativeThreadLastRanOnOtherInstance(providerThread)) {
           return yield* loadFromProvider(Effect.fail(resumed.failure));
         }
 
@@ -1438,9 +1493,11 @@ export const layer: Layer.Layer<
           runId,
           reason: uncertainDelivery
             ? "uncertain_history_delivery"
-            : resumed._tag === "Success"
-              ? "handoff_budget_exhausted"
-              : "resume_failed",
+            : inUse
+              ? "held_by_previous_instance"
+              : resumed._tag === "Success"
+                ? "handoff_budget_exhausted"
+                : "resume_failed",
           errorTag: resumed._tag === "Failure" ? resumed.failure._tag : "ContextHandoffBudgetError",
         });
         const replacement = yield* loadFromProvider(
@@ -1824,7 +1881,14 @@ export const layer: Layer.Layer<
         !noteContinuation
           ? session
           : makeDeliverySession(session, startWithHandoffs);
+      const failoverTarget = yield* resolveFailoverTarget({
+        thread: projection.thread,
+        run,
+        message,
+        firstAttempt,
+      });
       return runExecution.startRootRun({
+        ...(failoverTarget === undefined ? {} : { failoverTarget }),
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
         appThread: projection.thread,
         providerSessionId,

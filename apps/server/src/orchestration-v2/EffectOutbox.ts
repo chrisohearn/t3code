@@ -37,6 +37,10 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     sourceRunId: RunId,
   }),
   Schema.Struct({
+    type: Schema.Literal("run.failover"),
+    sourceRunId: RunId,
+  }),
+  Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
     providerSessionId: ProviderSessionId,
     detail: Schema.optional(Schema.String),
@@ -134,6 +138,7 @@ export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.T
 
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
+  "run.failover",
   "provider-session.detach",
   "provider-thread.rollback",
   "checkpoint.capture",
