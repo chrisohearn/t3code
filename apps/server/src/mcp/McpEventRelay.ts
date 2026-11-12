@@ -23,6 +23,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as EventStore from "../persistence/OrchestrationEventStore.ts";
@@ -125,6 +126,7 @@ const make = Effect.gen(function* () {
   const threads = yield* Threads.ThreadManagementService;
   const events = yield* EventStore.OrchestrationEventStore;
   const digest = yield* Digest.Digest;
+  const pinGate = yield* Semaphore.make(1);
   const hash = Effect.fn("McpEventRelay.hash")(function* (value: unknown) {
     const json = yield* encode(value);
     return yield* digest
@@ -258,7 +260,9 @@ const make = Effect.gen(function* () {
           if (relayed.length > 0) continue;
         }
         const runId = event.type === "run.updated" ? event.payload.id : event.runId;
-        if (runId !== binding.runId) continue;
+        const threadLevelRelease =
+          event.type === "provider-session.detached" && runId === undefined;
+        if (!threadLevelRelease && runId !== binding.runId) continue;
         const outcome =
           event.type === "run.updated" &&
           ["completed", "failed", "interrupted", "cancelled", "rolled_back"].includes(
@@ -273,12 +277,7 @@ const make = Effect.gen(function* () {
             : event.type === "provider-session.detached"
               ? "thread.resource-released"
               : undefined;
-        if (
-          name === undefined ||
-          (!binding.events.includes(name) &&
-            !(outcome && binding.events.includes("thread.run.result")))
-        )
-          continue;
+        if (name === undefined || !binding.events.includes(name)) continue;
         const records = yield* threads
           .getThreadRecords(binding.threadId, ["messages"], {
             messageRunIds: [RunId.make(binding.runId)],
@@ -300,7 +299,8 @@ const make = Effect.gen(function* () {
             eventName: name,
             threadId: binding.threadId,
             threadTitle: excerpt(records.thread.title),
-            runId: binding.runId,
+            runId: runId ?? null,
+            ...(threadLevelRelease ? { boundRunId: binding.runId } : {}),
             ledgerKey: binding.ledgerKey === null ? null : excerpt(binding.ledgerKey),
             occurredAt: DateTime.formatIso(event.occurredAt),
             resultExcerpt: excerpt(text),
@@ -328,59 +328,65 @@ const make = Effect.gen(function* () {
     }
     return behind;
   });
-  const dispatch = Effect.fn("McpEventRelay.dispatch")(function* (job: Job) {
-    const pin = yield* pinFor(job.principal);
-    if (pin === undefined || pin.inboxThreadId !== job.inboxThreadId) return yield* denied();
-    if (job.alert === 0) yield* authorize(job.principal, job.sourceThreadId);
-    const { shell } = yield* authorize(job.principal, job.inboxThreadId, job);
-    yield* resolveRuntimeMode(pin.runtimeMode, shell.runtimeMode).pipe(Effect.mapError(denied));
-    yield* resolveInteractionMode(pin.interactionMode, shell.interactionMode).pipe(
-      Effect.mapError(denied),
-    );
-    yield* threads
-      .sendToThread({
-        projectId: shell.projectId,
-        threadId: job.inboxThreadId,
-        commandId: CommandId.make(job.clientRequestId),
-        messageId: job.messageId,
-        text: `[T3 event relay]\n${job.body}`,
-        attachments: [],
-        mode: "queue",
-        createdBy: "system",
-        creationSource: "server",
-      })
-      .pipe(
-        Effect.mapError(() => new McpEventsError({ code: -32603, reason: "inbox_send_failed" })),
+  const dispatch = Effect.fn("McpEventRelay.dispatch")(
+    function* (job: Job) {
+      const pin = yield* pinFor(job.principal);
+      if (pin === undefined || pin.inboxThreadId !== job.inboxThreadId) return yield* denied();
+      if (job.alert === 0) yield* authorize(job.principal, job.sourceThreadId);
+      const { shell } = yield* authorize(job.principal, job.inboxThreadId, job);
+      yield* resolveRuntimeMode(pin.runtimeMode, shell.runtimeMode).pipe(Effect.mapError(denied));
+      yield* resolveInteractionMode(pin.interactionMode, shell.interactionMode).pipe(
+        Effect.mapError(denied),
       );
-    yield* sql`UPDATE mcp_event_relay_outbox SET status = 'delivered', last_error = NULL WHERE id = ${job.id}`.pipe(
-      Effect.mapError(storage),
-    );
-  });
+      yield* threads
+        .sendToThread({
+          projectId: shell.projectId,
+          threadId: job.inboxThreadId,
+          commandId: CommandId.make(job.clientRequestId),
+          messageId: job.messageId,
+          text: `[T3 event relay]\n${job.body}`,
+          attachments: [],
+          mode: "queue",
+          createdBy: "system",
+          creationSource: "server",
+        })
+        .pipe(
+          Effect.mapError(() => new McpEventsError({ code: -32603, reason: "inbox_send_failed" })),
+        );
+      yield* sql`UPDATE mcp_event_relay_outbox SET status = 'delivered', last_error = NULL, body = '' WHERE id = ${job.id}`.pipe(
+        Effect.mapError(storage),
+      );
+    },
+    (effect) => pinGate.withPermit(effect),
+  );
   return McpEventRelay.of({
     inbox: Effect.fn("McpEventRelay.inbox")((principal) =>
       pinFor(principal).pipe(Effect.map((pin) => pin?.inboxThreadId ?? null)),
     ),
-    pin: Effect.fn("McpEventRelay.pin")(function* (scope, threadId) {
-      if (
-        scope.thread !== undefined ||
-        scope.client === undefined ||
-        scope.client.linked ||
-        scope.client.access === "read-only"
-      )
-        return yield* denied();
-      const modes = Invocation.clientModeCeiling(scope.client);
-      if (threadId === null) {
-        yield* sql`DELETE FROM mcp_event_inboxes WHERE principal = ${scope.client.sessionId}`.pipe(
-          Effect.mapError(storage),
-        );
-        return;
-      }
-      yield* authorize(scope.client.sessionId, threadId, modes);
-      yield* sql`INSERT INTO mcp_event_inboxes (principal, thread_id, runtime_mode, interaction_mode)
+    pin: Effect.fn("McpEventRelay.pin")(
+      function* (scope, threadId) {
+        if (
+          scope.thread !== undefined ||
+          scope.client === undefined ||
+          scope.client.linked ||
+          scope.client.access === "read-only"
+        )
+          return yield* denied();
+        const modes = Invocation.clientModeCeiling(scope.client);
+        if (threadId === null) {
+          yield* sql`DELETE FROM mcp_event_inboxes WHERE principal = ${scope.client.sessionId}`.pipe(
+            Effect.mapError(storage),
+          );
+          return;
+        }
+        yield* authorize(scope.client.sessionId, threadId, modes);
+        yield* sql`INSERT INTO mcp_event_inboxes (principal, thread_id, runtime_mode, interaction_mode)
         VALUES (${scope.client.sessionId}, ${threadId}, ${modes.runtimeMode}, ${modes.interactionMode})
         ON CONFLICT(principal) DO UPDATE SET thread_id = excluded.thread_id, runtime_mode = excluded.runtime_mode,
         interaction_mode = excluded.interaction_mode`.pipe(Effect.mapError(storage));
-    }),
+      },
+      (effect) => pinGate.withPermit(effect),
+    ),
     prepare: Effect.fn("McpEventRelay.prepare")(function* (scope, input) {
       if (
         scope.client === undefined ||
@@ -418,11 +424,24 @@ const make = Effect.gen(function* () {
         if (generated.length > 0)
           return yield* new McpEventsError({ code: -32602, reason: "relay_loop" });
       }
+      const [start] = yield* sql<{
+        firstSequence: number | null;
+      }>`SELECT MIN(sequence) AS "firstSequence" FROM orchestration_events
+        WHERE application_event_version = 2 AND aggregate_kind = 'thread' AND stream_id = ${threadId}
+          AND event_type = 'run.updated' AND json_extract(payload_json, '$.id') = ${runId}`.pipe(
+        Effect.mapError(storage),
+      );
+      if (run !== undefined && start?.firstSequence == null)
+        return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+      const cursor = Math.min(
+        prepared.cursor,
+        start?.firstSequence == null ? prepared.cursor : Math.max(0, start.firstSequence - 1),
+      );
       const id = yield* hash([prepared.principal, threadId, runId, prepared.inboxThreadId]);
       yield* sql`INSERT INTO mcp_event_relay_bindings
         (id, principal, thread_id, inbox_thread_id, run_id, events, ledger_key, runtime_mode, interaction_mode, scan_cursor, expires_at)
         VALUES (${id}, ${prepared.principal}, ${threadId}, ${prepared.inboxThreadId}, ${runId}, ${yield* encode(prepared.events).pipe(Effect.mapError(storage))},
-          ${ledgerKey ?? null}, ${prepared.runtimeMode}, ${prepared.interactionMode}, ${prepared.cursor},
+          ${ledgerKey ?? null}, ${prepared.runtimeMode}, ${prepared.interactionMode}, ${cursor},
           ${session.expiresAt.epochMilliseconds})
         ON CONFLICT DO NOTHING`.pipe(Effect.mapError(storage));
     }),
@@ -441,7 +460,7 @@ const make = Effect.gen(function* () {
       yield* authorize(scope.client.sessionId, pin.inboxThreadId, modes);
       const rows = yield* sql`SELECT d.body FROM mcp_event_deliveries AS d
         JOIN mcp_event_subscriptions AS s ON s.id = d.subscription_id
-        WHERE s.id = ${id} AND s.principal = ${scope.client.sessionId} AND s.active = 0
+        WHERE s.id = ${id} AND s.principal = ${scope.client.sessionId} AND (s.active = 0 OR s.expires_at <= ${yield* Clock.currentTimeMillis})
           AND d.acknowledged = 0 AND d.attempts >= 8 AND NOT EXISTS (
             SELECT 1 FROM mcp_event_relay_outbox AS r WHERE r.principal = s.principal
             AND r.inbox_thread_id = ${pin.inboxThreadId} AND r.source_key = 'replay:' || s.id || ':' || d.event_id
@@ -482,7 +501,7 @@ const make = Effect.gen(function* () {
         SELECT DISTINCT s.principal, 'subscription:' || s.id AS "sourceKey", s.thread_id AS "threadId"
         FROM mcp_event_subscriptions AS s JOIN mcp_event_deliveries AS d ON d.subscription_id = s.id
         JOIN mcp_event_inboxes AS i ON i.principal = s.principal
-        WHERE s.active = 0 AND d.attempts >= 8 AND d.acknowledged = 0 AND NOT EXISTS (
+        WHERE (s.active = 0 OR s.expires_at <= ${yield* Clock.currentTimeMillis}) AND d.attempts >= 8 AND d.acknowledged = 0 AND NOT EXISTS (
           SELECT 1 FROM mcp_event_relay_alerts AS a WHERE a.principal = s.principal
           AND a.source_key = 'subscription:' || s.id AND a.day = ${day}) LIMIT 64`.pipe(
         Effect.mapError(storage),

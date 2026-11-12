@@ -1,4 +1,5 @@
 import * as ConnectReachability from "../cloud/ConnectReachability.ts";
+import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import type { EnvironmentConnectReachability } from "@t3tools/contracts";
@@ -360,6 +361,8 @@ it.effect(
         yield* f.outcome(threadId, runId, "-second-terminal");
         yield* rebuilt.drain();
         expect(f.inboxSends).toHaveLength(1);
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        expect(yield* sql`SELECT body FROM mcp_event_relay_outbox`).toEqual([{ body: "" }]);
         expect(f.sent).toHaveLength(0);
         expect((yield* f.call(rebuilt.listSubscriptions())).subscriptions).toHaveLength(0);
         expect(f.inboxSends[0]).toMatchObject({
@@ -388,6 +391,27 @@ it.effect(
         ).toBe("access_denied");
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("recovers the source result when an idempotent retry follows a lost binding", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.grantWrite(f.principal);
+      const source = ThreadId.make("committed-before-binding");
+      const run = RunId.make("committed-run");
+      yield* f.call(f.service.setInbox({ threadId: ThreadId.make("inbox") }));
+      yield* f.call(f.service.prepareNotify({}));
+      yield* f.outcome(source, run);
+      const rebuilt = yield* f.build();
+      const replayed = yield* f.call(rebuilt.prepareNotify({}));
+      if ("status" in replayed) throw new Error("Expected inbox");
+      yield* f.call(rebuilt.notifyThread(replayed, source, run, "same-request"));
+      yield* rebuilt.drain();
+      expect(f.inboxSends).toHaveLength(1);
+      expect(f.inboxSends[0]?.text).toContain('"runId":"committed-run"');
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
 it.effect(
@@ -431,6 +455,79 @@ it.effect(
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
+it.effect.each(["thread.run.result", "thread.blocker", "thread.resource-released"] as const)(
+  "honors the requested %s subset and thread-level resource releases",
+  (event) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const source = ThreadId.make("filtered-source");
+        const run = RunId.make("filtered-run");
+        yield* f.call(f.service.setInbox({ threadId: ThreadId.make("inbox") }));
+        const prepared = yield* f.call(f.service.prepareNotify({ events: [event] }));
+        if ("status" in prepared) throw new Error("Expected inbox");
+        yield* f.call(f.service.notifyThread(prepared, source, run));
+        if (event === "thread.resource-released")
+          yield* f.append([source, ThreadId.make("unrelated")]);
+        else yield* f.outcome(source, run);
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(event === "thread.run.result" ? 0 : 1);
+        if (event === "thread.resource-released")
+          expect(f.inboxSends[0]?.text).toContain('"runId":null');
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("serializes clearing the inbox pin with an in-flight queued send", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.grantWrite(f.principal);
+      const source = ThreadId.make("pin-race-source");
+      const run = RunId.make("pin-race-run");
+      const order: string[] = [];
+      const sending = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const clearing = yield* Deferred.make<void>();
+      yield* f.call(f.service.setInbox({ threadId: ThreadId.make("inbox") }));
+      const prepared = yield* f.call(f.service.prepareNotify({}));
+      if ("status" in prepared) throw new Error("Expected inbox");
+      yield* f.call(f.service.notifyThread(prepared, source, run));
+      yield* f.outcome(source, run);
+      f.setSendWork(
+        Deferred.succeed(sending, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.andThen(
+            Effect.sync(() => {
+              order.push("sent");
+            }),
+          ),
+        ),
+      );
+      const drain = yield* f.service.drain().pipe(Effect.forkScoped);
+      yield* Deferred.await(sending);
+      const clear = yield* Deferred.succeed(clearing, undefined).pipe(
+        Effect.andThen(f.call(f.service.setInbox({ threadId: null }))),
+        Effect.andThen(
+          Effect.sync(() => {
+            order.push("cleared");
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(clearing);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(drain);
+      yield* Fiber.join(clear);
+      expect(order).toEqual(["sent", "cleared"]);
+      expect(yield* f.call(f.service.prepareNotify({}))).toMatchObject({
+        reason: "no_pinned_inbox",
+      });
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
 it.effect(
   "rechecks relay authority and deduplicates exhausted webhook alerts and replay by principal",
   () =>
@@ -447,10 +544,12 @@ it.effect(
         const sql = Context.get(f.context, SqlClient.SqlClient);
         yield* f.service.drain();
         yield* sql`UPDATE mcp_event_deliveries SET attempts = 8, next_attempt_at = 0 WHERE subscription_id = ${sub.id}`;
+        yield* sql`UPDATE mcp_event_subscriptions SET expires_at = 0 WHERE id = ${sub.id}`;
         yield* f.service.drain();
         yield* f.service.drain();
         expect(f.inboxSends).toHaveLength(1);
         expect(f.inboxSends[0]?.text).toContain('"relay":"delivery-alert"');
+        expect((yield* f.subscriptions.get(sub.id))?.active).toBe(1);
         yield* TestClock.adjust("1 day");
         yield* f.service.drain();
         expect(f.inboxSends).toHaveLength(2);
