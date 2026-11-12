@@ -3313,6 +3313,17 @@ describe("OrchestratorMcpService provider resolution", () => {
                   refs.includes(revision)
                     ? Effect.succeed({ commitSha: "abc123" })
                     : Effect.fail(gitFailure(cwd, "Needed a single revision")),
+                execute: () =>
+                  Effect.succeed({
+                    exitCode: refs.length === 0 ? 128 : 0,
+                    stdout: refs.length === 0 ? "" : "true\n",
+                    stderr:
+                      refs.length === 0
+                        ? "fatal: not a git repository (or any of the parent directories): .git\n"
+                        : "",
+                    stdoutTruncated: false,
+                    stderrTruncated: false,
+                  } as never),
               },
               saved,
             ),
@@ -3324,6 +3335,61 @@ describe("OrchestratorMcpService provider resolution", () => {
           baseRef === null
             ? { type: "root" }
             : { type: "worktree", baseRef, startFromOrigin: true },
+        ]);
+      }),
+    );
+
+    it.effect.each([
+      {
+        name: "Git refuses the repository",
+        execute: () =>
+          Effect.succeed({
+            exitCode: 128,
+            stdout: "",
+            stderr: "fatal: detected dubious ownership in repository at '/repo/scheduled-base'\n",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          } as never),
+      },
+      {
+        name: "Git cannot run",
+        execute: (input: { readonly cwd: string }) =>
+          Effect.fail(
+            new GitCommandError({
+              operation: "GitVcsDriver.test",
+              command: "git",
+              cwd: input.cwd,
+              detail: "spawn git ENOENT",
+            }),
+          ),
+      },
+    ])("keeps a worktree when $name", ({ execute }) =>
+      Effect.gen(function* () {
+        const saved = yield* Ref.make<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>([]);
+        const unreadable = (cwd: string) =>
+          new GitCommandError({
+            operation: "GitVcsDriver.test",
+            command: "git",
+            cwd,
+            detail: "detected dubious ownership in repository",
+          });
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(
+            service(
+              {
+                resolvePrimaryRemoteName: (cwd) => Effect.fail(unreadable(cwd)),
+                resolveDefaultBranchName: () => Effect.succeed(null),
+                resolveCommit: ({ cwd }) => Effect.fail(unreadable(cwd)),
+                execute: execute as never,
+              },
+              saved,
+            ),
+          ),
+        );
+        yield* mcp.scheduleTask(client, { projectId, prompt: "Check the build", schedule });
+        // Preparation fails closed rather than running in the shared checkout.
+        assert.deepEqual(yield* Ref.get(saved), [
+          { type: "worktree", baseRef: "main", startFromOrigin: true },
         ]);
       }),
     );

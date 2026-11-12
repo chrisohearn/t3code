@@ -1883,6 +1883,28 @@ const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => false),
     );
 
+  const confirmedNotARepository = (cwd: string) =>
+    gitDriver
+      .execute({
+        operation: "OrchestratorMcpService.confirmedNotARepository",
+        cwd,
+        args: ["rev-parse", "--is-inside-work-tree"],
+        env: { LC_ALL: "C" },
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+        maxOutputBytes: 4_096,
+      })
+      .pipe(
+        Effect.map(
+          (result) =>
+            result.exitCode !== 0 &&
+            result.stderr
+              .split(/\r?\n/u)
+              .some((line) => line.startsWith("fatal: not a git repository")),
+        ),
+        Effect.orElseSucceed(() => false),
+      );
+
   const resolveScheduledTaskBaseRef = Effect.fn(
     "OrchestratorMcpService.resolveScheduledTaskBaseRef",
   )(function* (cwd: string) {
@@ -1908,8 +1930,11 @@ const make = Effect.gen(function* () {
     for (const branch of conventional) {
       if (yield* refExists(cwd, `refs/heads/${branch}`)) return branch;
     }
-    // No commit at all (not a repository, or an empty one): a worktree has nothing to start from.
-    return (yield* refExists(cwd, "HEAD")) ? "main" : null;
+    if (yield* refExists(cwd, "HEAD")) return "main";
+    // Only Git's own "not a git repository" proves there is nothing to start a worktree from. A
+    // repository Git cannot read (ownership, permissions, a broken gitfile, a missing executable)
+    // keeps a worktree, so its runs fail during preparation instead of running in the checkout.
+    return (yield* confirmedNotARepository(cwd)) ? null : "main";
   });
 
   const scheduledTaskWorkspaceStrategy = Effect.fn(
