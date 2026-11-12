@@ -3285,6 +3285,17 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         yield* readMessageIds({ latestMessageOnly: true, messageOrder: "created_at" }),
         [queuedMessageId],
       );
+      const laterQueuedMessageId = MessageId.make("message:bounded-sql-history:aaa-later");
+      yield* sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+        SELECT ${laterQueuedMessageId}, thread_id, run_id, node_id, role, streaming,
+          created_at, updated_at, json_set(payload_json, '$.id', ${laterQueuedMessageId})
+        FROM orchestration_v2_projection_messages WHERE message_id = ${queuedMessageId}`;
+      assert.deepEqual(
+        yield* readMessageIds({ latestMessageOnly: true, messageOrder: "created_at" }),
+        [laterQueuedMessageId],
+      );
+      yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE message_id = ${laterQueuedMessageId}`;
       const visibleLatest = {
         latestMessageOnly: true,
         messageOrder: "created_at",

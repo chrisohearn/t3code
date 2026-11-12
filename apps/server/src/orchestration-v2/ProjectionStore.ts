@@ -3875,7 +3875,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ${
                   filter?.latestMessageOnly === true
                     ? filter.messageOrder === "created_at"
-                      ? sql`ORDER BY created_at DESC, message_id DESC LIMIT 1`
+                      ? sql`ORDER BY created_at DESC, message.rowid DESC LIMIT 1`
                       : sql`ORDER BY (
                     SELECT MIN(item.ordinal) FROM orchestration_v2_projection_turn_items AS item
                     WHERE item.thread_id = message.thread_id

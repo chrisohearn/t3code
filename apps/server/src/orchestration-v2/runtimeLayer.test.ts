@@ -8325,6 +8325,13 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         commandId: CommandId.make("runtime-layer-queued-edit-queued-message"),
         threadId,
         messageId: MessageId.make("runtime-layer-queued-edit-queued-message"),
+        senderThreadId: ThreadId.make("original-sender"),
+        senderClient: {
+          kind: "outside-client",
+          sessionId: "original",
+          clientLabel: "Original client",
+          access: "full-access",
+        },
         text: "Original queued text.",
         attachments: [],
         modelSelection,
@@ -8348,6 +8355,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         afterEdit.messages.find((message) => message.id === queuedRun.userMessageId)?.text,
         "Updated queued text.",
       );
+      const editedMessage = afterEdit.messages.find(
+        (message) => message.id === queuedRun.userMessageId,
+      );
+      assert.isUndefined(editedMessage?.senderClient);
+      assert.isUndefined(editedMessage?.senderThreadId);
       const editedItem = afterEdit.turnItems.find(
         (item) => item.type === "user_message" && item.messageId === queuedRun.userMessageId,
       );

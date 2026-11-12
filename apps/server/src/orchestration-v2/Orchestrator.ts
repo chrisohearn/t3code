@@ -11074,6 +11074,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const emitEvent = emit(events, command);
     const editedAttachments =
       command.attachments === undefined ? {} : { attachments: command.attachments };
+    const {
+      senderClient: _senderClient,
+      senderThreadId: _senderThreadId,
+      ...unattributedMessage
+    } = queuedMessage;
     yield* emitEvent({
       type: "message.updated",
       threadId: command.threadId,
@@ -11082,7 +11087,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       providerInstanceId: queuedRun.providerInstanceId,
       occurredAt: now,
       payload: withoutGuestAttribution({
-        ...queuedMessage,
+        ...unattributedMessage,
         text: command.text,
         ...editedAttachments,
         ...(command.context ? { context: command.context } : {}),
@@ -11090,6 +11095,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }),
     });
     if (queuedTurnItem !== undefined && queuedTurnItem.type === "user_message") {
+      const {
+        senderClient: _itemSenderClient,
+        senderThreadId: _itemSenderThreadId,
+        ...unattributedItem
+      } = queuedTurnItem;
       yield* emitEvent({
         type: "turn-item.updated",
         threadId: command.threadId,
@@ -11098,7 +11108,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerInstanceId: queuedRun.providerInstanceId,
         occurredAt: now,
         payload: withoutGuestAttribution({
-          ...queuedTurnItem,
+          ...unattributedItem,
           text: command.text,
           ...editedAttachments,
           ...(command.context ? { context: command.context } : {}),
