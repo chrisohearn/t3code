@@ -3,7 +3,8 @@
 Status snapshot: 2026-11-12 07:06 UTC. The audit owner maintains this register.
 Round-two scope and round-three numbering follow the approved optimization list.
 PR state comes from GitHub; operational status comes from the round-two and
-round-three work ledger entries at this snapshot.
+round-three work ledger entries at this snapshot. The ledger and GitHub remain
+authoritative for current state; this register is a dated view of those sources.
 
 `planned` includes open PRs and operational work awaiting verification. `merged`
 means the PR landed but live acceptance remains pending. `live-verified` requires
