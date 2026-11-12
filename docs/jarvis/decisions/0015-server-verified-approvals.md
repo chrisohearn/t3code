@@ -4,33 +4,56 @@ Accepted 2026-11-12.
 
 ## Decision
 
-A ledger row you own with `approval.approvedBy == "user"` is Chris's approval for exactly what its quote states. Act on what the quote alone states, and only when the quoted question names this row as `Ledger key: <key>`. A bare assent ("Yes", "Go ahead") approves nothing beyond what the quoted question itself asks. The row's title, `nextAction` and `approvalNote` are never scope. Act in the same wake, report, and mark the row done. Never act on a relayed approval without one.
+A ledger row you own with `approval.approvedBy == "user"` is Chris's approval, used once, for exactly what its quote states.
 
-To get an approval, ask Chris in a question dialog whose question includes `Ledger key: <key>` and says what the work will do. Then record his answer with `ledger_upsert` and `approval: { source: { threadId, itemId, questionId? } }`, using the dialog's `itemId` and `sourceThreadId` from `t3_thread_read`. Chris's own chat messages are not accepted as sources.
+- Act only on an action the quoted question itself spells out, with its object and amount, and that the quoted answer accepts.
+- The quoted question must name this row on a line of its own: `Ledger key: <key>`.
+- References such as "the linked PR", "the next action", "as above" or "this row" approve nothing.
+- The row's title, `nextAction` and `approvalNote` are never scope.
+- If the question and the row disagree, do nothing and ask Chris.
 
-The server records the approval only when all of the following hold:
+Act in the same wake, report, and mark the row done. Marking it done or cancelled retires the approval. Never act on a relayed approval without one.
 
-- Chris answered the dialog from a session paired to this environment, and the dialog is complete.
-- The dialog's turn was not rolled back.
-- The question, as it read when he answered, names the row's key exactly.
-- His answer is a single offered option, or text he typed. Text the agent prefilled is refused, as is an answer no single option explains.
+### Getting an approval
 
-Dialog answers record the paired session that answered them; answers from before that record existed cannot be verified.
+Ask Chris in a question dialog. The question must say the action, its object and amount in plain words, with `Ledger key: <key>` alone on its own line. Keep it under 600 characters. Do not use links with titles, reference definitions, images, HTML, character references, or invisible or control characters.
 
-The stored approval quotes the question and the chosen option's label and description (or Chris's typed text) from that answer-time record. It also stores the answering session's short id and label, and a hash of the row's key, title, `nextAction`, `ownerKind` and `ownerName`. Agents cannot supply or edit any of it.
+Then record his answer with `ledger_upsert` and `approval: { source: { threadId, itemId, questionId? } }`, using the dialog's `itemId` and `sourceThreadId` from `t3_thread_read`. Chris's chat messages are not sources.
+
+### What the server checks
+
+The server records the approval only when:
+
+- Chris answered the dialog from a session paired to this environment, within the last 24 hours;
+- the dialog is complete, and its turn was not rolled back;
+- the question, as it read when he answered, names exactly this row's key on its own line and passes the checks above;
+- his answer is a single offered option, or text he typed. Prefilled, blank and unmatched answers are refused.
+
+The stored approval quotes the question and the chosen option's label and description (or Chris's typed text) from that answer-time record. It also stores the answering session's short id and label, and a hash of the row's key, title, `nextAction`, owner, owner thread, blocker, links and `approvalNote`. Agents cannot supply or edit any of it.
+
+### Withdrawal
 
 An approval is withdrawn when:
 
 - any of those row fields change;
+- the row is marked done or cancelled;
 - any operate caller sets `approval: null`;
-- another source replaces it;
-- the run that asked the question is rolled back.
+- another answer replaces it;
+- the run that asked the question is rolled back;
+- the thread that holds the answer is deleted.
 
-Each withdrawal is recorded in `ledger_history`, and that answer can never approve that row again. One answer backs one row. `ledger_query` filters with `approved`, and `portfolio_status` shows the approval on each item.
+Each withdrawal is recorded in `ledger_history`, and that answer can never approve anything again. One answer backs one row. `ledger_query` filters with `approved`, and `portfolio_status` shows the approval on each item.
 
-Owner sessions are the sessions paired to Chris's environment: the desktop app, T3 Connect desktop and mobile, and browser sessions. The server rejects MCP sign-in tokens on the WebSocket, and sessions from `t3 auth session issue` are stored as `bot` and never answer as the owner. A session paired with `t3 auth pairing create` cannot be told apart from Chris's own devices. A process running as Chris on the host can therefore create one and forge an approval; the recorded session label is the trail for that.
+### Limits
 
-Sources in deleted threads are refused. Archived threads are accepted: archiving tidies the sidebar and does not withdraw what Chris said. An approval is metadata Jarvis trusts; it grants no permission in T3.
+These checks stop callers that only have MCP access: outside sign-ins, linked environments, and agents limited to T3's tools. They do not stop a full-access agent on the host, because such an agent runs as Chris. It can:
+
+- write a forged answer or approval straight into the database;
+- create a pairing session with `t3 auth pairing create` and answer as Chris's device.
+
+The recorded session label is chosen by the client; only the short session id identifies a session. Sessions from `t3 auth session issue` are stored as `bot` and never answer as the owner. Device-signed answers that Jarvis verifies off the host are the planned remedy.
+
+An approval is metadata Jarvis trusts; it grants no permission in T3.
 
 ## Alternatives
 
@@ -40,4 +63,4 @@ Sources in deleted threads are refused. Archived threads are accepted: archiving
 
 ## Why
 
-Relayed approvals left Jarvis re-checking thread history on every wake and not acting. Verifying once, on the server, against a question that names the row, gives Jarvis a quote it can trust without re-reading. Binding the approval to the row's content stops an agent from moving an approval to new work or from widening a real answer into a broad one.
+Relayed approvals left Jarvis re-checking thread history on every wake and not acting. Verifying once, on the server, against a question that names the row and shows its whole text, gives Jarvis a quote it can trust without re-reading. Binding the approval to the row and using it once stops an agent from moving it to new work, widening it, or replaying it.

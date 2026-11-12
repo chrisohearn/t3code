@@ -44,7 +44,7 @@ export const LedgerToolkit = Toolkit.make(
   Tool.make("ledger_upsert", {
     ...common,
     description:
-      "Create or partially update work by a stable `key`. New items need title, ownerKind and ownerName. Omitted fields stay; null clears a nullable field. Requires operate access. approvalNote grants no approval. For Chris's approval, ask him in a dialog whose question includes `Ledger key: <key>`, then pass `approval.source` (itemId, sourceThreadId from t3_thread_read); the server verifies and quotes it, or refuses. `approval: null` revokes.",
+      "Create or partially update work by a stable `key`. New items need title, ownerKind and ownerName. Omitted fields stay; null clears a nullable field. Requires operate access. approvalNote grants no approval. For Chris's approval, ask him in a dialog whose question has `Ledger key: <key>` on its own line, then pass `approval.source` (itemId, sourceThreadId from t3_thread_read); the server verifies and quotes it, or refuses. `approval: null` revokes.",
     parameters: WorkLedgerUpsertInput,
     success: WorkLedgerUpsertResult,
   }).annotate(Tool.Destructive, true),

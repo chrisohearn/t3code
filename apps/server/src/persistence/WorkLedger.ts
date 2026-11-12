@@ -76,22 +76,44 @@ const answeredByRefusal = {
   mcp_client: "the dialog was answered by an outside MCP sign-in, not by Chris in a T3 client.",
   agent: "the dialog was answered by an agent, not by Chris.",
 } as const;
-const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-/** The question must name this row as `Ledger key: <key>`, with nothing appended to the key. */
-const namesLedgerKey = (question: string, key: string) =>
-  new RegExp(`(^|[^\\w])[Ll]edger [Kk]ey:[*\\s\`]*${escapeRegExp(key)}[*\`]*[.,;]?(?=\\s|$)`).test(
-    question,
-  );
+const QUESTION_LIMIT = 600;
+const ANSWER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Markdown and characters that put text in the quote that the dialog does not show.
+const HIDDEN_CONTENT: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^ {0,3}\[[^\]\n]+\]:/m, "a link reference definition"],
+  [/!\[/, "an image"],
+  [/\]\([^)\n]*\s["'(]/, "a link title"],
+  [/<[A-Za-z!/?]/, "raw HTML"],
+  [/&(#\d+|#x[0-9a-f]+|[a-z][a-z0-9]*);/i, "a character reference"],
+  [/[\p{Cf}\p{Co}\p{Cn}\p{Cs}]|[^\P{Cc}\n\t]/u, "invisible or control characters"],
+];
+const hiddenContent = (text: string) => HIDDEN_CONTENT.find(([pattern]) => pattern.test(text))?.[1];
+const KEY_LINE = /^[\s*_`]*ledger key:[\s*_`]*(.*?)[\s*_`]*$/i;
+/** Why the question does not name exactly this row on a `Ledger key: <key>` line, if it does not. */
+const keyLineProblem = (question: string, key: string) => {
+  const mentions = question.split("\n").filter((line) => /ledger key/i.test(line));
+  if (mentions.length > 1) return "the question names more than one ledger key.";
+  const named = mentions[0]?.match(KEY_LINE)?.[1];
+  return named === key
+    ? undefined
+    : `the question does not name this row on a line of its own as "Ledger key: ${key}".`;
+};
 /** What an approval is bound to; changing any of it withdraws the approval. */
-const ledgerRowHash = (row: {
-  readonly key: string;
-  readonly title: string;
-  readonly nextAction: string | null;
-  readonly ownerKind: string;
-  readonly ownerName: string;
-}) =>
+const ledgerRowHash = (row: WorkLedgerItem) =>
   NodeCrypto.createHash("sha256")
-    .update(JSON.stringify([row.key, row.title, row.nextAction, row.ownerKind, row.ownerName]))
+    .update(
+      JSON.stringify([
+        row.key,
+        row.title,
+        row.nextAction,
+        row.ownerKind,
+        row.ownerName,
+        row.ownerThreadId,
+        row.blocker,
+        row.approvalNote,
+        row.links,
+      ]),
+    )
     .digest("hex");
 const decodeHistory = Schema.decodeUnknownEffect(
   Schema.Array(
@@ -153,6 +175,12 @@ const make = Effect.gen(function* () {
       return yield* refuse("T3 has no record of who answered this dialog. Ask Chris again.");
     if (answer.answeredBy !== "owner_client")
       return yield* refuse(answeredByRefusal[answer.answeredBy]);
+    const now = DateTime.toEpochMillis(yield* DateTime.now);
+    if (
+      item.completedAt === null ||
+      now - DateTime.toEpochMillis(item.completedAt) > ANSWER_MAX_AGE_MS
+    )
+      return yield* refuse("the answer is more than 24 hours old. Ask Chris again.");
     const [run] =
       item.runId === null
         ? []
@@ -178,8 +206,15 @@ const make = Effect.gen(function* () {
     const quotes = answer.quotesById?.[question.id];
     if (quotedQuestion === undefined || quotes === undefined)
       return yield* refuse("T3 has no record of how the dialog read when it was answered.");
-    if (!namesLedgerKey(quotedQuestion, row.key))
-      return yield* refuse(`the question does not name this row as "Ledger key: ${row.key}".`);
+    if (quotedQuestion.length > QUESTION_LIMIT)
+      return yield* refuse(`the question is longer than ${QUESTION_LIMIT} characters.`);
+    const hiddenInQuestion = hiddenContent(quotedQuestion);
+    if (hiddenInQuestion !== undefined)
+      return yield* refuse(
+        `the question contains ${hiddenInQuestion}, which the dialog does not show.`,
+      );
+    const keyProblem = keyLineProblem(quotedQuestion, row.key);
+    if (keyProblem !== undefined) return yield* refuse(keyProblem);
     const parts: string[] = [];
     for (const quote of quotes) {
       if (quote.kind === "unmatched")
@@ -193,16 +228,20 @@ const make = Effect.gen(function* () {
     if (parts.length === 0)
       return yield* refuse(`Chris gave no answer to question ${question.id}.`);
     const quotedAnswer = parts.join("\n");
-    if (quotedAnswer.length > QUOTE_LIMIT || quotedQuestion.length > QUOTE_LIMIT)
+    if (quotedAnswer.length > QUOTE_LIMIT)
+      return yield* refuse(`the answer is longer than ${QUOTE_LIMIT} characters to quote.`);
+    const hiddenInAnswer = hiddenContent(quotedAnswer);
+    if (hiddenInAnswer !== undefined)
       return yield* refuse(
-        `the question or answer is longer than ${QUOTE_LIMIT} characters to quote.`,
+        `the answer contains ${hiddenInAnswer}, which the dialog does not show.`,
       );
-    const [revoked] =
-      yield* sql`SELECT 1 FROM work_ledger_revoked_approvals WHERE work_key = ${row.key}
-        AND source_thread_id = ${source.threadId} AND source_item_id = ${source.itemId}
+    const [revoked] = yield* sql`SELECT 1 FROM work_ledger_revoked_approvals
+      WHERE source_thread_id = ${source.threadId} AND source_item_id = ${source.itemId}
         AND question_id = ${question.id}`;
     if (revoked !== undefined)
-      return yield* refuse("this answer's approval of this row was withdrawn. Ask Chris again.");
+      return yield* refuse(
+        "this answer's approval was already used or withdrawn. Ask Chris again.",
+      );
     const [other] = yield* sql<{ work_key: string }>`SELECT work_key FROM work_ledger
       WHERE work_key != ${row.key} AND approval_json IS NOT NULL
         AND json_extract(approval_json, '$.sourceThreadId') = ${source.threadId}
@@ -352,13 +391,21 @@ const make = Effect.gen(function* () {
               })}`;
               approval = null;
             });
+            const finished = item.status === "done" || item.status === "cancelled";
             if (approval !== null && approvalInput === null) yield* retire(approval, "revoked.");
+            else if (approval !== null && finished)
+              yield* retire(approval, `the work is ${item.status}; an approval is used once.`);
             else if (approval !== null && approval.rowHash !== ledgerRowHash(item))
               yield* retire(
                 approval,
-                "the title, next action or owner changed. Ask Chris again to approve the new version.",
+                "the row's title, next action, owner, blocker, links or approval note changed. Ask Chris again.",
               );
             if (approvalInput !== undefined && approvalInput !== null) {
+              if (finished)
+                return yield* new OrchestratorMcpFailure({
+                  code: "invalid_request",
+                  message: "Approve open work only; this row is done or cancelled.",
+                });
               const verified = yield* verifyApproval(approvalInput.source, item, updatedBy, now);
               if (
                 approval !== null &&
