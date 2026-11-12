@@ -3131,7 +3131,7 @@ const make = Effect.gen(function* () {
         pendingRequestIds: target.runtimeRequests
           .filter((request) => request.status === "pending")
           .map((request) => request.id),
-        pullRequests: threadPullRequests(shell.pullRequests),
+        pullRequests: threadPullRequests(shell.pullRequests).pullRequests ?? [],
         revision,
       };
     }),

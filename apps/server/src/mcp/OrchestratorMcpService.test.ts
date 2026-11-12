@@ -3819,6 +3819,7 @@ describe("OrchestratorMcpService thread lookup", () => {
           const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
           const result = yield* mcp.threadResult(client, { threadId: launched.id });
           assert.equal(result.revision, 42);
+          assert.deepEqual(result.pullRequests, []);
           assert.equal(Array.from(result.lastAssistantMessage?.text ?? "").length, 4000);
           assert.equal(result.lastAssistantMessage?.truncated, true);
           assert.equal(result.run?.runId, runId);
