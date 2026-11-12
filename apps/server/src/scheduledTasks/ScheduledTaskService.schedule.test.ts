@@ -6,14 +6,18 @@ import {
   type OrchestrationV2Run,
   MessageId,
   RunId,
+  type ScheduledTask,
   ScheduledTaskUpsertInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -467,6 +471,128 @@ it.effect("a fixed-time slot missed while the server was off shows on the task",
 );
 
 it.effect(
+  "a slot missed during a restart is not overwritten by the run still going from before",
+  () =>
+    Effect.gen(function* () {
+      const at = (hour: number, minute = 0) =>
+        DateTime.makeZonedUnsafe(
+          { year: 2026, month: 7, day: 1, hour, minute, second: 0, millisecond: 0 },
+          { timeZone: DateTime.zoneMakeLocal(), adjustForTimeZone: true },
+        );
+      yield* TestClock.setTime(DateTime.toEpochMillis(at(8)));
+      const sql = yield* SqlClient.SqlClient;
+      const sent = yield* Ref.make("");
+      const end = yield* Deferred.make<void>();
+      const threadId = "thread-pending-run";
+      const layer = ScheduledTaskService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            NodeCrypto.layer,
+            Scheduler.layer,
+            ManagedPolicy.layerTest(),
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+              launch: (input) =>
+                Ref.set(sent, input.initialMessage?.messageId ?? "").pipe(
+                  Effect.as({ threadId } as never),
+                ),
+            }),
+            Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+              namedProjectsRoot: "/projects",
+              isScratchProject: () => Effect.succeed(false),
+            }),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadShell: () =>
+                Effect.succeed({ projectId: "project-pending-run", deletedAt: null } as never),
+              getProjectThreadRecords: () =>
+                Effect.map(
+                  Ref.get(sent),
+                  (userMessageId) =>
+                    ({
+                      runs: [{ id: "run:1", status: "running", userMessageId }],
+                      messages: [{ id: userMessageId, runId: "run:1" }],
+                    }) as never,
+                ),
+              waitForThread: (input) =>
+                Deferred.await(end).pipe(
+                  Effect.as({
+                    threadId: input.threadId,
+                    run: { id: "run:1", status: "completed", rootNodeId: "node:root" },
+                    timedOut: false,
+                  } as never),
+                ),
+            }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+          ),
+        ),
+      );
+
+      const taskId = yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        const { task } = yield* service.upsert(
+          yield* decodeUpsertInput({
+            title: "Morning bookkeeping",
+            prompt: "Update yesterday's notes.",
+            enabled: true,
+            schedule: { type: "fixed_time", timeOfDay: "09:00" },
+            projectId: "project-pending-run",
+            workspaceStrategy: { type: "root" },
+            modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          }),
+        );
+        yield* service.runNow({ id: task.id });
+        return task.id;
+      }).pipe(Effect.provide(layer));
+      // What the launch committed; the mocked launch writes no projection.
+      yield* sql`
+      INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, role, streaming, created_at, updated_at, payload_json)
+      VALUES (${yield* Ref.get(sent)}, ${threadId}, 'run:1', 'user', 0, '', '', '{}')
+    `;
+
+      // The server is off across the 09:00 slot while the 08:00 run keeps going.
+      yield* TestClock.setTime(DateTime.toEpochMillis(at(9, 30)));
+      const missedError = yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        const states = yield* Queue.unbounded<ScheduledTask | undefined>();
+        yield* service.subscribeList().pipe(
+          Stream.runForEach(({ tasks }) =>
+            Queue.offer(
+              states,
+              tasks.find((candidate) => candidate.id === taskId),
+            ),
+          ),
+          Effect.forkChild,
+        );
+        expect((yield* Queue.take(states))?.runInProgressSince).toBeDefined();
+        yield* TestClock.adjust("6 seconds");
+        const missed = yield* Queue.take(states);
+        expect(missed?.lastRunStatus).toBe("failed");
+        yield* Deferred.succeed(end, undefined);
+        const afterRun = yield* Queue.take(states);
+        expect({
+          status: afterRun?.lastRunStatus,
+          error: afterRun?.lastRunError,
+          since: afterRun?.runInProgressSince,
+        }).toEqual({ status: "failed", error: missed?.lastRunError, since: undefined });
+        return missed?.lastRunError;
+      }).pipe(Effect.provide(layer));
+
+      // A second restart must not find the 08:00 run again and record its success over the miss.
+      const [again] = yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        return (yield* service.list()).tasks;
+      }).pipe(Effect.provide(layer));
+      expect({
+        status: again?.lastRunStatus,
+        error: again?.lastRunError,
+        since: again?.runInProgressSince,
+      }).toEqual({ status: "failed", error: missedError, since: undefined });
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect(
   "a run made while the scheduler was busy is not overwritten by its stale missed slot",
   () =>
     Effect.gen(function* () {
@@ -549,8 +675,9 @@ it.effect(
         }),
       );
 
+      // The manual run's outcome is still pending, and the stale slot recorded no miss over it.
       expect({ status: morning?.lastRunStatus, error: morning?.lastRunError }).toEqual({
-        status: "succeeded",
+        status: "never",
         error: null,
       });
       expect(morning?.nextRunAt).toBe(DateTime.formatIso(DateTime.toUtc(at(8, 0, 2))));

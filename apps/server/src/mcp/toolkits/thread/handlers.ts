@@ -7,6 +7,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type RunId,
   OrchestratorMcpFailure,
+  orchestratorMcpScheduledTaskRunStatus,
   type OrchestrationV2Command,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -130,7 +131,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           : {
               link: McpInvocationContext.threadLinkFor(scope, threadId),
             }),
-        lastRunStatus: task.lastRunStatus,
+        lastRunStatus: orchestratorMcpScheduledTaskRunStatus(task),
         runCount: task.runCount,
         nextRunAt: task.nextRunAt,
       };

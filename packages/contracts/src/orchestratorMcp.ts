@@ -769,6 +769,20 @@ export const OrchestratorMcpSaveScheduledTaskInput = Schema.Struct({
 export type OrchestratorMcpSaveScheduledTaskInput =
   typeof OrchestratorMcpSaveScheduledTaskInput.Type;
 
+/** `started`: the latest run was accepted and has not finished; the others describe a finished run. */
+export const OrchestratorMcpScheduledTaskRunStatus = Schema.Literals([
+  ...ScheduledTaskRunStatus.literals,
+  "started",
+]);
+export type OrchestratorMcpScheduledTaskRunStatus =
+  typeof OrchestratorMcpScheduledTaskRunStatus.Type;
+
+export const orchestratorMcpScheduledTaskRunStatus = (task: {
+  readonly lastRunStatus: ScheduledTaskRunStatus;
+  readonly runInProgressSince?: string;
+}): OrchestratorMcpScheduledTaskRunStatus =>
+  task.runInProgressSince === undefined ? task.lastRunStatus : "started";
+
 export const OrchestratorMcpScheduledTask = Schema.Struct({
   scheduledTaskId: ScheduledTaskId,
   title: Schema.String,
@@ -779,7 +793,7 @@ export const OrchestratorMcpScheduledTask = Schema.Struct({
   freshSession: Schema.Boolean,
   schedule: ScheduledTaskSchedule,
   nextRunAt: Schema.NullOr(IsoDateTime),
-  lastRunStatus: ScheduledTaskRunStatus,
+  lastRunStatus: OrchestratorMcpScheduledTaskRunStatus,
   webhookUrl: Schema.optional(Schema.String).annotate({
     description:
       "Public URL for the sender. Absent: no T3 Connect tunnel. The user must enable T3 Connect remote access.",
