@@ -32,6 +32,8 @@ import {
   OrchestratorMcpThreadResult,
   OrchestratorMcpThreadReadInput,
   OrchestratorMcpThreadReadResult,
+  OrchestratorMcpThreadPostInput,
+  OrchestratorMcpThreadPostResult,
   OrchestratorMcpThreadSendInput,
   OrchestratorMcpThreadSendResult,
   OrchestratorMcpThreadWaitInput,
@@ -290,6 +292,18 @@ const ThreadUpdateTool = Tool.make("t3_thread_update", {
   .annotate(Tool.Destructive, true)
   .annotate(Tool.Idempotent, false);
 
+const ThreadPostTool = Tool.make("t3_thread_post", {
+  description:
+    "Add a message to a thread without starting, queueing or steering a run. Uses the same authorship and mode limits as t3_thread_send. Read stored posts with t3_thread_read; they are not injected into a provider turn. Retry with the same clientRequestId to avoid duplicates.",
+  parameters: OrchestratorMcpThreadPostInput,
+  success: OrchestratorMcpThreadPostResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Post to a T3 thread")
+  .annotate(Tool.Destructive, true);
+
 const ThreadSendTool = Tool.make("t3_thread_send", {
   description:
     "Send a message to any thread. The target cannot run with broader modes than yours. `mode:'auto'` starts an idle thread, steers a running turn, or queues. `queue`: new turn. `steer`: mid-turn update. `restart`: interrupt and restart. A send to a finished child thread starts a fresh task and returns its `taskId`. In your reply, name it as its `link` verbatim.",
@@ -387,6 +401,7 @@ export const OrchestratorToolkit = Toolkit.make(
   ThreadReadTool,
   ThreadResultTool,
   ThreadUpdateTool,
+  ThreadPostTool,
   ThreadSendTool,
   ThreadWaitTool,
   ThreadInterruptTool,

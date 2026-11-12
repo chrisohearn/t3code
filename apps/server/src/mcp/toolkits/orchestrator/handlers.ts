@@ -176,6 +176,17 @@ const handlers = {
         return yield* service.update(scope, input);
       }),
   ),
+  t3_thread_post: McpToolAccess.writesThreads(
+    (input) => [input.threadId],
+    (input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).postToThread(
+          scope,
+          input,
+        );
+      }),
+  ),
   t3_thread_send: McpToolAccess.afterForwarding(
     McpToolAccess.writesThreads(
       (input) => [input.threadId],
