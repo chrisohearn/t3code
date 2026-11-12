@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  EnvironmentId,
   MessageId,
   EventId,
   NodeId,
@@ -44,6 +45,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -2217,13 +2219,20 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const outbox = yield* EffectOutbox.EffectOutboxV2;
     const now = yield* DateTime.now;
-    for (const kind of ["user_input", "command"] as const) {
-      const threadId = ThreadId.make(`thread:snoozed-live-${kind}`);
-      const requestId = RuntimeRequestId.make(`request:snoozed-live-${kind}`);
-      const sessionId = ProviderSessionId.make(`session:snoozed-live-${kind}`);
+    for (const [kind, decision, standingOnly] of [
+      ["user_input", "cancel"],
+      ["command", "accept"],
+      ["command", "decline"],
+      ["command", "accept", true],
+    ] as const) {
+      const sql = yield* SqlClient.SqlClient;
+      const suffix = `${kind}-${decision}${standingOnly ? "-standing-only" : ""}`;
+      const threadId = ThreadId.make(`thread:snoozed-live-${suffix}`);
+      const requestId = RuntimeRequestId.make(`request:snoozed-live-${suffix}`);
+      const sessionId = ProviderSessionId.make(`session:snoozed-live-${suffix}`);
       yield* orchestrator.dispatch({
         type: "thread.create",
-        commandId: CommandId.make(`create-snoozed-live-${kind}`),
+        commandId: CommandId.make(`create-snoozed-live-${suffix}`),
         threadId,
         projectId: ProjectId.make("project:snoozed-live"),
         title: "Deferred question",
@@ -2237,13 +2246,13 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
       });
       yield* orchestrator.dispatch({
         type: "thread.snooze",
-        commandId: CommandId.make(`snooze-live-${kind}`),
+        commandId: CommandId.make(`snooze-live-${suffix}`),
         threadId,
         snoozedUntil: "2099-07-25T09:00:00.000Z",
       });
       const before = yield* projections.getThread(threadId);
       yield* projections.apply({
-        id: EventId.make(`attach-snoozed-live-${kind}`),
+        id: EventId.make(`attach-snoozed-live-${suffix}`),
         type: "provider-session.attached",
         threadId,
         occurredAt: now,
@@ -2261,7 +2270,7 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
         },
       });
       yield* projections.apply({
-        id: EventId.make(`request-snoozed-live-${kind}`),
+        id: EventId.make(`request-snoozed-live-${suffix}`),
         type: "runtime-request.updated",
         threadId,
         occurredAt: now,
@@ -2277,14 +2286,69 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
           resolvedAt: null,
         },
       });
-      const commandId = CommandId.make(`respond-snoozed-live-${kind}`);
-      yield* orchestrator.dispatch({
+      if (kind === "command")
+        yield* projections.apply({
+          id: EventId.make(`approval-item-${suffix}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`approval-item-${suffix}`),
+            threadId,
+            runId: null,
+            nodeId: NodeId.make(`node:snoozed-live-${kind}`),
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 0,
+            status: "running",
+            title: null,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+            type: "approval_request",
+            requestId,
+            requestKind: "command",
+            ...(standingOnly
+              ? { options: [{ decision: "acceptForSession" as const, label: "Always allow" }] }
+              : { options: [{ decision, label: decision === "accept" ? "Run once" : "Reject" }] }),
+            prompt: "Run project tests",
+            reason: "Needs process access",
+          },
+        });
+      const commandId = CommandId.make(`respond-snoozed-live-${suffix}`);
+      const respond = orchestrator.dispatch({
         type: "runtime-request.respond",
         commandId,
         threadId,
         requestId,
-        decision: kind === "user_input" ? "cancel" : "accept",
+        decision,
       });
+      const attributedRespond =
+        kind === "command"
+          ? respond.pipe(
+              Effect.provideService(McpApprovalAnswerContext, {
+                sessionId: "outside-test-session",
+                clientLabel: "Outside test client",
+                originEnvironmentId: EnvironmentId.make("origin-env"),
+                note: "Chris said to answer this prompt.",
+              }),
+            )
+          : respond;
+      if (standingOnly) {
+        assert.isTrue(Result.isFailure(yield* attributedRespond.pipe(Effect.result)));
+        assert.equal(
+          (yield* projections.getRuntimeRequest(threadId, requestId))?.status,
+          "pending",
+        );
+        assert.equal(
+          (yield* sql`SELECT 1 FROM mcp_approval_answers WHERE thread_id = ${threadId}`).length,
+          0,
+        );
+        continue;
+      }
+      yield* attributedRespond;
       const after = yield* projections.getThread(threadId);
       assert.deepEqual(after.snoozedUntil, before.snoozedUntil);
       assert.deepEqual(after.snoozedAt, before.snoozedAt);
@@ -2293,6 +2357,58 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
         (yield* outbox.listByCommandId(commandId))[0]?.request.type,
         "runtime-request.respond",
       );
+      if (kind === "command") {
+        const request = yield* projections.getRuntimeRequest(threadId, requestId);
+        assert.deepInclude(request?.mcpApprovalAnswer, {
+          sessionId: "outside-test-session",
+          clientLabel: "Outside test client",
+          originEnvironmentId: EnvironmentId.make("origin-env"),
+          threadId,
+          requestId,
+          decision,
+          selectedOption: { decision, label: decision === "accept" ? "Run once" : "Reject" },
+          answeredAt: DateTime.formatIso(now),
+          note: "Chris said to answer this prompt.",
+          requested: {
+            requestKind: "command",
+            prompt: "Run project tests",
+            reason: "Needs process access",
+          },
+        });
+        const audit = yield* sql<{
+          answer_json: string;
+        }>`SELECT answer_json FROM mcp_approval_answers WHERE thread_id = ${threadId}`;
+        assert.deepEqual(
+          audit.map((row) => JSON.parse(row.answer_json)),
+          [request?.mcpApprovalAnswer],
+        );
+        const timeline = (yield* projections.getThreadProjection(threadId)).turnItems;
+        assert.isTrue(
+          timeline.some(
+            (item) =>
+              item.type === "system_notice" &&
+              item.message.includes("Outside test client") &&
+              item.message.includes(decision === "accept" ? "allowed once" : "denied"),
+          ),
+        );
+        assert.isTrue(
+          Result.isFailure(
+            yield* orchestrator
+              .dispatch({
+                type: "runtime-request.respond",
+                commandId: CommandId.make(`duplicate-${suffix}`),
+                threadId,
+                requestId,
+                decision,
+              })
+              .pipe(Effect.result),
+          ),
+        );
+        assert.equal(
+          (yield* sql`SELECT 1 FROM mcp_approval_answers WHERE thread_id = ${threadId}`).length,
+          1,
+        );
+      }
     }
   }).pipe(Effect.provide(layerTest)),
 );

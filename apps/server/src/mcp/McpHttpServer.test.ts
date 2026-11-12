@@ -1,3 +1,4 @@
+import * as RequestLog from "../persistence/McpRequestLog.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
@@ -63,6 +64,7 @@ import { ProjectToolkit } from "./toolkits/project/tools.ts";
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
 const alternateTabId = PreviewTabId.make("tab-mcp-alternate");
+const encodeJsonText = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeJsonText = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const invocation = {
   environmentId,
@@ -89,6 +91,7 @@ const client = McpSchema.McpServerClient.of({
   getClient: Effect.die("unused"),
 });
 const layerTest = McpHttpServer.layerPreviewToolkit.pipe(
+  Layer.provideMerge(RequestLog.layer.pipe(Layer.provide(Sqlite.layerMemory))),
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
   Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
   Layer.provideMerge(PreviewAutomationBroker.layer),
@@ -432,6 +435,7 @@ it.effect.each([
       }).pipe(Effect.forkScoped);
       yield* Deferred.await(connected);
 
+      let expectedBytes = 0;
       for (const call of [1, 2, 3, 4, 5, 6]) {
         const snapshot = yield* server
           .callTool({
@@ -442,6 +446,16 @@ it.effect.each([
             Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
             Effect.provideService(McpSchema.McpServerClient, client),
           );
+        const expectedWire = {
+          ...snapshot,
+          content: snapshot.content.map((item) =>
+            item.type === "image" ? { ...item, data: png } : item,
+          ),
+        };
+        expectedBytes += Buffer.byteLength(yield* encodeJsonText(expectedWire));
+        expect(
+          (yield* (yield* RequestLog.McpRequestLog).usage({}, undefined)).byTool[0]?.responseBytes,
+        ).toBe(expectedBytes);
         const metadata = { ...page, title: `Snapshot ${call}`, screenshot };
         const { accessibilityTree: _tree, ...boundedMetadata } = metadata;
         expect(snapshot.isError).toBe(false);
@@ -1608,6 +1622,120 @@ it.effect(
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("accepts approval origin only from an authenticated peer", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const origin = {
+        environmentId: "origin-env",
+        sessionId: "jarvis-session",
+        clientLabel: "Jarvis",
+      };
+      const originHeader = encodeURIComponent(JSON.stringify(origin));
+      const ApprovalToolkit = Toolkit.make(
+        Tool.make("approval", {
+          description: "Returns the authenticated approval origin.",
+          dependencies: [McpInvocationContext.McpInvocationContext],
+          success: McpInvocationContext.McpApprovalOrigin,
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+        }),
+      );
+      const serverLayer = McpHttpServer.layerMcpTransport(
+        McpHttpServer.toolkitRegistration(
+          ApprovalToolkit,
+          McpToolAccess.toLayer(ApprovalToolkit, {
+            approval: McpToolAccess.answersApprovals(() =>
+              McpInvocationContext.McpInvocationContext.pipe(
+                Effect.map((scope) => scope.client!.approvalOrigin!),
+              ),
+            ),
+          }),
+        ),
+      ).pipe(
+        Layer.provide(ServerSettings.layerTest({ linkedEnvironmentsEnabled: true })),
+        Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({ resolve: () => Effect.undefined }),
+        ),
+        Layer.provide(
+          Layer.succeed(McpHttpServer.McpClientAuthenticator, {
+            authenticate: (request) => {
+              const actor = request.headers.authorization?.slice("Bearer ".length);
+              return Effect.succeed({
+                ...invocation,
+                capabilities: new Set(["orchestration"] as const),
+                thread: actor === "thread" ? invocation.thread : undefined,
+                client: {
+                  sessionId: "authenticated-session",
+                  label: "Authenticated client",
+                  access: actor === "limited" ? ("auto" as const) : ("full-access" as const),
+                  linked: actor === "peer" || actor === "limited",
+                },
+              });
+            },
+          }),
+        ),
+      );
+      yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+        Layer.build,
+      );
+      const http = yield* HttpClient.HttpClient;
+      const call = (actor: string, header?: string) =>
+        Effect.gen(function* () {
+          const headers = {
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${actor}`,
+          };
+          const initialized = yield* http.post("/mcp", {
+            headers,
+            body: HttpBody.text(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "initialize",
+                params: {
+                  protocolVersion: "2025-06-18",
+                  capabilities: {},
+                  clientInfo: { name: "test", version: "1" },
+                },
+              }),
+              "application/json",
+            ),
+          });
+          const response = yield* http.post("/mcp", {
+            headers: {
+              ...headers,
+              "mcp-session-id": initialized.headers["mcp-session-id"]!,
+              ...(header === undefined ? {} : { "t3-approval-origin": header }),
+            },
+            body: HttpBody.text(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "tools/call",
+                params: { name: "approval", arguments: {} },
+              }),
+              "application/json",
+            ),
+          });
+          return {
+            status: response.status,
+            body: JSON.parse(yield* response.text) as {
+              result?: { isError?: boolean; structuredContent?: unknown };
+            },
+          };
+        });
+      expect((yield* call("direct", originHeader)).status).toBe(400);
+      expect((yield* call("thread", originHeader)).status).toBe(400);
+      for (const bad of ["%", encodeURIComponent("{}"), "x".repeat(4097)]) {
+        expect((yield* call("peer", bad)).status).toBe(400);
+      }
+      expect((yield* call("limited", originHeader)).body.result?.structuredContent).toEqual(origin);
+      expect((yield* call("peer", originHeader)).body.result?.structuredContent).toEqual(origin);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("lists optional tools to a deferring client only after tool_search loads them", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1732,4 +1860,44 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       expect(yield* other.listed).toEqual(["delegate_task", "preview_open", "schedule_task"]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each(["capability_denied", "invalid_request"] as const)(
+  "records declared failure code %s without retaining failure text",
+  (code) => {
+    const entries: Array<{ readonly errorClass: string | null }> = [];
+    const toolkit = Toolkit.make(
+      Tool.make("declared_failure", {
+        parameters: Schema.Struct({ value: Schema.optional(Schema.String) }),
+        success: Schema.String,
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        declared_failure: McpToolAccess.reads(() =>
+          Effect.fail(new OrchestratorMcpFailure({ code, message: "private failure details" })),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+      Layer.provide(
+        Layer.mock(RequestLog.McpRequestLog)({
+          record: (entry) =>
+            Effect.sync(() => {
+              entries.push(entry);
+            }),
+        }),
+      ),
+    );
+    return Effect.gen(function* () {
+      const result = yield* callTool("declared_failure", {});
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toBeUndefined();
+      expect(entries.map((entry) => entry.errorClass)).toEqual([code]);
+      expect(JSON.stringify(entries)).not.toContain("private failure details");
+    }).pipe(Effect.provide(layer));
+  },
 );
