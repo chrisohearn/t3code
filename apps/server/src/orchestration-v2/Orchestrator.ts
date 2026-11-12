@@ -3982,13 +3982,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const blockingRequestExists = pendingRequests.some(
         (request) => request.kind !== "user_input" || request.responseCapability.type !== "message",
       );
+      const restartContinuationPending =
+        !runningRunExists &&
+        !blockingRequestExists &&
+        (yield* effectOutbox
+          .hasUnsettled({
+            threadId: command.threadId,
+            effectTypes: ["provider-runtime.continue"],
+          })
+          .pipe(mapDispatchError(command)));
       const blocker = blockingRequestExists
         ? "is waiting on an approval or question. Answer it before settling."
         : runningRunExists
           ? "is still running. Stop it before settling."
-          : queuedMessageExists
-            ? "has a queued message. Send it or remove it from the queue before settling."
-            : null;
+          : restartContinuationPending
+            ? "has a restart continuation pending. Wait for recovery before settling."
+            : queuedMessageExists
+              ? "has a queued message. Send it or remove it from the queue before settling."
+              : null;
       if (blocker !== null) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,

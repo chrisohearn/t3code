@@ -24,6 +24,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -1885,6 +1886,106 @@ it.effect("replays a thread.create receipt without changing the thread", () =>
     assert.deepEqual(replayed, { ...original, replayed: true });
     assert.deepEqual(yield* projections.getThread(threadId), before);
     assert.equal(yield* orchestrator.getThreadEventSequence(threadId), original.sequence);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each(
+  (["thread.settle", "thread.auto-settle"] as const).flatMap((type) =>
+    (["running", "restart-pending", "restart-running", "restart-finished"] as const).map(
+      (state) => ({ type, state }),
+    ),
+  ),
+)("$type admission with $state work", ({ type, state }) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const threadId = ThreadId.make("thread:settlement-admission");
+    const runId = RunId.make("run:settlement-admission");
+    const now = yield* DateTime.now;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-settlement-admission"),
+      threadId,
+      projectId: ProjectId.make("project:settlement-admission"),
+      title: "Settlement admission",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* projections.apply({
+      id: EventId.make("event:settlement-admission-run"),
+      type: "run.created",
+      threadId,
+      occurredAt: now,
+      payload: {
+        id: runId,
+        threadId,
+        ordinal: 1,
+        providerInstanceId: instanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make("message:settlement-admission"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: state === "running" ? "running" : "cancelled",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: state === "running" ? null : now,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    });
+    if (state !== "running") {
+      const effectId = `effect:restart-continuation:${runId}`;
+      yield* outbox.enqueue([
+        {
+          id: effectId,
+          commandId: CommandId.make("prepare-settlement-admission-restart"),
+          threadId,
+          request: { type: "provider-runtime.continue", sourceRunId: runId },
+        },
+      ]);
+      if (state !== "restart-pending") {
+        const claimed = yield* outbox.claimNext({ workerId: "settlement-test" });
+        assert.equal(Option.getOrThrow(claimed).id, effectId);
+        if (state === "restart-finished") {
+          assert.isTrue(yield* outbox.succeed({ effectId, workerId: "settlement-test" }));
+        }
+      }
+    }
+    const thread = yield* projections.getThread(threadId);
+    const sequence = yield* orchestrator.getThreadEventSequence(threadId);
+    const result = yield* orchestrator
+      .dispatch({
+        commandId: CommandId.make("settle-with-work"),
+        threadId,
+        ...(type === "thread.auto-settle" ? { type, snapshotAt: thread.updatedAt } : { type }),
+      })
+      .pipe(Effect.result);
+    if (state === "restart-finished") {
+      assert.ok(Result.isSuccess(result));
+      assert.equal((yield* projections.getThread(threadId)).settledOverride, "settled");
+      return;
+    }
+    assert.ok(Result.isFailure(result));
+    assert.instanceOf(result.failure, Orchestrator.OrchestratorDispatchError);
+    assert.include(
+      String(result.failure.cause),
+      state === "running" ? "is still running" : "has a restart continuation pending",
+    );
+    assert.equal((yield* projections.getThread(threadId)).settledOverride, null);
+    assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
+    if (state !== "running") {
+      assert.equal(
+        Option.getOrThrow(yield* outbox.get(`effect:restart-continuation:${runId}`)).status,
+        state === "restart-pending" ? "pending" : "running",
+      );
+    }
   }).pipe(Effect.provide(layerTest)),
 );
 
