@@ -253,9 +253,11 @@ With a **Fallback model** set in **Settings → Threads**, a Codex or Claude run
 stops on a usage limit, a rate limit it could not wait out, or a sign-in or billing
 error before the agent did anything moves to the fallback model and sends the
 same message once. A notice names the account that failed. The thread stays on
-the fallback model; pick another model in the composer to switch back. It never
-happens after the agent replied, used a tool or changed a file, after Stop, or a
-second time for the same message. Otherwise the limit choices below apply.
+the fallback model, and messages already queued for the failed account follow it;
+pick another model in the composer to switch back. It never happens after the
+agent replied, used a tool or changed a file, after you steered the turn or
+pressed Stop, or a second time for the same message. Otherwise the limit choices
+below apply.
 Press **Resume** in an empty composer to continue a limited or interrupted turn
 manually. Do this when the provider reports no reset time, because nothing
 continues the turn on its own.

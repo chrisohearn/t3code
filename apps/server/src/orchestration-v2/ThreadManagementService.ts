@@ -88,7 +88,13 @@ export function withCreationProvenance(
       return { ...rest, ...provenance };
     }
     case "message.dispatch": {
-      const { senderClient: _senderClient, ...rest } = command;
+      // Only the server re-sends a failed run on its fallback model.
+      const {
+        senderClient: _senderClient,
+        failoverOfRunId: _failoverOfRunId,
+        failoverNotice: _failoverNotice,
+        ...rest
+      } = command;
       return { ...rest, ...provenance };
     }
     case "thread.fork":

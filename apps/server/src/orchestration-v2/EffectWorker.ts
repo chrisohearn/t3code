@@ -129,6 +129,7 @@ export const layerExecutor: Layer.Layer<
             return ProviderFailoverDispatch.dispatchProviderFailover({
               threadId: effect.threadId,
               sourceRunId: effect.request.sourceRunId,
+              attempt: effect.attemptCount,
               willRetry,
               providers: Option.isSome(providerRegistry)
                 ? providerRegistry.value.getProviders

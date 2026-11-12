@@ -1,6 +1,7 @@
 import {
   type OrchestrationV2AppThread,
   OrchestrationV2ContextHandoff,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2TurnItem,
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
@@ -8,6 +9,7 @@ import {
   ProviderThreadId,
   RunId,
   ThreadId,
+  type TurnItemId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -26,6 +28,7 @@ import {
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { createOrchestrationV2TurnItemVisibility } from "@t3tools/shared/orchestrationV2Timeline";
 import type { ProjectionStoreV2Shape } from "./ProjectionStore.ts";
+import { cancelledBeforeStart } from "./RestartBackgroundNote.ts";
 
 export class ContextHandoffPrepareError extends Schema.TaggedError<ContextHandoffPrepareError>()(
   "ContextHandoffPrepareError",
@@ -84,6 +87,8 @@ export interface ContextHandoffServiceV2Shape {
       "delta_since_target_last_seen" | "full_thread_summary"
     >;
     readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
+    /** A full summary names this item as the thread's standing instructions. */
+    readonly standingItemId?: TurnItemId;
     readonly createdAt: DateTime.Utc;
   }) => Effect.Effect<OrchestrationV2ContextHandoff, ContextHandoffServiceV2Error>;
   /** Parent activity after the fork point, prepended to a side chat's first provider turn. */
@@ -114,6 +119,88 @@ function compactText(text: string, maxLength = 240): string {
   const end = maxLength - 3;
   const last = compacted.charCodeAt(end - 1);
   return `${compacted.slice(0, last >= 0xd800 && last <= 0xdbff ? end - 1 : end)}...`;
+}
+
+/** Ordinal of the latest started fresh-context run. Runs before it never reach a provider again. */
+export function contextBoundaryOrdinal(
+  runs: ReadonlyArray<
+    Pick<
+      OrchestrationV2Run,
+      "ordinal" | "freshContext" | "status" | "startedAt" | "restartContinuationOfRunId"
+    >
+  >,
+): number {
+  let boundary = 0;
+  for (const run of runs) {
+    if (
+      run.freshContext === true &&
+      run.status !== "queued" &&
+      !cancelledBeforeStart(run) &&
+      run.ordinal > boundary
+    ) {
+      boundary = run.ordinal;
+    }
+  }
+  return boundary;
+}
+
+/**
+ * The run whose message opened the current conversation. A fresh-context run starts a new
+ * conversation, so nothing before it counts.
+ */
+export function firstConversationRunId(runs: ReadonlyArray<OrchestrationV2Run>): RunId | undefined {
+  const boundary = contextBoundaryOrdinal(runs);
+  return runs
+    .filter(
+      (run) =>
+        run.status !== "queued" &&
+        run.status !== "rolled_back" &&
+        !cancelledBeforeStart(run) &&
+        run.ordinal >= boundary,
+    )
+    .reduce<OrchestrationV2Run | undefined>(
+      (first, run) => (first === undefined || run.ordinal < first.ordinal ? run : first),
+      undefined,
+    )?.id;
+}
+
+/**
+ * The item a full summary names as the thread's standing instructions: the opening run's own
+ * message, sent by the user or by whoever launched the thread. Posts, wakes, deliveries and
+ * messages from other threads never qualify.
+ */
+export function standingInstructionsItemId(input: {
+  readonly thread: Pick<OrchestrationV2AppThread, "createdBy" | "creationSource" | "lineage">;
+  readonly run: Pick<OrchestrationV2Run, "id" | "userMessageId"> | undefined;
+  readonly message: OrchestrationV2ConversationMessage | undefined;
+  readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
+}): TurnItemId | undefined {
+  const { thread, run, message } = input;
+  if (
+    run === undefined ||
+    message === undefined ||
+    message.id !== run.userMessageId ||
+    message.runId !== run.id ||
+    message.role !== "user" ||
+    message.postOnly === true ||
+    message.notification !== undefined ||
+    message.delegatedCompletion !== undefined ||
+    message.idleCompaction !== undefined ||
+    message.workflowScript === true ||
+    message.linkedSender !== undefined
+  )
+    return undefined;
+  const fromLauncher =
+    message.createdBy === "user"
+      ? message.senderThreadId === undefined
+      : message.createdBy === thread.createdBy &&
+        message.creationSource === thread.creationSource &&
+        (message.senderThreadId ?? null) === thread.lineage.parentThreadId;
+  if (!fromLauncher) return undefined;
+  return input.items.find(
+    (item) =>
+      item.type === "user_message" && item.runId === run.id && item.messageId === message.id,
+  )?.id;
 }
 
 export function visibleDeltaRunOrdinals(
@@ -503,6 +590,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         "delta_since_target_last_seen" | "full_thread_summary"
       >;
       readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
+      readonly standingItemId?: TurnItemId;
       readonly createdAt: DateTime.Utc;
     }) {
       const handoffId = yield* idAllocator.allocate
@@ -528,11 +616,6 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         ...input,
         threadId: input.sourceThreadId ?? input.threadId,
       });
-      // A full summary starts a new native conversation, which must keep the thread's standing role.
-      const standingItemId =
-        input.strategy === "full_thread_summary"
-          ? input.items.find((item) => item.type === "user_message")?.id
-          : undefined;
       const selected = selectHistory({
         messages: input.items.flatMap((item) => {
           const message = historicalMessage(item);
@@ -542,11 +625,14 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
                 {
                   ...message,
                   ...(item.runId === null ? {} : { runStatus: runStatuses.get(item.runId) }),
-                  ...(item.id === standingItemId ? { standingInstructions: true as const } : {}),
                 },
               ];
         }),
         coverage,
+        // A full summary starts a new native conversation, which must keep the thread's standing role.
+        ...(input.strategy === "full_thread_summary" && input.standingItemId !== undefined
+          ? { standingItemId: input.standingItemId }
+          : {}),
         budget: tokenCap,
       });
       return {
@@ -566,6 +652,10 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           coverage,
           omittedItems: selected.omittedItems,
           omittedItemIds: selected.omittedItemIds,
+          ...(input.standingItemId !== undefined &&
+          selected.messages.some((message) => message.itemId === input.standingItemId)
+            ? { standingItemId: input.standingItemId }
+            : {}),
         },
         createdByProviderInstanceId: null,
         createdAt: input.createdAt,

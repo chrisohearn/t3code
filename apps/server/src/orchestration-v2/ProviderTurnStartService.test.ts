@@ -681,6 +681,7 @@ function makeLocalCommandHarness(input: {
         {
           ...run,
           id: earlierRunId,
+          userMessageId: MessageId.make("earlier-role-message"),
           ordinal: 1,
           providerInstanceId: instanceId,
           modelSelection: { instanceId, model: "gpt-5.4" },
@@ -700,6 +701,15 @@ function makeLocalCommandHarness(input: {
           status: "completed",
         },
         ...projection.attempts,
+      ],
+      messages: [
+        {
+          ...message,
+          id: MessageId.make("earlier-role-message"),
+          runId: earlierRunId,
+          text: roleText,
+        },
+        ...projection.messages,
       ],
     };
   }
@@ -1955,7 +1965,7 @@ effectIt.effect.each(["previous", "current"] as const)(
       expect(harness.fallbackEnsureThread).toHaveBeenCalledOnce();
       const delivered = JSON.stringify(harness.startTurn.mock.calls[0]?.[0]);
       expect(delivered).toContain("You are the inbox.");
-      expect(delivered).toContain("; standing-instructions]");
+      expect(delivered).toContain("Item earlier-role-message is this thread's first message");
     }),
 );
 

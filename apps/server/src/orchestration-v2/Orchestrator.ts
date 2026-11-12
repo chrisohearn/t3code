@@ -120,7 +120,10 @@ import {
 import { CommandReceiptStoreV2, type CommandReceiptV2 } from "./CommandReceiptStore.ts";
 import {
   ContextHandoffServiceV2,
+  contextBoundaryOrdinal,
+  firstConversationRunId,
   readForkHistoryItems,
+  standingInstructionsItemId,
   readInheritedHandoffItems,
   visibleConversationItems,
   visibleDeltaRunOrdinals,
@@ -915,12 +918,42 @@ function followsCurrentConversation(
   );
 }
 
+/**
+ * A run queued for an instance whose account then failed over follows the thread to the
+ * fallback, so it does not switch back and fail again. A later pick of that instance stays.
+ */
+function queuedBeforeFailoverFrom(
+  projection: Pick<OrchestrationV2ThreadProjection, "runs">,
+  run: OrchestrationV2Run,
+  message: Pick<OrchestrationV2ConversationMessage, "text"> | undefined,
+): boolean {
+  if (message === undefined || message.text.trimStart().startsWith("/")) return false;
+  return projection.runs.some((source) => {
+    if (
+      source.failover?.state !== "dispatched" ||
+      source.providerInstanceId !== run.modelSelection.instanceId
+    )
+      return false;
+    const failoverRunId = source.failover.runId;
+    const failoverRun = projection.runs.find((candidate) => candidate.id === failoverRunId);
+    // Ordinals are taken when a run is queued, so they order these runs exactly.
+    return failoverRun !== undefined && run.ordinal < failoverRun.ordinal;
+  });
+}
+
+function queuedRunFollowsThread(
+  projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
+  run: OrchestrationV2Run,
+): boolean {
+  const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
+  return followsCurrentConversation(message) || queuedBeforeFailoverFrom(projection, run, message);
+}
+
 function queuedRunModelSelection(
-  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "messages">,
+  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
   run: OrchestrationV2Run,
 ): ModelSelection {
-  const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
-  return followsCurrentConversation(message)
+  return queuedRunFollowsThread(projection, run)
     ? projection.thread.modelSelection
     : run.modelSelection;
 }
@@ -931,10 +964,7 @@ function queueTailModelSelection(
 ): ModelSelection {
   return (
     queuedRunsInDeliveryOrder(projection).findLast(
-      (run) =>
-        !followsCurrentConversation(
-          projection.messages.find((message) => message.id === run.userMessageId),
-        ),
+      (run) => !queuedRunFollowsThread(projection, run),
     )?.modelSelection ?? projection.thread.modelSelection
   );
 }
@@ -1266,45 +1296,6 @@ function appendContextHandoffId(
   return handoffId === null ? handoffIds : Array.from(new Set([...handoffIds, handoffId]));
 }
 
-/** Ordinal of the latest started fresh-context run. Runs before it never reach a provider again. */
-/**
- * The run whose message opened the current conversation; its standing instructions survive
- * handoffs. A fresh-context run starts a new conversation, so nothing before it counts.
- */
-function firstConversationRunId(runs: ReadonlyArray<OrchestrationV2Run>): RunId | undefined {
-  const boundary = contextBoundaryOrdinal(runs);
-  return runs
-    .filter(
-      (run) => run.status !== "queued" && run.status !== "rolled_back" && run.ordinal >= boundary,
-    )
-    .reduce<OrchestrationV2Run | undefined>(
-      (first, run) => (first === undefined || run.ordinal < first.ordinal ? run : first),
-      undefined,
-    )?.id;
-}
-
-function contextBoundaryOrdinal(
-  runs: ReadonlyArray<
-    Pick<
-      OrchestrationV2Run,
-      "ordinal" | "freshContext" | "status" | "startedAt" | "restartContinuationOfRunId"
-    >
-  >,
-): number {
-  let boundary = 0;
-  for (const run of runs) {
-    if (
-      run.freshContext === true &&
-      run.status !== "queued" &&
-      !cancelledBeforeStart(run) &&
-      run.ordinal > boundary
-    ) {
-      boundary = run.ordinal;
-    }
-  }
-  return boundary;
-}
-
 /** Threads with no started run (imported, or reserved by another queued run) never cross it. */
 function providerThreadPredatesBoundary(
   providerThread: Pick<OrchestrationV2ProviderThread, "firstRunOrdinal">,
@@ -1629,26 +1620,56 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
           );
 
-  /** With standingRunId, a full summary also carries that run's message when the runs skip it. */
-  const readHandoffItems = Effect.fn("Orchestrator.readHandoffItems")(function* (
-    threadId: ThreadId,
-    runIds?: ReadonlyArray<RunId | null>,
-    standingRunId?: RunId,
+  const readHandoffItems = (threadId: ThreadId, runIds?: ReadonlyArray<RunId | null>) =>
+    projectionStore
+      .getThreadRecords(
+        threadId,
+        ["turnItems"],
+        runIds === undefined ? undefined : { turnItemRunIds: runIds },
+      )
+      .pipe(
+        Effect.map((records) => records.turnItems),
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      );
+
+  /**
+   * Items for a full summary, which starts a new native conversation: the covered runs plus the
+   * message that opened the conversation, named as standing instructions. A run being re-sent is
+   * the live prompt, so it is never standing history.
+   */
+  const readFullHandoffItems = Effect.fn("Orchestrator.readFullHandoffItems")(function* (
+    projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs">,
+    runIds: ReadonlyArray<RunId | null> | undefined,
+    resentRunId?: RunId,
   ) {
-    const read = (filter: ProjectionRecordFilter | undefined) =>
-      projectionStore
-        .getThreadRecords(threadId, ["turnItems"], filter)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
-    const { turnItems } = yield* read(
-      runIds === undefined ? undefined : { turnItemRunIds: runIds },
-    );
-    if (runIds === undefined || standingRunId === undefined || runIds.includes(standingRunId))
-      return turnItems;
-    const standing = yield* read({
-      turnItemRunIds: [standingRunId],
-      turnItemTypes: ["user_message"],
+    const threadId = projection.thread.id;
+    const items = yield* readHandoffItems(threadId, runIds);
+    const firstRunId = firstConversationRunId(projection.runs);
+    const run =
+      firstRunId === undefined || firstRunId === resentRunId
+        ? undefined
+        : projection.runs.find((candidate) => candidate.id === firstRunId);
+    if (run === undefined) return { items };
+    const records = yield* projectionStore
+      .getThreadRecords(threadId, ["messages", "turnItems"], {
+        messageIds: [run.userMessageId],
+        turnItemRunIds: [run.id],
+        turnItemTypes: ["user_message"],
+      })
+      .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+    const standingItemId = standingInstructionsItemId({
+      thread: projection.thread,
+      run,
+      message: records.messages.find((message) => message.id === run.userMessageId),
+      items: records.turnItems,
     });
-    return [...standing.turnItems, ...turnItems];
+    if (standingItemId === undefined) return { items };
+    return {
+      items: items.some((item) => item.id === standingItemId)
+        ? items
+        : [...records.turnItems.filter((item) => item.id === standingItemId), ...items],
+      standingItemId,
+    };
   });
 
   const readInheritedItems = (thread: OrchestrationV2AppThread) =>
@@ -2213,7 +2234,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       const latestRun = latestExecutedRun(projection.runs);
       // The failover run goes first; a restart can resume the queue before its effect runs.
-      if (latestRun !== null && (yield* awaitsFailover(latestRun))) return;
+      if (latestRun?.failover?.state === "pending") {
+        if (!(yield* awaitsFailover(latestRun))) {
+          // Its effect settled without resolving it; the skip's own update moves the queue on.
+          yield* writeSystemEvents([
+            failoverRunUpdate(latestRun, settledFailover(latestRun.failover), yield* DateTime.now),
+          ]);
+        }
+        return;
+      }
 
       if (yield* cancelStaleQuestionWakes(projection)) {
         projection = yield* readCommandProjection(threadId);
@@ -2397,7 +2426,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const activeProviderThread = projection.providerThreads.find(
         (candidate) => candidate.id === projection.thread.activeProviderThreadId,
       );
-      const followsCurrent = followsCurrentConversation(queuedMessage);
+      const followsCurrent = queuedRunFollowsThread(projection, storedQueuedRun);
       const freshContext = queuedRun.freshContext === true;
       const contextBoundary = freshContext ? ordinal : contextBoundaryOrdinal(projection.runs);
       // A run queued before a fresh run started is bound to the conversation that run left behind.
@@ -2598,8 +2627,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           strategy: needsFullContext ? "full_thread_summary" : "delta_context",
         });
       }
-      const handoff =
+      const coveredItems =
         transferId === null || latestHandoffRun === undefined
+          ? undefined
+          : needsFullContext
+            ? yield* readFullHandoffItems(
+                projection,
+                coveredRuns.map((run) => run.id),
+              )
+            : {
+                items: yield* readHandoffItems(
+                  threadId,
+                  coveredRuns.map((run) => run.id),
+                ),
+              };
+      const handoff =
+        transferId === null || latestHandoffRun === undefined || coveredItems === undefined
           ? null
           : yield* contextHandoffService
               .prepareProviderHandoff({
@@ -2626,12 +2669,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   ...(needsFullContext && latestCompletedRun !== undefined
                     ? legacyImportItems
                     : []),
-                  ...(yield* readHandoffItems(
-                    threadId,
-                    coveredRuns.map((run) => run.id),
-                    needsFullContext ? firstConversationRunId(projection.runs) : undefined,
-                  )),
+                  ...coveredItems.items,
                 ],
+                ...(coveredItems.standingItemId === undefined
+                  ? {}
+                  : { standingItemId: coveredItems.standingItemId }),
                 createdAt: now,
               })
               .pipe(
@@ -4224,6 +4266,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         );
       }
       const failoverPending = latestRun !== null && (yield* awaitsFailover(latestRun));
+      if (latestRun?.failover?.state === "pending" && !failoverPending) {
+        yield* emit(
+          events,
+          command,
+        )(failoverRunUpdate(latestRun, settledFailover(latestRun.failover), yield* DateTime.now));
+      }
       const restartContinuationPending =
         !runningRunExists &&
         !blockingRequestExists &&
@@ -6278,15 +6326,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           toProviderInstanceId: input.modelSelection.instanceId,
           coveredRunOrdinals: { from: Math.max(1, contextBoundary), to: targetRun.ordinal },
           strategy: "full_thread_summary",
-          items: yield* readHandoffItems(
-            input.command.threadId,
+          ...(yield* readFullHandoffItems(
+            input.projection,
             contextBoundary === 0
               ? undefined
               : input.projection.runs
                   .filter((run) => run.ordinal >= contextBoundary)
                   .map((run) => run.id),
-            firstConversationRunId(input.projection.runs),
-          ),
+          )),
           runs: input.projection.runs,
           createdAt: now,
         })
@@ -8498,26 +8545,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : projection.runs.filter(
             (run) =>
               isHandoffSourceRun(run) &&
+              // A failover re-sends this run's prompt as the new turn.
+              run.id !== command.failoverOfRunId &&
               run.ordinal >= contextBoundary &&
               run.ordinal >
                 (requiresFullProviderSwitchContext ? 0 : (targetLastCompletedRun?.ordinal ?? 0)) &&
               run.ordinal <= latestHandoffRun.ordinal,
           );
+    const providerSwitchFullContext =
+      targetProviderThread === undefined || requiresFullProviderSwitchContext;
+    const providerSwitchCovered =
+      providerSwitchCoveredRuns.length === 0
+        ? { items: [] }
+        : providerSwitchFullContext
+          ? yield* readFullHandoffItems(
+              projection,
+              providerSwitchCoveredRuns.map((run) => run.id),
+              command.failoverOfRunId,
+            )
+          : {
+              items: yield* readHandoffItems(
+                command.threadId,
+                providerSwitchCoveredRuns.map((run) => run.id),
+              ),
+            };
     const providerSwitchItems =
       providerSwitchCoveredRuns.length === 0
         ? []
         : [
-            ...(latestCompletedRun !== undefined &&
-            (targetProviderThread === undefined || requiresFullProviderSwitchContext)
+            ...(latestCompletedRun !== undefined && providerSwitchFullContext
               ? legacyImportItems
               : []),
-            ...(yield* readHandoffItems(
-              command.threadId,
-              providerSwitchCoveredRuns.map((run) => run.id),
-              targetProviderThread === undefined || requiresFullProviderSwitchContext
-                ? firstConversationRunId(projection.runs)
-                : undefined,
-            )),
+            ...providerSwitchCovered.items,
           ];
     const providerSwitchTransferId =
       providerSwitchCoveredRuns.length === 0 || latestHandoffRun === undefined
@@ -8570,6 +8629,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   ? "full_thread_summary"
                   : "delta_since_target_last_seen",
               items: providerSwitchItems,
+              ...(providerSwitchCovered.standingItemId === undefined
+                ? {}
+                : { standingItemId: providerSwitchCovered.standingItemId }),
               runs: projection.runs,
               createdAt: now,
             })
@@ -9256,6 +9318,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
   });
 
+  const settledFailover = (failover: NonNullable<OrchestrationV2Run["failover"]>) => ({
+    ...failover,
+    state: "skipped" as const,
+  });
+
+  /** Resolves claims whose effect settled without resolving them; the caller holds the lock. */
+  const skipSettledFailovers = Effect.fn("Orchestrator.skipSettledFailovers")(function* (
+    threadId: ThreadId,
+  ) {
+    const { runs } = yield* projectionStore
+      .getThreadRecords(threadId, ["runs"])
+      .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+    const now = yield* DateTime.now;
+    const updates = [];
+    for (const run of runs) {
+      if (run.failover?.state === "pending" && !(yield* awaitsFailover(run))) {
+        updates.push(failoverRunUpdate(run, settledFailover(run.failover), now));
+      }
+    }
+    if (updates.length > 0) yield* writeSystemEvents(updates);
+  });
+
   const failoverRunUpdate = (
     source: OrchestrationV2Run,
     failover: NonNullable<OrchestrationV2Run["failover"]>,
@@ -9300,8 +9384,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
       return;
     }
+    const sourceMessage = projection.messages.find(
+      (message) => message.id === source.userMessageId,
+    );
     if (
       source.status !== "failed" ||
+      // Only the source's own message is re-sent, from its own sender.
+      sourceMessage === undefined ||
+      command.text !== sourceMessage.text ||
+      command.createdBy !== sourceMessage.createdBy ||
+      command.creationSource !== sourceMessage.creationSource ||
+      command.senderThreadId !== sourceMessage.senderThreadId ||
+      command.senderClient?.sessionId !== sourceMessage.senderClient?.sessionId ||
+      // A steer reached the failed run; re-sending only the first message would drop it.
+      projection.messages.some(
+        (message) =>
+          message.role === "user" && message.runId === source.id && message.id !== sourceMessage.id,
+      ) ||
       command.modelSelection === undefined ||
       !modelSelectionsEqual(command.modelSelection, failover.modelSelection) ||
       command.dispatchMode.type !== "start_immediately" ||
@@ -15842,6 +15941,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   );
 
   const recoverDelegatedTasks = Effect.gen(function* () {
+    // A claim left pending by an effect that already settled would hold its queue and parent.
+    yield* projectionStore.getRecoveryThreadIds("pending-failovers").pipe(
+      Effect.flatMap((threadIds) =>
+        Effect.forEach(
+          threadIds,
+          (threadId) =>
+            threadDispatch.withLock(threadId, skipSettledFailovers(threadId)).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Failed to resolve a settled provider failover", {
+                  threadId,
+                  cause,
+                }),
+              ),
+            ),
+          { concurrency: 8, discard: true },
+        ),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Failed to inspect provider failovers during recovery", { cause }),
+      ),
+    );
     yield* projectionStore.getRecoveryThreadIds("subagent-results").pipe(
       Effect.tap((threadIds) =>
         Effect.annotateCurrentSpan("recovery.subagentResultThreads", threadIds.length),

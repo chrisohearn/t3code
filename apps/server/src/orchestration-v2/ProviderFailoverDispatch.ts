@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import { DispatchModeLimit } from "./DispatchModeLimit.ts";
 import { providerFailoverNotice } from "./ProviderFailover.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
@@ -18,6 +19,8 @@ export const dispatchProviderFailover = Effect.fn("ProviderFailover.dispatch")(
   function* (input: {
     readonly threadId: ThreadId;
     readonly sourceRunId: RunId;
+    /** Each attempt is its own command, so a rejected attempt does not replay into the next. */
+    readonly attempt: number;
     readonly willRetry: boolean;
     readonly providers: Effect.Effect<ReadonlyArray<ServerProvider>>;
   }) {
@@ -34,9 +37,9 @@ export const dispatchProviderFailover = Effect.fn("ProviderFailover.dispatch")(
       return yield* threads.skipProviderFailover({ threadId: input.threadId, runId: source.id });
     }
     const providers = yield* input.providers;
-    yield* threads.dispatch({
+    const dispatch = threads.dispatch({
       type: "message.dispatch",
-      commandId: CommandId.make(`command:provider-failover:${source.id}`),
+      commandId: CommandId.make(`command:provider-failover:${source.id}:${input.attempt}`),
       threadId: input.threadId,
       messageId: MessageId.make(`failover:${source.id}`),
       text: message.text,
@@ -46,6 +49,9 @@ export const dispatchProviderFailover = Effect.fn("ProviderFailover.dispatch")(
       dispatchMode: { type: "start_immediately" },
       createdBy: message.createdBy,
       creationSource: message.creationSource,
+      ...(message.scheduledTaskId === undefined
+        ? {}
+        : { scheduledTaskId: message.scheduledTaskId }),
       ...(message.senderThreadId === undefined ? {} : { senderThreadId: message.senderThreadId }),
       ...(message.linkedSender === undefined ? {} : { linkedSender: message.linkedSender }),
       ...(message.senderClient === undefined ? {} : { senderClient: message.senderClient }),
@@ -57,6 +63,16 @@ export const dispatchProviderFailover = Effect.fn("ProviderFailover.dispatch")(
         reason: failover.reason,
       }),
     });
+    // An outside client's message stays within the modes that client was approved for.
+    const access = message.senderClient?.access;
+    yield* access === undefined
+      ? dispatch
+      : dispatch.pipe(
+          Effect.provideService(DispatchModeLimit, {
+            runtimeMode: access === "full-access" ? "full-access" : "approval-required",
+            interactionMode: "default",
+          }),
+        );
   },
   (effect, input) =>
     effect.pipe(

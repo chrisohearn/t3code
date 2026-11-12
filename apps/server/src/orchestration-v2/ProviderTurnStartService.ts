@@ -8,7 +8,6 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
-  type OrchestrationV2RunFailover,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2TurnItem,
   isCompactionCommandMessage,
@@ -473,10 +472,8 @@ export const layer: Layer.Layer<
                 "type" | "title" | "input" | "output" | "exitCode"
               >;
           readonly providerThreadUpdate?: OrchestrationV2ProviderThread;
-          readonly failover?: OrchestrationV2RunFailover;
         }) {
           const { now, status } = input;
-          const failover = input.failover === undefined ? {} : { failover: input.failover };
           const started = input.startedAt === undefined ? {} : { startedAt: input.startedAt };
           const item: OrchestrationV2TurnItem = {
             id: idAllocator.derive.runSignalTurnItem({ runId, signal: input.signal }),
@@ -502,10 +499,7 @@ export const layer: Layer.Layer<
           };
           const eventPayloads = [
             { type: "turn-item.updated", payload: item },
-            {
-              type: "run.updated",
-              payload: { ...run, status, ...started, completedAt: now, ...failover },
-            },
+            { type: "run.updated", payload: { ...run, status, ...started, completedAt: now } },
             {
               type: "run-attempt.updated",
               payload: { ...attempt, status, ...started, completedAt: now },
@@ -542,11 +536,6 @@ export const layer: Layer.Layer<
             activeAttemptId: attempt.id,
             expectedStatus: "starting",
             events,
-            ...(input.failover === undefined
-              ? {}
-              : {
-                  effects: [ProviderFailover.providerFailoverEffect(projection.thread.id, runId)],
-                }),
           });
           // A steering restart that cannot start still ends a run whose earlier turns counted.
           if (written.committed) {
@@ -565,7 +554,6 @@ export const layer: Layer.Layer<
           readonly title: string;
           readonly error: Error;
           readonly message?: string;
-          readonly failover?: OrchestrationV2RunFailover;
         }) {
           yield* settleRunBeforeStart({
             signal: failed.signal,
@@ -573,7 +561,6 @@ export const layer: Layer.Layer<
             now: yield* DateTime.now,
             providerInstanceId: run.providerInstanceId,
             itemProviderThreadId: providerThread.id,
-            ...(failed.failover === undefined ? {} : { failover: failed.failover }),
             item: {
               type: "error",
               title: failed.title,
@@ -882,23 +869,10 @@ export const layer: Layer.Layer<
           isProviderAdapterOpenSessionError(failure.cause) &&
           failure.cause.requiresSignIn === true;
         if (input.willRetry === true && !requiresSignIn) return yield* failure;
-        // A session that never opened did no work, so a sign-in failure can fail over.
-        const failover = requiresSignIn
-          ? ProviderFailover.providerFailoverClaim(
-              yield* resolveFailoverTarget({
-                thread: projection.thread,
-                run,
-                message,
-                firstAttempt,
-              }),
-              { noWorkObserved: true, accountFailure: "auth" },
-            )
-          : undefined;
         yield* settleStartFailure({
           signal: "provider-session-open-failure",
           title: "Provider session failed to open",
           error: sessionResult.failure,
-          ...(failover === undefined ? {} : { failover }),
         });
         return;
       }
@@ -1160,6 +1134,35 @@ export const layer: Layer.Layer<
             type: "provider_resume_fallback",
           });
           const createdAt = yield* DateTime.now;
+          // Runs before a fresh-context run never reach a provider again.
+          const boundary = ContextHandoffService.contextBoundaryOrdinal(projection.runs);
+          const items = (yield* projectionStore.getTurnStartHistory(input.threadId)).filter(
+            (item) =>
+              item.runId === null
+                ? boundary === 0
+                : projection.runs.some(
+                    (source) =>
+                      source.id === item.runId &&
+                      source.ordinal >= boundary &&
+                      source.ordinal < run.ordinal,
+                  ),
+          );
+          const standingRunId = ContextHandoffService.firstConversationRunId(projection.runs);
+          const standingRun =
+            standingRunId === run.id
+              ? undefined
+              : projection.runs.find((candidate) => candidate.id === standingRunId);
+          const standingItemId =
+            standingRun === undefined
+              ? undefined
+              : ContextHandoffService.standingInstructionsItemId({
+                  thread: projection.thread,
+                  run: standingRun,
+                  message: (yield* projectionStore.getThreadRecords(input.threadId, ["messages"], {
+                    messageIds: [standingRun.userMessageId],
+                  })).messages.find((candidate) => candidate.id === standingRun.userMessageId),
+                  items,
+                });
           const handoff = yield* contextHandoffService.prepareProviderHandoff({
             threadId: projection.thread.id,
             targetRunId: run.id,
@@ -1168,16 +1171,11 @@ export const layer: Layer.Layer<
             toProviderThreadId: providerThread.id,
             fromProviderInstanceId: providerThread.providerInstanceId,
             toProviderInstanceId: run.providerInstanceId,
-            coveredRunOrdinals: { from: 1, to: Math.max(1, run.ordinal - 1) },
+            coveredRunOrdinals: { from: Math.max(1, boundary), to: Math.max(1, run.ordinal - 1) },
             strategy: "full_thread_summary",
             runs: projection.runs,
-            items: (yield* projectionStore.getTurnStartHistory(input.threadId)).filter(
-              (item) =>
-                item.runId === null ||
-                projection.runs.some(
-                  (source) => source.id === item.runId && source.ordinal < run.ordinal,
-                ),
-            ),
+            items,
+            ...(standingItemId === undefined ? {} : { standingItemId }),
             createdAt,
           });
           return { handoff, transferId, createdAt };

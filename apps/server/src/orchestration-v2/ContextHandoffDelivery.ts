@@ -12,6 +12,13 @@ import {
   selectHistory,
 } from "@t3tools/provider-core/server/handoffBudget";
 
+/** The first pending handoff that kept the thread's standing instructions names them. */
+const standingItem = (pending: ReadonlyArray<OrchestrationV2ContextHandoff>) => {
+  const standingItemId = pending.find((handoff) => handoff.history?.standingItemId !== undefined)
+    ?.history?.standingItemId;
+  return standingItemId === undefined ? {} : { standingItemId };
+};
+
 /** The provider prompt for a turn that carries inline context ahead of the user's text. */
 export const withInlineContext = (context: string, userText: string): string =>
   context === "" ? userText : `${context}\n\nUser message:\n${userText}`;
@@ -73,6 +80,7 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
       coverage: fullCoverage,
       omittedItems: pending.reduce((sum, handoff) => sum + (handoff.history?.omittedItems ?? 0), 0),
       omittedItemIds: pending.flatMap((handoff) => handoff.history?.omittedItemIds ?? []),
+      ...standingItem(pending),
       budget,
     });
     if (historyCost(selected.messages, selected.context) > budget) {

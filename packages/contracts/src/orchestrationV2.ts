@@ -1165,8 +1165,6 @@ export const OrchestrationV2HistoricalMessage = Schema.Struct({
   providerThreadId: Schema.NullOr(ProviderThreadId),
   status: Schema.String,
   kind: Schema.String,
-  /** The thread's first message: a role or rules it sets still apply after a handoff. */
-  standingInstructions: Schema.optional(Schema.Literal(true)),
 });
 export type OrchestrationV2HistoricalMessage = typeof OrchestrationV2HistoricalMessage.Type;
 
@@ -1197,6 +1195,8 @@ export const OrchestrationV2ContextHandoff = Schema.Struct({
       coverage: Schema.String,
       omittedItems: NonNegativeInt,
       omittedItemIds: Schema.optional(Schema.Array(TurnItemId)),
+      /** The kept item that holds the thread's standing instructions; delivery names it. */
+      standingItemId: Schema.optional(TurnItemId),
     }),
   ),
   delivery: Schema.optional(

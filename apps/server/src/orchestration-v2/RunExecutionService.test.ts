@@ -3427,6 +3427,15 @@ it.effect.each([
   { name: "observed work", noWork: false, account: true, target: true, claim: false },
   { name: "no account cause", noWork: true, account: false, target: true, claim: false },
   { name: "no fallback target", noWork: true, account: true, target: false, claim: false },
+  // A provider that reports the same terminal twice still claims once.
+  {
+    name: "a duplicated terminal",
+    noWork: true,
+    account: true,
+    target: true,
+    claim: true,
+    duplicate: true,
+  },
 ])("claims a failover with the failure only for $name", (scenario) =>
   Effect.gen(function* () {
     const fallback = { instanceId: ProviderInstanceId.make("claude"), model: "claude-opus-5-5" };
@@ -3437,7 +3446,7 @@ it.effect.each([
       ...(scenario.target ? { failoverTarget: fallback } : {}),
       events: (ids) => {
         const terminal = rootTerminalEvent(ids, "failed");
-        return Stream.make(
+        const failed =
           terminal.type === "turn.terminal" && terminal.status === "failed"
             ? {
                 ...terminal,
@@ -3445,13 +3454,15 @@ it.effect.each([
                 ...(scenario.noWork ? { noWorkObserved: true as const } : {}),
                 ...(scenario.account ? { accountFailure: "usage_limit" as const } : {}),
               }
-            : terminal,
-        );
+            : terminal;
+        return "duplicate" in scenario ? Stream.make(failed, failed) : Stream.make(failed);
       },
     });
-    const failed = finalEvents.find(
+    const failures = finalEvents.filter(
       (event) => event.type === "run.updated" && event.payload.status === "failed",
     );
+    assert.lengthOf(failures, 1);
+    const failed = failures[0];
     assert.equal(failed?.type, "run.updated");
     if (failed?.type !== "run.updated") return;
     const failoverEffects = committedEffects.filter(

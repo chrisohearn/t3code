@@ -5876,6 +5876,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 action: "decline",
               } satisfies CodexSchema.McpServerElicitationRequestResponse;
             }
+            context.workObserved = true;
 
             const nativeRequestId =
               payload.mode === "url"

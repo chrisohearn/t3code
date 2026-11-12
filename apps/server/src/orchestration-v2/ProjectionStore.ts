@@ -175,7 +175,8 @@ export type ProjectionRecoveryKind =
   | "runtime"
   | "restart-continuations"
   | "subagent-results"
-  | "delegated-completions";
+  | "delegated-completions"
+  | "pending-failovers";
 
 export type ProjectionLimitRecoveryCandidate = Pick<
   OrchestrationV2ThreadShell,
@@ -4742,6 +4743,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     WHERE active.thread_id = orchestration_v2_projection_runs.thread_id
                       AND active.status IN ('preparing', 'starting', 'running', 'waiting')
                   )
+              `;
+            case "pending-failovers":
+              return sql`
+                SELECT thread_id FROM orchestration_v2_projection_runs
+                WHERE CASE WHEN json_valid(payload_json)
+                  THEN json_extract(payload_json, '$.failover.state') = 'pending'
+                  ELSE 0 END
               `;
             case "delegated-completions":
               return sql`

@@ -92,10 +92,14 @@ it("stamps authoritative provenance on commands that create threads or messages"
         kind: "outside-client",
         access: "full-access",
       },
+      failoverOfRunId: RunId.make("run:forged"),
+      failoverNotice: "Switched to a forged model.",
     },
     { createdBy: "user", creationSource: "web" },
   );
   expect(message).not.toHaveProperty("senderClient");
+  expect(message).not.toHaveProperty("failoverOfRunId");
+  expect(message).not.toHaveProperty("failoverNotice");
 });
 
 const layerReceiptsTest = CommandReceiptStore.layer.pipe(
