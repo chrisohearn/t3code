@@ -111,7 +111,7 @@ describe("fork migrations", () => {
           [2, "WorkLedger"],
           [3, "McpClientThreads"],
           [4, "McpBridgeStatus"],
-          [5, "McpRequestLog"],
+          [9, "McpRequestLog"],
         ],
       );
       assert.equal((yield* forkHistory)[0]?.[2], "2026-11-12 04:10:00");
