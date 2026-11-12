@@ -3230,8 +3230,15 @@ describe("OrchestratorMcpService provider resolution", () => {
         name: "no remote, neither main nor master",
         remote: null,
         remoteDefault: null,
-        refs: ["refs/heads/develop"],
+        refs: ["refs/heads/develop", "HEAD"],
         baseRef: "main",
+      },
+      {
+        name: "a folder that is not a repository",
+        remote: null,
+        remoteDefault: null,
+        refs: [],
+        baseRef: null,
       },
       {
         name: "no recorded HEAD, remote main and a stale local master",
@@ -3282,7 +3289,13 @@ describe("OrchestratorMcpService provider resolution", () => {
         refs: ["refs/remotes/upstream/main"],
         baseRef: "upstream/main",
       },
-    ])("$name starts from $baseRef", ({ remote, remoteDefault, refs, baseRef }) =>
+    ] as ReadonlyArray<{
+      readonly name: string;
+      readonly remote: string | null;
+      readonly remoteDefault: string | null;
+      readonly refs: ReadonlyArray<string>;
+      readonly baseRef: string | null;
+    }>)("$name starts from $baseRef", ({ remote, remoteDefault, refs, baseRef }) =>
       Effect.gen(function* () {
         const saved = yield* Ref.make<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>([]);
         const gitFailure = (cwd: string, detail: string) =>
@@ -3306,8 +3319,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           ),
         );
         yield* mcp.scheduleTask(client, { projectId, prompt: "Check the build", schedule });
+        // No commit to start a worktree from: runs use the project folder itself.
         assert.deepEqual(yield* Ref.get(saved), [
-          { type: "worktree", baseRef, startFromOrigin: true },
+          baseRef === null
+            ? { type: "root" }
+            : { type: "worktree", baseRef, startFromOrigin: true },
         ]);
       }),
     );

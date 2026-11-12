@@ -1908,7 +1908,8 @@ const make = Effect.gen(function* () {
     for (const branch of conventional) {
       if (yield* refExists(cwd, `refs/heads/${branch}`)) return branch;
     }
-    return "main";
+    // No commit at all (not a repository, or an empty one): a worktree has nothing to start from.
+    return (yield* refExists(cwd, "HEAD")) ? "main" : null;
   });
 
   const scheduledTaskWorkspaceStrategy = Effect.fn(
@@ -1916,11 +1917,10 @@ const make = Effect.gen(function* () {
   )(function* (boundToThread: boolean, projectId: ProjectId) {
     if (boundToThread) return { type: "root" as const };
     const { workspaceRoot } = yield* requireProject(projectId);
-    return {
-      type: "worktree" as const,
-      baseRef: yield* resolveScheduledTaskBaseRef(workspaceRoot),
-      startFromOrigin: true,
-    };
+    const baseRef = yield* resolveScheduledTaskBaseRef(workspaceRoot);
+    // Every run would otherwise fail while provisioning a worktree.
+    if (baseRef === null) return { type: "root" as const };
+    return { type: "worktree" as const, baseRef, startFromOrigin: true };
   });
 
   const scheduledTaskRunModes = Effect.fn("OrchestratorMcpService.scheduledTaskRunModes")(
