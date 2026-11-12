@@ -88,7 +88,13 @@ export function withCreationProvenance(
       return { ...rest, ...provenance };
     }
     case "message.dispatch": {
-      const { senderClient: _senderClient, ...rest } = command;
+      // Only the server re-sends a failed run on its fallback model.
+      const {
+        senderClient: _senderClient,
+        failoverOfRunId: _failoverOfRunId,
+        failoverNotice: _failoverNotice,
+        ...rest
+      } = command;
       return { ...rest, ...provenance };
     }
     case "thread.fork":
@@ -506,6 +512,7 @@ export interface ThreadManagementServiceShape {
   >;
   readonly getThreadEventSequence: Orchestrator.OrchestratorV2["Service"]["getThreadEventSequence"];
   readonly recoverDelegatedTask: Orchestrator.OrchestratorV2["Service"]["recoverDelegatedTask"];
+  readonly skipProviderFailover: Orchestrator.OrchestratorV2["Service"]["skipProviderFailover"];
   readonly cancelDelegatedTask: Orchestrator.OrchestratorV2["Service"]["cancelDelegatedTask"];
   readonly delegatedTaskResultPending: Orchestrator.OrchestratorV2["Service"]["delegatedTaskResultPending"];
   readonly streamStoredEvents: Orchestrator.OrchestratorV2["Service"]["streamStoredEvents"];
@@ -553,7 +560,11 @@ function latestRestartContinuation(
 ): OrchestrationV2Run {
   let current = run;
   for (let hops = 0; hops < runs.length; hops++) {
-    const next = runs.find((candidate) => candidate.restartContinuationOfRunId === current.id);
+    const next = runs.find(
+      (candidate) =>
+        candidate.restartContinuationOfRunId === current.id ||
+        candidate.failoverOfRunId === current.id,
+    );
     if (next === undefined) break;
     current = next;
   }
@@ -984,8 +995,8 @@ const make = Effect.gen(function* () {
     if (selectedRun === undefined) {
       return { threadId: input.threadId, run: null, timedOut: false };
     }
-    // A restart cuts a run and continues it as a new run. Follow that chain,
-    // so a cut run is not the answer while its continuation is pending.
+    // A restart or a failover continues a run as a new run. Follow that chain,
+    // so a cut or failed-over run is not the answer while its continuation is pending.
     // Runs per matching event and is already covered by the waitForThread span.
     const outcome = Effect.fnUntraced(function* (runs: ReadonlyArray<OrchestrationV2Run>) {
       const current = runs.find((candidate) => candidate.id === selectedRun.id);
@@ -1082,7 +1093,8 @@ const make = Effect.gen(function* () {
             untilDelegatedWorkSettled ||
             stored.event.type !== "run.updated" ||
             stored.event.payload.id === selectedRun.id ||
-            stored.event.payload.restartContinuationOfRunId !== undefined,
+            stored.event.payload.restartContinuationOfRunId !== undefined ||
+            stored.event.payload.failoverOfRunId !== undefined,
         ),
       ),
       initial.pending
@@ -1705,6 +1717,7 @@ const make = Effect.gen(function* () {
     awaitBackgroundTasks,
     getThreadEventSequence: orchestrator.getThreadEventSequence,
     recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+    skipProviderFailover: orchestrator.skipProviderFailover,
     cancelDelegatedTask: orchestrator.cancelDelegatedTask,
     delegatedTaskResultPending: orchestrator.delegatedTaskResultPending,
     streamStoredEvents: orchestrator.streamStoredEvents,

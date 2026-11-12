@@ -24,6 +24,7 @@ import {
   type ThreadId,
   type TurnItemId,
 } from "@t3tools/contracts";
+import * as ProviderFailover from "./ProviderFailover.ts";
 import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -590,6 +591,8 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly hasWorkspaceMoved?: () => Effect.Effect<boolean, never>;
   readonly message: ProviderAdapter.ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
+  /** Where an account failure before any work moves this run; see ProviderFailover. */
+  readonly failoverTarget?: ModelSelection;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }
 
@@ -649,6 +652,7 @@ export const layer: Layer.Layer<
         readonly terminal: ProviderTerminalEvent;
         readonly completedAt?: DateTime.Utc;
         readonly failureItemPersisted: boolean;
+        readonly failoverTarget?: ModelSelection;
         readonly refreshAfterTurn: Effect.Effect<void>;
         readonly writeIfRunCurrent?: {
           readonly activeAttemptId: RunAttemptId;
@@ -733,10 +737,16 @@ export const layer: Layer.Layer<
         // Omit delegatedCompletion; the startup snapshot must not overwrite newer acknowledgements, successors, or Stop barriers.
         const { delegatedCompletion: _delegatedCompletion, ...runWithoutDelegatedCompletion } =
           input.run;
+        // The claim commits with the failure and its effect, so a restart cannot lose or repeat it.
+        const failover =
+          input.terminal.status === "failed"
+            ? ProviderFailover.providerFailoverClaim(input.failoverTarget, input.terminal)
+            : undefined;
         const finalizedRun: OrchestrationV2Run = {
           ...runWithoutDelegatedCompletion,
           status: persistedStatus,
           completedAt: input.terminal.status === "completed" ? null : completedAt,
+          ...(failover === undefined ? {} : { failover }),
         };
         const finalizedRootNode: OrchestrationV2ExecutionNode = {
           ...input.rootNode,
@@ -773,7 +783,9 @@ export const layer: Layer.Layer<
                     },
                   },
                 ]
-              : [],
+              : failover === undefined
+                ? []
+                : [ProviderFailover.providerFailoverEffect(input.run.threadId, input.run.id)],
           events: [
             ...cascadedSubagentEvents,
             ...(input.abandonedProviderTurn === undefined
@@ -1151,6 +1163,9 @@ export const layer: Layer.Layer<
               openRunOwnedSubagentsTerminal: terminal,
               terminal: settledTerminal,
               failureItemPersisted: settledTerminal.status === "failed",
+              ...(input.failoverTarget === undefined
+                ? {}
+                : { failoverTarget: input.failoverTarget }),
               refreshAfterTurn,
             }).pipe(
               Effect.mapError(

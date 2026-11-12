@@ -24,7 +24,7 @@ rolling renewal still needs an acknowledged delivery before an idle watch expire
 | 3      | Refresh ChatGPT's stored tool list; Jarvis acceptance remains pending                                                           | Audit owner and Jarvis                    | —                                                                                                          | planned       |
 | 4      | Verified fork releases and guarded service updates                                                                              | Fork maintenance owner                    | [#11](https://github.com/chrisohearn/t3code/pull/11); [#13](https://github.com/chrisohearn/t3code/pull/13) | live-verified |
 | 5      | Jarvis glossary and decision records in the fork                                                                                | Reliability worker                        | [#22](https://github.com/chrisohearn/t3code/pull/22)                                                       | merged        |
-| 6      | One fallback relaunch for classified provider launch failures before any work                                                   | Reliability worker                        | —                                                                                                          | planned       |
+| 6      | Automatic failover to the fallback model for account failures before any work                                                   | Reliability worker                        | [#68](https://github.com/chrisohearn/t3code/pull/68)                                                       | in review     |
 | 7      | Verify existing restart continuation at the first coordinated update                                                            | Reliability worker and audit owner        | [#36](https://github.com/chrisohearn/t3code/pull/36)                                                       | planned       |
 | 8      | Rolling thirty-day outside sign-ins with refresh tokens and reuse detection                                                     | Auth worker                               | [#23](https://github.com/chrisohearn/t3code/pull/23)                                                       | merged        |
 | 9      | Hold restart event deliveries until T3 Connect is reachable                                                                     | Reliability worker                        | [#24](https://github.com/chrisohearn/t3code/pull/24)                                                       | merged        |
@@ -34,8 +34,10 @@ rolling renewal still needs an acknowledged delivery before an idle watch expire
 | 13     | T3-to-Jarvis inbox and event route, with a verified reply to the sender                                                         | Jarvis and audit owner                    | —                                                                                                          | live-verified |
 | 14     | Twelve-hour inbox keep-alive; first scheduled delivery remains pending                                                          | Audit owner                               | —                                                                                                          | planned       |
 
-Provider fallback is limited to a classified launch failure before a tool call or
-assistant message. Restart work verifies existing recovery; it adds no draining
+Provider fallback is automatic in T3: an account failure (usage or rate limit,
+sign-in or billing) that the Codex or Claude adapter proves happened before any
+assistant output, tool call or file change re-sends the message once on the
+fallback model. Jarvis must not also relaunch these itself, or one failure runs twice. Restart work verifies existing recovery; it adds no draining
 code. Adaptive scheduler backoff and cost guardrails were dropped.
 
 ## Round three

@@ -53,6 +53,25 @@ const usageLimitCodes = new Set<string>([
   "subscription_sharing_usage_limit_exceeded",
   "subscription_sharing_workplace_individual_usage_limit_exceeded",
 ]);
+// The account or its sharing grant cannot run Codex at all; another provider can.
+const accountAuthCodes = new Set<string>([
+  "subscription_sharing_v2_user_not_eligible",
+  "subscription_sharing_user_not_eligible",
+  "subscription_sharing_v2_client_not_enabled",
+  "subscription_sharing_v2_invalid_user",
+  "subscription_sharing_invalid_user",
+  "chatpass_v2_scope_not_authorized",
+  "chatpass_v2_invalid_authorization_context",
+]);
+
+/** The account-side cause a managed failure code names, if any. */
+export function codexManagedAccountFailure(
+  code: string | null | undefined,
+): "usage_limit" | "auth" | undefined {
+  if (code == null) return undefined;
+  if (usageLimitCodes.has(code)) return "usage_limit";
+  return accountAuthCodes.has(code) ? "auth" : undefined;
+}
 
 function unwrapError(value: unknown): unknown {
   if (typeof value === "string") {
