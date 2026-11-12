@@ -1,3 +1,7 @@
+import * as McpBridgeMetrics from "../McpBridgeMetrics.ts";
+import * as McpClientThreads from "../../persistence/McpClientThreads.ts";
+import * as WorkLedger from "../../persistence/WorkLedger.ts";
+import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as AssetSigner from "../../assets/AssetSigner.ts";
 import * as DocumentText from "../../provider/DocumentText.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -65,7 +69,12 @@ import * as PeerForwarding from "../../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../../peer/PeerLinkRequests.ts";
 import * as PeerLinks from "../../peer/PeerLinks.ts";
 
+const layerClientThreads = Layer.mock(McpClientThreads.McpClientThreads)({
+  record: () => Effect.void,
+  list: () => Effect.succeed([]),
+});
 const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
+  Layer.provide(layerClientThreads),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -115,6 +124,70 @@ const client = McpSchema.McpServerClient.of({
   getClient: Effect.die("unused"),
 });
 
+it.effect(
+  "ledger permits outside and thread callers to read but requires operate access to write",
+  () =>
+    Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const metrics = yield* McpBridgeMetrics.McpBridgeMetrics;
+      const call = (
+        name: string,
+        args: object,
+        invocation: McpInvocationContext.McpInvocationScope,
+      ) =>
+        server
+          .callTool({ name, arguments: args })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+      const outside = {
+        ...scope,
+        thread: undefined,
+        client: { sessionId: "ledger-session", label: "Jarvis", access: "read-only" as const },
+      };
+      const item = { key: "ledger-task", title: "Task", ownerKind: "jarvis", ownerName: "chief" };
+      expect(declaredFailure(yield* call("ledger_upsert", item, outside))).toMatchObject({
+        code: "capability_denied",
+      });
+      expect(
+        (yield* call("ledger_upsert", item, {
+          ...outside,
+          client: { ...outside.client, access: "full-access" },
+        })).isError,
+      ).toBe(false);
+      expect((yield* call("ledger_query", {}, outside)).structuredContent).toMatchObject({
+        items: [{ ...item, updatedBy: "ledger-session" }],
+      });
+      expect(
+        (yield* call("ledger_upsert", { key: item.key, status: "done" }, scope)).structuredContent,
+      ).toMatchObject({ status: "done", updatedBy: threadId });
+      expect(
+        declaredFailure(yield* call("ledger_query", {}, { ...outside, capabilities: new Set() })),
+      ).toMatchObject({ code: "capability_denied" });
+      expect(yield* metrics.read("ledger-session")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            tool: "ledger_upsert",
+            calls: 2,
+            errors: 1,
+            responseBytes: expect.any(Number),
+          }),
+        ]),
+      );
+      expect(yield* metrics.read("another-session")).toEqual([]);
+    }).pipe(
+      Effect.provide(
+        McpHttpServer.layerLedgerToolkit.pipe(
+          Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provideMerge(McpBridgeMetrics.layer),
+          Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+          Layer.provide(WorkLedger.layer.pipe(Layer.provide(Sqlite.layerMemory))),
+        ),
+      ),
+    ),
+);
+
 it.effect("checks capability through the production registration", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -158,6 +231,21 @@ it.effect("an answered question reports already answered instead of not found", 
           Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
           Effect.provideService(McpSchema.McpServerClient, client),
         );
+    const listed = yield* server
+      .callTool({ name: "t3_pending_request", arguments: { action: "list" } })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(listed.structuredContent).toMatchObject({
+      requests: [
+        { requestId: "pending-approval", kind: "approval" },
+        { requestId: "pending-question", kind: "user_input" },
+      ],
+    });
+    expect(declaredFailure(yield* respond("pending-approval"))).toMatchObject({
+      code: "invalid_request",
+    });
     expect(declaredFailure(yield* respond(requestId))).toMatchObject({
       code: "invalid_request",
       message: "The user-input request was already answered.",
@@ -190,6 +278,19 @@ it.effect("an answered question reports already answered instead of not found", 
                     resolvedAt: shell.updatedAt,
                     answers: { size: "large" },
                   },
+                  ...(["command", "user_input"] as const).map((kind) => ({
+                    id: RuntimeRequestId.make(
+                      kind === "command" ? "pending-approval" : "pending-question",
+                    ),
+                    nodeId: NodeId.make("root"),
+                    providerTurnId: null,
+                    nativeRequestRef: null,
+                    kind,
+                    status: "pending" as const,
+                    responseCapability: { type: "message" as const },
+                    createdAt: shell.createdAt,
+                    resolvedAt: null,
+                  })),
                 ],
                 turnItems: [
                   {
@@ -1010,6 +1111,30 @@ it.effect("discovers workflow stop targets and requires orchestration capability
     expect(read.isError).toBe(false);
     const result = yield* decodeThreadReadResult(read.structuredContent);
     expect(result.items[0]?.subagentId).toBe(subagentId);
+    expect(result.revision).toBe(7);
+    const unchanged = yield* server
+      .callTool({ name: "t3_thread_read", arguments: { threadId, sinceRevision: 7 } })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect(unchanged.structuredContent).toMatchObject({
+      revision: 7,
+      items: [],
+      hasMore: false,
+      nextPosition: null,
+    });
+    // A page past the first is still read, so a caller paging with a stored revision gets items.
+    const paged = yield* server
+      .callTool({
+        name: "t3_thread_read",
+        arguments: { threadId, view: "activity", sinceRevision: 7, afterPosition: 0 },
+      })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+    expect((yield* decodeThreadReadResult(paged.structuredContent)).items).toHaveLength(1);
     const call = (invocation: McpInvocationContext.McpInvocationScope) =>
       server
         .callTool({
@@ -1036,6 +1161,7 @@ it.effect("discovers workflow stop targets and requires orchestration capability
             getThreadShell: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
             getProjectThreadRecords: () =>
               Effect.succeed(McpToolAccessTestkit.idleThreadProjection(shell)),
+            getThreadEventSequence: () => Effect.succeed(7),
             getTimelinePage: () => Effect.succeed({ items: [row], totalItems: 1, hasMore: false }),
             stopWorkflow: (input) =>
               Effect.sync(() => {
@@ -1143,7 +1269,7 @@ it.effect(
         );
       expect(result.isError).toBe(false);
       expect(result.structuredContent).toMatchObject({
-        threads: [{ threadId: unsettled.id, settled: false }],
+        threads: [{ threadId: unsettled.id, settled: false, pendingRequestCount: 2 }],
         total: 1,
       });
     }).pipe(
@@ -1154,6 +1280,7 @@ it.effect(
           Layer.provide(
             Layer.mock(ThreadManagement.ThreadManagementService)({
               listProjectThreads: () => Effect.succeed([unsettled, settled]),
+              getPendingRuntimeRequestCounts: () => Effect.succeed({ [unsettled.id]: 2 }),
             }),
           ),
           Layer.provide(ServerSettings.layerTest()),

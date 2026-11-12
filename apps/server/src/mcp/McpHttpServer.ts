@@ -1,3 +1,13 @@
+import * as BridgeStatusService from "./BridgeStatusService.ts";
+import { BridgeToolkit } from "./toolkits/bridge/tools.ts";
+import * as BridgeHandlers from "./toolkits/bridge/handlers.ts";
+import * as McpBridgeMetrics from "./McpBridgeMetrics.ts";
+import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
+import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
+import * as McpClientThreads from "../persistence/McpClientThreads.ts";
+import * as WorkLedger from "../persistence/WorkLedger.ts";
+import { LedgerToolkit } from "./toolkits/ledger/tools.ts";
+import * as LedgerHandlers from "./toolkits/ledger/handlers.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -945,12 +955,13 @@ const handoffTargetIds = (
 };
 
 /** Tool analytics must never include IDs, prompts or free text. */
+const encodeBridgeResponse = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const withToolAnalytics =
   /* Request instrumentation already owns the span; keep this helper in that context. */
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
-    if (Option.isNone(analytics)) return yield* registration;
+    const bridgeMetrics = yield* Effect.serviceOption(McpBridgeMetrics.McpBridgeMetrics);
     const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
     const threads = yield* Effect.serviceOption(ThreadManagementService.ThreadManagementService);
     const shellOf = (threadId: string) =>
@@ -1004,6 +1015,7 @@ const withToolAnalytics =
           result: McpSchema.CallToolResult | undefined,
           durationMs: number,
         ) {
+          if (Option.isNone(analytics)) return;
           const handoff =
             HANDOFF_TOOLS.has(tool) ||
             isInputTargetHandoff(tool, args) ||
@@ -1071,10 +1083,38 @@ const withToolAnalytics =
                   const result = exit._tag === "Success" ? exit.value : undefined;
                   // A call that asks for input is retried with it, and that call is the one counted.
                   if (result instanceof McpSchema.InputRequired) return Effect.void;
-                  // Handoff tools look up threads to record; the response must not wait on them.
+                  const count = Effect.gen(function* () {
+                    const invocation = yield* Effect.serviceOption(
+                      McpInvocationContext.McpInvocationContext,
+                    );
+                    const session = Option.isSome(invocation)
+                      ? invocation.value.client?.sessionId
+                      : undefined;
+                    if (session !== undefined && Option.isSome(bridgeMetrics)) {
+                      const bytes =
+                        result === undefined
+                          ? 0
+                          : Buffer.byteLength(
+                              yield* encodeBridgeResponse(result).pipe(
+                                Effect.orElseSucceed(() => ""),
+                              ),
+                            );
+                      yield* bridgeMetrics.value.record(
+                        session,
+                        options.tool.name,
+                        result === undefined || result.isError === true,
+                        bytes,
+                      );
+                    }
+                  });
+                  // Handoff tools look up threads, and byte counts re-encode the result; the response waits on neither.
                   return Clock.currentTimeMillis.pipe(
                     Effect.flatMap((endedAt) =>
-                      record(options.tool.name, payload, result, endedAt - startedAt),
+                      count.pipe(
+                        Effect.andThen(
+                          record(options.tool.name, payload, result, endedAt - startedAt),
+                        ),
+                      ),
                     ),
                     Effect.forkDetach,
                     Effect.asVoid,
@@ -1217,6 +1257,8 @@ export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorHandlers.layer,
 ).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
 
+export const layerLedgerToolkit = toolkitRegistration(LedgerToolkit, LedgerHandlers.layer);
+
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
@@ -1234,7 +1276,10 @@ const layerEnvironmentToolkit = toolkitRegistration(
   EnvironmentHandlers.layer,
 ).pipe(Layer.provide(ThreadCommandExecutor.layer));
 
-export const layerProjectRegistration = toolkitRegistration(ProjectToolkit, ProjectHandlers.layer);
+export const layerProjectRegistration = toolkitRegistration(
+  ProjectToolkit,
+  ProjectHandlers.layer,
+).pipe(Layer.provide(ThreadLaunchMcp.layer));
 
 export const layerAttachmentToolkit = toolkitRegistration(
   AttachmentToolkit,
@@ -1298,6 +1343,10 @@ export const layerMcpTransport = <RA, RE, RR>(registrations: Layer.Layer<RA, RE,
 
 /** Every tool the T3 MCP server advertises. AgentContextBudget.test.ts measures this set. */
 export const layerTools = Layer.mergeAll(
+  toolkitRegistration(BridgeToolkit, BridgeHandlers.layer).pipe(
+    Layer.provide(BridgeStatusService.layer),
+  ),
+  layerLedgerToolkit,
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,
@@ -1314,6 +1363,7 @@ export const layerTools = Layer.mergeAll(
 const layerEvents = McpEvents.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      BridgeStatus.layer,
       McpEventSubscriptions.layer,
       McpEventDeliveries.layer,
       AuthSessions.layer,
@@ -1366,4 +1416,9 @@ export const layerToolSearch = Layer.mergeAll(
 export const layer = Layer.merge(
   layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch)),
   McpEvents.layerDeliveryWorker,
-).pipe(Layer.provide(layerEvents));
+).pipe(
+  Layer.provide(layerEvents),
+  Layer.provide(WorkLedger.layer),
+  Layer.provide(McpClientThreads.layer),
+  Layer.provide(McpBridgeMetrics.layer),
+);

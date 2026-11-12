@@ -1,3 +1,4 @@
+import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as DocumentText from "../provider/DocumentText.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -54,6 +55,10 @@ import * as PeerLinks from "../peer/PeerLinks.ts";
 // its real T3 tools. What the link starts carries its origin, and the link
 // changes only that.
 
+const layerClientThreads = Layer.mock(McpClientThreads.McpClientThreads)({
+  record: () => Effect.void,
+  list: () => Effect.succeed([]),
+});
 const instanceId = ProviderInstanceId.make("codex");
 const projectId = ProjectId.make("project:link-origin");
 const adapter = {
@@ -116,9 +121,9 @@ const layerLaunches = Layer.effect(
 );
 
 const layerTools = Layer.mergeAll(
-  McpHttpServer.layerOrchestratorToolkit,
+  McpHttpServer.layerOrchestratorToolkit.pipe(Layer.provide(layerClientThreads)),
   McpHttpServer.layerThreadToolkit,
-  McpHttpServer.layerProjectRegistration,
+  McpHttpServer.layerProjectRegistration.pipe(Layer.provide(layerClientThreads)),
 ).pipe(
   Layer.provide(DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer))),
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),

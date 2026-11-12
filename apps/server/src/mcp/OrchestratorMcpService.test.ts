@@ -1,3 +1,4 @@
+import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -71,9 +72,14 @@ import { resolveRuntimeMode } from "./delegatedTaskModes.ts";
 import type { ProjectionRecordFilter } from "../orchestration-v2/ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+const layerClientThreads = Layer.mock(McpClientThreads.McpClientThreads)({
+  record: () => Effect.void,
+  list: () => Effect.succeed([]),
+});
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(layerClientThreads),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -3052,6 +3058,7 @@ describe("OrchestratorMcpService provider resolution", () => {
       modes?: Ref.Ref<ReadonlyArray<ScheduledTaskUpsertInput["threadMode"]>>,
     ) =>
       OrchestratorMcpService.layer.pipe(
+        Layer.provide(layerClientThreads),
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)(git)),
         Layer.provide(
@@ -3780,6 +3787,76 @@ describe("OrchestratorMcpService thread lookup", () => {
       }).pipe(Effect.provide(service(shells, sent)));
     });
 
+  it.effect(
+    "reads a capped final reply directly without paging history or acknowledging delivery",
+    () =>
+      Effect.gen(function* () {
+        const sent = yield* Ref.make(0);
+        const runId = RunId.make("result-run");
+        const run = {
+          id: runId,
+          ordinal: 1,
+          status: "completed",
+          activeAttemptId: null,
+          modelSelection: launched.modelSelection,
+          requestedAt: launched.createdAt,
+          startedAt: launched.createdAt,
+          completedAt: launched.updatedAt,
+        } as unknown as OrchestrationV2ThreadProjection["runs"][number];
+        // A later silent run, such as idle compaction, is not the thread's result.
+        const silent = { ...run, id: RunId.make("compaction-run"), ordinal: 2 };
+        const projection = { ...idleThreadProjection(launched), runs: [run, silent] };
+        yield* Effect.gen(function* () {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const result = yield* mcp.threadResult(client, { threadId: launched.id });
+          assert.equal(result.revision, 42);
+          assert.equal(Array.from(result.lastAssistantMessage?.text ?? "").length, 4000);
+          assert.equal(result.lastAssistantMessage?.truncated, true);
+          assert.equal(result.run?.runId, runId);
+          const short = yield* mcp.threadResult(client, {
+            threadId: launched.id,
+            runId,
+            maxChars: 1,
+          });
+          assert.equal(short.lastAssistantMessage?.text, "😀");
+          const missing = yield* mcp
+            .threadResult(client, { threadId: launched.id, runId: RunId.make("wrong-run") })
+            .pipe(Effect.flip);
+          assert.equal(missing.code, "invalid_request");
+        }).pipe(
+          Effect.provide(
+            service([{ ...launched, latestRunId: runId }], sent, {
+              getThreadEventSequence: () => Effect.succeed(42),
+              getProjectThreadRecords: (_input, fields, filter) => {
+                assert.deepEqual<ReadonlyArray<string>>(fields, ["runs", "runtimeRequests"]);
+                assert.deepEqual(filter, {
+                  runIds: filter?.runIds?.includes(runId) ? [runId] : [RunId.make("wrong-run")],
+                  runtimeRequestStatuses: ["pending"],
+                });
+                return Effect.succeed({
+                  ...projection,
+                  runs: projection.runs.filter((run) => filter?.runIds?.includes(run.id)),
+                });
+              },
+              getThreadRecords: (_id, _fields, filter) => {
+                assert.deepEqual(filter, {
+                  messageRoles: ["assistant"],
+                  messageRunIds: [runId],
+                  latestMessageOnly: true,
+                });
+                return Effect.succeed({
+                  ...projection,
+                  messages: [{ id: MessageId.make("final-reply"), text: "😀".repeat(4001) }],
+                } as unknown as OrchestrationV2ThreadProjection);
+              },
+              getTimelinePage: () => Effect.die("must not page history"),
+              dispatch: () => Effect.die("must not acknowledge delivery"),
+            }),
+          ),
+        );
+      }),
+  );
+
   it.effect("points a bare uuid at the mcp: thread it belongs to", () =>
     Effect.gen(function* () {
       const { read, send, wait, sends } = yield* failuresFor([launched]);
@@ -3825,6 +3902,34 @@ describe("OrchestratorMcpService thread lookup", () => {
         Effect.provide(
           service([], sent, {
             getThreadShell: () => Effect.die("Unauthorized target access"),
+          }),
+        ),
+      );
+    }),
+  );
+
+  it.effect("waits for the first ready thread and validates every requested thread", () =>
+    Effect.gen(function* () {
+      const sent = yield* Ref.make(0);
+      const second = { ...launched, id: ThreadId.make("second-wait-thread") };
+      yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const result = yield* mcp.waitForThread(client, { threadIds: [launched.id, second.id] });
+        assert.equal(result.threadId, second.id);
+        assert.equal(result.timedOut, false);
+        const denied = yield* mcp
+          .waitForThread(client, { threadIds: [second.id, bareId] })
+          .pipe(Effect.flip);
+        assert.equal(denied.code, "thread_not_found");
+      }).pipe(
+        Effect.provide(
+          service([launched, second], sent, {
+            getProjectThreadRecords: ({ threadId }) =>
+              Effect.succeed(idleThreadProjection(threadId === second.id ? second : launched)),
+            waitForThread: ({ threadId }) =>
+              threadId === launched.id
+                ? Effect.never
+                : Effect.succeed({ threadId, run: null, timedOut: false }),
           }),
         ),
       );
@@ -3894,12 +3999,28 @@ describe("OrchestratorMcpService thread list", () => {
       ],
     },
   ];
-  const service = layerOrchestratorService.pipe(
+  const service = OrchestratorMcpService.layer.pipe(
+    Layer.provide(
+      Layer.mock(McpClientThreads.McpClientThreads)({
+        list: () =>
+          Effect.succeed([
+            { threadId: shells[0]!.id, sessionId: "thread-list", clientLabel: "Shared client" },
+            { threadId: shells[2]!.id, sessionId: "other-session", clientLabel: "Shared client" },
+          ]),
+      }),
+    ),
+    Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+    Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
     Layer.provide(
       Layer.mergeAll(
         NodeServices.layer,
         NodeCrypto.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () =>
+            Effect.succeed({
+              runtimeRequests: [{ status: "pending" }, { status: "pending" }],
+            } as unknown as OrchestrationV2ThreadProjection),
+          getPendingRuntimeRequestCounts: () => Effect.succeed({}),
           listProjectThreads: (input) =>
             Effect.succeed(
               shells.filter(
@@ -3929,6 +4050,18 @@ describe("OrchestratorMcpService thread list", () => {
         snoozed: true,
       });
       assert.equal(listed.projectId, null);
+      assert.equal(listed.threads[0]?.launchedBy, "Shared client");
+      assert.equal(listed.threads[0]?.pendingRequestCount, 0);
+      const mine = yield* mcp.listThreads(client, { allProjects: true, launchedByMe: true });
+      assert.deepEqual(
+        mine.threads.map((thread) => thread.threadId),
+        [shells[0]!.id],
+      );
+      const linked = { ...client, client: { ...client.client!, linked: true } };
+      const refused = yield* mcp
+        .listThreads(linked, { allProjects: true, launchedByMe: true })
+        .pipe(Effect.flip);
+      assert.equal(refused.code, "invalid_request");
       assert.deepStrictEqual(
         listed.threads.map((thread) => [thread.threadId, thread.projectId]),
         [

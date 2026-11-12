@@ -69,11 +69,60 @@ describe("fork migrations", () => {
       // McpEvents is not run again: its CREATE TABLE would fail on the existing tables.
       assert.deepStrictEqual(yield* runMigrations(), pendingUpstream);
       assert.deepStrictEqual(yield* upstreamHistory, migrationManifest);
-      assert.deepStrictEqual(yield* forkHistory, [[1, "McpEvents", "2026-11-10 10:32:04"]]);
+      assert.deepStrictEqual((yield* forkHistory)[0], [1, "McpEvents", "2026-11-10 10:32:04"]);
+      assert.deepStrictEqual(
+        (yield* forkHistory).map(([id, name]) => [id, name] as const),
+        forkMigrationManifest,
+      );
 
       const before = [yield* upstreamHistory, yield* forkHistory];
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual([yield* upstreamHistory, yield* forkHistory], before);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("upgrades fork migration 1 while preserving existing event subscriptions", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: migrationManifest.at(-1)![0] });
+      yield* McpEvents;
+      yield* sql`CREATE TABLE t3_fork_migrations (
+        migration_id integer PRIMARY KEY NOT NULL,
+        created_at datetime NOT NULL DEFAULT current_timestamp,
+        name VARCHAR(255) NOT NULL
+      )`;
+      yield* sql`INSERT INTO t3_fork_migrations (migration_id, name, created_at)
+        VALUES (1, 'McpEvents', '2026-11-12 04:10:00')`;
+      yield* sql`INSERT INTO auth_sessions
+        (session_id, subject, scopes, method, issued_at, expires_at)
+        VALUES ('fork-upgrade', 'test', '[]', 'test', '2026-11-12', '2026-11-13')`;
+      yield* sql`INSERT INTO mcp_event_subscriptions
+        (id, principal, name, thread_id, callback_url, source_url, secret, rotation_until,
+         expires_at, active, scan_cursor, ack_cursor)
+        VALUES ('preserved', 'fork-upgrade', 'thread.run.result', 'thread:test',
+          'https://example.com/events', 'https://example.com', 'test-secret', 0, 100, 1, 5, 3)`;
+      const subscriptions = yield* sql`SELECT * FROM mcp_event_subscriptions`;
+      assert.isTrue(yield* hasPendingMigrations());
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(
+        (yield* forkHistory).map(([id, name]) => [id, name] as const),
+        [
+          [1, "McpEvents"],
+          [2, "WorkLedger"],
+          [3, "McpClientThreads"],
+          [4, "McpBridgeStatus"],
+        ],
+      );
+      assert.equal((yield* forkHistory)[0]?.[2], "2026-11-12 04:10:00");
+      assert.deepStrictEqual(yield* upstreamHistory, migrationManifest);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM mcp_event_subscriptions`, subscriptions);
+      yield* sql`SELECT * FROM work_ledger`;
+      yield* sql`SELECT * FROM mcp_client_threads`;
+      yield* sql`SELECT * FROM mcp_bridge_status`;
+      const before = yield* forkHistory;
+      assert.isFalse(yield* hasPendingMigrations());
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* forkHistory, before);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 

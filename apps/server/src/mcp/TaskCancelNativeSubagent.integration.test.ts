@@ -1,3 +1,4 @@
+import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -49,7 +50,12 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 
+const layerClientThreads = Layer.mock(McpClientThreads.McpClientThreads)({
+  record: () => Effect.void,
+  list: () => Effect.succeed([]),
+});
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(layerClientThreads),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );

@@ -10,6 +10,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 const isMcpEventsError = Schema.is(McpEventsError);
 
 const SubscriptionRow = Schema.Struct({
+  refreshedAt: Schema.Number,
   id: Schema.String,
   principal: Schema.String,
   name: McpEventName,
@@ -37,7 +38,9 @@ export class McpEventSubscriptions extends Context.Service<
     ) => Effect.Effect<ReadonlyArray<Subscription>, McpEventsError>;
     readonly remove: (id: string, principal: string) => Effect.Effect<void, McpEventsError>;
     readonly save: (
-      input: Omit<Subscription, "previousSecret" | "rotationUntil"> & { readonly now: number },
+      input: Omit<Subscription, "previousSecret" | "rotationUntil" | "refreshedAt"> & {
+        readonly now: number;
+      },
     ) => Effect.Effect<void, McpEventsError>;
     readonly stop: (id: string, principal: string) => Effect.Effect<void, McpEventsError>;
   }
@@ -45,7 +48,7 @@ export class McpEventSubscriptions extends Context.Service<
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const select = sql`SELECT id, principal, name, thread_id AS "threadId", callback_url AS url, source_url AS "sourceUrl",
+  const select = sql`SELECT COALESCE((SELECT refreshed_at FROM mcp_event_subscription_activity WHERE subscription_id = mcp_event_subscriptions.id), 0) AS "refreshedAt", id, principal, name, thread_id AS "threadId", callback_url AS url, source_url AS "sourceUrl",
     secret, previous_secret AS "previousSecret", rotation_until AS "rotationUntil", expires_at AS "expiresAt",
     active, scan_cursor AS "scanCursor", ack_cursor AS "ackCursor", truncated FROM mcp_event_subscriptions`;
   const decode = Schema.decodeUnknownEffect(Schema.Array(SubscriptionRow));
@@ -64,7 +67,7 @@ const make = Effect.gen(function* () {
       ),
     ),
     forPrincipal: Effect.fn("McpEventSubscriptions.forPrincipal")((principal) =>
-      sql`${select} WHERE principal = ${principal} ORDER BY id`.pipe(
+      sql`${select} WHERE principal = ${principal} ORDER BY "refreshedAt" DESC, rowid DESC`.pipe(
         Effect.flatMap(decode),
         Effect.mapError(() => new McpEventsError({ code: -32603, reason: "storage" })),
       ),
@@ -84,6 +87,10 @@ const make = Effect.gen(function* () {
               SELECT session_id FROM auth_sessions
               WHERE revoked_at IS NOT NULL OR expires_at <= ${DateTime.formatIso(DateTime.makeUnsafe(input.now))}
             )`;
+            // An expired row stays a day, then frees its slot; the one being resubscribed is kept,
+            // since an explicit resubscribe resumes from its acknowledged cursor.
+            yield* sql`DELETE FROM mcp_event_subscriptions
+              WHERE id <> ${input.id} AND expires_at <= ${input.now - 86_400_000}`;
             // Bound retained storage as well as live delivery. Check and activate in
             // this transaction, so distinct identities cannot race for the last slot.
             const [counts] = yield* sql<{
@@ -126,6 +133,7 @@ const make = Effect.gen(function* () {
         scan_cursor = MIN(scan_cursor, excluded.scan_cursor), ack_cursor = MIN(ack_cursor, excluded.ack_cursor),
         truncated = excluded.truncated
       `;
+            yield* sql`INSERT INTO mcp_event_subscription_activity (subscription_id, refreshed_at) VALUES (${input.id}, ${input.now}) ON CONFLICT(subscription_id) DO UPDATE SET refreshed_at = excluded.refreshed_at`;
             yield* sql`UPDATE mcp_event_deliveries SET body = json_set(body, '$.cursor', ${String(input.ackCursor)})
         WHERE subscription_id = ${input.id} AND CAST(json_extract(body, '$.cursor') AS INTEGER) > ${input.ackCursor}`;
           }),

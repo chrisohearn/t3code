@@ -1,3 +1,4 @@
+import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as DocumentText from "../provider/DocumentText.ts";
 import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -44,6 +45,10 @@ import * as PeerLinks from "./PeerLinks.ts";
 import * as PeerLinkRequests from "./PeerLinkRequests.ts";
 import { descriptorOf, layerLinkingEnvironment, linkTo, servePeer } from "./PeerLinks.testkit.ts";
 
+const layerClientThreads = Layer.mock(McpClientThreads.McpClientThreads)({
+  record: () => Effect.void,
+  list: () => Effect.succeed([]),
+});
 const laptop = descriptorOf("environment-laptop", "Laptop");
 const box = descriptorOf("environment-box", "Box");
 const boxProject = ProjectId.make("project:box");
@@ -96,6 +101,7 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
     getProjectThreadRecords: (input) => projectionOf(input.threadId),
     getThreadRecords: (threadId) => projectionOf(threadId),
     listProjectThreads: () => linked.pipe(Effect.map((shell) => [shell] as never)),
+    getPendingRuntimeRequestCounts: () => Effect.succeed({}),
     sendToThread: (input) =>
       Ref.update(seen, (current) => ({ ...current, sends: [...current.sends, input] })).pipe(
         Effect.as({ run: run("running"), delivery: "started" } as never),
@@ -221,8 +227,8 @@ const serveBox = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) =>
   servePeer(
     box,
     Layer.mergeAll(
-      McpHttpServer.layerOrchestratorToolkit,
-      McpHttpServer.layerProjectRegistration,
+      McpHttpServer.layerOrchestratorToolkit.pipe(Layer.provide(layerClientThreads)),
+      McpHttpServer.layerProjectRegistration.pipe(Layer.provide(layerClientThreads)),
       McpHttpServer.layerThreadToolkit,
     ).pipe(
       Layer.provide(DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer))),
@@ -281,8 +287,8 @@ const mcpClient = McpSchema.McpServerClient.of({
 const makeLaptop = Effect.gen(function* () {
   const linking = yield* layerLinkingEnvironment(laptop).pipe(Layer.build);
   const layerHere = Layer.mergeAll(
-    McpHttpServer.layerOrchestratorToolkit,
-    McpHttpServer.layerProjectRegistration,
+    McpHttpServer.layerOrchestratorToolkit.pipe(Layer.provide(layerClientThreads)),
+    McpHttpServer.layerProjectRegistration.pipe(Layer.provide(layerClientThreads)),
     McpHttpServer.layerThreadToolkit,
   ).pipe(
     Layer.provide(DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer))),
@@ -485,6 +491,13 @@ it.effect("keeps a forwarded wait short and its retries scoped to the caller", (
         [PeerForwarding.FORWARDED_WAIT_CHUNK_MS, boxRun],
         [PeerForwarding.FORWARDED_WAIT_CHUNK_MS, boxRun],
       ]);
+      // The several-thread form reaches the linked environment too.
+      const waitedMany = yield* a.call("thread:laptop-full", "t3_thread_wait", {
+        environmentId: box.environmentId,
+        threadIds: [boxThread],
+        timeoutMs: 600_000,
+      });
+      expect(waitedMany.structuredContent).toMatchObject({ threadId: boxThread, timedOut: false });
 
       const send = (caller: string, clientRequestId: string) =>
         a.call(caller, "t3_thread_send", {

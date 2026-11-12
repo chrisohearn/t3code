@@ -132,7 +132,7 @@ const question = Schema.Struct({
 const PendingRequestTool = Tool.make("t3_pending_request", {
   ...commandTool,
   description:
-    "Pending user questions in a thread. Omit `threadId` for this thread. list: their ids; approvals are not listed. read: one by `requestId`. respond: answer one with `answers`; this cannot approve a permission request.",
+    "Pending user questions in a thread. Omit `threadId` for this thread. list: question and approval ids with `kind`. read: one by `requestId`. respond: answer one with `answers`; this cannot approve a permission request.",
   parameters: Schema.Struct({
     action: Schema.Literals(["list", "read", "respond"]),
     environmentId: OrchestratorMcpEnvironmentTarget,
@@ -141,7 +141,18 @@ const PendingRequestTool = Tool.make("t3_pending_request", {
     answers: Schema.optional(ProviderUserInputAnswers),
   }),
   success: Schema.Union([
-    Schema.Struct({ requestIds: Schema.Array(RuntimeRequestId) }),
+    Schema.Struct({
+      requestIds: Schema.Array(RuntimeRequestId),
+      // Optional: a linked environment on an older build omits it.
+      requests: Schema.optional(
+        Schema.Array(
+          Schema.Struct({
+            requestId: RuntimeRequestId,
+            kind: Schema.Literals(["user_input", "approval"]),
+          }),
+        ),
+      ),
+    }),
     Schema.Struct({ requestId: RuntimeRequestId, questions: Schema.Array(question) }),
     OrchestrationV2DispatchCommandResult,
   ]),

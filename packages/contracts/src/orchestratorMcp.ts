@@ -1,3 +1,4 @@
+import { McpThreadNotify, McpThreadNotifyResult } from "./mcpEvents.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
@@ -339,6 +340,7 @@ export const OrchestratorMcpThreadListInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
   projectId: OrchestratorMcpProjectTarget,
   allProjects: Schema.optional(Schema.Boolean),
+  launchedByMe: Schema.optional(Schema.Boolean),
   statuses: Schema.optional(
     Schema.Array(OrchestratorMcpThreadStatus).check(Schema.isMaxLength(10)),
   ),
@@ -361,6 +363,9 @@ export const OrchestratorMcpThreadPullRequest = Schema.Struct({
 export type OrchestratorMcpThreadPullRequest = typeof OrchestratorMcpThreadPullRequest.Type;
 
 export const OrchestratorMcpThreadListItem = Schema.Struct({
+  // Optional: a linked environment on an older build omits them.
+  launchedBy: Schema.optional(Schema.NullOr(Schema.String)),
+  pendingRequestCount: Schema.optional(NonNegativeInt),
   threadId: ThreadId,
   projectId: ProjectId,
   title: Schema.String,
@@ -412,6 +417,7 @@ const clampedPositiveInt = (maximum: number) =>
   );
 
 export const OrchestratorMcpThreadReadInput = Schema.Struct({
+  sinceRevision: Schema.optional(NonNegativeInt),
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,
   itemId: Schema.optional(TurnItemId),
@@ -499,6 +505,8 @@ export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
 export type OrchestratorMcpThreadTimelineItem = typeof OrchestratorMcpThreadTimelineItem.Type;
 
 export const OrchestratorMcpThreadReadResult = Schema.Struct({
+  // Optional: a linked environment on an older build omits it.
+  revision: Schema.optional(NonNegativeInt),
   thread: OrchestratorMcpThreadDetail,
   recentRuns: Schema.Array(OrchestratorMcpThreadRun),
   items: Schema.Array(OrchestratorMcpThreadTimelineItem),
@@ -507,7 +515,28 @@ export const OrchestratorMcpThreadReadResult = Schema.Struct({
 });
 export type OrchestratorMcpThreadReadResult = typeof OrchestratorMcpThreadReadResult.Type;
 
+export const OrchestratorMcpThreadResultInput = Schema.Struct({
+  environmentId: OrchestratorMcpEnvironmentTarget,
+  threadId: ThreadId,
+  runId: Schema.optional(RunId),
+  maxChars: Schema.optional(clampedPositiveInt(50_000)),
+});
+export type OrchestratorMcpThreadResultInput = typeof OrchestratorMcpThreadResultInput.Type;
+export const OrchestratorMcpThreadResult = Schema.Struct({
+  threadId: ThreadId,
+  status: OrchestratorMcpThreadStatus,
+  run: Schema.NullOr(OrchestratorMcpThreadRun),
+  lastAssistantMessage: Schema.NullOr(
+    Schema.Struct({ messageId: MessageId, text: Schema.String, truncated: Schema.Boolean }),
+  ),
+  pendingRequestIds: Schema.Array(RuntimeRequestId),
+  pullRequests: Schema.Array(OrchestratorMcpThreadPullRequest),
+  revision: NonNegativeInt,
+});
+export type OrchestratorMcpThreadResult = typeof OrchestratorMcpThreadResult.Type;
+
 export const OrchestratorMcpThreadSendInput = Schema.Struct({
+  notify: Schema.optional(McpThreadNotify),
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
@@ -523,6 +552,7 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;
 
 export const OrchestratorMcpThreadSendResult = Schema.Struct({
+  notify: Schema.optional(McpThreadNotifyResult),
   threadId: ThreadId,
   link: Schema.optional(Schema.String),
   messageId: MessageId,
@@ -535,7 +565,10 @@ export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendRe
 
 export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
-  threadId: ThreadId,
+  threadId: Schema.optional(ThreadId),
+  threadIds: Schema.optional(
+    Schema.Array(ThreadId).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
+  ),
   runId: Schema.optional(RunId),
   timeoutMs: Schema.optional(Schema.Finite),
   untilDelegatedWorkSettled: Schema.optional(

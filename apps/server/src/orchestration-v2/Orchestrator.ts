@@ -506,6 +506,9 @@ export interface OrchestratorV2Shape {
   readonly getThreadLinkMetadata: (
     threadIds: ReadonlyArray<ThreadId>,
   ) => Effect.Effect<Record<ThreadId, OrchestrationV2ThreadLinkMetadata>, OrchestratorV2Error>;
+  readonly getPendingRuntimeRequestCounts: (
+    threadIds: ReadonlyArray<ThreadId>,
+  ) => Effect.Effect<Record<ThreadId, number>, OrchestratorV2Error>;
   readonly getThreadTitles: (
     threadIds: ReadonlyArray<ThreadId>,
   ) => Effect.Effect<Record<ThreadId, string>, OrchestratorV2Error>;
@@ -15416,6 +15419,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .getThreadLinkMetadata(threadIds)
         .pipe(Effect.mapError(shellProjectionError));
     }),
+    getPendingRuntimeRequestCounts: Effect.fn("OrchestratorV2.getPendingRuntimeRequestCounts")(
+      function (threadIds) {
+        return projectionStore
+          .getPendingRuntimeRequestCounts(threadIds)
+          .pipe(Effect.mapError(shellProjectionError));
+      },
+    ),
     getThreadTitles: Effect.fn("OrchestratorV2.getThreadTitles")(function (threadIds) {
       return projectionStore.getThreadTitles(threadIds).pipe(Effect.mapError(shellProjectionError));
     }),

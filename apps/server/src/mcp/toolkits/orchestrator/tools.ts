@@ -28,6 +28,8 @@ import {
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadListInput,
   OrchestratorMcpThreadListResult,
+  OrchestratorMcpThreadResultInput,
+  OrchestratorMcpThreadResult,
   OrchestratorMcpThreadReadInput,
   OrchestratorMcpThreadReadResult,
   OrchestratorMcpThreadSendInput,
@@ -245,7 +247,7 @@ const ThreadListTool = Tool.make("t3_thread_list", {
 
 const ThreadReadTool = Tool.make("t3_thread_read", {
   description:
-    "Read any thread by id. `messages` (default): user and assistant messages and plans. `activity`: all timeline items. Keep reads small: low `limit` and `maxCharsPerItem`. Page with `afterPosition=nextPosition`. Cut-off text: `itemId` with `textOffset=nextTextOffset`. Reading a child's final result marks it delivered. In your reply, name it as its `link` verbatim.",
+    "Read any thread by id. `sinceRevision`: an unchanged thread returns an empty first page. `messages` (default): user and assistant messages and plans. `activity`: all timeline items. Keep reads small: low `limit` and `maxCharsPerItem`. Page with `afterPosition=nextPosition`. Cut-off text: `itemId` with `textOffset=nextTextOffset`. Reading a child's final result marks it delivered. In your reply, name it as its `link` verbatim.",
   parameters: OrchestratorMcpThreadReadInput,
   success: OrchestratorMcpThreadReadResult,
   failure: OrchestratorMcpFailure,
@@ -255,6 +257,19 @@ const ThreadReadTool = Tool.make("t3_thread_read", {
   .annotate(Tool.Title, "Read a T3 thread")
   .annotate(Tool.Strict, true)
   .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
+const ThreadResultTool = Tool.make("t3_thread_result", {
+  description:
+    "Read a thread's latest run or `runId`: status, last assistant message (default 4000 chars), pending request ids, PRs and revision. Does not acknowledge a child's result. Use `t3_thread_read` for history.",
+  parameters: OrchestratorMcpThreadResultInput,
+  success: OrchestratorMcpThreadResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true);
 
@@ -290,7 +305,7 @@ const ThreadSendTool = Tool.make("t3_thread_send", {
 
 const ThreadWaitTool = Tool.make("t3_thread_wait", {
   description:
-    "Wait for a thread's run to finish. No `runId`: latest. Idle: at once. On timeout, with `next` end your turn; without, call again.",
+    "Wait until a run finishes, asks a question, or raises a new approval. Use `threadId`, or `threadIds` to return the first ready thread. No `runId`: latest. Idle: at once. On timeout, with `next` end your turn; without, call again.",
   parameters: OrchestratorMcpThreadWaitInput,
   success: OrchestratorMcpThreadWaitResult,
   failure: OrchestratorMcpFailure,
@@ -370,6 +385,7 @@ export const OrchestratorToolkit = Toolkit.make(
   CreateThreadsTool,
   ThreadListTool,
   ThreadReadTool,
+  ThreadResultTool,
   ThreadUpdateTool,
   ThreadSendTool,
   ThreadWaitTool,

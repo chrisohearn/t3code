@@ -1,4 +1,5 @@
 import {
+  ProviderRequestKind,
   type CommandId,
   type RuntimeRequestId,
   ThreadId,
@@ -8,6 +9,7 @@ import {
   type OrchestrationV2Command,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -24,6 +26,8 @@ import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { ThreadToolkit } from "./tools.ts";
+
+const isApprovalKind = Schema.is(ProviderRequestKind);
 
 function queueEntry(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
@@ -233,11 +237,17 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       Effect.gen(function* () {
         if (input.action === "list") {
           const { projection } = yield* readThread(input.threadId, ["runtimeRequests"]);
-          return {
-            requestIds: projection.runtimeRequests
-              .filter((request) => request.kind === "user_input" && request.status === "pending")
-              .map((request) => request.id),
-          };
+          const requests = projection.runtimeRequests
+            .filter(
+              (request) =>
+                request.status === "pending" &&
+                (request.kind === "user_input" || isApprovalKind(request.kind)),
+            )
+            .map((request) => ({
+              requestId: request.id,
+              kind: request.kind === "user_input" ? ("user_input" as const) : ("approval" as const),
+            }));
+          return { requestIds: requests.map((request) => request.requestId), requests };
         }
         const requestId = yield* required(input.requestId, "requestId");
         const { item } = yield* readQuestion({ threadId: input.threadId, requestId });
