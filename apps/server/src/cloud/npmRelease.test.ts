@@ -199,42 +199,29 @@ it.effect.each(["--registry=https://example.com", "../other", "other-package@lat
 );
 
 // The desktop requests its own nightly version even when the host runs a fork.
-it.effect("uses the fork feed for nightly metadata without spawning npm", () =>
+it.effect("uses the fork feed and resolves exact versions outside the newest release page", () =>
   Effect.gen(function* () {
+    const releases = ["0.1.9-preview.20261112.2", "0.1.9-preview.20261112.10"].map((version) => ({
+      tag_name: `v${version}`,
+      draft: false,
+      assets: [{ name: "SHA256SUMS" }, { name: `t3-${version}-linux-x64.tar.gz` }],
+    }));
+    const urls: string[] = [];
     const service = yield* makeService(
       () => Effect.die("must not query npm for a fork"),
-      HttpClient.make((request) =>
-        Effect.succeed(
+      HttpClient.make((request) => {
+        urls.push(request.url);
+        const tag = request.url.split("/tags/")[1];
+        const release = releases.find((release) => release.tag_name === tag);
+        return Effect.succeed(
           HttpClientResponse.fromWeb(
             request,
-            new Response(
-              JSON.stringify([
-                {
-                  tag_name: "v0.1.9-preview.20261112.2",
-                  draft: false,
-                  assets: [
-                    { name: "SHA256SUMS" },
-                    { name: "t3-0.1.9-preview.20261112.2-linux-x64.tar.gz" },
-                  ],
-                },
-                {
-                  tag_name: "v0.1.9-preview.20261112.10",
-                  draft: false,
-                  assets: [
-                    { name: "SHA256SUMS" },
-                    { name: "t3-0.1.9-preview.20261112.10-linux-x64.tar.gz" },
-                  ],
-                },
-                {
-                  tag_name: "v0.1.10-nightly.20261113.1",
-                  draft: false,
-                  assets: [{ name: "SHA256SUMS" }],
-                },
-              ]),
-            ),
+            new Response(JSON.stringify(tag === undefined ? [releases[1]] : (release ?? {})), {
+              status: tag === undefined || release !== undefined ? 200 : 404,
+            }),
           ),
-        ),
-      ),
+        );
+      }),
     ).pipe(
       Effect.provide(
         ConfigProvider.layer(
@@ -256,6 +243,9 @@ it.effect("uses the fork feed for nightly metadata without spawning npm", () =>
       version: "0.1.9-preview.20261112.2",
     });
     expect(yield* service.get({ spec: "0.1.9-preview.20261112.99" })).toBeNull();
+    expect(urls).toContain(
+      "https://api.github.com/repos/chrisohearn/t3code/releases/tags/v0.1.9-preview.20261112.2",
+    );
   }),
 );
 

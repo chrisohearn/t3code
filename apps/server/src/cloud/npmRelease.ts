@@ -65,15 +65,13 @@ function toRelease(spec: string, json: string) {
 
 const FORK_RELEASE_BASE_URL = "https://github.com/chrisohearn/t3code/releases/download";
 
-const decodeForkReleases = Schema.decodeUnknownEffect(
-  Schema.Array(
-    Schema.Struct({
-      tag_name: Schema.String,
-      draft: Schema.Boolean,
-      assets: Schema.Array(Schema.Struct({ name: Schema.String })),
-    }),
-  ),
-);
+const ForkRelease = Schema.Struct({
+  tag_name: Schema.String,
+  draft: Schema.Boolean,
+  assets: Schema.Array(Schema.Struct({ name: Schema.String })),
+});
+const decodeForkRelease = Schema.decodeUnknownEffect(ForkRelease);
+const decodeForkReleases = Schema.decodeUnknownEffect(Schema.Array(ForkRelease));
 
 // Fork releases are not published to npm. Resolve desktop targets at the host boundary.
 export const lookupForkRelease = Effect.fn("NpmRelease.lookupForkRelease")(function* (
@@ -88,12 +86,17 @@ export const lookupForkRelease = Effect.fn("NpmRelease.lookupForkRelease")(funct
   const unavailable = new ServerNpmReleaseError({
     reason: "The fork release feed could not be read.",
   });
+  const exact = spec.includes("-preview.");
   const releases = yield* Effect.gen(function* () {
     const response = yield* http.get(
-      "https://api.github.com/repos/chrisohearn/t3code/releases?per_page=50",
+      exact
+        ? `https://api.github.com/repos/chrisohearn/t3code/releases/tags/v${spec}`
+        : "https://api.github.com/repos/chrisohearn/t3code/releases?per_page=50",
     );
+    if (exact && response.status === 404) return [];
     if (response.status !== 200) return yield* unavailable;
-    return yield* decodeForkReleases(yield* response.json);
+    const json = yield* response.json;
+    return exact ? [yield* decodeForkRelease(json)] : yield* decodeForkReleases(json);
   }).pipe(
     Effect.timeout(Duration.seconds(15)),
     Effect.mapError(() => unavailable),
@@ -113,9 +116,7 @@ export const lookupForkRelease = Effect.fn("NpmRelease.lookupForkRelease")(funct
     .map((release) => release.tag_name.slice(1))
     .sort(compareSemverVersions);
   // Keep exact fork selections exact; upstream desktop versions follow the newest fork.
-  const version = spec.includes("-preview.")
-    ? versions.find((version) => version === spec)
-    : versions.at(-1);
+  const version = exact ? versions.find((version) => version === spec) : versions.at(-1);
   return version === undefined ? null : { version };
 });
 

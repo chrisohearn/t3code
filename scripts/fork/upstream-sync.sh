@@ -194,7 +194,7 @@ if [[ -n "$dry_run" ]]; then
 fi
 
 git push -q -u origin "$sync_branch"
-summary=$(printf 'Daily upstream sync: merges `pingdotgg/t3code` main (%s, %s commits) into `%s`.\n\nFormat, lint, typecheck, server tests (no new failures), the container release build with its smoke test, and the service preflight against the live database passed. Released as `v%s`.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' \
+summary=$(printf 'Daily upstream sync: merges `pingdotgg/t3code` main (%s, %s commits) into `%s`.\n\nFormat, lint, typecheck, server tests, the container release build with its smoke test, and the service preflight against the live database passed. Prepared release candidate `v%s`; publication follows a successful merge.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' \
   "$upstream_sha" "$behind" "$BRANCH" "$version")
 if [[ -n "$pr_number" ]]; then
   pr_url=$(gh pr view "$pr_number" -R "$FORK" --json url --jq .url)
@@ -210,9 +210,14 @@ checks=$(gh pr checks "$pr_url" -R "$FORK" --json name,bucket) || {
 }
 python3 -I -c 'import json,sys; c=json.load(sys.stdin); sys.exit(0 if c and all(x["bucket"] in ("pass", "skipping") for x in c) else 1)' \
   <<<"$checks" || { log "hosted checks have not all passed for $pr_url; nothing released"; exit 4; }
-gh pr merge "$pr_url" -R "$FORK" --merge --match-head-commit "$(git rev-parse HEAD)"
+# The synchronous API refuses pending checks instead of silently enabling auto-merge.
+merge_commit=$(gh api --method PUT "repos/$FORK/pulls/${pr_url##*/}/merge" \
+  -f merge_method=merge -f sha="$(git rev-parse HEAD)" \
+  --jq 'if .merged then .sha else error(.message) end') || {
+  log "merge has not completed for $pr_url; nothing released"
+  exit 4
+}
 git -C "$SOURCE" fetch -q origin
-merge_commit=$(gh pr view "$pr_url" -R "$FORK" --json mergeCommit --jq .mergeCommit.oid)
 scripts/fork/publish-release.sh "$version" "$artifacts" "$merge_commit" \
   "Upstream sync: pingdotgg/t3code main ${upstream_sha:0:10} merged into $BRANCH ($pr_url)."
 log "released v$version from $merge_commit"

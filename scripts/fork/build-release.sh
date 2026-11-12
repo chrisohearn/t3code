@@ -25,8 +25,13 @@ source "$repo/scripts/fork/node.sh"
 node_dir=$(fork_node_archive "$cache")
 
 # Resource monitor: the native helper from upstream's newest linux-x64 nightly, as earlier releases did.
-nightly=$(gh release list -R pingdotgg/t3code --limit 20 --json tagName,isPrerelease \
-  --jq '[.[] | select(.isPrerelease)][0].tagName')
+nightly=$(gh api 'repos/pingdotgg/t3code/releases?per_page=100' --jq '
+  [.[] | select(.draft | not) | select(.prerelease)
+   | select(.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[0-9]+$"))
+   | . as $release
+   | select(any(.assets[]; .name == ("t3-" + ($release.tag_name | ltrimstr("v")) + "-linux-x64.tar.gz")))
+  ][0].tag_name // empty')
+[[ -n "$nightly" ]] || { echo "no upstream nightly contains the linux-x64 CLI archive" >&2; exit 1; }
 monitor_dir="$cache/resource-monitor/$nightly"
 if [[ ! -x "$monitor_dir/resource-monitor/linux-x64/t3-resource-monitor" ]]; then
   tmp=$(mktemp -d -p "$cache/resource-monitor")
