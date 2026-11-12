@@ -301,6 +301,15 @@ it.effect("records only approvals Chris authored, quoted from the source, and re
     });
     yield* message("mcp-user-message", "Approved.", { createdBy: "user", creationSource: "mcp" });
     yield* message("relayed-reply", "Approved.", { createdBy: "user", creationSource: "server" });
+    yield* message("guest-message", "Approved.", {
+      createdBy: "user",
+      creationSource: "web",
+      context: {
+        version: 1,
+        guest: { guestMessageId: "guest-1", name: "Guest", text: "Approved." },
+        records: [],
+      },
+    });
     const question = (id: string) => ({
       id,
       header: id,
@@ -340,6 +349,7 @@ it.effect("records only approvals Chris authored, quoted from the source, and re
       ["agent-message", "not typed by Chris"],
       ["mcp-user-message", "not typed by Chris"],
       ["relayed-reply", "not typed by Chris"],
+      ["guest-message", "not typed by Chris"],
       ["mcp-dialog", "outside MCP sign-in"],
       ["agent-dialog", "answered by an agent"],
       ["legacy-dialog", "before T3 recorded who answered"],

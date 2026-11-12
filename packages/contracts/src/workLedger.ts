@@ -61,7 +61,8 @@ export type WorkLedgerApproval = typeof WorkLedgerApproval.Type;
 export const WorkLedgerItem = Schema.Struct({
   key: name,
   ...fields,
-  approval: Schema.NullOr(WorkLedgerApproval),
+  // Optional: an environment on an older build omits it.
+  approval: Schema.optional(Schema.NullOr(WorkLedgerApproval)),
   lastRunId: Schema.NullOr(RunId),
   lastRunStatus: Schema.NullOr(Schema.String),
   lastRunAt: Schema.NullOr(IsoDateTime),

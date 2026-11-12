@@ -15,6 +15,8 @@ The server stores who recorded the approval, when it verified it, and quotes tak
 
 Any operate caller can revoke with `approval: null`. Revocation is recorded in `ledger_history` and nothing re-verifies it later; a new approval needs a new source. Other writes to the row leave the approval as it was. `ledger_query` filters with `approved`, and `portfolio_status` shows the approval on each item.
 
+Owner clients are the sessions paired to Chris's WebSocket: the server rejects MCP sign-in tokens there (`rejectMcpClientAudience` in `EnvironmentAuth`), and guests post through their own routes. The WebSocket dispatch stamps the answer as the owner's; MCP tools stamp it as an agent's or outside client's.
+
 Sources in deleted threads are refused, because their items are no longer inspectable. Archived threads are accepted: archiving tidies the sidebar and does not withdraw what Chris said. An approval is metadata Jarvis trusts; it grants no permission in T3.
 
 ## Alternatives

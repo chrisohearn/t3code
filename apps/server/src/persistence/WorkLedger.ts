@@ -201,7 +201,7 @@ const make = Effect.gen(function* () {
     if (question === undefined)
       return yield* unknownSource(
         source.questionId === undefined
-          ? `The dialog asked ${item.questions.length} questions. Pass questionId.`
+          ? `The dialog asked ${item.questions.length} questions. Pass questionId: ${item.questions.map((candidate) => candidate.id).join(", ")}.`
           : `The dialog has no question ${source.questionId}.`,
       );
     const raw = answer.answers[question.id];
@@ -351,9 +351,9 @@ const make = Effect.gen(function* () {
             );
             const linksJson = yield* encodeLinks(item.links).pipe(Effect.mapError(storage));
             const approvalJsonText =
-              item.approval === null
+              approval === null
                 ? null
-                : yield* encodeApproval(item.approval).pipe(Effect.mapError(storage));
+                : yield* encodeApproval(approval).pipe(Effect.mapError(storage));
             const row = {
               work_key: item.key,
               title: item.title,
