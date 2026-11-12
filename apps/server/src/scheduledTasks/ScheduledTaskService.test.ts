@@ -697,16 +697,20 @@ it.effect("a run still going when the next one starts cannot overwrite the newer
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
-it.effect("a restart finds manual and webhook runs again and records how they ended", () =>
+it.effect("a restart finds each trigger's run again and records how it ended", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const startedAt = "2026-11-12T17:44:47.869Z";
+    const startedMs = Date.parse(startedAt);
     const threadId = ThreadId.make("thread:resumed");
-    const messages = {
-      "task:manual": `scheduled-task-message:task:manual:${Date.parse(startedAt)}:manual`,
+    const release = yield* Deferred.make<void>();
+    const followed = {
+      "task:scheduled": `scheduled-task-message:task:scheduled:${startedMs}:scheduled`,
+      "task:manual": `scheduled-task-message:task:manual:${startedMs}:manual`,
       "task:webhook": "scheduled-task-message:task:webhook:webhook:delivery-1",
     };
-    for (const id of ["task:manual", "task:webhook", "task:lost"]) {
+    const matched = `scheduled-task-message:task:matched:${startedMs}:scheduled`;
+    for (const id of [...Object.keys(followed), "task:matched", "task:lost"]) {
       yield* insertRow(sql, { id, next: null, enabled: 1, status: "succeeded" }, startedAt);
       yield* sql`
         UPDATE scheduled_tasks
@@ -715,26 +719,32 @@ it.effect("a restart finds manual and webhook runs again and records how they en
         WHERE task_id = ${id}
       `;
     }
-    for (const messageId of Object.values(messages)) {
+    for (const messageId of [...Object.values(followed), matched]) {
       yield* sql`
         INSERT INTO orchestration_v2_projection_messages
           (message_id, thread_id, run_id, role, streaming, created_at, updated_at, payload_json)
         VALUES (${messageId}, ${threadId}, ${`run:${messageId}`}, 'user', 0, ${startedAt}, ${startedAt}, '{}')
       `;
     }
+    // Already recorded as the clean success it was, so there is nothing to follow.
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_runs
+        (run_id, thread_id, ordinal, provider, status, requested_at, payload_json)
+      VALUES (${`run:${matched}`}, ${threadId}, 1, 'codex', 'completed', ${startedAt}, '{}')
+    `;
     const layer = followerLayer(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadShell: () => Effect.succeed(threadShell(ProjectId.make("project:test"))),
         getProjectThreadRecords: () =>
           Effect.succeed({
-            runs: Object.values(messages).map((userMessageId) => ({
+            runs: Object.values(followed).map((userMessageId) => ({
               id: `run:${userMessageId}`,
               status: "failed",
               rootNodeId: "node:root",
               userMessageId,
             })),
-            messages: Object.values(messages).map((id) => ({ id, runId: `run:${id}` })),
-            turnItems: Object.values(messages).map((id) => ({
+            messages: Object.values(followed).map((id) => ({ id, runId: `run:${id}` })),
+            turnItems: Object.values(followed).map((id) => ({
               type: "error",
               status: "failed",
               runId: `run:${id}`,
@@ -743,31 +753,40 @@ it.effect("a restart finds manual and webhook runs again and records how they en
             })),
           } as never),
         waitForThread: (input) =>
-          Effect.succeed({
-            threadId: input.threadId,
-            run: { id: input.runId, status: "failed", rootNodeId: "node:root" },
-            timedOut: false,
-          } as never),
+          Deferred.await(release).pipe(
+            Effect.as({
+              threadId: input.threadId,
+              run: { id: input.runId, status: "failed", rootNodeId: "node:root" },
+              timedOut: false,
+            } as never),
+          ),
       }),
     );
     yield* Effect.gen(function* () {
       const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const pending = (yield* service.list()).tasks
+        .filter((task) => task.runInProgressSince !== undefined)
+        .map((task) => task.id)
+        .toSorted();
+      assert.deepEqual(pending, ["task:manual", "task:scheduled", "task:webhook"]);
       const settled = yield* service.subscribeList().pipe(
         Stream.map(({ tasks }) => tasks),
-        Stream.filter((tasks) =>
-          tasks.every((task) => task.id === "task:lost" || task.lastRunStatus === "failed"),
-        ),
+        Stream.filter((tasks) => tasks.every((task) => task.runInProgressSince === undefined)),
         Stream.runHead,
+        Effect.forkChild,
       );
+      yield* Deferred.succeed(release, undefined);
       const recorded = Object.fromEntries(
-        Option.getOrThrow(settled).map((task) => [
+        Option.getOrThrow(yield* Fiber.join(settled)).map((task) => [
           task.id,
           [task.lastRunStatus, task.lastRunError],
         ]),
       );
       assert.deepEqual(recorded, {
+        "task:scheduled": ["failed", PREPARATION_FAILURE],
         "task:manual": ["failed", PREPARATION_FAILURE],
         "task:webhook": ["failed", PREPARATION_FAILURE],
+        "task:matched": ["succeeded", null],
         // No message to follow: left as it was.
         "task:lost": ["succeeded", null],
       });

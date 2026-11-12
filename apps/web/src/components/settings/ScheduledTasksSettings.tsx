@@ -800,7 +800,9 @@ function ScheduledTaskRow({
           {task.threadId !== null && scheduledTaskThreadMode(task) !== "new_thread" ? (
             <ScheduledTaskThreadLink environmentId={environmentId} threadId={task.threadId} />
           ) : null}
-          {task.lastRunError ? <span className="text-destructive">{task.lastRunError}</span> : null}
+          {task.lastRunError && task.runInProgressSince === undefined ? (
+            <span className="text-destructive">{task.lastRunError}</span>
+          ) : null}
         </div>
       }
       control={

@@ -553,7 +553,7 @@ it.effect(
 
       // The server is off across the 09:00 slot while the 08:00 run keeps going.
       yield* TestClock.setTime(DateTime.toEpochMillis(at(9, 30)));
-      yield* Effect.gen(function* () {
+      const missedError = yield* Effect.gen(function* () {
         const service = yield* ScheduledTaskService.ScheduledTaskService;
         const states = yield* Queue.unbounded<ScheduledTask | undefined>();
         yield* service.subscribeList().pipe(
@@ -576,7 +576,19 @@ it.effect(
           error: afterRun?.lastRunError,
           since: afterRun?.runInProgressSince,
         }).toEqual({ status: "failed", error: missed?.lastRunError, since: undefined });
+        return missed?.lastRunError;
       }).pipe(Effect.provide(layer));
+
+      // A second restart must not find the 08:00 run again and record its success over the miss.
+      const [again] = yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        return (yield* service.list()).tasks;
+      }).pipe(Effect.provide(layer));
+      expect({
+        status: again?.lastRunStatus,
+        error: again?.lastRunError,
+        since: again?.runInProgressSince,
+      }).toEqual({ status: "failed", error: missedError, since: undefined });
     }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 

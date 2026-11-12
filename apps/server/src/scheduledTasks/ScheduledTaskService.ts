@@ -2,7 +2,6 @@ import {
   CommandId,
   MessageId,
   type OrchestrationV2Run,
-  OrchestrationV2RunStatus,
   type RunId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   type ProjectId,
@@ -18,7 +17,7 @@ import {
   type ScheduledTaskListWebhookDeliveriesInput,
   type ScheduledTaskListWebhookDeliveriesResult,
   type ScheduledTaskRotateWebhookTokenInput,
-  type ScheduledTaskRunStatus,
+  ScheduledTaskRunStatus,
   type ScheduledTaskWebhookDeliveryOutcome,
   type ScheduledTaskWebhookFilter,
   type ScheduledTaskListResult,
@@ -243,6 +242,7 @@ interface LastRunRow {
   readonly task_id: string;
   readonly last_run_at: string;
   readonly last_run_status: string;
+  readonly last_run_error: string | null;
   readonly last_run_webhook_delivery_id: string | null;
 }
 
@@ -332,7 +332,7 @@ const THREAD_DELETED_OUTCOME: RunOutcome = {
   status: "failed",
   error: "The run's thread was deleted before the run finished.",
 };
-const isRunStatus = Schema.is(OrchestrationV2RunStatus);
+const isStoredRunStatus = Schema.is(ScheduledTaskRunStatus);
 const localNow = DateTime.withCurrentZoneLocal(DateTime.nowInCurrentZone);
 
 function nextRunAt(
@@ -785,24 +785,41 @@ export const layer = Layer.effect(
           ),
         );
 
+    // Returns the run state it replaces, read in the same transaction.
     const markRunning = (id: ScheduledTaskId, startedAtIso: string, webhookDeliveryId?: string) =>
-      sql<{ task_id: string }>`
-        UPDATE scheduled_tasks
-        SET updated_at = ${startedAtIso},
-            last_run_at = ${startedAtIso},
-            last_run_webhook_delivery_id = ${webhookDeliveryId ?? null},
-            last_run_status = 'running',
-            last_run_error = NULL
-        WHERE task_id = ${id}
-        RETURNING task_id
-      `.pipe(
-        Effect.mapError((cause) =>
-          taskError("Could not mark schedule task as running.", { taskId: id, cause }),
-        ),
-        Effect.flatMap((rows) =>
-          rows.length > 0 ? Effect.void : taskError("Schedule task not found.", { taskId: id }),
-        ),
-      );
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const [previous] = yield* sql<{
+              last_run_status: string;
+              last_run_error: string | null;
+            }>`SELECT last_run_status, last_run_error FROM scheduled_tasks WHERE task_id = ${id}`;
+            if (previous === undefined) {
+              return yield* taskError("Schedule task not found.", { taskId: id });
+            }
+            yield* sql`
+              UPDATE scheduled_tasks
+              SET updated_at = ${startedAtIso},
+                  last_run_at = ${startedAtIso},
+                  last_run_webhook_delivery_id = ${webhookDeliveryId ?? null},
+                  last_run_status = 'running',
+                  last_run_error = NULL
+              WHERE task_id = ${id}
+            `;
+            const status =
+              isStoredRunStatus(previous.last_run_status) && previous.last_run_status !== "running"
+                ? previous.last_run_status
+                : ("never" as const);
+            return { status, error: previous.last_run_error };
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isScheduledTaskError(cause)
+              ? cause
+              : taskError("Could not mark schedule task as running.", { taskId: id, cause }),
+          ),
+        );
 
     const markCompleted = (input: {
       readonly id: ScheduledTaskId;
@@ -1038,13 +1055,13 @@ export const layer = Layer.effect(
         LIMIT 1
       `.pipe(NodeSqliteClient.readOnly);
       if (found === undefined) return;
+      // A failure's error text needs the run's turn items, so only a clean success is skipped.
       if (
-        isRunStatus(found.run_status) &&
-        ThreadManagementService.isTerminalRunStatus(found.run_status)
-      ) {
-        const recorded = found.run_status === "completed" ? "succeeded" : "failed";
-        if (row.last_run_status === recorded) return;
-      }
+        found.run_status === "completed" &&
+        row.last_run_status === "succeeded" &&
+        row.last_run_error === null
+      )
+        return;
       const taskId = ScheduledTaskId.make(row.task_id);
       yield* setPendingRun(taskId, row.last_run_at);
       yield* followRunOutcome(
@@ -1153,21 +1170,27 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
-        if (webhook === undefined) yield* markRunning(active.id, startedAtIso);
-        else
-          yield* sql
-            .withTransaction(
-              Effect.gen(function* () {
-                yield* markRunning(active.id, startedAtIso, webhook.deliveryId);
-                // Recovery must distinguish this delivery from other windows waiting on the same task.
-                yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'running' WHERE delivery_id = ${webhook.deliveryId}`;
-              }),
-            )
-            .pipe(
-              Effect.mapError((cause) =>
-                taskError("Could not start webhook run.", { taskId: task.id, cause }),
-              ),
-            );
+        const previousRun =
+          webhook === undefined
+            ? yield* markRunning(active.id, startedAtIso)
+            : yield* sql
+                .withTransaction(
+                  Effect.gen(function* () {
+                    const previous = yield* markRunning(
+                      active.id,
+                      startedAtIso,
+                      webhook.deliveryId,
+                    );
+                    // Recovery must distinguish this delivery from other windows waiting on the same task.
+                    yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'running' WHERE delivery_id = ${webhook.deliveryId}`;
+                    return previous;
+                  }),
+                )
+                .pipe(
+                  Effect.mapError((cause) =>
+                    taskError("Could not start webhook run.", { taskId: task.id, cause }),
+                  ),
+                );
 
         yield* notifyChanged;
 
@@ -1262,12 +1285,8 @@ export const layer = Layer.effect(
         if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
         const completedAt = yield* localNow;
         // An accepted run keeps the previous run's status until its own outcome is known.
-        const lastRunStatus = !runSucceeded
-          ? ("failed" as const)
-          : active.lastRunStatus === "running"
-            ? ("never" as const)
-            : active.lastRunStatus;
-        const lastRunError = runSucceeded ? active.lastRunError : errorMessage(result.cause);
+        const lastRunStatus = runSucceeded ? previousRun.status : ("failed" as const);
+        const lastRunError = runSucceeded ? previousRun.error : errorMessage(result.cause);
         const threadId = runSucceeded ? result.value : null;
         // One transaction, so an edit cannot land between reading the schedule and
         // writing the next run computed from it. The origin is read first: it reads
@@ -1395,7 +1414,14 @@ export const layer = Layer.effect(
         UPDATE scheduled_tasks
         SET next_run_at = ${next},
             updated_at = ${iso(now)}
-            ${runError === undefined ? sql`` : sql`, last_run_status = 'failed', last_run_error = ${runError}`}
+            ${
+              runError === undefined
+                ? sql``
+                : // A new last_run_at makes the miss the latest run, so no earlier run's follower,
+                  // now or after a restart, can record its outcome over it.
+                  sql`, last_run_status = 'failed', last_run_error = ${runError},
+                    last_run_at = ${iso(now)}, last_run_webhook_delivery_id = NULL`
+            }
         WHERE task_id = ${task.id}
           AND next_run_at IS ${task.nextRunAt}
           AND last_run_at IS ${task.lastRunAt}
@@ -1406,7 +1432,6 @@ export const layer = Layer.effect(
         ),
       );
       if (updated.length === 0) return;
-      // The recorded miss stands over the outcome of a run still pending from before it.
       if (runError !== undefined) yield* clearPendingRun(task.id);
       yield* notifyChanged;
     });
@@ -1464,7 +1489,7 @@ export const layer = Layer.effect(
 
     // Before the running-row recovery below, whose rows never dispatched a message to follow.
     yield* sql<LastRunRow>`
-      SELECT task_id, last_run_at, last_run_status, last_run_webhook_delivery_id
+      SELECT task_id, last_run_at, last_run_status, last_run_error, last_run_webhook_delivery_id
       FROM scheduled_tasks
       WHERE last_run_at IS NOT NULL AND last_run_status <> 'running'
     `.pipe(
