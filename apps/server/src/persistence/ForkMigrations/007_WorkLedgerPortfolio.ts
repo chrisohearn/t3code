@@ -1,5 +1,11 @@
+import { formatThreadLink, parseThreadLinkHref } from "@t3tools/shared/threadLinks";
+import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
+
+const linksCodec = Schema.fromJsonString(Schema.Array(Schema.String));
+const decodeLinks = Schema.decodeUnknownEffect(linksCodec);
+const encodeLinks = Schema.encodeEffect(linksCodec);
 
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -12,6 +18,22 @@ export default Effect.gen(function* () {
     WHEN blocker GLOB 'WAIT_EXTERNAL*' THEN 'external'
     WHEN blocker GLOB 'WAIT_NATURAL*' THEN 'natural'
     WHEN blocker GLOB 'NEEDS_DECISION*' THEN 'decision' ELSE NULL END`;
+  const owners = yield* sql<{ work_key: string; owner_thread_id: string; links_json: string }>`
+    SELECT work_key, owner_thread_id, links_json FROM work_ledger WHERE owner_thread_id IS NOT NULL
+  `;
+  for (const owner of owners) {
+    const ref = parseThreadLinkHref(owner.owner_thread_id);
+    if (ref === null) continue;
+    if (ref.environmentId === null) {
+      yield* sql`UPDATE work_ledger SET owner_thread_id = ${ref.threadId} WHERE work_key = ${owner.work_key}`;
+    } else {
+      const links = yield* decodeLinks(owner.links_json);
+      const href = formatThreadLink(ref).slice(1, -1);
+      const encodedLinks = yield* encodeLinks([...new Set([...links, href])]);
+      yield* sql`UPDATE work_ledger SET owner_thread_id = NULL,
+        links_json = ${encodedLinks} WHERE work_key = ${owner.work_key}`;
+    }
+  }
   yield* sql`CREATE INDEX work_ledger_due_idx ON work_ledger(next_check_at) WHERE next_check_at IS NOT NULL`;
   yield* sql`CREATE TABLE work_ledger_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT, work_key TEXT NOT NULL,

@@ -213,7 +213,7 @@ it.effect(
     }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
 
-it.effect("backfills only recognized blocker prefixes during migration", () =>
+it.effect("backfills recognized blockers and preserves legacy thread link destinations", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* BaseLedgerMigration;
@@ -228,7 +228,23 @@ it.effect("backfills only recognized blocker prefixes during migration", () =>
       yield* sql`INSERT INTO work_ledger (work_key, title, owner_kind, owner_name, status, blocker, links_json, created_at, updated_at, updated_by)
         VALUES (${key!}, 'Title', 't3', 'worker', 'blocked', ${blocker!}, '[]', '1970-01-01', '1970-01-01', 'caller')`;
     }
+    yield* sql`UPDATE work_ledger SET owner_thread_id = 't3-thread://v1/worker-local' WHERE work_key = 'a'`;
+    yield* sql`UPDATE work_ledger SET owner_thread_id = 't3-thread://v2/remote/worker-remote', links_json = '["https://example.com"]' WHERE work_key = 'b'`;
+    yield* sql`UPDATE work_ledger SET owner_thread_id = 'https://app.t3.codes/threads/remote/worker%3Ahosted' WHERE work_key = 'c'`;
+    yield* sql`UPDATE work_ledger SET owner_thread_id = 'plain-thread' WHERE work_key = 'd'`;
     yield* LedgerMigration;
+    expect(
+      yield* sql`SELECT owner_thread_id, links_json FROM work_ledger ORDER BY work_key`,
+    ).toEqual([
+      { owner_thread_id: "worker-local", links_json: "[]" },
+      {
+        owner_thread_id: null,
+        links_json: '["https://example.com","t3-thread://v2/remote/worker-remote"]',
+      },
+      { owner_thread_id: null, links_json: '["t3-thread://v2/remote/worker:hosted"]' },
+      { owner_thread_id: "plain-thread", links_json: "[]" },
+      { owner_thread_id: null, links_json: "[]" },
+    ]);
     expect(yield* sql`SELECT wait_reason FROM work_ledger ORDER BY work_key`).toEqual([
       { wait_reason: "external" },
       { wait_reason: "natural" },
