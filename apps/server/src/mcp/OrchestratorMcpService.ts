@@ -1,6 +1,7 @@
 import * as JarvisPlaybook from "./JarvisPlaybook.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
 import { advertisedModel, requireAdvertisedModel } from "./providerModels.ts";
+import { hasGitEntry } from "./gitEntryProbe.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as ThreadNotifications from "./ThreadNotifications.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
@@ -1952,10 +1953,13 @@ const make = Effect.gen(function* () {
       if (yield* refExists(cwd, `refs/heads/${branch}`)) return branch;
     }
     if (yield* refExists(cwd, "HEAD")) return "main";
-    // Only Git's own "not a git repository" proves there is nothing to start a worktree from. A
-    // repository Git cannot read (ownership, permissions, a broken gitfile, a missing executable)
-    // keeps a worktree, so its runs fail during preparation instead of running in the checkout.
-    return (yield* confirmedNotARepository(cwd)) ? null : "main";
+    // Only Git's own "not a git repository", with no `.git` entry anywhere above, proves there is
+    // nothing to start a worktree from. Anything else keeps a worktree, so runs fail during
+    // preparation instead of running in the shared checkout.
+    if (!(yield* confirmedNotARepository(cwd))) return "main";
+    // Git also says "not a git repository" for a repository it cannot open (an unreadable `.git`,
+    // a missing HEAD), so a `.git` entry here or in any parent still keeps a worktree.
+    return (yield* hasGitEntry(cwd)) ? "main" : null;
   });
 
   const scheduledTaskWorkspaceStrategy = Effect.fn(

@@ -2,6 +2,8 @@ import * as WorkLedger from "../persistence/WorkLedger.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import { assert, describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
@@ -3087,6 +3089,7 @@ describe("OrchestratorMcpService provider resolution", () => {
       saved: Ref.Ref<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>,
       task: ScheduledTask = existing,
       modes?: Ref.Ref<ReadonlyArray<ScheduledTaskUpsertInput["threadMode"]>>,
+      root: string = workspaceRoot,
     ) =>
       OrchestratorMcpService.layer.pipe(
         Layer.provide(layerClientThreads),
@@ -3108,7 +3111,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               getById: () =>
                 Effect.succeedSome({
                   id: projectId,
-                  workspaceRoot,
+                  workspaceRoot: root,
                   defaultModelSelection: existing.modelSelection,
                 } as never),
             }),
@@ -3368,6 +3371,55 @@ describe("OrchestratorMcpService provider resolution", () => {
             : { type: "worktree", baseRef, startFromOrigin: true },
         ]);
       }),
+    );
+
+    it.effect.each([
+      { name: "the folder has an unreadable `.git`", gitAt: "project" },
+      { name: "a parent folder holds the repository", gitAt: "" },
+    ])("keeps a worktree when Git says not a repository but $name", ({ gitAt }) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const parent = yield* fileSystem.makeTempDirectoryScoped({ prefix: "scheduled-gitdir-" });
+        const root = path.join(parent, "project");
+        yield* fileSystem.makeDirectory(root);
+        yield* fileSystem.makeDirectory(path.join(parent, gitAt, ".git"));
+        const saved = yield* Ref.make<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>([]);
+        const gitFailure = (cwd: string) =>
+          new GitCommandError({
+            operation: "GitVcsDriver.test",
+            command: "git",
+            cwd,
+            detail: "Needed a single revision",
+          });
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(
+            service(
+              {
+                resolvePrimaryRemoteName: (cwd) => Effect.fail(gitFailure(cwd)),
+                resolveDefaultBranchName: () => Effect.succeed(null),
+                resolveCommit: ({ cwd }) => Effect.fail(gitFailure(cwd)),
+                execute: () =>
+                  Effect.succeed({
+                    exitCode: 128,
+                    stdout: "",
+                    stderr: "fatal: not a git repository (or any parent up to mount point /)\n",
+                    stdoutTruncated: false,
+                    stderrTruncated: false,
+                  } as never),
+              },
+              saved,
+              existing,
+              undefined,
+              root,
+            ),
+          ),
+        );
+        yield* mcp.scheduleTask(client, { projectId, prompt: "Check the build", schedule });
+        assert.deepEqual(yield* Ref.get(saved), [
+          { type: "worktree", baseRef: "main", startFromOrigin: true },
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
 
     it.effect.each([
