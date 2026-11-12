@@ -9001,6 +9001,7 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
           }),
           Effect.provide(
             McpHttpServer.layerThreadToolkit.pipe(
+              Layer.provide(SqlitePersistence.layerMemory),
               Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
               Layer.provide(NodeCrypto.layer),
               Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
