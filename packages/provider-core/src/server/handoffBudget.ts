@@ -172,8 +172,14 @@ export function historicalMessage(
   };
 }
 
-/** Item text cannot open a line that reads as T3's own item header. */
-const neutralizeHeaders = (text: string) => text.replaceAll(/^\[Historical /gm, "\\[Historical ");
+/**
+ * Item text cannot open a line that reads as T3's own item header, even behind blanks or
+ * invisible characters, nor repeat the context line's standing-instructions sentence.
+ */
+const neutralizeHeaders = (text: string) =>
+  text
+    .replaceAll(/^(?:[^\S\r\n]|[\u200B-\u200D\u2060\uFEFF])*\[Historical /gimu, "\\[Historical ")
+    .replaceAll(/\bItem(\s+\S+\s+is this thread's first message)/giu, "\\Item$1");
 
 function renderHistoricalMessage(message: OrchestrationV2HistoricalMessage): string {
   return `[Historical ${message.role}; ${message.kind}; thread=${message.threadId}; run=${message.runId ?? "imported"}; item=${message.itemId}; provider-thread=${message.providerThreadId ?? "none"}; status=${message.status}${message.runStatus === undefined ? "" : `; run-status=${message.runStatus}`}]\n${neutralizeHeaders(message.text)}`;

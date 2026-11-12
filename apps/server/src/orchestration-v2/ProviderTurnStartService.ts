@@ -1143,13 +1143,15 @@ export const layer: Layer.Layer<
                 : projection.runs.some(
                     (source) =>
                       source.id === item.runId &&
+                      // A failover re-sends its source's prompt as this turn.
+                      source.id !== run.failoverOfRunId &&
                       source.ordinal >= boundary &&
                       source.ordinal < run.ordinal,
                   ),
           );
           const standingRunId = ContextHandoffService.firstConversationRunId(projection.runs);
           const standingRun =
-            standingRunId === run.id
+            standingRunId === run.id || standingRunId === run.failoverOfRunId
               ? undefined
               : projection.runs.find((candidate) => candidate.id === standingRunId);
           const standingItemId =

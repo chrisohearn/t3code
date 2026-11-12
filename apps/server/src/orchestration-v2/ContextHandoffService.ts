@@ -187,7 +187,8 @@ export function standingInstructionsItemId(input: {
     message.delegatedCompletion !== undefined ||
     message.idleCompaction !== undefined ||
     message.workflowScript === true ||
-    message.linkedSender !== undefined
+    message.linkedSender !== undefined ||
+    message.senderClient?.kind === "linked-agent"
   )
     return undefined;
   const fromLauncher =

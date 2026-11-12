@@ -287,6 +287,7 @@ function makeLocalCommandHarness(input: {
   readonly resumeFailure?: ProviderAdapter.ProviderAdapterV2Error;
   /** An earlier run on this instance or the previous one last ran the resumed native thread. */
   readonly nativeThreadLastRanOn?: "previous" | "current";
+  readonly failoverOfEarlierRun?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -689,7 +690,12 @@ function makeLocalCommandHarness(input: {
           startedAt: now,
           completedAt: now,
         },
-        ...projection.runs,
+        ...projection.runs.map((candidate) =>
+          // A failover re-sends the earlier run's prompt; recovery must not replay it as history.
+          input.failoverOfEarlierRun === true && candidate.id === runId
+            ? { ...candidate, failoverOfRunId: earlierRunId }
+            : candidate,
+        ),
       ],
       attempts: [
         {
@@ -1940,13 +1946,15 @@ effectIt.effect("fails the run instead of replacing a native thread another clie
 
 // The 2026-11-12 incident: after a switch between two Codex accounts, the previous account's
 // shared app-server still held the conversation's writer lock, and every start failed.
-effectIt.effect.each(["previous", "current"] as const)(
+effectIt.effect.each(["previous", "current", "previous-failover"] as const)(
   "starts fresh with the thread's role only when the %s instance last held the native thread",
   (lastRanOn) =>
     Effect.gen(function* () {
+      const failover = lastRanOn === "previous-failover";
       const harness = makeLocalCommandHarness({
         text: "Continue",
-        nativeThreadLastRanOn: lastRanOn,
+        nativeThreadLastRanOn: failover ? "previous" : lastRanOn,
+        failoverOfEarlierRun: failover,
         resumeFailure: new ProviderAdapter.ProviderAdapterThreadInUseError({
           driver: ProviderDriverKind.make("codex"),
           providerThreadId: ProviderThreadId.make("new-provider-thread"),
@@ -1964,8 +1972,11 @@ effectIt.effect.each(["previous", "current"] as const)(
       }
       expect(harness.fallbackEnsureThread).toHaveBeenCalledOnce();
       const delivered = JSON.stringify(harness.startTurn.mock.calls[0]?.[0]);
-      expect(delivered).toContain("You are the inbox.");
-      expect(delivered).toContain("Item earlier-role-message is this thread's first message");
+      // A failover's source is this turn's own prompt, never history or standing instructions.
+      expect(delivered.includes("You are the inbox.")).toBe(!failover);
+      expect(delivered.includes("Item earlier-role-message is this thread's first message")).toBe(
+        !failover,
+      );
     }),
 );
 
