@@ -545,6 +545,9 @@ it.layer(layerTest)("ProjectService", (it) => {
       });
       const input = { commandId: CommandId.make("command:delete-retry:delete"), projectId };
       const deleted = yield* service.delete(input);
+      const enrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
+      // Optional workspace metadata can finish after deletion; retries must still return the tombstone.
+      yield* enrichment.readRepositoryIdentity("/work/delete-retry");
       assert.deepEqual(yield* service.delete(input), deleted);
       const events = yield* sql<{ readonly command_id: string }>`
         SELECT command_id FROM orchestration_events
