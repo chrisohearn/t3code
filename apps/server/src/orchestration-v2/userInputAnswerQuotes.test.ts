@@ -64,6 +64,17 @@ describe("quoteUserInputAnswer", () => {
       [{ kind: "unmatched" }],
     ],
     [
+      "a value that is also another option's label",
+      question({
+        options: [
+          { label: "A", description: "a", value: "B" },
+          { label: "B", description: "b" },
+        ],
+      }),
+      "B",
+      [{ kind: "unmatched" }],
+    ],
+    [
       "each of several selections",
       question({ multiSelect: true }),
       ["Ship", "hold"],

@@ -464,9 +464,9 @@ it.effect("records Chris's dialog answer only for the row it names, and withdraw
     });
 
     // Changing what was approved withdraws it, and the same answer cannot come back.
-    expect(
-      (yield* ledger.upsert({ key: "r3/task", nextAction: "Pay vendor X." }, "agent")).approval,
-    ).toBeNull();
+    const changed = yield* ledger.upsert({ key: "r3/task", nextAction: "Pay vendor X." }, "agent");
+    expect(changed.approval).toBeNull();
+    expect(changed.warnings).toEqual([expect.stringContaining("approval was withdrawn")]);
     expect((yield* ledger.history({ key: "r3/task" })).items.at(-1)).toMatchObject({
       changedBy: "agent",
       changes: { approval: { before: approved, after: null } },

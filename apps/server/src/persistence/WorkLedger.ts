@@ -339,7 +339,9 @@ const make = Effect.gen(function* () {
             let approval = current?.approval ?? null;
             const retire = Effect.fn("WorkLedger.retireApproval")(function* (
               retired: WorkLedgerApproval,
+              reason: string,
             ) {
+              warnings.push(`Chris's approval was withdrawn: ${reason}`);
               yield* sql`INSERT OR IGNORE INTO work_ledger_revoked_approvals ${sql.insert({
                 work_key: item.key,
                 source_thread_id: retired.sourceThreadId,
@@ -350,11 +352,12 @@ const make = Effect.gen(function* () {
               })}`;
               approval = null;
             });
-            if (
-              approval !== null &&
-              (approvalInput === null || approval.rowHash !== ledgerRowHash(item))
-            )
-              yield* retire(approval);
+            if (approval !== null && approvalInput === null) yield* retire(approval, "revoked.");
+            else if (approval !== null && approval.rowHash !== ledgerRowHash(item))
+              yield* retire(
+                approval,
+                "the title, next action or owner changed. Ask Chris again to approve the new version.",
+              );
             if (approvalInput !== undefined && approvalInput !== null) {
               const verified = yield* verifyApproval(approvalInput.source, item, updatedBy, now);
               if (
@@ -363,7 +366,7 @@ const make = Effect.gen(function* () {
                   approval.sourceItemId !== verified.sourceItemId ||
                   approval.questionId !== verified.questionId)
               )
-                yield* retire(approval);
+                yield* retire(approval, "replaced by a new answer.");
               approval = verified;
             }
             const linksJson = yield* encodeLinks(item.links).pipe(Effect.mapError(storage));
