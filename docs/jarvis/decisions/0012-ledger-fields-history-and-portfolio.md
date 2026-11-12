@@ -8,6 +8,8 @@ The ledger separates a work item's status from its reason for waiting. External 
 
 Every upsert retains its caller, time, and changed values. A run started with a client request id equal to a work item's key records its terminal outcome on that item without changing the item's status. Finishing a run does not prove that the work is done.
 
+An owner thread belongs to the ledger's environment. References to other environments retain their scope as links.
+
 The portfolio joins open work with each owner thread's latest run, pending requests, and a short result excerpt. A worker with no run for over 24 hours is flagged for attention. That flag does not establish failure or authorize a restart. The web panel reads the same ledger and provides no editing controls.
 
 ## Alternatives

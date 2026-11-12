@@ -273,3 +273,15 @@ Revoke one there to cut off its access immediately. New sign-ins renew with use
 and expire after 30 days without use. Clients receive a renewal token, which is
 replaced each time they use it. Reusing a replaced token cuts off the sign-in.
 Sign-ins created before rolling renewal keep their original expiry.
+
+## Track shared work
+
+The work ledger keeps shared work, its owner, blockers, and next action in one
+place. Open **Settings → Work ledger** and choose an environment to read its
+items or open an owner's thread. The panel is read-only. Owner threads belong
+to the selected environment; references to other environments remain links.
+
+An assistant can update items with `ledger_upsert`, read their changes with
+`ledger_history`, and check worker activity with `portfolio_status`. A wait
+reason distinguishes an external dependency, a natural event, and a decision.
+A due check or a completed agent run does not mark the work done.

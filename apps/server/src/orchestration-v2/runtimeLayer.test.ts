@@ -1076,6 +1076,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       expect(projection.messages).toHaveLength(1);
       expect(projection.messages[0]).toMatchObject({
         text: command.text,
+        postOnly: true,
+        posted: true,
         runId: null,
         createdBy: "agent",
         creationSource: "mcp",

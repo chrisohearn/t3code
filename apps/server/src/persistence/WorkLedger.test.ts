@@ -129,6 +129,17 @@ it.effect(
       expect((yield* ledger.query({ waitReason: null })).items).toHaveLength(1);
       expect((yield* ledger.query({ due: true })).items).toEqual([]);
       const before = yield* ledger.history({ key: "wait" });
+      expect(
+        (yield* ledger
+          .upsert(
+            {
+              key: "wait",
+              ownerThreadId: ThreadId.make("t3-thread://v2/other-environment/worker"),
+            },
+            "caller-c",
+          )
+          .pipe(Effect.flip)).code,
+      ).toBe("invalid_request");
       yield* ledger.upsert({ key: "wait", nextCheckAt: "invalid" }, "caller-c").pipe(Effect.flip);
       expect(yield* ledger.history({ key: "wait" })).toEqual(before);
     }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),

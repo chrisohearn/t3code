@@ -146,6 +146,12 @@ const make = Effect.gen(function* () {
             const threadIds = new Set<string>();
             if (candidate.ownerThreadId !== null) {
               const ref = parseThreadLinkHref(candidate.ownerThreadId);
+              if (ref?.environmentId != null)
+                return yield* new OrchestratorMcpFailure({
+                  code: "invalid_request",
+                  message:
+                    "ownerThreadId must be an environment-local thread id or v1 link. Keep scoped thread references in links.",
+                });
               if (ref !== null) candidate.ownerThreadId = ref.threadId;
               threadIds.add(candidate.ownerThreadId);
             }
@@ -153,7 +159,8 @@ const make = Effect.gen(function* () {
               const href = link.match(/^\[[^\]]*\]\((.*)\)$/)?.[1] ?? link.replace(/^<|>$/g, "");
               const ref = parseThreadLinkHref(href);
               if (ref === null) return link;
-              threadIds.add(ref.threadId);
+              if (ref.environmentId === null) threadIds.add(ref.threadId);
+              else warnings.push(`Scoped thread ${ref.threadId} was not checked locally.`);
               return formatThreadLink(ref).slice(1, -1);
             });
             for (const threadId of threadIds) {

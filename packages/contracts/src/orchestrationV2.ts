@@ -1311,6 +1311,7 @@ export const OrchestrationV2IdleCompaction = Schema.Literals(["beforeCacheExpire
 export type OrchestrationV2IdleCompaction = typeof OrchestrationV2IdleCompaction.Type;
 
 export const OrchestrationV2ConversationMessage = Schema.Struct({
+  postOnly: Schema.optional(Schema.Boolean),
   posted: Schema.optional(Schema.Boolean),
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
