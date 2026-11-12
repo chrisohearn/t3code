@@ -28,7 +28,7 @@ import * as DateTime from "effect/DateTime";
 import { resolveNewThreadModelSelection } from "@t3tools/shared/usageLimits";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { resolveRuntimeMode } from "./delegatedTaskModes.ts";
-import * as OrchestrationMcp from "./OrchestratorMcpService.ts";
+import { requireAdvertisedModel } from "./providerModels.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
 import { newCommandId, readCaller, resolveProjectId, unavailable } from "./threadAccess.ts";
@@ -233,8 +233,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         const { instanceId, model } = input.modelSelection;
         const providers = yield* (yield* ProviderRegistry.ProviderRegistry).getProviders;
         const provider = providers.find((candidate) => candidate.instanceId === instanceId);
-        if (provider !== undefined)
-          yield* OrchestrationMcp.requireAdvertisedModel(provider, model);
+        if (provider !== undefined) yield* requireAdvertisedModel(provider, model);
       }
       // Reject unresolved base refs and blocked branch names before accepting a launch; worktree provisioning happens later.
       const strategy = input.workspaceStrategy;
