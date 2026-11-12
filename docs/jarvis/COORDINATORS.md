@@ -7,3 +7,5 @@ The thread keeps its history and identity. Its next turn uses a fresh provider s
 Fetch the MCP resource `t3://jarvis/playbook` when starting or rolling over a coordinator. It serves the vocabulary and decisions in `docs/jarvis` from the running T3 build. `orchestrator_capabilities` returns its URI. A newly merged decision becomes available after that build is released and installed.
 
 The playbook resource belongs to the MCP connection’s environment. Forwarded capabilities omit its URI because resource reads cannot route to a peer.
+
+A linked environment must run a build with coordinator rollover support to seed its owned ledger work. Older peers still receive a fresh-context reset, but cannot add the seed; upgrade the peer before relying on rollover there.

@@ -3873,6 +3873,7 @@ describe("OrchestratorMcpService thread lookup", () => {
         const received = yield* Ref.make<
           ReadonlyArray<{ readonly text: string; readonly freshContext?: boolean }>
         >([]);
+        const latestResult = yield* Ref.make("Latest result" + "\n😀".repeat(10_000));
         const projection = idleThreadProjection(launched);
         const ledgerLayer = WorkLedger.layer.pipe(Layer.provide(SqlitePersistence.layerMemory));
         yield* Effect.gen(function* () {
@@ -3905,6 +3906,14 @@ describe("OrchestratorMcpService thread lookup", () => {
             message: "Clean reset",
             freshContext: true,
           });
+          yield* Ref.set(latestResult, "a".repeat(4000));
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Check result budget",
+            coordinatorRollover: true,
+          });
+          const nearLimit = (yield* Ref.get(received)).at(-1)!.text;
+          assert.include(nearLimit, JSON.stringify("a".repeat(3998)));
           for (let index = 0; index < 25; index++) {
             yield* ledger.upsert(
               {
@@ -3927,10 +3936,10 @@ describe("OrchestratorMcpService thread lookup", () => {
           });
           const messages = yield* Ref.get(received);
           assert.isAtMost(
-            Buffer.byteLength(messages[3]!.text) - Buffer.byteLength(currentRequest),
+            Buffer.byteLength(messages[4]!.text) - Buffer.byteLength(currentRequest),
             8192,
           );
-          assert.isTrue(messages[3]!.text.endsWith(currentRequest));
+          assert.isTrue(messages[4]!.text.endsWith(currentRequest));
           assert.deepEqual(messages[2], { text: "Clean reset", freshContext: true });
           assert.equal(messages[0]?.freshContext, true);
           assert.include(messages[0]!.text, '"key":"owned"');
@@ -3944,10 +3953,15 @@ describe("OrchestratorMcpService thread lookup", () => {
             service([launched], sent, {
               getProjectThreadRecords: () => Effect.succeed(projection),
               getThreadRecords: () =>
-                Effect.succeed({
-                  ...projection,
-                  messages: [{ text: "Latest result" + "\n😀".repeat(10_000) }],
-                } as unknown as OrchestrationV2ThreadProjection),
+                Ref.get(latestResult).pipe(
+                  Effect.map(
+                    (text) =>
+                      ({
+                        ...projection,
+                        messages: [{ text }],
+                      }) as unknown as OrchestrationV2ThreadProjection,
+                  ),
+                ),
               sendToThread: (input) =>
                 Ref.update(received, (items) => [
                   ...items,

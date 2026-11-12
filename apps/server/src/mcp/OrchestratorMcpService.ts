@@ -3316,11 +3316,19 @@ const make = Effect.gen(function* () {
           compact.pop();
           rowsJson = yield* encode(compact);
         }
-        let latest = records.messages[0]?.text.slice(0, 4000) ?? null;
-        let latestJson = yield* encode(latest);
-        while (Buffer.byteLength(latestJson) > 4000 && latest !== null) {
-          latest = latest.slice(0, Math.floor(latest.length / 2));
-          latestJson = yield* encode(latest);
+        const latest = records.messages[0]?.text;
+        const characters = Array.from(latest?.slice(0, 4000) ?? "");
+        let latestJson = yield* encode(latest === undefined ? null : characters.join(""));
+        if (Buffer.byteLength(latestJson) > 4000) {
+          let low = 0;
+          let high = characters.length;
+          while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            const candidate = yield* encode(characters.slice(0, mid).join(""));
+            if (Buffer.byteLength(candidate) <= 4000) low = mid;
+            else high = mid - 1;
+          }
+          latestJson = yield* encode(characters.slice(0, low).join(""));
         }
         text = [
           "Coordinator rollover: fresh provider session in the same thread.",
