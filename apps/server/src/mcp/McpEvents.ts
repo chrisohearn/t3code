@@ -367,7 +367,7 @@ const make = Effect.gen(function* () {
         }),
       );
     if (status >= 200 && status < 300) {
-      yield* deliveries.acknowledge(delivery);
+      yield* deliveries.acknowledge(delivery, yield* Clock.currentTimeMillis);
       return yield* bridge.delivered(sub.principal, yield* Clock.currentTimeMillis);
     }
     if (
@@ -439,7 +439,10 @@ const make = Effect.gen(function* () {
     };
   });
 
-  const subscribe = Effect.fn("McpEvents.subscribe")(function* (input: McpEventSubscribe) {
+  const subscribe = Effect.fn("McpEvents.subscribe")(function* (
+    input: McpEventSubscribe,
+    renewOnDelivery = true,
+  ) {
     const { scope, principal } = yield* caller();
     yield* resource(input.arguments.threadId);
     const { id, url } = yield* identity(principal.sessionId, input);
@@ -483,10 +486,8 @@ const make = Effect.gen(function* () {
         yield* resource(input.arguments.threadId);
         const current = yield* subscriptions.get(id);
         const now = yield* Clock.currentTimeMillis;
-        const expiresAt = Math.min(
-          principal.expiresAt.epochMilliseconds,
-          now + Math.min(7 * 86400_000, Math.max(60_000, input.ttlMs ?? 86400_000)),
-        );
+        const ttlMs = Math.min(7 * 86400_000, Math.max(60_000, input.ttlMs ?? 86400_000));
+        const expiresAt = Math.min(principal.expiresAt.epochMilliseconds, now + ttlMs);
         // A cursorless refresh must use the acknowledgement after verification:
         // delivery may have advanced while the callback challenge was in flight.
         const currentFloor = yield* events.prunedThroughSequence.pipe(Effect.mapError(storage));
@@ -510,6 +511,7 @@ const make = Effect.gen(function* () {
           active: 1,
           now,
           expiresAt,
+          renewalTtlMs: renewOnDelivery || (current?.renewalTtlMs ?? 0) > 0 ? ttlMs : 0,
           scanCursor:
             current !== undefined && cursor === current.ackCursor ? current.scanCursor : cursor,
           ackCursor: cursor,
@@ -588,15 +590,18 @@ const make = Effect.gen(function* () {
           );
           existing = undefined;
         }
-        const result = yield* subscribe({
-          name,
-          arguments: { threadId },
-          cursor: existing === undefined ? prepared.cursor : null,
-          delivery,
-          // Each active subscription scans the event log, so one made for a run lapses within a day.
-          // Not the source's own expiry: it may be an earlier notify subscription near its end.
-          ttlMs: 86_400_000,
-        }).pipe(Effect.result);
+        const result = yield* subscribe(
+          {
+            name,
+            arguments: { threadId },
+            cursor: existing === undefined ? prepared.cursor : null,
+            delivery,
+            // Each active subscription scans the event log, so one made for a run lapses within a day.
+            // Not the source's own expiry: it may be an earlier notify subscription near its end.
+            ttlMs: 86_400_000,
+          },
+          false,
+        ).pipe(Effect.result);
         if (result._tag === "Failure")
           return { status: "failed" as const, subscriptionIds, reason: result.failure.reason };
         subscriptionIds.push(result.success.id);
