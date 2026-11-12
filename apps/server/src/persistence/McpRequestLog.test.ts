@@ -52,5 +52,33 @@ it.effect("aggregates nearest-rank latency and bytes, isolates sign-ins and expi
     yield* TestClock.setTime(now + 15 * 24 * 60 * 60 * 1_000);
     expect((yield* log.usage({}, "a")).byTool).toEqual([]);
     expect(yield* sql`SELECT * FROM mcp_request_log`).toEqual([]);
+    const later = now + 15 * 24 * 60 * 60 * 1_000;
+    yield* sql`WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 100100)
+      INSERT INTO mcp_request_log (client, session, tool, started_at, duration_ms, request_bytes, response_bytes)
+      SELECT printf('%06d', n), 'test', 'read', ${later}, 1, 1, 1 FROM rows`;
+    yield* log.record({
+      client: "z",
+      session: "z",
+      tool: "read",
+      startedAt: later,
+      durationMs: 2,
+      requestBytes: 1,
+      responseBytes: 1,
+      errorClass: null,
+    });
+    expect(
+      (yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM mcp_request_log`)[0]?.count,
+    ).toBe(100000);
+    const firstPage = yield* log.usage({}, undefined);
+    expect(firstPage.byClient).toHaveLength(100);
+    expect(firstPage.byClient[0]?.client).toBe("000102");
+    expect(firstPage.nextClientCursor).toBe(firstPage.byClient.at(-1)?.client);
+    const secondPage = yield* log.usage(
+      { since: firstPage.since, until: firstPage.until, clientCursor: firstPage.nextClientCursor! },
+      undefined,
+    );
+    expect(secondPage.byClient).toHaveLength(100);
+    expect(secondPage.byClient[0]!.client > firstPage.nextClientCursor!).toBe(true);
+    expect((yield* log.usage({ clientCursor: "000001" }, "missing")).byClient).toEqual([]);
   }).pipe(Effect.provide(Log.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );

@@ -19,12 +19,14 @@ const Counts = Schema.Struct({
 export const UsageInput = Schema.Struct({
   since: Schema.optional(Schema.Number),
   until: Schema.optional(Schema.Number),
+  clientCursor: Schema.optional(Schema.String),
 });
 export const UsageResult = Schema.Struct({
   since: Schema.Number,
   until: Schema.Number,
   retentionDays: Schema.Number,
   byTool: Schema.Array(Schema.Struct({ tool: Schema.String, ...Counts.fields })),
+  nextClientCursor: Schema.NullOr(Schema.String),
   byClient: Schema.Array(Schema.Struct({ client: Schema.String, ...Counts.fields })),
 });
 interface RequestEntry {
@@ -57,7 +59,7 @@ const make = Effect.gen(function* () {
   const prune = Effect.fn("McpRequestLog.prune")(function* () {
     const now = yield* Clock.currentTimeMillis;
     yield* sql`DELETE FROM mcp_request_log WHERE started_at < ${now - RETENTION_MS}`;
-    yield* sql`DELETE FROM mcp_request_log WHERE id <= (SELECT id FROM mcp_request_log ORDER BY id DESC LIMIT 1 OFFSET ${MAX_ROWS})`;
+    yield* sql`DELETE FROM mcp_request_log WHERE id <= (SELECT MAX(id) - ${MAX_ROWS} FROM mcp_request_log)`;
   });
   const record = Effect.fn("McpRequestLog.record")((entry: RequestEntry) =>
     sql
@@ -99,17 +101,22 @@ const make = Effect.gen(function* () {
         COUNT(*) OVER (PARTITION BY ${sql(column)}) AS total
       FROM mcp_request_log WHERE started_at >= ${since} AND started_at <= ${until}
         ${client === undefined ? sql`` : sql`AND client = ${client}`}
+        ${column === "client" && input.clientCursor !== undefined ? sql`AND client > ${input.clientCursor}` : sql``}
     ) SELECT name, COUNT(*) AS calls, SUM(error_class IS NOT NULL) AS errors,
       SUM(request_bytes) AS "requestBytes", SUM(response_bytes) AS "responseBytes",
       MAX(CASE WHEN rank = (total + 1) / 2 THEN duration_ms END) AS "p50Ms",
       MAX(CASE WHEN rank = (total * 95 + 99) / 100 THEN duration_ms END) AS "p95Ms"
-      FROM ranked GROUP BY name ORDER BY name`.pipe(Effect.mapError(storage));
+      FROM ranked GROUP BY name ORDER BY name ${column === "client" ? sql`LIMIT 101` : sql``}`.pipe(
+        Effect.mapError(storage),
+      );
+    const clients = yield* aggregate("client");
     return {
       since,
       until,
       retentionDays: 14,
       byTool: (yield* aggregate("tool")).map(({ name, ...counts }) => ({ tool: name, ...counts })),
-      byClient: (yield* aggregate("client")).map(({ name, ...counts }) => ({
+      nextClientCursor: clients.length > 100 ? clients[99]!.name : null,
+      byClient: clients.slice(0, 100).map(({ name, ...counts }) => ({
         client: name,
         ...counts,
       })),

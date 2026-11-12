@@ -957,6 +957,7 @@ const handoffTargetIds = (
 
 /** Tool analytics must never include IDs, prompts or free text. */
 const isRequestErrorCode = Schema.is(OrchestratorMcpFailure.fields.code);
+const encodeBridgeResult = Schema.encodeEffect(Schema.fromJsonString(McpSchema.CallToolResult));
 const encodeBridgeResponse = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const withToolAnalytics =
   /* Request instrumentation already owns the span; keep this helper in that context. */
@@ -1081,13 +1082,20 @@ const withToolAnalytics =
             /* Request instrumentation already owns the span; keep this helper in that context. */
             Effect.fnUntraced(function* (payload) {
               const startedAt = yield* Clock.currentTimeMillis;
+              const startedMono = yield* Clock.monotonicTimeNanos;
               return yield* options.handle(payload).pipe(
                 Effect.onExit((exit) => {
                   const result = exit._tag === "Success" ? exit.value : undefined;
                   // A call that asks for input is retried with it, and that call is the one counted.
                   if (result instanceof McpSchema.InputRequired) return Effect.void;
                   const count = Effect.gen(function* () {
-                    const endedAt = yield* Clock.currentTimeMillis;
+                    const endedMono = yield* Clock.monotonicTimeNanos;
+                    const responseBytes =
+                      result === undefined
+                        ? 0
+                        : Buffer.byteLength(
+                            yield* encodeBridgeResult(result).pipe(Effect.orElseSucceed(() => "")),
+                          );
                     const invocation = yield* Effect.serviceOption(
                       McpInvocationContext.McpInvocationContext,
                     );
@@ -1105,20 +1113,13 @@ const withToolAnalytics =
                             session: identity,
                             tool: options.tool.name,
                             startedAt,
-                            durationMs: Math.max(0, endedAt - startedAt),
+                            durationMs: Math.max(0, Number((endedMono - startedMono) / 1_000_000n)),
                             requestBytes: Buffer.byteLength(
                               yield* encodeBridgeResponse(payload).pipe(
                                 Effect.orElseSucceed(() => ""),
                               ),
                             ),
-                            responseBytes:
-                              result === undefined
-                                ? 0
-                                : Buffer.byteLength(
-                                    yield* encodeBridgeResponse(result).pipe(
-                                      Effect.orElseSucceed(() => ""),
-                                    ),
-                                  ),
+                            responseBytes,
                             errorClass:
                               outcome.outcome === "ok"
                                 ? null
@@ -1132,19 +1133,11 @@ const withToolAnalytics =
                       }
                     }
                     if (session !== undefined && Option.isSome(bridgeMetrics)) {
-                      const bytes =
-                        result === undefined
-                          ? 0
-                          : Buffer.byteLength(
-                              yield* encodeBridgeResponse(result).pipe(
-                                Effect.orElseSucceed(() => ""),
-                              ),
-                            );
                       yield* bridgeMetrics.value.record(
                         session,
                         options.tool.name,
                         result === undefined || result.isError === true,
-                        bytes,
+                        responseBytes,
                       );
                     }
                   });
@@ -1152,9 +1145,14 @@ const withToolAnalytics =
                   return count.pipe(
                     Effect.ignoreCause,
                     Effect.andThen(
-                      Clock.currentTimeMillis.pipe(
-                        Effect.flatMap((endedAt) =>
-                          record(options.tool.name, payload, result, endedAt - startedAt),
+                      Clock.monotonicTimeNanos.pipe(
+                        Effect.flatMap((endedMono) =>
+                          record(
+                            options.tool.name,
+                            payload,
+                            result,
+                            Number((endedMono - startedMono) / 1_000_000n),
+                          ),
                         ),
                         Effect.forkDetach,
                         Effect.asVoid,

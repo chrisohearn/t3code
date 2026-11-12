@@ -6,7 +6,7 @@ import * as Invocation from "../../McpInvocationContext.ts";
 export const BridgeToolkit = Toolkit.make(
   Tool.make("mcp_usage", {
     description:
-      "Read MCP tool counts, errors, bytes and nearest-rank p50/p95 latency by tool and client. since/until are epoch milliseconds (default last 24h). Retains up to 14 days and 100,000 calls. Outside sign-ins see only their own sign-in, since client IDs can be shared by different accounts. No bodies or secrets.",
+      "Read MCP tool counts, errors, bytes and nearest-rank p50/p95 latency by tool and client. since/until are epoch milliseconds (default last 24h). Retains up to 14 days and 100,000 calls. Outside sign-ins see only their own sign-in, since client IDs can be shared by different accounts. Client pages contain at most 100 rows; continue with nextClientCursor as clientCursor, keeping the same since/until. No bodies or secrets.",
     parameters: RequestLog.UsageInput,
     success: RequestLog.UsageResult,
     failure: OrchestratorMcpFailure,
