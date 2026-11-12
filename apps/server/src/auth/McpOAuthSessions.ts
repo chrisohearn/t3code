@@ -183,9 +183,11 @@ export const layer = Layer.effect(
                 ...mcpClientScopes(row.access),
                 ...(row.offlineAccess === 1 ? ["offline_access"] : []),
               ];
+              const requestedScopes = input.scope?.split(/\s+/u);
               if (
-                input.scope !== undefined &&
-                input.scope.split(/\s+/u).some((scope) => !scopes.includes(scope))
+                requestedScopes !== undefined &&
+                (requestedScopes.some((scope) => !scopes.includes(scope)) ||
+                  scopes.some((scope) => !requestedScopes.includes(scope)))
               )
                 return "invalid_scope" as const;
               yield* sql`UPDATE mcp_oauth_tokens SET used_at = ${now.epochMilliseconds} WHERE token_hash = ${tokenHash}`;

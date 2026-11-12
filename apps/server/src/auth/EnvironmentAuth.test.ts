@@ -192,6 +192,20 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
             return;
           }
           if (scenario === "binding") {
+            for (const scope of [
+              "orchestration:read",
+              "orchestration:read orchestration:operate offline_access",
+            ]) {
+              expect(
+                yield* auth
+                  .refreshMcpClientSession({
+                    ...oauth,
+                    refreshToken: Redacted.make(issued.refreshToken!),
+                    scope,
+                  })
+                  .pipe(Effect.flip),
+              ).toMatchObject({ error: "invalid_scope" });
+            }
             expect(
               yield* refresh(issued.refreshToken!, "another-client").pipe(Effect.flip),
             ).toMatchObject({ error: "invalid_grant" });
