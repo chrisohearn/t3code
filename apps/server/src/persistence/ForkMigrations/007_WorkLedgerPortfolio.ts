@@ -23,7 +23,8 @@ export default Effect.gen(function* () {
     yield* sql.unsafe(`CREATE TRIGGER work_ledger_run_${operation.toLowerCase()}
       AFTER ${operation} ON orchestration_v2_projection_runs
       WHEN NEW.status IN ('completed', 'failed', 'cancelled', 'interrupted', 'rolled_back')
-        AND json_extract(NEW.payload_json, '$.clientRequestId') IS NOT NULL
+        AND CASE WHEN json_valid(NEW.payload_json)
+          THEN json_extract(NEW.payload_json, '$.clientRequestId') IS NOT NULL ELSE 0 END
       BEGIN
         UPDATE work_ledger SET last_run_id = NEW.run_id, last_run_status = NEW.status,
           last_run_at = COALESCE(NEW.completed_at, NEW.requested_at)
