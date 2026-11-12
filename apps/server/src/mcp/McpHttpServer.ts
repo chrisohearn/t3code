@@ -959,6 +959,21 @@ const handoffTargetIds = (
 
 /** Tool analytics must never include IDs, prompts or free text. */
 const isRequestErrorCode = Schema.is(OrchestratorMcpFailure.fields.code);
+const decodeDeclaredFailure = Schema.decodeUnknownOption(
+  Schema.fromJsonString(OrchestratorMcpFailure),
+);
+const requestErrorClass = (result: McpSchema.CallToolResult | undefined) => {
+  const outcome = toolOutcome(result);
+  if (outcome.outcome === "ok") return null;
+  if (isRequestErrorCode(outcome.errorCode)) return outcome.errorCode;
+  if (result === undefined) return "execution_failure";
+  for (const content of result.content) {
+    if (content.type !== "text") continue;
+    const failure = decodeDeclaredFailure(content.text);
+    if (Option.isSome(failure)) return failure.value.code;
+  }
+  return "tool_error";
+};
 const encodeBridgeResult = Schema.encodeEffect(Schema.fromJsonString(McpSchema.CallToolResult));
 const encodeBridgeResponse = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const withToolAnalytics =
@@ -1110,7 +1125,6 @@ const withToolAnalytics =
                         : undefined;
                       if (Option.isSome(invocation) && Option.isSome(requestLog)) {
                         const scope = invocation.value;
-                        const outcome = toolOutcome(result);
                         const identity = scope.client?.sessionId ?? scope.thread?.providerSessionId;
                         if (identity !== undefined) {
                           yield* requestLog.value
@@ -1126,14 +1140,7 @@ const withToolAnalytics =
                                 ),
                               ),
                               responseBytes,
-                              errorClass:
-                                outcome.outcome === "ok"
-                                  ? null
-                                  : isRequestErrorCode(outcome.errorCode)
-                                    ? outcome.errorCode
-                                    : result === undefined
-                                      ? "execution_failure"
-                                      : "tool_error",
+                              errorClass: requestErrorClass(result),
                             })
                             .pipe(Effect.ignoreCause);
                         }

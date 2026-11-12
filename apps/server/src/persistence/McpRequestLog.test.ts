@@ -1,3 +1,8 @@
+import * as NodeSqlite from "node:sqlite";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Tracer from "effect/Tracer";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -81,4 +86,59 @@ it.effect("aggregates nearest-rank latency and bytes, isolates sign-ins and expi
     expect(secondPage.byClient[0]!.client > firstPage.nextClientCursor!).toBe(true);
     expect((yield* log.usage({ clientCursor: "000001" }, "missing")).byClient).toEqual([]);
   }).pipe(Effect.provide(Log.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect("uses one reader snapshot while another connection records a completed call", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-usage-snapshot-" });
+    const filename = path.join(directory, "usage.sqlite");
+    yield* Effect.gen(function* () {
+      const log = yield* Log.McpRequestLog;
+      const other = yield* Effect.acquireRelease(
+        Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+        (db) => Effect.sync(() => db.close()),
+      );
+      yield* log.record({
+        client: "a",
+        session: "a",
+        tool: "read",
+        startedAt: 0,
+        durationMs: 1,
+        requestBytes: 2,
+        responseBytes: 3,
+        errorClass: null,
+      });
+      const connections: Array<unknown> = [];
+      let queries = 0;
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          const end = span.end.bind(span);
+          span.end = (time, exit) => {
+            const query = span.attributes.get("db.query.text");
+            if (typeof query === "string" && query.includes("WITH ranked")) {
+              queries++;
+              if (queries === 1)
+                other.exec(`
+              INSERT INTO mcp_request_log (client, session, tool, started_at, duration_ms, request_bytes, response_bytes)
+              VALUES ('a', 'a', 'read', 0, 1, 2, 3)
+            `);
+            }
+            if (span.name === "sql.transaction")
+              connections.push(span.attributes.get("db.connection"));
+            end(time, exit);
+          };
+          return span;
+        },
+      });
+      const usage = yield* log.usage({ since: 0, until: 0 }, "a").pipe(Effect.withTracer(tracer));
+      expect(usage.byClient[0]?.calls).toBe(1);
+      expect(usage.byTool[0]?.calls).toBe(1);
+      expect(queries).toBe(2);
+      expect(connections).toEqual(["reader"]);
+      expect((yield* log.usage({ since: 0, until: 0 }, "a")).byTool[0]?.calls).toBe(2);
+    }).pipe(Effect.provide(Log.layer.pipe(Layer.provide(Sqlite.layerFromPath(filename)))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

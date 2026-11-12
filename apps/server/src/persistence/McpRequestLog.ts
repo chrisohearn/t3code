@@ -1,3 +1,4 @@
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -109,18 +110,27 @@ const make = Effect.gen(function* () {
       FROM ranked GROUP BY name ORDER BY name ${column === "client" ? sql`LIMIT 101` : sql``}`.pipe(
         Effect.mapError(storage),
       );
-    const clients = yield* aggregate("client");
-    return {
-      since,
-      until,
-      retentionDays: 14,
-      byTool: (yield* aggregate("tool")).map(({ name, ...counts }) => ({ tool: name, ...counts })),
-      nextClientCursor: clients.length > 100 ? clients[99]!.name : null,
-      byClient: clients.slice(0, 100).map(({ name, ...counts }) => ({
-        client: name,
-        ...counts,
-      })),
-    };
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const clients = yield* aggregate("client");
+          return {
+            since,
+            until,
+            retentionDays: 14,
+            byTool: (yield* aggregate("tool")).map(({ name, ...counts }) => ({
+              tool: name,
+              ...counts,
+            })),
+            nextClientCursor: clients.length > 100 ? clients[99]!.name : null,
+            byClient: clients.slice(0, 100).map(({ name, ...counts }) => ({
+              client: name,
+              ...counts,
+            })),
+          };
+        }),
+      )
+      .pipe(NodeSqliteClient.readOnly, Effect.mapError(storage));
   });
   return McpRequestLog.of({ record, usage });
 });

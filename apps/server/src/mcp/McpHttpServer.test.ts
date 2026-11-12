@@ -1747,3 +1747,43 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
+
+it.effect.each(["capability_denied", "invalid_request"] as const)(
+  "records declared failure code %s without retaining failure text",
+  (code) => {
+    const entries: Array<{ readonly errorClass: string | null }> = [];
+    const toolkit = Toolkit.make(
+      Tool.make("declared_failure", {
+        parameters: Schema.Struct({ value: Schema.optional(Schema.String) }),
+        success: Schema.String,
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        declared_failure: McpToolAccess.reads(() =>
+          Effect.fail(new OrchestratorMcpFailure({ code, message: "private failure details" })),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+      Layer.provide(
+        Layer.mock(RequestLog.McpRequestLog)({
+          record: (entry) =>
+            Effect.sync(() => {
+              entries.push(entry);
+            }),
+        }),
+      ),
+    );
+    return Effect.gen(function* () {
+      const result = yield* callTool("declared_failure", {});
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toBeUndefined();
+      expect(entries.map((entry) => entry.errorClass)).toEqual([code]);
+      expect(JSON.stringify(entries)).not.toContain("private failure details");
+    }).pipe(Effect.provide(layer));
+  },
+);
