@@ -5,6 +5,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import ForkMigration0001 from "./ForkMigrations/001_McpEvents.ts";
 import ForkMigration0002 from "./ForkMigrations/002_WorkLedger.ts";
 import ForkMigration0003 from "./ForkMigrations/003_McpClientThreads.ts";
+import ForkMigration0007 from "./ForkMigrations/007_WorkLedgerPortfolio.ts";
 import ForkMigration0004 from "./ForkMigrations/004_McpBridgeStatus.ts";
 import ForkMigration0005 from "./ForkMigrations/005_McpOAuthRenewal.ts";
 
@@ -17,6 +18,7 @@ const forkMigrationEntries = [
   [3, "McpClientThreads", ForkMigration0003],
   [4, "McpBridgeStatus", ForkMigration0004],
   [5, "McpOAuthRenewal", ForkMigration0005],
+  [7, "WorkLedgerPortfolio", ForkMigration0007],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
