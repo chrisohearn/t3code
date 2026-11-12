@@ -220,7 +220,14 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
     );
     if (fork === null)
       return yield* failWith("No compatible fork release is published for this machine.");
-    if (fork !== undefined) targetVersion = fork.version;
+    if (fork !== undefined) {
+      targetVersion = fork.version;
+      const resolvedPolicyRefusal = managedUpdateRefusal(
+        policy.document,
+        cliReleaseChannelOf(targetVersion),
+      );
+      if (resolvedPolicyRefusal !== undefined) return yield* failWith(resolvedPolicyRefusal);
+    }
     const unsafeCrossing = crossesTrackUnsafely({ ...input, targetVersion });
     if (unsafeCrossing !== null) return yield* failWith(unsafeCrossing);
     if (yield* Ref.getAndSet(inFlight, true)) {

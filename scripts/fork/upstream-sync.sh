@@ -34,22 +34,44 @@ git -C "$SOURCE" remote get-url upstream >/dev/null 2>&1 ||
 git -C "$SOURCE" fetch -q origin
 git -C "$SOURCE" fetch -q --no-tags upstream main
 upstream_sha=$(git -C "$SOURCE" rev-parse upstream/main)
+release_only=0
 if git -C "$SOURCE" merge-base --is-ancestor "$upstream_sha" "origin/$BRANCH"; then
-  log "integration already contains upstream ${upstream_sha:0:10}"
-  exit 0
+  latest_tag=$(gh api "repos/$FORK/releases?per_page=100" --jq '
+    .[] | select(.draft | not)
+    | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-preview\\.[0-9]{8}\\.[0-9]+$"))
+    | . as $release
+    | select(any(.assets[]; .name == "SHA256SUMS"))
+    | select(any(.assets[]; .name == ("t3-" + ($release.tag_name | ltrimstr("v")) + "-linux-x64.tar.gz")))
+    | .tag_name' | sort -V | tail -1)
+  if [[ -n "$latest_tag" ]]; then
+    git -C "$SOURCE" fetch -q origin "refs/tags/$latest_tag:refs/tags/$latest_tag"
+    if [[ "$(git -C "$SOURCE" rev-parse "$latest_tag^{tree}")" == \
+          "$(git -C "$SOURCE" rev-parse "origin/$BRANCH^{tree}")" ]]; then
+      log "integration already contains upstream ${upstream_sha:0:10} and is published"
+      exit 0
+    fi
+  fi
+  release_only=1
+  log "integration contains upstream but is unpublished; retrying release"
 fi
 behind=$(git -C "$SOURCE" rev-list --count "origin/$BRANCH..$upstream_sha")
 
 # An open sync PR (one a failed run opened, or an agent's conflict fix) is re-checked and, when
 # it passes, merged and released. Otherwise start a new sync branch from the integration branch.
-open_pr=$(gh pr list -R "$FORK" --base "$BRANCH" --state open --json number,headRefName \
-  --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] | "\(.number) \(.headRefName)" // empty')
+open_pr=""
+if [[ "$release_only" == 0 ]]; then
+  open_pr=$(gh pr list -R "$FORK" --base "$BRANCH" --state open --json number,headRefName \
+    --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] | "\(.number) \(.headRefName)" // empty')
+fi
 stamp=$(date -u +%Y%m%d-%H%M)
 wt="$WORKTREES/upstream-sync-$stamp"
 if [[ -n "$open_pr" ]]; then
   read -r pr_number sync_branch <<<"$open_pr"
   git -C "$SOURCE" fetch -q origin "$sync_branch"
   git -C "$SOURCE" worktree add -q -B "$sync_branch" "$wt" "origin/$sync_branch"
+  # Finish this candidate before incorporating newer upstream commits and resetting its CI.
+  upstream_sha=$(git -C "$wt" merge-base HEAD upstream/main)
+  behind=$(git -C "$SOURCE" rev-list --count "origin/$BRANCH..$upstream_sha")
   log "re-checking open sync PR #$pr_number ($sync_branch)"
 else
   pr_number=""
@@ -189,7 +211,15 @@ done
 
 if [[ -n "$dry_run" ]]; then
   keep_worktree=1
-  log "dry run: would merge $sync_branch and publish $version from $artifacts (worktree kept at $wt)"
+  log "dry run: would prepare $sync_branch and publish $version from $artifacts (worktree kept at $wt)"
+  exit 0
+fi
+
+if [[ "$release_only" == 1 ]]; then
+  release_target=$(git rev-parse HEAD)
+  scripts/fork/publish-release.sh "$version" "$artifacts" "$release_target" \
+    "Publish the verified integration tree after an earlier publication did not finish."
+  log "released previously merged integration $release_target as v$version"
   exit 0
 fi
 

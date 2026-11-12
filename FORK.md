@@ -13,15 +13,15 @@ Upstream owns every id in `effect_sql_migrations`. Effect's migrator skips every
 
 ## Upstream sync and releases
 
-`scripts/fork/upstream-sync.sh` runs daily from a T3 scheduled task on Chris's machine (it needs Chris's `gh` login, Docker, and read access to the live database for the preflight). It:
+`scripts/fork/upstream-sync.sh` runs hourly from a T3 scheduled task on Chris's machine (it needs Chris's `gh` login, Docker, and read access to the live database for the preflight). It:
 
-1. Fetches upstream `main`. If the integration branch already contains it, it stops.
+1. Fetches upstream `main`. If the integration branch already contains it, it verifies that the integration tree is published and retries an unfinished publication.
 2. Merges it on a `sync/upstream-<UTC stamp>` branch, or re-checks an open `sync/upstream-*` PR (one a failed run opened, or an agent's conflict fix). `agentContextBudget.json` conflicts are taken from upstream and re-measured.
 3. Runs format, lint, typecheck and the server tests. Every test must pass; pre-existing failures still block publication.
 4. Builds the release in a container (`scripts/fork/build-release.sh`, the recipe every `v0.1.9-preview.*` release used) and smoke-tests it, then runs the built CLI's `__service-preflight` read-only against the live database for launcher protocols 3 and 4.
 5. When all of that and the hosted checks pass, it merges the PR and publishes `v<upstream nightly core>-preview.<UTC date>.<n>` with the tarball and `SHA256SUMS` (`scripts/fork/publish-release.sh`). The host's update guard then installs it when no threads are running.
 
-A conflict opens (or updates) an issue labelled `upstream-sync`, or comments on the open sync PR. A failed check opens a PR that says what failed. Neither publishes anything. Exit codes: 0 done or nothing to do, 3 conflict, 4 failed check, 2 environment problem.
+A conflict opens (or updates) an issue labelled `upstream-sync`, or comments on the open sync PR. A failed check opens a PR that says what failed. Neither publishes anything. The scheduled agent watches a pending PR and resumes on CI/review completion, so publication need not wait until the next hourly check. An existing candidate is completed before newer upstream changes are added, preventing repeated CI resets. Exit codes: 0 done or nothing to do, 3 conflict, 4 failed check, 2 environment problem.
 
 To release by hand from a clean, merged integration commit: `scripts/fork/build-release.sh <version>`, then `scripts/fork/publish-release.sh <version> <artifacts-dir> <merge-commit> "<notes>"`. Versions must sort above every earlier fork release under `sort -V`, because the guard installs the newest one.
 

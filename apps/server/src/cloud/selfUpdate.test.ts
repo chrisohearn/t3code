@@ -564,51 +564,73 @@ it("a host crosses tracks only to a release that knows its whole database", () =
 });
 
 it.layer(NodeServices.layer)("fork self update", (it) => {
-  it.effect("maps a nightly desktop target to a published fork archive and handoff", () =>
-    Effect.gen(function* () {
-      const version = "1.1.0-preview.20261112.1";
-      const urls: string[] = [];
-      const archive = releaseHttpClient([], urls, undefined, version);
-      const httpClient = HttpClient.make((request) =>
-        request.url.startsWith("https://api.github.com/")
-          ? Effect.succeed(
-              HttpClientResponse.fromWeb(
-                request,
-                new Response(
-                  JSON.stringify([
-                    {
-                      tag_name: `v${version}`,
-                      draft: false,
-                      assets: [{ name: "SHA256SUMS" }, { name: `t3-${version}-linux-x64.tar.gz` }],
-                    },
-                  ]),
+  it.effect.each([true, false])(
+    "resolves fork targets while honoring allowNightly=%s",
+    (allowNightly) =>
+      Effect.gen(function* () {
+        const version = "1.1.0-preview.20261112.1";
+        const urls: string[] = [];
+        const archive = releaseHttpClient([], urls, undefined, version);
+        const httpClient = HttpClient.make((request) =>
+          request.url.startsWith("https://api.github.com/")
+            ? Effect.succeed(
+                HttpClientResponse.fromWeb(
+                  request,
+                  new Response(
+                    JSON.stringify([
+                      {
+                        tag_name: `v${version}`,
+                        draft: false,
+                        assets: [
+                          { name: "SHA256SUMS" },
+                          { name: `t3-${version}-linux-x64.tar.gz` },
+                        ],
+                      },
+                    ]),
+                  ),
                 ),
-              ),
-            )
-          : archive.execute(request),
-      );
-      const harness = yield* makeHarness({ releaseVersion: version, httpClient }).pipe(
-        Effect.provide(
-          ConfigProvider.layer(
-            ConfigProvider.fromEnv({
-              env: {
-                T3CODE_RELEASE_BASE_URL: "https://github.com/chrisohearn/t3code/releases/download",
-              },
-            }),
+              )
+            : archive.execute(request),
+        );
+        const harness = yield* makeHarness({
+          releaseVersion: version,
+          httpClient,
+          policy: {
+            schemaVersion: 1,
+            organization: "Example Corp",
+            limits: { updates: { mode: "auto", allowNightly } },
+          },
+        }).pipe(
+          Effect.provide(
+            ConfigProvider.layer(
+              ConfigProvider.fromEnv({
+                env: {
+                  T3CODE_RELEASE_BASE_URL:
+                    "https://github.com/chrisohearn/t3code/releases/download",
+                },
+              }),
+            ),
           ),
-        ),
-      );
-      expect(
-        yield* harness.selfUpdate.update({ targetVersion: "0.1.10-nightly.20261111.4544" }),
-      ).toEqual({
-        targetVersion: version,
-        method: "boot-service",
-        updateId: "launcher-id",
-      });
-      expect(urls).toEqual([
-        `https://github.com/chrisohearn/t3code/releases/download/v${version}/SHA256SUMS`,
-        `https://github.com/chrisohearn/t3code/releases/download/v${version}/t3-${version}-linux-x64.tar.gz`,
-      ]);
-    }),
+        );
+        if (!allowNightly) {
+          expect(
+            (yield* harness.selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason,
+          ).toBe("Example Corp manages T3 Code updates. Only stable releases can be installed.");
+          expect(urls).toEqual([]);
+          expect(harness.order).toEqual([]);
+          return;
+        }
+        expect(
+          yield* harness.selfUpdate.update({ targetVersion: "0.1.10-nightly.20261111.4544" }),
+        ).toEqual({
+          targetVersion: version,
+          method: "boot-service",
+          updateId: "launcher-id",
+        });
+        expect(urls).toEqual([
+          `https://github.com/chrisohearn/t3code/releases/download/v${version}/SHA256SUMS`,
+          `https://github.com/chrisohearn/t3code/releases/download/v${version}/t3-${version}-linux-x64.tar.gz`,
+        ]);
+      }),
   );
 });
