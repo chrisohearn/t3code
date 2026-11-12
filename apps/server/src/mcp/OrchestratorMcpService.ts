@@ -11,6 +11,7 @@ import {
   NodeId,
   ORCHESTRATOR_MCP_RUNNING_TASK_NEXT,
   TurnItemId,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2Run,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
@@ -86,6 +87,7 @@ import {
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
+import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -1045,6 +1047,7 @@ function timelineItem(input: {
     createdBy: message?.createdBy ?? null,
     creationSource: message?.creationSource ?? null,
     ...(message?.senderThreadId === undefined ? {} : { senderThreadId: message.senderThreadId }),
+    ...(message?.mcpSender === undefined ? {} : { mcpSender: message.mcpSender }),
     type: input.row.item.type,
     status: input.row.item.status,
     title: input.row.item.title,
@@ -1058,6 +1061,7 @@ function timelineItem(input: {
 const make = Effect.gen(function* () {
   const clientThreads = yield* McpClientThreads.McpClientThreads;
   const random = yield* SecureRandom.SecureRandom;
+  const senderDigest = yield* Digest.Digest;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
@@ -3095,21 +3099,32 @@ const make = Effect.gen(function* () {
                 providerTurnAttemptIds: [run.activeAttemptId],
               })
               .pipe(Effect.mapError(threadManagementFailure))).providerTurns;
-      const message = records?.messages[0];
-      const chars = Array.from(message?.text ?? "");
+      const latest = yield* threadManagement
+        .getThreadRecords(input.threadId, ["messages"], { latestMessageOnly: true })
+        .pipe(Effect.mapError(threadManagementFailure));
       const maxChars = input.maxChars ?? 4000;
+      const summarize = (message: OrchestrationV2ConversationMessage | undefined) => {
+        if (message === undefined) return null;
+        const chars = Array.from(message.text);
+        return {
+          messageId: message.id,
+          role: message.role,
+          text: chars.slice(0, maxChars).join(""),
+          truncated: chars.length > maxChars,
+          createdBy: message.createdBy,
+          creationSource: message.creationSource,
+          ...(message.senderThreadId === undefined
+            ? {}
+            : { senderThreadId: message.senderThreadId }),
+          ...(message.mcpSender === undefined ? {} : { mcpSender: message.mcpSender }),
+        };
+      };
       return {
         threadId: input.threadId,
         status: shell.activityRunStatus ?? shell.status,
         run: run === undefined ? null : threadRun({ providerTurns }, run),
-        lastAssistantMessage:
-          message === undefined
-            ? null
-            : {
-                messageId: message.id,
-                text: chars.slice(0, maxChars).join(""),
-                truncated: chars.length > maxChars,
-              },
+        lastAssistantMessage: summarize(records?.messages[0]),
+        latestMessage: summarize(latest.messages[0]),
         pendingRequestIds: target.runtimeRequests
           .filter((request) => request.status === "pending")
           .map((request) => request.id),
@@ -3248,6 +3263,7 @@ const make = Effect.gen(function* () {
           commandId: stableCommandId({ scope, requestKey: key, operation }),
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+          ...(yield* Invocation.messageSenderFor(scope, senderDigest)),
           messageId,
           text: input.message,
           attachments: [],
@@ -3288,6 +3304,7 @@ const make = Effect.gen(function* () {
           }),
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+          ...(yield* Invocation.messageSenderFor(scope, senderDigest)),
           messageId,
           text: input.message,
           attachments: [],
@@ -3487,6 +3504,7 @@ export const layer: Layer.Layer<
   never,
   | McpClientThreads.McpClientThreads
   | SecureRandom.SecureRandom
+  | Digest.Digest
   | ThreadManagementService.ThreadManagementService
   | ThreadLaunchService.ThreadLaunchService
   | GitVcsDriver.GitVcsDriver

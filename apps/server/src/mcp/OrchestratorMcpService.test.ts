@@ -1,7 +1,7 @@
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
   ContextTransferId,
@@ -3787,6 +3787,52 @@ describe("OrchestratorMcpService thread lookup", () => {
       }).pipe(Effect.provide(service(shells, sent)));
     });
 
+  it.effect("stamps authenticated outside and linked senders on sends and posts", () =>
+    Effect.gen(function* () {
+      const sent = yield* Ref.make(0);
+      const commands: unknown[] = [];
+      yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        for (const linked of [false, true]) {
+          const scope = { ...client, client: { ...client.client!, linked } };
+          const forged = { mcpSender: { clientLabel: "Impersonator" } };
+          yield* mcp.postToThread(scope, { threadId: launched.id, message: "hello", ...forged });
+          yield* mcp.sendToThread(scope, { threadId: launched.id, message: "hello", ...forged });
+          for (const command of commands.splice(0)) {
+            expect(command).toMatchObject({
+              mcpSender: {
+                sessionIdShort: "e11fdfccaf06a2df",
+                clientLabel: "Claude Code",
+                kind: linked ? "linked_t3_agent" : "outside_client",
+              },
+            });
+            expect(JSON.stringify(command)).not.toContain('"sessionId":');
+          }
+        }
+      }).pipe(
+        Effect.provide(
+          service([launched], sent, {
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(launched)),
+            getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(launched)),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command);
+                return { sequence: 1, storedEvents: [] };
+              }),
+            sendToThread: (command) =>
+              Effect.sync(() => {
+                commands.push(command);
+                return {
+                  delivery: "queued",
+                  run: { id: RunId.make("sender-run"), status: "queued" },
+                } as ThreadManagementService.ThreadManagementSendResult;
+              }),
+          }),
+        ),
+      );
+    }),
+  );
+
   it.effect(
     "reads a capped final reply directly without paging history or acknowledging delivery",
     () =>
@@ -3810,6 +3856,15 @@ describe("OrchestratorMcpService thread lookup", () => {
           const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
           const result = yield* mcp.threadResult(client, { threadId: launched.id });
           assert.equal(result.revision, 42);
+          expect(result.latestMessage).toMatchObject({
+            messageId: "inbox-post",
+            role: "user",
+            mcpSender: {
+              sessionIdShort: "0123456789abcdef",
+              clientLabel: "Jarvis",
+              kind: "outside_client",
+            },
+          });
           assert.equal(Array.from(result.lastAssistantMessage?.text ?? "").length, 4000);
           assert.equal(result.lastAssistantMessage?.truncated, true);
           assert.equal(result.run?.runId, runId);
@@ -3839,6 +3894,24 @@ describe("OrchestratorMcpService thread lookup", () => {
                 });
               },
               getThreadRecords: (_id, _fields, filter) => {
+                if (filter?.messageRoles === undefined)
+                  return Effect.succeed({
+                    ...projection,
+                    messages: [
+                      {
+                        id: MessageId.make("inbox-post"),
+                        role: "user",
+                        text: "hello",
+                        createdBy: "agent",
+                        creationSource: "mcp",
+                        mcpSender: {
+                          sessionIdShort: "0123456789abcdef",
+                          clientLabel: "Jarvis",
+                          kind: "outside_client",
+                        },
+                      },
+                    ],
+                  } as unknown as OrchestrationV2ThreadProjection);
                 assert.deepEqual(filter, {
                   messageRoles: ["assistant"],
                   messageRunIds: [runId],

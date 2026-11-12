@@ -1056,6 +1056,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         createdBy: "agent",
         creationSource: "mcp",
         senderThreadId: ThreadId.make("sender"),
+        mcpSender: {
+          sessionIdShort: "0123456789abcdef",
+          clientLabel: "Jarvis",
+          kind: "outside_client",
+        },
         commandId: CommandId.make("post-message"),
         threadId,
         messageId: MessageId.make("post-message"),
@@ -1080,6 +1085,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         createdBy: "agent",
         creationSource: "mcp",
         senderThreadId: "sender",
+        mcpSender: command.mcpSender,
       });
       expect(projection.turnItems.filter((item) => item.type === "user_message")).toHaveLength(1);
     }),
@@ -1679,12 +1685,22 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         commandId: steerCommandId,
         threadId,
         messageId: steerMessageId,
+        mcpSender: {
+          sessionIdShort: "0123456789abcdef",
+          clientLabel: "Jarvis",
+          kind: "outside_client",
+        },
         text: "Include this in the active work.",
         attachments: [],
         dispatchMode: { type: "start_immediately" },
         deliveryIntent: "auto",
       });
       const steered = yield* orchestrator.getThreadProjection(threadId);
+      expect(steered.messages.find((message) => message.id === steerMessageId)?.mcpSender).toEqual({
+        sessionIdShort: "0123456789abcdef",
+        clientLabel: "Jarvis",
+        kind: "outside_client",
+      });
       assert.lengthOf(steered.runs, 1);
       assert.equal(
         steered.messages.find((message) => message.id === steerMessageId)?.runId,
@@ -6070,6 +6086,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           commandId: CommandId.make(`runtime-layer-serialized-queue-first-${automatic}`),
           threadId,
           messageId: MessageId.make(`runtime-layer-serialized-queue-first-${automatic}`),
+          mcpSender: {
+            sessionIdShort: "0123456789abcdef",
+            clientLabel: "Jarvis",
+            kind: "outside_client",
+          },
           text: "First queued",
           attachments: [],
           modelSelection,
@@ -6155,6 +6176,15 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             item.runId === firstQueuedRun.id &&
             (item.type === "user_message" || item.type === "notification"),
         );
+        expect(
+          afterFirstPromotion.messages.find(
+            (message) => message.id === firstQueuedRun.userMessageId,
+          )?.mcpSender,
+        ).toEqual({
+          sessionIdShort: "0123456789abcdef",
+          clientLabel: "Jarvis",
+          kind: "outside_client",
+        });
         assert.isDefined(promotedMessageItem);
         if (automatic) {
           assert.equal(promotedMessageItem.type, "notification");
