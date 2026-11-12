@@ -1,0 +1,44 @@
+# Jarvis and T3
+
+Terms for the work Chris shares between Jarvis, Vision, and T3.
+
+## Language
+
+**Jarvis**:
+Chris's ChatGPT chief of staff and the coordinator of work shared with T3.
+
+**Vision**:
+A worker directed by Jarvis through Slack.
+
+**dot**:
+A named ChatGPT assistant, such as Jarvis or Vision.
+
+**T3 Omarchy plugin**:
+The connection through which an outside assistant works with T3 on Omarchy.
+
+**work ledger**:
+The shared record of work, its owners, progress, blockers, and next actions.
+
+**work item**:
+One outcome tracked in the work ledger under a stable key.
+
+**inbox**:
+The T3 thread where agents leave requests for Jarvis.
+
+**event subscription**:
+An arrangement to receive notice when a selected kind of change happens in T3.
+
+**notify**:
+A request for event subscriptions when starting or sending work to a thread.
+
+**coordinator thread**:
+A conversation that directs work across worker threads and follows their outcomes.
+
+**worker thread**:
+A T3 conversation responsible for a bounded piece of work and its verified result.
+
+**fork release**:
+A published build of Chris's personal T3 fork that includes his changes and upstream updates.
+
+**guarded update**:
+A service update that checks the fork release, waits for a suitable time, and restores a healthy build if the new build fails.
