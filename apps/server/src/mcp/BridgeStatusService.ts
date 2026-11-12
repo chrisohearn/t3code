@@ -1,12 +1,15 @@
 import {
+  EnvironmentId,
   EnvironmentConnectReachability,
   McpEventSubscriptionsResult,
   OrchestratorMcpFailure,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as McpEvents from "./McpEvents.ts";
 import * as Metrics from "./McpBridgeMetrics.ts";
@@ -17,6 +20,19 @@ export const BridgeStatusResult = Schema.Struct({
   subscriptions: McpEventSubscriptionsResult.fields.subscriptions,
   lastSuccessfulEventDeliveryAt: Schema.NullOr(Schema.String),
   deliveriesExhaustedRetries: Schema.Number,
+  linkedEnvironments: Schema.NullOr(
+    Schema.Struct({
+      checkedAt: Schema.String,
+      links: Schema.Array(
+        Schema.Struct({
+          environmentId: EnvironmentId,
+          label: Schema.String,
+          status: Schema.Literals(["reachable", "unreachable", "expired"]),
+          answeredProbe: Schema.Boolean,
+        }),
+      ),
+    }),
+  ),
   toolCalls: Schema.Array(
     Schema.Struct({
       tool: Schema.String,
@@ -41,6 +57,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const events = yield* McpEvents.McpEvents;
     const metrics = yield* Metrics.McpBridgeMetrics;
+    const forwarding = yield* PeerForwarding.PeerForwarding;
     return BridgeStatusService.of({
       status: Effect.fn("BridgeStatusService.status")(function* () {
         const scope = yield* Invocation.McpInvocationContext;
@@ -54,7 +71,27 @@ export const layer = Layer.effect(
               }),
           ),
         );
-        return { ...status, toolCalls: yield* metrics.read(scope.client!.sessionId) };
+        const linkedEnvironments = yield* forwarding.links(scope).pipe(
+          Effect.map((result) => ({
+            links: result.links.map(({ environmentId, label, status }) => ({
+              environmentId,
+              label,
+              status,
+              answeredProbe: status === "reachable",
+            })),
+          })),
+          Effect.flatMap((result) =>
+            DateTime.now.pipe(
+              Effect.map((now) => ({ ...result, checkedAt: DateTime.formatIso(now) })),
+            ),
+          ),
+          Effect.orElseSucceed(() => null),
+        );
+        return {
+          ...status,
+          linkedEnvironments,
+          toolCalls: yield* metrics.read(scope.client!.sessionId),
+        };
       }),
     });
   }),

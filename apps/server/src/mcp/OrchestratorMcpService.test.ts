@@ -1532,6 +1532,13 @@ describe("OrchestratorMcpService provider resolution", () => {
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const capabilities = yield* service.capabilities(scope);
+          assert.equal(capabilities.jarvisPlaybookResource, "t3://jarvis/playbook");
+          const peerCapabilities = yield* service.capabilities({
+            ...scope,
+            thread: undefined,
+            client: { sessionId: "peer", label: "Peer", access: "full-access", linked: true },
+          });
+          assert.isUndefined(peerCapabilities.jarvisPlaybookResource);
           const byId = new Map(
             capabilities.providers.map((provider) => [provider.providerInstanceId, provider]),
           );
@@ -3898,7 +3905,32 @@ describe("OrchestratorMcpService thread lookup", () => {
             message: "Clean reset",
             freshContext: true,
           });
+          for (let index = 0; index < 25; index++) {
+            yield* ledger.upsert(
+              {
+                key: `large-${index}`,
+                title: "😀".repeat(100),
+                ownerKind: "t3",
+                ownerName: "Coordinator",
+                ownerThreadId: launched.id,
+                blocker: "\n".repeat(400),
+                nextAction: "😀".repeat(200),
+              },
+              "test",
+            );
+          }
+          const currentRequest = "Keep this request intact. ".repeat(4000);
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: currentRequest,
+            coordinatorRollover: true,
+          });
           const messages = yield* Ref.get(received);
+          assert.isAtMost(
+            Buffer.byteLength(messages[3]!.text) - Buffer.byteLength(currentRequest),
+            8192,
+          );
+          assert.isTrue(messages[3]!.text.endsWith(currentRequest));
           assert.deepEqual(messages[2], { text: "Clean reset", freshContext: true });
           assert.equal(messages[0]?.freshContext, true);
           assert.include(messages[0]!.text, '"key":"owned"');
@@ -3914,7 +3946,7 @@ describe("OrchestratorMcpService thread lookup", () => {
               getThreadRecords: () =>
                 Effect.succeed({
                   ...projection,
-                  messages: [{ text: "Latest result" + "x".repeat(10_000) }],
+                  messages: [{ text: "Latest result" + "\n😀".repeat(10_000) }],
                 } as unknown as OrchestrationV2ThreadProjection),
               sendToThread: (input) =>
                 Ref.update(received, (items) => [
