@@ -6699,6 +6699,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           AND NOT (json_extract(payload_json, '$.forkedFrom.type') IS 'run'
             AND json_extract(payload_json, '$.lineage.sideChat') IS NOT 1)`;
       if (ownRowsOnly.length === 0) return null;
+      const legacyPosts = yield* sql`
+        SELECT 1 FROM orchestration_v2_projection_turn_items
+          INDEXED BY orchestration_v2_projection_turn_items_user_message_idx
+        WHERE thread_id = ${threadId} AND type = 'user_message' AND ordinal < 1000000
+          AND run_id IS NULL AND json_extract(payload_json, '$.inputIntent') = 'post'
+        LIMIT 1`;
+      if (legacyPosts.length > 0) return null;
       const records = yield* getThreadRecords(threadId, ["runs", "attempts"]);
       if (inheritedRunFork(records.thread) !== null) return null;
       const superseded = records.attempts.filter((attempt) => attempt.status === "superseded");
