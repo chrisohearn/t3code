@@ -3101,6 +3101,7 @@ const make = Effect.gen(function* () {
         .getThreadRecords(input.threadId, ["messages"], {
           latestMessageOnly: true,
           messageOrder: "created_at",
+          excludeSilentMaintenance: true,
         })
         .pipe(Effect.mapError(threadManagementFailure));
       const maxChars = input.maxChars ?? 4000;

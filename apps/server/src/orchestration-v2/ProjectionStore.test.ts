@@ -3285,6 +3285,33 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         yield* readMessageIds({ latestMessageOnly: true, messageOrder: "created_at" }),
         [queuedMessageId],
       );
+      const visibleLatest = {
+        latestMessageOnly: true,
+        messageOrder: "created_at",
+        excludeSilentMaintenance: true,
+      } as const;
+      yield* sql`UPDATE orchestration_v2_projection_messages
+        SET payload_json = json_set(payload_json, '$.text', '/compact',
+          '$.createdBy', 'agent', '$.creationSource', 'server', '$.attachments', json('[]'))
+        WHERE message_id = ${queuedMessageId}`;
+      assert.deepEqual(yield* readMessageIds(visibleLatest), [lastMessageId]);
+      const maintenanceRunId = RunId.make("run:bounded-sql-history:1000");
+      yield* sql`UPDATE orchestration_v2_projection_messages
+        SET run_id = ${maintenanceRunId}, role = 'assistant',
+          payload_json = json_set(payload_json, '$.role', 'assistant',
+            '$.text', 'Internal summary', '$.runId', ${maintenanceRunId})
+        WHERE message_id = ${queuedMessageId}`;
+      yield* sql`UPDATE orchestration_v2_projection_runs
+        SET payload_json = json_set(payload_json, '$.userMessageId', ${lastMessageId})
+        WHERE run_id = ${maintenanceRunId}`;
+      yield* sql`UPDATE orchestration_v2_projection_messages
+        SET payload_json = json_set(payload_json, '$.text', '/compact',
+          '$.createdBy', 'agent', '$.creationSource', 'server', '$.attachments', json('[]'))
+        WHERE message_id = ${lastMessageId}`;
+      assert.deepEqual(yield* readMessageIds(visibleLatest), [firstMessageId]);
+      yield* sql`UPDATE orchestration_v2_projection_runs SET status = 'failed'
+        WHERE run_id = ${maintenanceRunId}`;
+      assert.deepEqual(yield* readMessageIds(visibleLatest), [queuedMessageId]);
       yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE message_id = ${queuedMessageId}`;
       assert.deepEqual(yield* readMessageIds({ messageIds: [] }), []);
       assert.deepEqual(yield* readMessageIds({ messageIds: [firstMessageId] }), [firstMessageId]);
