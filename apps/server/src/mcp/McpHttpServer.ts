@@ -77,6 +77,7 @@ import * as AttachmentHandlers from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import * as ThreadHandlers from "./toolkits/thread/handlers.ts";
 import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
+import * as PendingApproval from "./PendingApprovalMcpService.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import * as OrchestratorHandlers from "./toolkits/orchestrator/handlers.ts";
@@ -209,6 +210,37 @@ const withModeLimit = (
     : { ...invocation, client: { ...invocation.client, narrowedTo: limit.value } };
 };
 
+const decodeApprovalOrigin = Schema.decodeUnknownOption(
+  Schema.fromJsonString(McpInvocationContext.McpApprovalOrigin),
+);
+const invalidApprovalOrigin = HttpServerResponse.jsonUnsafe(
+  {
+    error: "invalid_approval_origin",
+    message: "Approval origin requires a valid authenticated peer link.",
+  },
+  { status: 400, headers: { "cache-control": "no-store" } },
+);
+const withApprovalOrigin = (
+  invocation: McpInvocationContext.McpInvocationScope,
+  request: HttpServerRequest.HttpServerRequest,
+): McpInvocationContext.McpInvocationScope | undefined => {
+  const header = request.headers[McpInvocationContext.APPROVAL_ORIGIN_HEADER];
+  if (header === undefined) return invocation;
+  if (invocation.thread !== undefined || invocation.client?.linked !== true || header.length > 4096)
+    return undefined;
+  try {
+    const origin = decodeApprovalOrigin(decodeURIComponent(header));
+    return Option.isNone(origin)
+      ? undefined
+      : {
+          ...invocation,
+          client: { ...invocation.client, approvalOrigin: origin.value },
+        };
+  } catch {
+    return undefined;
+  }
+};
+
 // The Linked environments beta is off here: links wait until it is on again.
 const linkedEnvironmentsOff = HttpServerResponse.jsonUnsafe(
   {
@@ -256,7 +288,9 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     }
     const asked = withModeLimit(invocation, request);
     if (asked === undefined) return invalidModeLimit;
-    const limited = McpInvocationContext.withRuntimeModeCeiling(asked, runtimeModeCeiling);
+    const attributed = withApprovalOrigin(asked, request);
+    if (attributed === undefined) return invalidApprovalOrigin;
+    const limited = McpInvocationContext.withRuntimeModeCeiling(attributed, runtimeModeCeiling);
     const linkedEnvironments = yield* linksEnabled;
     if (limited.client?.linked === true && !linkedEnvironments) return linkedEnvironmentsOff;
     return { ...limited, linkedEnvironments };
@@ -1305,7 +1339,9 @@ export const layerOrchestratorToolkit = toolkitRegistration(
 
 export const layerLedgerToolkit = toolkitRegistration(LedgerToolkit, LedgerHandlers.layer);
 
-export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
+export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer).pipe(
+  Layer.provide(PendingApproval.layer),
+);
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,

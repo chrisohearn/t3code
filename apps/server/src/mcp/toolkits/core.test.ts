@@ -17,6 +17,7 @@ import {
   CommandId,
   EnvironmentId,
   NodeId,
+  OrchestrationV2McpApprovalAnswer,
   OrchestratorMcpThreadReadResult,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -35,6 +36,8 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Schema from "effect/Schema";
 import { McpAttachmentInput } from "./attachment/input.ts";
 import { McpSchema, McpServer } from "effect/ai";
@@ -67,6 +70,7 @@ import * as McpInvocationContext from "../McpInvocationContext.ts";
 import * as McpToolAccessTestkit from "../McpToolAccess.testkit.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { dispatchFailure } from "../threadAccess.ts";
+import { McpApprovalAnswerContext } from "../McpApprovalAnswerContext.ts";
 import * as EnvironmentHandlers from "./environment/handlers.ts";
 import * as AttachmentHandlers from "./attachment/handlers.ts";
 import * as PeerForwarding from "../../peer/PeerForwarding.ts";
@@ -90,6 +94,9 @@ const declaredFailure = (result: McpSchema.CallToolResult) => {
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 
 const decodeMcpAttachmentInput = Schema.decodeUnknownEffect(McpAttachmentInput);
+const encodeApprovalAnswer = Schema.encodeSync(
+  Schema.fromJsonString(OrchestrationV2McpApprovalAnswer),
+);
 const decodeThreadReadResult = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadResult);
 
 const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
@@ -100,6 +107,8 @@ const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
   Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
   Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
   Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+  Layer.provideMerge(Sqlite.layerMemory),
+  Layer.provide(NodeServices.layer),
 );
 
 const threadId = ThreadId.make("mcp-core-thread");
@@ -238,6 +247,235 @@ it.effect("checks capability through the production registration", () =>
     ),
   ),
 );
+
+it.effect("only outside full-access sign-ins answer approvals, with attribution", () => {
+  const shell = McpToolAccessTestkit.liveThreadShell(ThreadId.make("someone-elses-thread"));
+  const requestId = RuntimeRequestId.make("outside-approval");
+  const projection = McpToolAccessTestkit.idleThreadProjection(shell);
+  const decisionContext: Array<unknown> = [];
+  const outside = (
+    access: "read-only" | "approval-required" | "auto-accept-edits" | "auto" | "full-access",
+  ): McpInvocationContext.McpInvocationScope => ({
+    ...scope,
+    thread: undefined,
+    client: { sessionId: "outside-session", label: "Outside client", access, linked: false },
+  });
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const respond = (invocation: McpInvocationContext.McpInvocationScope, decision: string) =>
+      server
+        .callTool({
+          name: "t3_pending_request",
+          arguments: {
+            action: "respond",
+            threadId: shell.id,
+            requestId,
+            decision,
+            note: "Chris said yes.",
+          },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+    for (const invocation of [
+      scope,
+      outside("read-only"),
+      outside("approval-required"),
+      outside("auto-accept-edits"),
+      outside("auto"),
+      {
+        ...outside("full-access"),
+        client: {
+          ...outside("full-access").client!,
+          narrowedTo: { runtimeMode: "full-access", interactionMode: "plan" } as const,
+        },
+      },
+      {
+        ...outside("full-access"),
+        client: {
+          ...outside("full-access").client!,
+          narrowedTo: { runtimeMode: "approval-required", interactionMode: "default" } as const,
+        },
+      },
+    ]) {
+      expect((yield* respond(invocation, "accept")).isError).toBe(true);
+    }
+    expect(decisionContext).toHaveLength(0);
+    for (const decision of ["acceptForSession", "acceptAlways", "cancel"]) {
+      const result = yield* respond(outside("full-access"), decision).pipe(Effect.result);
+      expect(result._tag === "Failure" || result.success.isError).toBe(true);
+    }
+    expect(decisionContext).toHaveLength(0);
+    for (const decision of ["accept", "decline"]) {
+      expect((yield* respond(outside("full-access"), decision)).isError).not.toBe(true);
+    }
+    expect(decisionContext).toEqual([
+      {
+        sessionId: "outside-session",
+        clientLabel: "Outside client",
+        originEnvironmentId: scope.environmentId,
+        note: "Chris said yes.",
+      },
+      {
+        sessionId: "outside-session",
+        clientLabel: "Outside client",
+        originEnvironmentId: scope.environmentId,
+        note: "Chris said yes.",
+      },
+    ]);
+    const log = (invocation: McpInvocationContext.McpInvocationScope) =>
+      server
+        .callTool({ name: "t3_approval_log", arguments: {} })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+    expect(declaredFailure(yield* log(outside("auto")))).toMatchObject({
+      code: "capability_denied",
+    });
+    expect((yield* log(outside("full-access"))).structuredContent).toMatchObject({
+      records: [],
+      nextCursor: null,
+    });
+    const forwarded = {
+      ...outside("full-access"),
+      client: {
+        ...outside("full-access").client!,
+        linked: true,
+        approvalOrigin: {
+          environmentId: EnvironmentId.make("origin-env"),
+          sessionId: "jarvis-origin-session",
+          clientLabel: "Jarvis",
+        },
+      },
+    };
+    for (const decision of ["accept", "decline"]) {
+      expect(declaredFailure(yield* respond(forwarded, decision))).toMatchObject({
+        code: "capability_denied",
+        message: expect.stringContaining("direct sign-in to the target server"),
+      });
+    }
+    expect(
+      declaredFailure(
+        yield* respond(
+          {
+            ...outside("full-access"),
+            client: { ...outside("auto").client!, linked: true },
+          },
+          "accept",
+        ),
+      ),
+    ).toMatchObject({
+      code: "capability_denied",
+      message: expect.stringContaining("direct sign-in to the target server"),
+    });
+    expect(decisionContext).toHaveLength(2);
+    const refused = (yield* log(outside("full-access"))).structuredContent as {
+      records: ReadonlyArray<unknown>;
+    };
+    expect(refused.records.slice(0, 2)).toEqual(
+      ["accept", "decline"].map((decision) =>
+        expect.objectContaining({
+          sessionId: "jarvis-origin-session",
+          clientLabel: "Jarvis",
+          originEnvironmentId: "origin-env",
+          forwardedBy: { sessionId: "outside-session", clientLabel: "Outside client" },
+          threadId: shell.id,
+          requestId,
+          requested: { requestKind: "command", prompt: "Run tests" },
+          decision: "refused",
+          attemptedDecision: decision,
+          answeredAt: expect.any(String),
+          note: "Chris said yes.",
+        }),
+      ),
+    );
+    expect(refused.records[2]).toMatchObject({
+      sessionId: "outside-session",
+      clientLabel: "Outside client",
+      decision: "refused",
+      forwardedBy: { sessionId: "outside-session", clientLabel: "Outside client" },
+    });
+    expect(refused.records[2]).not.toHaveProperty("originEnvironmentId");
+    const sql = yield* SqlClient.SqlClient;
+    const record = {
+      sessionId: "outside-session",
+      clientLabel: "Outside client",
+      threadId: shell.id,
+      requestId,
+      requested: { requestKind: "command" as const, prompt: "Run tests" },
+      decision: "accept" as const,
+      answeredAt: "2026-11-12T00:00:00.000Z",
+      note: "Chris said yes.",
+    };
+    yield* sql`INSERT INTO mcp_approval_answers (thread_id, request_id, answer_json)
+      VALUES (${shell.id}, ${requestId}, ${encodeApprovalAnswer(record)})`;
+    expect((yield* log(outside("full-access"))).structuredContent).toEqual({
+      records: [...refused.records, record],
+      nextCursor: null,
+    });
+  }).pipe(
+    Effect.provide(
+      layerThreadToolkit.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Effect.succeed(id === threadId ? McpToolAccessTestkit.liveThreadShell(id) : shell),
+            getProjectThreadRecords: () =>
+              Effect.succeed({
+                ...projection,
+                runtimeRequests: [
+                  {
+                    id: requestId,
+                    nodeId: NodeId.make("approval-node"),
+                    providerTurnId: null,
+                    nativeRequestRef: null,
+                    kind: "command",
+                    status: "pending",
+                    responseCapability: { type: "message" },
+                    createdAt: shell.createdAt,
+                    resolvedAt: null,
+                  },
+                ],
+                turnItems: [
+                  {
+                    id: TurnItemId.make("approval-item"),
+                    threadId: shell.id,
+                    runId: null,
+                    nodeId: null,
+                    providerThreadId: null,
+                    providerTurnId: null,
+                    nativeItemRef: null,
+                    parentItemId: null,
+                    ordinal: 0,
+                    status: "running",
+                    title: null,
+                    startedAt: shell.createdAt,
+                    completedAt: null,
+                    updatedAt: shell.updatedAt,
+                    type: "approval_request",
+                    requestId,
+                    requestKind: "command",
+                    prompt: "Run tests",
+                  },
+                ],
+              }),
+            dispatch: () =>
+              Effect.gen(function* () {
+                decisionContext.push(
+                  Option.getOrUndefined(yield* Effect.serviceOption(McpApprovalAnswerContext)),
+                );
+                return { sequence: 1, storedEvents: [] };
+              }),
+          }),
+        ),
+      ),
+    ),
+  );
+});
 
 it.effect("an answered question reports already answered instead of not found", () => {
   const shell = McpToolAccessTestkit.liveThreadShell(threadId);
@@ -540,6 +778,7 @@ it.effect("requires a projectId to file a scratch thread and returns the moved s
   }).pipe(
     Effect.provide(
       McpHttpServer.layerThreadToolkit.pipe(
+        Layer.provide(Sqlite.layerMemory),
         Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
         Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
         Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
@@ -979,6 +1218,7 @@ it.effect.each([
   }).pipe(
     Effect.provide(
       McpHttpServer.layerThreadToolkit.pipe(
+        Layer.provide(Sqlite.layerMemory),
         Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
         Layer.provide(NodeCrypto.layer),
         Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),

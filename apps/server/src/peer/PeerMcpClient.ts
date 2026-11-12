@@ -41,11 +41,15 @@ export class PeerMcpClient extends Context.Service<
       readonly tool: string;
       readonly arguments: Record<string, unknown>;
       readonly limits: PeerCallLimits;
+      readonly approvalOrigin?: typeof McpInvocationContext.McpApprovalOrigin.Type;
       readonly success: S;
     }) => Effect.Effect<S["Type"], OrchestratorMcpFailure>;
   }
 >()("t3/peer/PeerMcpClient") {}
 
+const encodeApprovalOrigin = Schema.encodeEffect(
+  Schema.fromJsonString(McpInvocationContext.McpApprovalOrigin),
+);
 const ToolCallResponse = Schema.Struct({
   result: Schema.optional(
     Schema.Struct({
@@ -158,7 +162,24 @@ const make = Effect.gen(function* () {
       const resolved = yield* links
         .resolve(input.environmentId)
         .pipe(Effect.mapError(fromLinkError));
+      const approvalOrigin =
+        input.approvalOrigin === undefined
+          ? undefined
+          : yield* encodeApprovalOrigin(input.approvalOrigin).pipe(
+              Effect.mapError(
+                () =>
+                  new OrchestratorMcpFailure({
+                    code: "invalid_request",
+                    message: "The approval origin cannot be forwarded.",
+                  }),
+              ),
+            );
       const limitHeader = {
+        ...(approvalOrigin === undefined
+          ? {}
+          : {
+              [McpInvocationContext.APPROVAL_ORIGIN_HEADER]: encodeURIComponent(approvalOrigin),
+            }),
         [McpInvocationContext.MODE_LIMIT_HEADER]: `${input.limits.runtimeMode}/${input.limits.interactionMode}`,
       };
       const sessionKey = `${input.environmentId} ${resolved.url}`;
