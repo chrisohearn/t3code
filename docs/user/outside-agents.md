@@ -145,18 +145,19 @@ approval by its `requestId` before answering. An outside sign-in approved for
 **Full access** can answer on any thread with `action: "respond"` and
 `decision: "accept"` to allow once, or `decision: "decline"` to deny. Other
 sign-ins and agents running inside T3 threads cannot answer approvals over MCP.
-Standing grants and permission-mode changes stay in the app. To answer in a linked
-environment, pass its `environmentId`; both the outside sign-in and the link must
-have Full access.
+Standing grants and permission-mode changes stay in the app. Answer through a direct
+Full-access sign-in to the server that owns the thread. Forwarded answers are refused;
+a link to another environment does not authorize an answer there. Each target server
+needs a fork release that supports MCP approval answers.
 
 Every answer records the session, client label, thread, request, requested action,
 decision, and time. An optional `note` records the caller's statement of what the
 user said. The thread timeline identifies the MCP client that answered. A
 full-access caller can read the records with `t3_approval_log`; use `threadId`
-to filter and `cursor` and `limit` to page through them. Forwarded answers retain
-the original client, session and environment, as attested by the authenticated
-link. The audit also records that link's session and label; the timeline shows
-which client answered and which link forwarded it.
+to filter and `cursor` and `limit` to page through them. The log also records refused
+forwarded attempts, including the attempted decision and any origin attested by the
+authenticated link. A refusal leaves the approval pending so a direct sign-in can
+answer it.
 
 `t3_thread_list` includes `launchedBy` and `pendingRequestCount`. Pass
 `launchedByMe: true` to find threads launched through this sign-in session.

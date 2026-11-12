@@ -147,7 +147,11 @@ export const reads = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>)
 
 export const answersApprovals = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) => {
   const check = McpInvocationContext.McpInvocationContext.pipe(
-    Effect.flatMap(McpInvocationContext.assertOutsideApprovalCaller),
+    Effect.flatMap((scope) =>
+      scope.thread === undefined && scope.client?.linked === true
+        ? Effect.void
+        : McpInvocationContext.assertOutsideApprovalCaller(scope),
+    ),
   );
   return declare(
     (params: P) => check.pipe(Effect.flatMap(() => handle(params))),

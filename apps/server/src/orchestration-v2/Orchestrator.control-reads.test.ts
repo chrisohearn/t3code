@@ -2066,7 +2066,7 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
             requestKind: "command",
             ...(standingOnly
               ? { options: [{ decision: "acceptForSession" as const, label: "Always allow" }] }
-              : {}),
+              : { options: [{ decision, label: decision === "accept" ? "Run once" : "Reject" }] }),
             prompt: "Run project tests",
             reason: "Needs process access",
           },
@@ -2086,10 +2086,6 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
                 sessionId: "outside-test-session",
                 clientLabel: "Outside test client",
                 originEnvironmentId: EnvironmentId.make("origin-env"),
-                forwardedBy: {
-                  sessionId: "authenticated-link-session",
-                  clientLabel: "Origin server",
-                },
                 note: "Chris said to answer this prompt.",
               }),
             )
@@ -2121,10 +2117,10 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
           sessionId: "outside-test-session",
           clientLabel: "Outside test client",
           originEnvironmentId: EnvironmentId.make("origin-env"),
-          forwardedBy: { sessionId: "authenticated-link-session", clientLabel: "Origin server" },
           threadId,
           requestId,
           decision,
+          selectedOption: { decision, label: decision === "accept" ? "Run once" : "Reject" },
           answeredAt: DateTime.formatIso(now),
           note: "Chris said to answer this prompt.",
           requested: {
@@ -2146,8 +2142,6 @@ it.effect("keeps a snooze when a live question is cancelled or an approval is an
             (item) =>
               item.type === "system_notice" &&
               item.message.includes("Outside test client") &&
-              item.message.includes("Origin server") &&
-              item.message.includes("origin-env") &&
               item.message.includes(decision === "accept" ? "allowed once" : "denied"),
           ),
         );

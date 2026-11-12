@@ -2651,7 +2651,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               if (event.payload.mcpApprovalAnswer !== undefined) {
                 yield* sql`INSERT INTO mcp_approval_answers (thread_id, request_id, answer_json)
                   VALUES (${event.threadId}, ${event.payload.id}, json_extract(${payloadJson}, '$.mcpApprovalAnswer'))
-                  ON CONFLICT(thread_id, request_id) DO NOTHING`;
+                  ON CONFLICT(thread_id, request_id) WHERE outcome = 'answered' DO NOTHING`;
               }
               break;
             }

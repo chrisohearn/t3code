@@ -260,6 +260,20 @@ it.effect("only outside full-access sign-ins answer approvals, with attribution"
       outside("approval-required"),
       outside("auto-accept-edits"),
       outside("auto"),
+      {
+        ...outside("full-access"),
+        client: {
+          ...outside("full-access").client!,
+          narrowedTo: { runtimeMode: "full-access", interactionMode: "plan" } as const,
+        },
+      },
+      {
+        ...outside("full-access"),
+        client: {
+          ...outside("full-access").client!,
+          narrowedTo: { runtimeMode: "approval-required", interactionMode: "default" } as const,
+        },
+      },
     ]) {
       expect((yield* respond(invocation, "accept")).isError).toBe(true);
     }
@@ -300,6 +314,66 @@ it.effect("only outside full-access sign-ins answer approvals, with attribution"
       records: [],
       nextCursor: null,
     });
+    const forwarded = {
+      ...outside("full-access"),
+      client: {
+        ...outside("full-access").client!,
+        linked: true,
+        approvalOrigin: {
+          environmentId: EnvironmentId.make("origin-env"),
+          sessionId: "jarvis-origin-session",
+          clientLabel: "Jarvis",
+        },
+      },
+    };
+    for (const decision of ["accept", "decline"]) {
+      expect(declaredFailure(yield* respond(forwarded, decision))).toMatchObject({
+        code: "capability_denied",
+        message: expect.stringContaining("direct sign-in to the target server"),
+      });
+    }
+    expect(
+      declaredFailure(
+        yield* respond(
+          {
+            ...outside("full-access"),
+            client: { ...outside("auto").client!, linked: true },
+          },
+          "accept",
+        ),
+      ),
+    ).toMatchObject({
+      code: "capability_denied",
+      message: expect.stringContaining("direct sign-in to the target server"),
+    });
+    expect(decisionContext).toHaveLength(2);
+    const refused = (yield* log(outside("full-access"))).structuredContent as {
+      records: ReadonlyArray<unknown>;
+    };
+    expect(refused.records.slice(0, 2)).toEqual(
+      ["accept", "decline"].map((decision) =>
+        expect.objectContaining({
+          sessionId: "jarvis-origin-session",
+          clientLabel: "Jarvis",
+          originEnvironmentId: "origin-env",
+          forwardedBy: { sessionId: "outside-session", clientLabel: "Outside client" },
+          threadId: shell.id,
+          requestId,
+          requested: { requestKind: "command", prompt: "Run tests" },
+          decision: "refused",
+          attemptedDecision: decision,
+          answeredAt: expect.any(String),
+          note: "Chris said yes.",
+        }),
+      ),
+    );
+    expect(refused.records[2]).toMatchObject({
+      sessionId: "outside-session",
+      clientLabel: "Outside client",
+      decision: "refused",
+      forwardedBy: { sessionId: "outside-session", clientLabel: "Outside client" },
+    });
+    expect(refused.records[2]).not.toHaveProperty("originEnvironmentId");
     const sql = yield* SqlClient.SqlClient;
     const record = {
       sessionId: "outside-session",
@@ -314,7 +388,7 @@ it.effect("only outside full-access sign-ins answer approvals, with attribution"
     yield* sql`INSERT INTO mcp_approval_answers (thread_id, request_id, answer_json)
       VALUES (${shell.id}, ${requestId}, ${encodeApprovalAnswer(record)})`;
     expect((yield* log(outside("full-access"))).structuredContent).toEqual({
-      records: [record],
+      records: [...refused.records, record],
       nextCursor: null,
     });
   }).pipe(

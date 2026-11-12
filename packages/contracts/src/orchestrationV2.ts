@@ -1231,6 +1231,7 @@ export const OrchestrationV2McpApprovalAnswer = Schema.Struct({
     appName: Schema.optional(Schema.String),
   }),
   decision: Schema.Literals(["accept", "decline"]),
+  selectedOption: Schema.optional(ProviderApprovalOption),
   answeredAt: IsoDateTime,
   note: Schema.optional(Schema.String),
 });

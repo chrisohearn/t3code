@@ -10290,6 +10290,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
 
       const now = yield* DateTime.now;
+      const selectedApprovalOption =
+        approvalTurnItem?.type === "approval_request"
+          ? approvalTurnItem.options?.find((option) => option.decision === command.decision)
+          : undefined;
       const resolvedRequest = {
         ...runtimeRequest,
         status: "resolved" as const,
@@ -10319,6 +10323,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     : { appName: approvalTurnItem.appName }),
                 },
                 decision: command.decision,
+                ...(selectedApprovalOption === undefined
+                  ? {}
+                  : { selectedOption: selectedApprovalOption }),
                 answeredAt: DateTime.formatIso(now),
               },
             }),
@@ -10347,7 +10354,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             startedAt: now,
             completedAt: now,
             updatedAt: now,
-            message: `MCP client "${answer.clientLabel}" ${answer.decision === "accept" ? "allowed once" : "denied"} approval ${command.requestId}.${answer.forwardedBy === undefined ? "" : ` Forwarded by "${answer.forwardedBy.clientLabel}" (${answer.forwardedBy.sessionId}) from ${answer.originEnvironmentId}.`}${answer.note === undefined ? "" : ` Caller note: ${answer.note}`}`,
+            message: `MCP client "${answer.clientLabel}" ${answer.decision === "accept" ? "allowed once" : "denied"} approval ${command.requestId}.${answer.selectedOption === undefined ? "" : ` Selected option: ${answer.selectedOption.label}.`}${answer.note === undefined ? "" : ` Caller note: ${answer.note}`}`,
           },
         });
       }

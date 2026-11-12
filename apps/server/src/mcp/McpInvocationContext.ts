@@ -146,7 +146,6 @@ export interface McpInvocationScope {
 export const assertOutsideApprovalCaller = (scope: McpInvocationScope) =>
   scope.thread === undefined &&
   scope.client?.access === "full-access" &&
-  (scope.client.linked !== true || scope.client.approvalOrigin !== undefined) &&
   scope.capabilities.has("orchestration") &&
   clientModeCeiling(scope.client).runtimeMode === "full-access" &&
   clientModeCeiling(scope.client).interactionMode === "default"

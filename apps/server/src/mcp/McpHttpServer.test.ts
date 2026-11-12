@@ -1608,7 +1608,7 @@ it.effect(
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("accepts approval origin only from an authenticated full-access peer", () =>
+it.effect("accepts approval origin only from an authenticated peer", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const origin = {
@@ -1716,8 +1716,7 @@ it.effect("accepts approval origin only from an authenticated full-access peer",
       for (const bad of ["%", encodeURIComponent("{}"), "x".repeat(4097)]) {
         expect((yield* call("peer", bad)).status).toBe(400);
       }
-      expect((yield* call("peer")).body.result?.isError).toBe(true);
-      expect((yield* call("limited", originHeader)).body.result?.isError).toBe(true);
+      expect((yield* call("limited", originHeader)).body.result?.structuredContent).toEqual(origin);
       expect((yield* call("peer", originHeader)).body.result?.structuredContent).toEqual(origin);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),

@@ -6,6 +6,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as Effect from "effect/Effect";
@@ -25,14 +26,22 @@ import {
 } from "./threadAccess.ts";
 
 export const ApprovalDetails = OrchestrationV2McpApprovalAnswer.fields.requested;
+const ApprovalRefusal = Schema.Struct({
+  ...OrchestrationV2McpApprovalAnswer.fields,
+  threadId: Schema.optional(OrchestrationV2McpApprovalAnswer.fields.threadId),
+  requested: Schema.optional(ApprovalDetails),
+  decision: Schema.Literal("refused"),
+  attemptedDecision: OrchestrationV2McpApprovalAnswer.fields.decision,
+  reason: Schema.String,
+});
+const ApprovalRecord = Schema.Union([OrchestrationV2McpApprovalAnswer, ApprovalRefusal]);
 export const ApprovalLogResult = Schema.Struct({
-  records: Schema.Array(OrchestrationV2McpApprovalAnswer),
+  records: Schema.Array(ApprovalRecord),
   nextCursor: Schema.NullOr(Schema.Number),
 });
 const isApproval = Schema.is(ProviderRequestKind);
-const decodeAnswer = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(OrchestrationV2McpApprovalAnswer),
-);
+const decodeAnswer = Schema.decodeUnknownEffect(Schema.fromJsonString(ApprovalRecord));
+const encodeRefusal = Schema.encodeEffect(Schema.fromJsonString(ApprovalRefusal));
 const readApproval = Effect.fn("PendingApprovalMcpService.readApproval")(function* (
   scope: Invocation.McpInvocationScope,
   input: { threadId?: ThreadId | undefined; requestId: RuntimeRequestId },
@@ -112,7 +121,61 @@ export const layer = Layer.effect(
         };
       }),
       respond: Effect.fn("PendingApprovalMcpService.respond")(function* (scope, input) {
-        yield* Invocation.assertOutsideApprovalCaller(scope);
+        if (scope.thread !== undefined || scope.client?.linked !== true)
+          yield* Invocation.assertOutsideApprovalCaller(scope);
+        const attribution = {
+          sessionId: scope.client!.approvalOrigin?.sessionId ?? scope.client!.sessionId,
+          clientLabel: scope.client!.approvalOrigin?.clientLabel ?? scope.client!.label,
+          ...(scope.client!.approvalOrigin !== undefined
+            ? { originEnvironmentId: scope.client!.approvalOrigin.environmentId }
+            : scope.client!.linked === true
+              ? {}
+              : { originEnvironmentId: scope.environmentId }),
+          ...(scope.client!.linked !== true
+            ? {}
+            : {
+                forwardedBy: {
+                  sessionId: scope.client!.sessionId,
+                  clientLabel: scope.client!.label,
+                },
+              }),
+          ...(input.note === undefined ? {} : { note: input.note }),
+        };
+        if (scope.thread === undefined && scope.client?.linked === true) {
+          const reason =
+            "Forwarded approval answers are refused. Answer through a direct sign-in to the target server with Full access.";
+          const approval = yield* readApproval(scope, input).pipe(
+            Effect.provideService(ThreadManagement.ThreadManagementService, threads),
+            Effect.option,
+          );
+          const details = approval._tag === "Some" ? approval.value : undefined;
+          const json = yield* encodeRefusal({
+            ...attribution,
+            ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+            requestId: input.requestId,
+            ...(details === undefined
+              ? {}
+              : {
+                  requested: {
+                    requestKind: details.item.requestKind,
+                    ...(details.item.prompt === undefined ? {} : { prompt: details.item.prompt }),
+                    ...(details.item.reason === undefined ? {} : { reason: details.item.reason }),
+                    ...(details.item.appName === undefined
+                      ? {}
+                      : { appName: details.item.appName }),
+                  },
+                }),
+            decision: "refused",
+            attemptedDecision: input.decision,
+            answeredAt: DateTime.formatIso(yield* DateTime.now),
+            reason,
+          }).pipe(Effect.mapError(unavailable));
+          yield* sql`INSERT INTO mcp_approval_answers (thread_id, request_id, outcome, answer_json)
+            VALUES (${input.threadId ?? null}, ${input.requestId}, 'refused', ${json})`.pipe(
+            Effect.mapError(unavailable),
+          );
+          return yield* new OrchestratorMcpFailure({ code: "capability_denied", message: reason });
+        }
         const { projection } = yield* readApproval(scope, input).pipe(
           Effect.provideService(ThreadManagement.ThreadManagementService, threads),
         );
@@ -127,21 +190,7 @@ export const layer = Layer.effect(
             decision: input.decision,
           })
           .pipe(
-            Effect.provideService(McpApprovalAnswerContext, {
-              sessionId: scope.client!.approvalOrigin?.sessionId ?? scope.client!.sessionId,
-              clientLabel: scope.client!.approvalOrigin?.clientLabel ?? scope.client!.label,
-              originEnvironmentId:
-                scope.client!.approvalOrigin?.environmentId ?? scope.environmentId,
-              ...(scope.client!.approvalOrigin === undefined
-                ? {}
-                : {
-                    forwardedBy: {
-                      sessionId: scope.client!.sessionId,
-                      clientLabel: scope.client!.label,
-                    },
-                  }),
-              ...(input.note === undefined ? {} : { note: input.note }),
-            }),
+            Effect.provideService(McpApprovalAnswerContext, attribution),
             Effect.mapError(dispatchFailure),
             Effect.map(({ sequence }) => ({ sequence })),
           );

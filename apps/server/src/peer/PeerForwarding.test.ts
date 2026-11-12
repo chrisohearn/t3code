@@ -461,7 +461,7 @@ const failureOf = (result: McpSchema.CallToolResult) => {
   return result.isError === true && text?.type === "text" ? JSON.parse(text.text) : undefined;
 };
 
-it.effect("forwards outside approval answers with authenticated origin attribution", () =>
+it.effect("refuses forwarded approval answers without dispatching a response", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const seen = yield* Ref.make<Seen>(nothingSeen);
@@ -469,7 +469,6 @@ it.effect("forwards outside approval answers with authenticated origin attributi
       const b = yield* serveBox(seen, linkSession);
       const a = yield* makeLaptop;
       yield* linkTo(a.links, b, "full-access");
-      const peerSession = (yield* b.linkedSessions)[0]!;
       const args = {
         environmentId: box.environmentId,
         threadId: usersThread,
@@ -483,22 +482,21 @@ it.effect("forwards outside approval answers with authenticated origin attributi
       expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(0);
       for (const [index, decision] of ["accept", "decline"].entries()) {
         expect(
-          (yield* a.callOutside("full-access", { ...args, decision }, `jarvis-session-${index}`))
-            .isError,
-        ).not.toBe(true);
+          failureOf(
+            yield* a.callOutside("full-access", { ...args, decision }, `jarvis-session-${index}`),
+          ),
+        ).toMatchObject({
+          code: "capability_denied",
+          message: expect.stringContaining("direct sign-in to the target server"),
+        });
       }
-      expect((yield* Ref.get(seen)).approvalAnswers).toEqual(
-        [0, 1].map((index) => ({
-          sessionId: `jarvis-session-${index}`,
-          clientLabel: "Jarvis",
-          originEnvironmentId: laptop.environmentId,
-          forwardedBy: { sessionId: peerSession.sessionId, clientLabel: "T3 Code · Laptop" },
-          note: "Chris said to run tests.",
-        })),
-      );
+      expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(0);
       yield* linkTo(a.links, b, "auto");
-      expect((yield* a.callOutside("full-access", args)).isError).toBe(true);
-      expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(2);
+      expect(failureOf(yield* a.callOutside("full-access", args))).toMatchObject({
+        code: "capability_denied",
+        message: expect.stringContaining("direct sign-in to the target server"),
+      });
+      expect((yield* Ref.get(seen)).approvalAnswers).toHaveLength(0);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
