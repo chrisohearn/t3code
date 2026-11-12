@@ -3982,6 +3982,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const blockingRequestExists = pendingRequests.some(
         (request) => request.kind !== "user_input" || request.responseCapability.type !== "message",
       );
+      const latestRun = latestExecutedRun(projection.runs);
+      if (
+        !runningRunExists &&
+        !blockingRequestExists &&
+        latestRun?.status === "failed" &&
+        latestRun.restartContinuationOfRunId !== undefined
+      ) {
+        // Settlement can win the thread lock before the failed-run subscriber schedules recovery.
+        yield* retryContinuationStart(command.threadId, latestRun.id).pipe(
+          mapDispatchError(command),
+        );
+      }
       const restartContinuationPending =
         !runningRunExists &&
         !blockingRequestExists &&

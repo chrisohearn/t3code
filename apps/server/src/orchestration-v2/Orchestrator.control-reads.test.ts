@@ -37,6 +37,10 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as DelegatedTaskQuestionReactor from "./DelegatedTaskQuestionReactor.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EffectWorker from "./EffectWorker.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -1891,9 +1895,15 @@ it.effect("replays a thread.create receipt without changing the thread", () =>
 
 it.effect.each(
   (["thread.settle", "thread.auto-settle"] as const).flatMap((type) =>
-    (["running", "restart-pending", "restart-running", "restart-finished"] as const).map(
-      (state) => ({ type, state }),
-    ),
+    (
+      [
+        "running",
+        "restart-pending",
+        "restart-running",
+        "restart-finished",
+        "restart-retry-unscheduled",
+      ] as const
+    ).map((state) => ({ type, state })),
   ),
 )("$type admission with $state work", ({ type, state }) =>
   Effect.gen(function* () {
@@ -1932,7 +1942,15 @@ it.effect.each(
         userMessageId: MessageId.make("message:settlement-admission"),
         rootNodeId: null,
         activeAttemptId: null,
-        status: state === "running" ? "running" : "cancelled",
+        status:
+          state === "running"
+            ? "running"
+            : state === "restart-retry-unscheduled"
+              ? "failed"
+              : "cancelled",
+        ...(state === "restart-retry-unscheduled"
+          ? { restartContinuationOfRunId: RunId.make("run:original-before-retry") }
+          : {}),
         requestedAt: now,
         startedAt: now,
         completedAt: state === "running" ? null : now,
@@ -1940,7 +1958,7 @@ it.effect.each(
         contextHandoffId: null,
       },
     });
-    if (state !== "running") {
+    if (state !== "running" && state !== "restart-retry-unscheduled") {
       const effectId = `effect:restart-continuation:${runId}`;
       yield* outbox.enqueue([
         {
@@ -1983,9 +2001,136 @@ it.effect.each(
     if (state !== "running") {
       assert.equal(
         Option.getOrThrow(yield* outbox.get(`effect:restart-continuation:${runId}`)).status,
-        state === "restart-pending" ? "pending" : "running",
+        state === "restart-pending" || state === "restart-retry-unscheduled"
+          ? "pending"
+          : "running",
       );
     }
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("starts prepared restart recovery before an auto-settle tick can settle the thread", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const events = yield* EventSink.EventSinkV2;
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+    const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+      Effect.provide(Layer.merge(IdAllocator.layer, ServerSettings.layerTest())),
+    );
+    const threadId = ThreadId.make("thread:settle-during-restart");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-settle-during-restart"),
+      threadId,
+      projectId: ProjectId.make("project:settle-during-restart"),
+      title: "Restart recovery",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("start-before-restart"),
+      threadId,
+      messageId: MessageId.make("message:before-restart"),
+      text: "Continue working",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const before = yield* projections.getThreadProjection(threadId);
+    const run = before.runs[0]!;
+    const providerThread = before.providerThreads[0]!;
+    const now = yield* DateTime.now;
+    const runningEvents = [
+      {
+        type: "provider-session.attached",
+        payload: {
+          id: providerThread.providerSessionId!,
+          driver: adapter.driver,
+          providerInstanceId: instanceId,
+          status: "ready",
+          cwd: "/repo",
+          model: modelSelection.model,
+          capabilities: CodexProviderCapabilitiesV2,
+          createdAt: now,
+          updatedAt: now,
+          lastError: null,
+        },
+      },
+      {
+        type: "provider-thread.updated",
+        payload: {
+          ...providerThread,
+          status: "active",
+          nativeThreadRef: {
+            driver: adapter.driver,
+            nativeId: "native:restart",
+            strength: "strong",
+          },
+        },
+      },
+      { type: "run.updated", payload: { ...run, status: "running", startedAt: now } },
+      {
+        type: "provider-turn.updated",
+        payload: {
+          id: ProviderTurnId.make("provider-turn:before-restart"),
+          providerThreadId: providerThread.id,
+          nodeId: run.rootNodeId!,
+          runAttemptId: run.activeAttemptId!,
+          nativeTurnRef: { driver: adapter.driver, nativeId: "native:turn", strength: "strong" },
+          ordinal: 1,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
+      },
+    ] as const;
+    yield* events.write({
+      events: runningEvents.map((event, index) => ({
+        ...event,
+        id: EventId.make(`event:before-restart:${index}`),
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+      })),
+    });
+    yield* recovery.prepareForShutdown;
+    const effectId = `effect:restart-continuation:${run.id}`;
+    assert.equal(Option.getOrThrow(yield* outbox.get(effectId)).status, "pending");
+    yield* recovery.reconcile("shutdown");
+    const cancelled = yield* projections.getThreadProjection(threadId);
+    assert.equal(cancelled.runs[0]?.status, "cancelled");
+    assert.equal(cancelled.providerTurns[0]?.status, "cancelled");
+    const tick = yield* orchestrator
+      .dispatch({
+        type: "thread.auto-settle",
+        commandId: CommandId.make("auto-settle-after-shutdown"),
+        threadId,
+        snapshotAt: cancelled.thread.updatedAt,
+      })
+      .pipe(Effect.result);
+    assert.isTrue(yield* worker.runOnce());
+    assert.equal(Option.getOrThrow(yield* outbox.get(effectId)).status, "succeeded");
+    const resumed = yield* projections.getThreadProjection(threadId);
+    const continuation = resumed.runs.find(
+      (candidate) => candidate.restartContinuationOfRunId === run.id,
+    );
+    assert.ok(continuation, "auto-settle must not suppress the prepared continuation");
+    assert.ok(Result.isFailure(tick));
+    assert.include(String(tick.failure.cause), "has a restart continuation pending");
+    assert.equal(continuation.status, "starting");
+    assert.deepEqual(continuation.modelSelection, modelSelection);
+    assert.equal(continuation.providerThreadId, providerThread.id);
+    assert.equal(resumed.runs.length, 2);
+    assert.equal(resumed.thread.settledOverride, null);
   }).pipe(Effect.provide(layerTest)),
 );
 
