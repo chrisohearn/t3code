@@ -1,3 +1,4 @@
+import * as WorkLedger from "../persistence/WorkLedger.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -1531,6 +1532,13 @@ describe("OrchestratorMcpService provider resolution", () => {
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const capabilities = yield* service.capabilities(scope);
+          assert.equal(capabilities.jarvisPlaybookResource, "t3://jarvis/playbook");
+          const peerCapabilities = yield* service.capabilities({
+            ...scope,
+            thread: undefined,
+            client: { sessionId: "peer", label: "Peer", access: "full-access", linked: true },
+          });
+          assert.isUndefined(peerCapabilities.jarvisPlaybookResource);
           const byId = new Map(
             capabilities.providers.map((provider) => [provider.providerInstanceId, provider]),
           );
@@ -3932,6 +3940,120 @@ describe("OrchestratorMcpService thread lookup", () => {
               dispatch: () => Effect.die("must not acknowledge delivery"),
             }),
           ),
+        );
+      }),
+  );
+
+  it.effect(
+    "seeds coordinator rollover while leaving ordinary sends and clean resets unchanged",
+    () =>
+      Effect.gen(function* () {
+        const sent = yield* Ref.make(0);
+        const received = yield* Ref.make<
+          ReadonlyArray<{ readonly text: string; readonly freshContext?: boolean }>
+        >([]);
+        const latestResult = yield* Ref.make("Latest result" + "\n😀".repeat(10_000));
+        const projection = idleThreadProjection(launched);
+        const ledgerLayer = WorkLedger.layer.pipe(Layer.provide(SqlitePersistence.layerMemory));
+        yield* Effect.gen(function* () {
+          const ledger = yield* WorkLedger.WorkLedger;
+          for (const [key, ownerThreadId] of [
+            ["owned", launched.id],
+            ["someone-else", ThreadId.make("other")],
+          ] as const) {
+            yield* ledger.upsert(
+              {
+                key,
+                title: key,
+                ownerKind: "t3",
+                ownerName: "Coordinator",
+                ownerThreadId,
+                nextAction: "Check CI",
+              },
+              "test",
+            );
+          }
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Continue",
+            coordinatorRollover: true,
+          });
+          yield* mcp.sendToThread(client, { threadId: launched.id, message: "Unchanged" });
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Clean reset",
+            freshContext: true,
+          });
+          yield* Ref.set(latestResult, "a".repeat(4000));
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "Check result budget",
+            coordinatorRollover: true,
+          });
+          const nearLimit = (yield* Ref.get(received)).at(-1)!.text;
+          assert.include(nearLimit, JSON.stringify("a".repeat(3998)));
+          for (let index = 0; index < 25; index++) {
+            yield* ledger.upsert(
+              {
+                key: `large-${index}`,
+                title: "😀".repeat(100),
+                ownerKind: "t3",
+                ownerName: "Coordinator",
+                ownerThreadId: launched.id,
+                blocker: "\n".repeat(400),
+                nextAction: "😀".repeat(200),
+              },
+              "test",
+            );
+          }
+          const currentRequest = "Keep this request intact. ".repeat(4000);
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: currentRequest,
+            coordinatorRollover: true,
+          });
+          const messages = yield* Ref.get(received);
+          assert.isAtMost(
+            Buffer.byteLength(messages[4]!.text) - Buffer.byteLength(currentRequest),
+            8192,
+          );
+          assert.isTrue(messages[4]!.text.endsWith(currentRequest));
+          assert.deepEqual(messages[2], { text: "Clean reset", freshContext: true });
+          assert.equal(messages[0]?.freshContext, true);
+          assert.include(messages[0]!.text, '"key":"owned"');
+          assert.notInclude(messages[0]!.text, '"key":"someone-else"');
+          assert.include(messages[0]!.text, "Latest result");
+          assert.isBelow(messages[0]!.text.length, 6000);
+          assert.isTrue(messages[0]!.text.endsWith("Continue"));
+          assert.deepEqual(messages[1], { text: "Unchanged" });
+        }).pipe(
+          Effect.provide([
+            service([launched], sent, {
+              getProjectThreadRecords: () => Effect.succeed(projection),
+              getThreadRecords: () =>
+                Ref.get(latestResult).pipe(
+                  Effect.map(
+                    (text) =>
+                      ({
+                        ...projection,
+                        messages: [{ text }],
+                      }) as unknown as OrchestrationV2ThreadProjection,
+                  ),
+                ),
+              sendToThread: (input) =>
+                Ref.update(received, (items) => [
+                  ...items,
+                  { text: input.text, ...(input.freshContext ? { freshContext: true } : {}) },
+                ]).pipe(
+                  Effect.as({
+                    delivery: "queued",
+                    run: { id: RunId.make("fresh-run"), status: "queued" },
+                  } as never),
+                ),
+            }),
+            ledgerLayer,
+          ]),
         );
       }),
   );

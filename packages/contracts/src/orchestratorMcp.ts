@@ -569,7 +569,13 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
   freshContext: Schema.optional(
     Schema.Boolean.annotate({
       description:
-        "Start a new provider session without the thread's earlier context, like /clear. Never steers.",
+        "Start a new provider session without earlier context, like /clear. Never steers.",
+    }),
+  ),
+  coordinatorRollover: Schema.optional(
+    Schema.Boolean.annotate({
+      description:
+        "Start a fresh provider session seeded with a compact summary of owned unfinished ledger work and the latest assistant result. Implies freshContext. Queue at a clean turn boundary.",
     }),
   ),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
@@ -702,6 +708,7 @@ export type OrchestratorMcpEnvironmentLinksResult =
   typeof OrchestratorMcpEnvironmentLinksResult.Type;
 
 export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
+  jarvisPlaybookResource: Schema.optional(Schema.String),
   parentThreadId: Schema.NullOr(ThreadId),
   inheritedProviderInstanceId: Schema.NullOr(ProviderInstanceId),
   inheritedModel: Schema.NullOr(Schema.String),

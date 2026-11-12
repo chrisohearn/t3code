@@ -136,6 +136,9 @@ const make = Effect.gen(function* () {
       params,
     ).pipe(Effect.mapError(unavailable))) as Record<string, unknown>;
     const { environmentId: _target, ...args } = encoded;
+    // Older peers ignore coordinatorRollover but must still clear stale provider context.
+    if (toolName === "t3_thread_send" && args.coordinatorRollover === true)
+      args.freshContext = true;
     // A pending upload lives here, so it cannot go with the call.
     if (Array.isArray(args.attachments) && args.attachments.length > 0) {
       return yield* new OrchestratorMcpFailure({
