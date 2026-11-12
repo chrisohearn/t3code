@@ -85,7 +85,10 @@ export function withCreationProvenance(
       const { linkOrigin: _linkOrigin, delegatedFrom: _delegatedFrom, ...rest } = command;
       return { ...rest, ...provenance };
     }
-    case "message.dispatch":
+    case "message.dispatch": {
+      const { senderClient: _senderClient, ...rest } = command;
+      return { ...rest, ...provenance };
+    }
     case "thread.fork":
     case "thread.merge_back":
     case "delegated_task.request":
@@ -144,6 +147,7 @@ export interface ThreadManagementSendInput {
   readonly messageId: MessageId;
   readonly scheduledTaskId?: ScheduledTaskId;
   readonly senderThreadId?: ThreadId;
+  readonly senderClient?: import("@t3tools/contracts").OrchestrationV2SenderClient;
   readonly text: string;
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly modelSelection?: ModelSelection;
@@ -871,6 +875,7 @@ const make = Effect.gen(function* () {
       messageId: input.messageId,
       ...(input.scheduledTaskId === undefined ? {} : { scheduledTaskId: input.scheduledTaskId }),
       ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
+      ...(input.senderClient === undefined ? {} : { senderClient: input.senderClient }),
       text: input.text,
       attachments: input.attachments,
       ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),

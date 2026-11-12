@@ -1056,6 +1056,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         createdBy: "agent",
         creationSource: "mcp",
         senderThreadId: ThreadId.make("sender"),
+        senderClient: {
+          sessionId: "01234567",
+          clientLabel: "Jarvis",
+          kind: "outside-client",
+          access: "full-access",
+        },
         commandId: CommandId.make("post-message"),
         threadId,
         messageId: MessageId.make("post-message"),
@@ -1082,6 +1088,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         createdBy: "agent",
         creationSource: "mcp",
         senderThreadId: "sender",
+        senderClient: command.senderClient,
       });
       expect(projection.turnItems.filter((item) => item.type === "user_message")).toMatchObject([
         { messageId: command.messageId, postOnly: true, inputIntent: "post" },
@@ -1683,12 +1690,26 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         commandId: steerCommandId,
         threadId,
         messageId: steerMessageId,
+        senderClient: {
+          sessionId: "01234567",
+          clientLabel: "Jarvis",
+          kind: "outside-client",
+          access: "full-access",
+        },
         text: "Include this in the active work.",
         attachments: [],
         dispatchMode: { type: "start_immediately" },
         deliveryIntent: "auto",
       });
       const steered = yield* orchestrator.getThreadProjection(threadId);
+      expect(
+        steered.messages.find((message) => message.id === steerMessageId)?.senderClient,
+      ).toEqual({
+        sessionId: "01234567",
+        clientLabel: "Jarvis",
+        kind: "outside-client",
+        access: "full-access",
+      });
       assert.lengthOf(steered.runs, 1);
       assert.equal(
         steered.messages.find((message) => message.id === steerMessageId)?.runId,
@@ -6074,6 +6095,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           commandId: CommandId.make(`runtime-layer-serialized-queue-first-${automatic}`),
           threadId,
           messageId: MessageId.make(`runtime-layer-serialized-queue-first-${automatic}`),
+          senderClient: {
+            sessionId: "01234567",
+            clientLabel: "Jarvis",
+            kind: "outside-client",
+            access: "full-access",
+          },
           text: "First queued",
           attachments: [],
           modelSelection,
@@ -6159,6 +6186,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             item.runId === firstQueuedRun.id &&
             (item.type === "user_message" || item.type === "notification"),
         );
+        expect(
+          afterFirstPromotion.messages.find(
+            (message) => message.id === firstQueuedRun.userMessageId,
+          )?.senderClient,
+        ).toEqual({
+          sessionId: "01234567",
+          clientLabel: "Jarvis",
+          kind: "outside-client",
+          access: "full-access",
+        });
         assert.isDefined(promotedMessageItem);
         if (automatic) {
           assert.equal(promotedMessageItem.type, "notification");
@@ -8292,6 +8329,13 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         commandId: CommandId.make("runtime-layer-queued-edit-queued-message"),
         threadId,
         messageId: MessageId.make("runtime-layer-queued-edit-queued-message"),
+        senderThreadId: ThreadId.make("original-sender"),
+        senderClient: {
+          kind: "outside-client",
+          sessionId: "original",
+          clientLabel: "Original client",
+          access: "full-access",
+        },
         text: "Original queued text.",
         attachments: [],
         modelSelection,
@@ -8315,6 +8359,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         afterEdit.messages.find((message) => message.id === queuedRun.userMessageId)?.text,
         "Updated queued text.",
       );
+      const editedMessage = afterEdit.messages.find(
+        (message) => message.id === queuedRun.userMessageId,
+      );
+      assert.isUndefined(editedMessage?.senderClient);
+      assert.isUndefined(editedMessage?.senderThreadId);
       const editedItem = afterEdit.turnItems.find(
         (item) => item.type === "user_message" && item.messageId === queuedRun.userMessageId,
       );

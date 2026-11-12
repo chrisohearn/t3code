@@ -344,6 +344,8 @@ export interface ProjectionRecordFilter {
   readonly providerThreadIds?: ReadonlyArray<ProviderThreadId>;
   readonly providerTurnAttemptIds?: ReadonlyArray<RunAttemptId>;
   readonly latestMessageOnly?: true;
+  readonly messageOrder?: "created_at";
+  readonly excludeSilentMaintenance?: true;
   readonly messageRoles?: ReadonlyArray<OrchestrationV2ConversationMessage["role"]>;
   readonly monitorNotificationsOnly?: boolean;
   readonly turnItemRunId?: RunId;
@@ -2021,6 +2023,43 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+
+    // Mirror idleCompactionOf, including JavaScript trim whitespace.
+    const isIdleCompactionMessage = (alias: string) => {
+      const payload = sql.literal(`${alias}.payload_json`);
+      return sql`(
+        ${sql.literal(`${alias}.role`)} = 'user'
+        AND lower(trim(json_extract(${payload}, '$.text'),
+          char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195,
+            8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279)
+        )) = ${IDLE_COMPACTION_TEXT}
+        AND coalesce(json_array_length(${payload}, '$.attachments'), 0) = 0
+        AND (
+          json_extract(${payload}, '$.idleCompaction') IS NOT NULL
+          OR (
+            json_extract(${payload}, '$.createdBy') = 'agent'
+            AND json_extract(${payload}, '$.creationSource') = 'server'
+          )
+        )
+      )`;
+    };
+    // Mirrors isSilentRunForShell.
+    const isSilentShellRun = (alias: string) => {
+      const run = sql.literal(alias);
+      return sql`(
+        ${run}.status <> 'failed'
+        AND EXISTS (
+          SELECT 1 FROM orchestration_v2_projection_messages prompt
+          WHERE prompt.message_id = json_extract(${run}.payload_json, '$.userMessageId')
+            AND ${isIdleCompactionMessage("prompt")}
+        ) AND NOT EXISTS (
+          SELECT 1 FROM orchestration_v2_projection_turn_items compaction
+          WHERE compaction.thread_id = ${run}.thread_id AND compaction.run_id = ${run}.run_id
+            AND compaction.type = 'compaction'
+            AND compaction.status = 'failed'
+        )
+      )`;
+    };
 
     const inlineWorkOutput = sql`item.type = 'dynamic_tool' AND (
       item.payload_json LIKE '%htmlRender%' OR item.payload_json LIKE ${`%${MCP_APP_OUTPUT_KEY}%`}
@@ -3827,9 +3866,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   ${filter?.messageRoles === undefined ? sql`` : sql`AND role IN (SELECT value FROM json_each(${encodeIdList(filter.messageRoles)}))`}
                   ${filter?.monitorNotificationsOnly === true ? sql`AND json_extract(payload_json, '$.notification.source.kind') = 'monitor'` : sql``}
                   ${filter?.messageRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageRunIds)}))`}
+                  ${
+                    filter?.excludeSilentMaintenance === true
+                      ? sql`AND NOT ${isIdleCompactionMessage("message")}
+                    AND NOT EXISTS (
+                      SELECT 1 FROM orchestration_v2_projection_runs maintenance
+                      WHERE maintenance.thread_id = message.thread_id
+                        AND maintenance.run_id = message.run_id
+                        AND ${isSilentShellRun("maintenance")}
+                    )`
+                      : sql``
+                  }
                 ${
                   filter?.latestMessageOnly === true
-                    ? sql`ORDER BY (
+                    ? filter.messageOrder === "created_at"
+                      ? sql`ORDER BY created_at DESC, message.rowid DESC LIMIT 1`
+                      : sql`ORDER BY (
                     SELECT MIN(item.ordinal) FROM orchestration_v2_projection_turn_items AS item
                     WHERE item.thread_id = message.thread_id
                       AND item.type IN ('user_message', 'assistant_message')
@@ -6469,42 +6521,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ),
         );
 
-    // Mirror idleCompactionOf, including JavaScript trim whitespace.
-    const isIdleCompactionMessage = (alias: string) => {
-      const payload = sql.literal(`${alias}.payload_json`);
-      return sql`(
-        ${sql.literal(`${alias}.role`)} = 'user'
-        AND lower(trim(json_extract(${payload}, '$.text'),
-          char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195,
-            8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279)
-        )) = ${IDLE_COMPACTION_TEXT}
-        AND coalesce(json_array_length(${payload}, '$.attachments'), 0) = 0
-        AND (
-          json_extract(${payload}, '$.idleCompaction') IS NOT NULL
-          OR (
-            json_extract(${payload}, '$.createdBy') = 'agent'
-            AND json_extract(${payload}, '$.creationSource') = 'server'
-          )
-        )
-      )`;
-    };
-    // Mirrors isSilentRunForShell.
-    const isSilentShellRun = (alias: string) => {
-      const run = sql.literal(alias);
-      return sql`(
-        ${run}.status <> 'failed'
-        AND EXISTS (
-          SELECT 1 FROM orchestration_v2_projection_messages prompt
-          WHERE prompt.message_id = json_extract(${run}.payload_json, '$.userMessageId')
-            AND ${isIdleCompactionMessage("prompt")}
-        ) AND NOT EXISTS (
-          SELECT 1 FROM orchestration_v2_projection_turn_items compaction
-          WHERE compaction.thread_id = ${run}.thread_id AND compaction.run_id = ${run}.run_id
-            AND compaction.type = 'compaction'
-            AND compaction.status = 'failed'
-        )
-      )`;
-    };
     // The newest run not waiting in a held queue, matching latestUnheldRun.
     const presentedShellRunId = (threadId: Statement.Fragment) => sql`(
       SELECT candidate.run_id

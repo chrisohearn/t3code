@@ -75,6 +75,27 @@ it("stamps authoritative provenance on commands that create threads or messages"
   });
   expect(stamped).not.toHaveProperty("linkOrigin");
   expect(stamped).not.toHaveProperty("delegatedFrom");
+  const message = ThreadManagementService.withCreationProvenance(
+    {
+      type: "message.dispatch",
+      commandId: CommandId.make("forged-sender"),
+      threadId: ThreadId.make("target"),
+      messageId: MessageId.make("forged-sender"),
+      createdBy: "agent",
+      creationSource: "mcp",
+      text: "forged",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      senderClient: {
+        sessionId: "01234567",
+        clientLabel: "Jarvis",
+        kind: "outside-client",
+        access: "full-access",
+      },
+    },
+    { createdBy: "user", creationSource: "web" },
+  );
+  expect(message).not.toHaveProperty("senderClient");
 });
 
 const layerReceiptsTest = CommandReceiptStore.layer.pipe(

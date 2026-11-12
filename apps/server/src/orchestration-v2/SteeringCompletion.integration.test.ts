@@ -280,6 +280,12 @@ it.effect.each(
             ],
           });
         }
+        const senderClient = {
+          sessionId: "01234567",
+          clientLabel: "Relay",
+          kind: "outside-client",
+          access: "full-access",
+        } as const;
         const dispatchSteer = orchestrator.dispatch({
           type: "message.dispatch",
           commandId: CommandId.make("steer"),
@@ -300,7 +306,8 @@ it.effect.each(
               ? { type: "queue_after_active" }
               : { type: "steer_active", targetRunId: first.runId },
           createdBy: mailbox || question ? "agent" : "user",
-          creationSource: mailbox || question ? "server" : "web",
+          creationSource: mailbox || question ? "server" : "mcp",
+          ...(!mailbox && !question ? { senderClient } : {}),
           ...(question
             ? {
                 notification: {
@@ -446,6 +453,18 @@ it.effect.each(
               (item) => item.type === "user_message" && item.messageId === messageId,
             )?.status,
             "completed",
+          );
+        }
+        if (!mailbox && !question) {
+          assert.deepEqual(
+            final.messages.find((message) => message.id === messageId)?.senderClient,
+            senderClient,
+          );
+          assert.deepEqual(
+            final.turnItems
+              .filter((item) => item.type === "user_message")
+              .find((item) => item.messageId === messageId)?.senderClient,
+            senderClient,
           );
         }
         assert.equal(final.messages.filter((message) => message.id === messageId).length, 1);

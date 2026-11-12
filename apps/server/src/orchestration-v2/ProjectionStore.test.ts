@@ -3273,6 +3273,57 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.deepEqual(yield* readMessageIds({ messageRoles: ["user"], latestMessageOnly: true }), [
         firstMessageId,
       ]);
+      const queuedMessageId = MessageId.make("message:bounded-sql-history:queued");
+      yield* sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+        SELECT ${queuedMessageId}, thread_id, NULL, NULL, role, streaming,
+          '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z',
+          json_set(payload_json, '$.id', ${queuedMessageId}, '$.runId', NULL,
+            '$.createdAt', '2099-01-01T00:00:00.000Z', '$.updatedAt', '2099-01-01T00:00:00.000Z')
+        FROM orchestration_v2_projection_messages WHERE message_id = ${firstMessageId}`;
+      assert.deepEqual(
+        yield* readMessageIds({ latestMessageOnly: true, messageOrder: "created_at" }),
+        [queuedMessageId],
+      );
+      const laterQueuedMessageId = MessageId.make("message:bounded-sql-history:aaa-later");
+      yield* sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+        SELECT ${laterQueuedMessageId}, thread_id, run_id, node_id, role, streaming,
+          created_at, updated_at, json_set(payload_json, '$.id', ${laterQueuedMessageId})
+        FROM orchestration_v2_projection_messages WHERE message_id = ${queuedMessageId}`;
+      assert.deepEqual(
+        yield* readMessageIds({ latestMessageOnly: true, messageOrder: "created_at" }),
+        [laterQueuedMessageId],
+      );
+      yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE message_id = ${laterQueuedMessageId}`;
+      const visibleLatest = {
+        latestMessageOnly: true,
+        messageOrder: "created_at",
+        excludeSilentMaintenance: true,
+      } as const;
+      yield* sql`UPDATE orchestration_v2_projection_messages
+        SET payload_json = json_set(payload_json, '$.text', '/compact',
+          '$.createdBy', 'agent', '$.creationSource', 'server', '$.attachments', json('[]'))
+        WHERE message_id = ${queuedMessageId}`;
+      assert.deepEqual(yield* readMessageIds(visibleLatest), [lastMessageId]);
+      const maintenanceRunId = RunId.make("run:bounded-sql-history:1000");
+      yield* sql`UPDATE orchestration_v2_projection_messages
+        SET run_id = ${maintenanceRunId}, role = 'assistant',
+          payload_json = json_set(payload_json, '$.role', 'assistant',
+            '$.text', 'Internal summary', '$.runId', ${maintenanceRunId})
+        WHERE message_id = ${queuedMessageId}`;
+      yield* sql`UPDATE orchestration_v2_projection_runs
+        SET payload_json = json_set(payload_json, '$.userMessageId', ${lastMessageId})
+        WHERE run_id = ${maintenanceRunId}`;
+      yield* sql`UPDATE orchestration_v2_projection_messages
+        SET payload_json = json_set(payload_json, '$.text', '/compact',
+          '$.createdBy', 'agent', '$.creationSource', 'server', '$.attachments', json('[]'))
+        WHERE message_id = ${lastMessageId}`;
+      assert.deepEqual(yield* readMessageIds(visibleLatest), [firstMessageId]);
+      yield* sql`UPDATE orchestration_v2_projection_runs SET status = 'failed'
+        WHERE run_id = ${maintenanceRunId}`;
+      assert.deepEqual(yield* readMessageIds(visibleLatest), [queuedMessageId]);
+      yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE message_id = ${queuedMessageId}`;
       assert.deepEqual(yield* readMessageIds({ messageIds: [] }), []);
       assert.deepEqual(yield* readMessageIds({ messageIds: [firstMessageId] }), [firstMessageId]);
       yield* sql`

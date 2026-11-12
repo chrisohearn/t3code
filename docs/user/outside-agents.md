@@ -133,9 +133,16 @@ Add the environment as a custom MCP app in ChatGPT's apps settings:
 
 Use `t3_thread_result` for a thread's latest run, or pass `runId` for a specific
 run. It returns status, the last assistant reply, pending request IDs, linked
-pull requests, and a revision. Replies default to 4,000 characters. Increase
+pull requests, and a revision. `latestMessage` also returns the thread’s most recent
+message, including inbox posts without a run. Replies default to 4,000 characters. Increase
 `maxChars` up to 50,000 when `truncated` is true. This read does not acknowledge
 a delegated child's result.
+
+Messages sent or posted by signed-in MCP clients include `senderClient`: the
+client label, the first eight characters of the sign-in session ID, its access
+tier, and whether it is an outside client or a linked T3 agent. The server records these fields;
+message text and tool arguments cannot supply them. Local T3 agents retain their
+`senderThreadId`. Older messages may have no sender record.
 
 For history, use `t3_thread_read`. Save its `revision` and pass it as
 `sinceRevision` on the next read. An unchanged thread returns an empty first
