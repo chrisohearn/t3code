@@ -1,3 +1,6 @@
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { CLOUD_CLI_DESIRED_LINK_SECRET } from "../cloud/CliState.ts";
+import { CLOUD_LINK_REVOKED, CLOUD_LINKED_USER_ID, RELAY_URL_SECRET } from "../cloud/config.ts";
 import * as ConnectReachability from "../cloud/ConnectReachability.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -94,7 +97,11 @@ const fixture = Effect.gen(function* () {
   > = [];
   let sendWork: Effect.Effect<void, McpEventsError> = Effect.void;
   const writable = new Set<string>();
+  const storedSecrets = new Map<string, Uint8Array>();
   const dependencies = Layer.mergeAll(
+    Layer.mock(ServerSecretStore.ServerSecretStore)({
+      get: (name) => Effect.sync(() => Option.fromNullishOr(storedSecrets.get(name))),
+    }),
     Layer.succeed(ConnectReachability.ConnectReachability, {
       latest: Effect.sync(() => Option.some(tunnel)),
       check: Effect.sync(() => tunnel),
@@ -267,6 +274,18 @@ const fixture = Effect.gen(function* () {
     setTunnel: (status: EnvironmentConnectReachability) => {
       tunnel = status;
     },
+    linkCloud: (mode: "managed" | "publish_only" | "revoked" | "web") => {
+      const bytes = (value: string) => new TextEncoder().encode(value);
+      storedSecrets.set(CLOUD_LINKED_USER_ID, bytes("cloud-user"));
+      storedSecrets.set(RELAY_URL_SECRET, bytes("https://relay.example.com"));
+      if (mode === "web") return;
+      storedSecrets.set(
+        CLOUD_CLI_DESIRED_LINK_SECRET,
+        bytes(mode === "publish_only" ? "publish_only" : "managed"),
+      );
+      if (mode === "revoked") storedSecrets.set(CLOUD_LINK_REVOKED, bytes("true"));
+    },
+    unlinkCloud: () => storedSecrets.clear(),
   };
 });
 
@@ -1369,6 +1388,57 @@ it.effect.each(["reachable", "deadline"] as const)(
         );
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each([
+  ["CLI managed link whose tunnel config is not stored yet", "managed", true],
+  ["CLI publish-only link", "publish_only", false],
+  ["web or mobile link", "web", false],
+  ["revoked link", "revoked", false],
+  ["server with no cloud link", null, false],
+] as const)("startup hold on not_linked for a %s", ([, link, held]) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      // The fixture's tunnel reads not_linked, as the first check after a restart does
+      // before the relay stores a managed tunnel's config again.
+      if (link !== null) f.linkCloud(link);
+      const input = inputFor(ThreadId.make("startup-not-linked"));
+      yield* f.call(f.service.subscribe(input));
+      yield* f.append([input.arguments.threadId]);
+      const drain = yield* Effect.forkChild(f.service.drain());
+      yield* TestClock.adjust("1 second");
+      expect(f.sent).toHaveLength(held ? 0 : 1);
+      f.setTunnel({
+        status: "reachable",
+        checkedAt: "1970-01-01T00:00:01.000Z",
+        readyConnections: 1,
+        protocol: "quic",
+      });
+      yield* TestClock.adjust("5 seconds");
+      yield* Fiber.join(drain);
+      expect(f.sent).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("releases the startup hold on the next check after the cloud link is removed", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      f.linkCloud("managed");
+      const input = inputFor(ThreadId.make("startup-unlinked"));
+      yield* f.call(f.service.subscribe(input));
+      yield* f.append([input.arguments.threadId]);
+      const drain = yield* Effect.forkChild(f.service.drain());
+      yield* TestClock.adjust("1 second");
+      expect(f.sent).toHaveLength(0);
+      f.unlinkCloud();
+      yield* TestClock.adjust("5 seconds");
+      yield* Fiber.join(drain);
+      expect(f.sent).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
 it.effect(
