@@ -42,3 +42,9 @@ A published build of Chris's personal T3 fork that includes his changes and upst
 
 **guarded update**:
 A service update that checks the fork release, waits for a suitable time, and restores a healthy build if the new build fails.
+
+**intake grill**:
+The one set of questions an agent asks Chris before a task starts. His answers authorize the task's sensitive actions.
+
+**completion supervisor**:
+The scheduled task that re-drives idle ledger work every 30 minutes and posts a digest to Jarvis's inbox.

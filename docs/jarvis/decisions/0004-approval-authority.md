@@ -1,6 +1,6 @@
 # Jarvis relays authority and answers individual prompts
 
-Accepted 2026-11-12.
+Accepted 2026-11-12. Amended 2026-11-13 by [0016](0016-no-human-in-the-loop.md): for a task with intake answers, those answers authorize its sensitive actions, and only spending money still needs Chris's fresh go-ahead.
 
 ## Decision
 
