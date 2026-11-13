@@ -1310,6 +1310,100 @@ it.effect("a read-only client reads threads and is refused every write before it
 const dispatched: Array<string> = [];
 let acknowledgeOnly = false;
 
+it.effect("schedules a model change on a busy thread and shows it until it applies", () => {
+  const commands: Array<unknown> = [];
+  const busyThread = {
+    id: ThreadId.make("busy-inbox"),
+    projectId: "other-project",
+    providerInstanceId: "codex",
+    modelSelection: { instanceId: "codex", model: "gpt-5" },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    deletedAt: null,
+  };
+  const scheduled = {
+    modelSelection: { instanceId: "codex", model: "gpt-6" },
+    afterRunId: "run:busy",
+  };
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const call = (args: Record<string, unknown>) =>
+      server
+        .callTool({ name: "t3_thread_configure", arguments: { threadId: busyThread.id, ...args } })
+        .pipe(
+          Effect.provideService(
+            McpInvocationContext.McpInvocationContext,
+            clientScope("full-access"),
+          ),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+    const result = yield* call({ modelSelection: scheduled.modelSelection, applyAt: "next_turn" });
+    expect(result.structuredContent).toEqual({
+      status: "scheduled",
+      afterRunId: "run:busy",
+      sequence: 7,
+    });
+    expect(commands).toEqual([
+      expect.objectContaining({ type: "thread.model-selection.set", applyAt: "next_turn" }),
+    ]);
+    expect((yield* call({})).structuredContent).toMatchObject({
+      modelSelection: busyThread.modelSelection,
+      scheduledModelSelection: scheduled,
+    });
+
+    for (const [refused, code] of [
+      [{ runtimeMode: "approval-required", applyAt: "next_turn" }, "invalid_request"],
+      [{ applyAt: "next_turn" }, "invalid_request"],
+      [
+        { modelSelection: { instanceId: "claudeAgent", model: "opus" }, applyAt: "next_turn" },
+        "invalid_request",
+      ],
+      [
+        { modelSelection: { instanceId: "codex", model: "gpt-9" }, applyAt: "next_turn" },
+        "model_unavailable",
+      ],
+    ] as const) {
+      expect(declaredFailure(yield* call(refused)), JSON.stringify(refused)).toMatchObject({
+        code,
+      });
+    }
+    expect(commands).toHaveLength(1);
+  }).pipe(
+    Effect.provide(
+      layerThreadToolkit.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: () => Effect.succeed(busyThread as never),
+            acknowledgeOnly: () => Effect.succeed(false),
+            getProjectThreadRecords: () =>
+              Effect.succeed({
+                thread: {
+                  ...busyThread,
+                  ...(commands.length === 0 ? {} : { scheduledModelSelection: scheduled }),
+                },
+              } as never),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command);
+                return { sequence: 7 } as never;
+              }),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([
+              { instanceId: "codex", models: [{ slug: "gpt-5" }, { slug: "gpt-6" }] } as never,
+            ]),
+          }),
+        ),
+      ),
+    ),
+  );
+});
+
 it.effect("refuses act-as-caller tools to a client caller", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;

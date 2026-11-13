@@ -18,6 +18,7 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import { CommandActor } from "./CommandActor.ts";
 import { ThreadFreezeGate } from "./ThreadFreeze.ts";
+import * as SnoozeDeferredDelivery from "./SnoozeDeferredDelivery.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -340,4 +341,80 @@ it.effect(
       assert.equal(started.frozen, null);
       assert.notInclude(started.runs[0], "queued");
     }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a freeze and a snooze each keep their own holds", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const id = threadId("snoozed");
+    yield* create(id);
+    yield* send(id, "first");
+    yield* freeze(id);
+    yield* orchestrator.dispatch({
+      type: "thread.snooze",
+      commandId: CommandId.make(`snooze:${id}`),
+      threadId: id,
+      snoozedUntil: "2099-01-01T00:00:00.000Z",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`send:${id}:agent`),
+      threadId: id,
+      messageId: MessageId.make(`message:${id}:agent`),
+      text: "agent",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      respectSnooze: true,
+      createdBy: "agent",
+      creationSource: "mcp",
+    });
+    const heldRun = () =>
+      state(id).pipe(
+        Effect.map(({ projection }) =>
+          projection.runs.find((run) => run.userMessageId === `message:${id}:agent`),
+        ),
+      );
+    assert.include(yield* heldRun(), { status: "queued", queueHeld: true, snoozeDeferred: true });
+    // The snooze sweep leaves a frozen thread to its unfreeze.
+    assert.deepEqual(
+      (yield* SnoozeDeferredDelivery.readSnoozeDeferredThreads()).filter(
+        (row) => row.threadId === id,
+      ),
+      [],
+    );
+
+    // Unfreezing resumes the queue, but the thread still sleeps: the snooze's hold stays.
+    yield* orchestrator
+      .dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make(`unfreeze:${id}`),
+        threadId: id,
+      })
+      .pipe(
+        Effect.provideService(ThreadFreezeGate, {
+          op: "unfreeze",
+          by: { kind: "agent", label: "Coordinator" },
+          at: "2026-11-13T01:00:00.000Z",
+          freshContext: false,
+        }),
+      );
+    assert.equal((yield* state(id)).frozen, null);
+    assert.include(yield* heldRun(), { status: "queued", queueHeld: true, snoozeDeferred: true });
+
+    // Awake, the sweep's resume releases it.
+    yield* orchestrator.dispatch({
+      type: "thread.unsnooze",
+      commandId: CommandId.make(`unsnooze:${id}`),
+      threadId: id,
+      reason: "user",
+    });
+    yield* orchestrator.dispatch({
+      type: "queue.resume",
+      commandId: CommandId.make(`snooze-release:${id}`),
+      threadId: id,
+    });
+    const released = yield* heldRun();
+    assert.notEqual(released?.queueHeld, true);
+    assert.isUndefined(released?.snoozeDeferred);
+  }).pipe(Effect.provide(layerTest)),
 );

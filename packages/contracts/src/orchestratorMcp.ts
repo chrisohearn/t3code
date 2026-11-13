@@ -567,17 +567,31 @@ export const OrchestratorMcpThreadResult = Schema.Struct({
 });
 export type OrchestratorMcpThreadResult = typeof OrchestratorMcpThreadResult.Type;
 
+const RespectSnooze = Schema.optional(
+  Schema.Boolean.annotate({
+    description: "Default true: a snoozed thread waits. false wakes it.",
+  }),
+);
+
+/** Set when the target is snoozed, so a sender sees the hold instead of silently ending it. */
+const SnoozeNotice = {
+  snoozedUntil: Schema.optional(IsoDateTime),
+  warning: Schema.optional(Schema.String),
+};
+
 export const OrchestratorMcpThreadPostInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+  respectSnooze: Schema.optional(Schema.Boolean),
 });
 export type OrchestratorMcpThreadPostInput = typeof OrchestratorMcpThreadPostInput.Type;
 export const OrchestratorMcpThreadPostResult = Schema.Struct({
   threadId: ThreadId,
   link: Schema.String,
   messageId: MessageId,
+  ...SnoozeNotice,
 });
 export type OrchestratorMcpThreadPostResult = typeof OrchestratorMcpThreadPostResult.Type;
 
@@ -587,6 +601,7 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
   mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
+  respectSnooze: RespectSnooze,
   freshContext: Schema.optional(
     Schema.Boolean.annotate({
       description:
@@ -603,6 +618,16 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
 });
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;
 
+/** Set when a send queues: `position` 1 starts next. `held` waits for a resume. */
+export const OrchestratorMcpQueueStanding = Schema.Struct({
+  position: PositiveInt,
+  messagesAhead: NonNegativeInt,
+  activeRunId: Schema.NullOr(RunId),
+  activeRunAgeSeconds: Schema.NullOr(NonNegativeInt),
+  held: Schema.optional(Schema.Boolean),
+});
+export type OrchestratorMcpQueueStanding = typeof OrchestratorMcpQueueStanding.Type;
+
 export const OrchestratorMcpThreadSendResult = Schema.Struct({
   notify: Schema.optional(McpThreadNotifyResult),
   threadId: ThreadId,
@@ -616,6 +641,8 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   held: Schema.optional(Schema.Literal(true)),
   /** Set when a freeze holds the send. */
   frozen: Schema.optional(Schema.Literal(true)),
+  queue: Schema.optional(OrchestratorMcpQueueStanding),
+  ...SnoozeNotice,
 });
 export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendResult.Type;
 

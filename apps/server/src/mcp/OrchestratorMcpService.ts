@@ -1,6 +1,6 @@
 import * as JarvisPlaybook from "./JarvisPlaybook.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
-import { advertisedModel, requireAdvertisedModel } from "./providerModels.ts";
+import { advertisedModel, listChoices, requireAdvertisedModel } from "./providerModels.ts";
 import { hasGitEntry } from "./gitEntryProbe.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as ThreadNotifications from "./ThreadNotifications.ts";
@@ -140,6 +140,9 @@ import {
   taskPrompt,
 } from "./delegatedTaskModes.ts";
 import { isLiveCallerShell, threadNotFound } from "./threadAccess.ts";
+import { resolveReadableThread } from "./threadReference.ts";
+import { queuedRunMessageIds, queueStanding } from "./queueStanding.ts";
+import { snoozeNotice } from "./snoozeNotice.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
@@ -411,7 +414,7 @@ function knownOptions(
 }
 
 /** Skip checks without descriptors; reject duplicate IDs because consumers disagree on precedence. */
-function invalidOptionSelections(
+export function invalidOptionSelections(
   selections: ReadonlyArray<ProviderOptionSelection>,
   descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
 ): ReadonlyArray<string> {
@@ -1280,19 +1283,14 @@ const make = Effect.gen(function* () {
 
   const loadReadableThread = Effect.fn("OrchestratorMcpService.loadReadableThread")(function* (
     scope: McpInvocationScope,
-    threadId: ThreadId,
+    reference: ThreadId,
   ) {
     const { parent } = yield* loadCaller(scope, []);
-    const shell = yield* threadManagement
-      .getThreadShell(threadId)
-      .pipe(Effect.mapError(threadManagementFailure));
-    if (shell === null || shell.deletedAt !== null) {
-      return yield* threadNotFound(
-        threadManagement,
-        threadId,
-        `Thread ${threadId} is no longer available.`,
-      );
-    }
+    const { threadId, shell } = yield* resolveReadableThread(
+      threadManagement,
+      scope.environmentId,
+      reference,
+    );
     const revision = yield* threadManagement
       .getThreadEventSequence(threadId)
       .pipe(Effect.mapError(threadManagementFailure));
@@ -1310,10 +1308,39 @@ const make = Effect.gen(function* () {
             "contextTransfers",
           ]);
     const target = yield* records.pipe(Effect.mapError(threadManagementFailure));
-    return { parent, target, shell, revision } as const;
+    return { parent, target, shell, revision, threadId } as const;
   });
 
   const loadProviders = providerRegistry.getProviders;
+
+  // Read after the dispatch: the orchestrator decides whether a snooze stays, and a usage-limit
+  // snooze always ends.
+  const snoozeOutcome = Effect.fn("OrchestratorMcpService.snoozeOutcome")(function* (
+    threadId: ThreadId,
+    snoozedUntil: DateTime.Utc | null | undefined,
+    kept: "held" | "posted" | "steered",
+  ) {
+    const nowMs = yield* Clock.currentTimeMillis;
+    if (snoozedUntil == null || DateTime.toEpochMillis(snoozedUntil) <= nowMs) return {};
+    const after = yield* threadManagement
+      .getThreadShell(threadId)
+      .pipe(Effect.orElseSucceed(() => null));
+    return snoozeNotice(snoozedUntil, nowMs, after?.snoozedUntil == null ? "woke" : kept);
+  });
+
+  // Best effort: the message is already queued, so a failed read only omits the standing.
+  const readQueueStanding = Effect.fn("OrchestratorMcpService.readQueueStanding")(
+    function* (threadId: ThreadId, runId: RunId) {
+      const { runs } = yield* threadManagement.getThreadRecords(threadId, ["runs"], {
+        runStatuses: [...ThreadManagementService.ACTIVE_RUN_STATUSES, "queued"],
+      });
+      const { messages } = yield* threadManagement.getThreadRecords(threadId, ["messages"], {
+        messageIds: queuedRunMessageIds(runs),
+      });
+      return queueStanding({ runs, messages }, runId, yield* Clock.currentTimeMillis);
+    },
+    Effect.orElseSucceed(() => undefined),
+  );
 
   const loadOrchestrationCapableInstanceIds = () =>
     providerAdapters.list().pipe(Effect.map((instanceIds) => new Set(instanceIds)));
@@ -1361,6 +1388,10 @@ const make = Effect.gen(function* () {
     const requestedInstanceId = input.target?.providerInstanceId;
     const requestedDriver = input.target?.driverKind;
     const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
+    const capableProviders = () =>
+      input.providers.filter((provider) =>
+        orchestrationCapableInstanceIds.has(provider.instanceId),
+      );
     let instanceId = requestedInstanceId;
 
     if (instanceId === undefined && requestedDriver !== undefined) {
@@ -1372,7 +1403,7 @@ const make = Effect.gen(function* () {
       if (candidates.length === 0) {
         return yield* failure(
           "provider_unavailable",
-          `No V2 provider adapter is registered for driver ${requestedDriver}.`,
+          `No V2 provider adapter is registered for target.driverKind ${requestedDriver}. Drivers here: ${listChoices(capableProviders().map((provider) => provider.driver))}.`,
         );
       }
       const healthyCandidates = candidates.filter(
@@ -1412,13 +1443,13 @@ const make = Effect.gen(function* () {
     if (provider === undefined) {
       return yield* failure(
         "provider_unavailable",
-        `Provider instance ${instanceId} is not registered.`,
+        `${requestedInstanceId === undefined ? "This thread's provider instance" : "target.providerInstanceId"} ${instanceId} is not registered. Pass target.providerInstanceId, one of: ${listChoices(capableProviders().map((provider) => provider.instanceId))}.`,
       );
     }
     if (requestedDriver !== undefined && provider.driver !== requestedDriver) {
       return yield* failure(
         "invalid_request",
-        `Provider instance ${instanceId} uses driver ${provider.driver}, not ${requestedDriver}.`,
+        `target.providerInstanceId ${instanceId} uses driver ${provider.driver}, not target.driverKind ${requestedDriver}. Pass only one of them.`,
       );
     }
     const constraints = providerConstraints(
@@ -2514,7 +2545,7 @@ const make = Effect.gen(function* () {
       ) {
         return yield* failure(
           "invalid_request",
-          "A local task runs in this thread's project. Omit target.projectId, or pass target.environmentId to run it in that environment's project.",
+          `target.projectId ${input.target.projectId} is not this thread's project (${parent.thread.projectId}), and a local task always runs here. To start work in that project, use t3_thread_launch with projectId: "${input.target.projectId}". Otherwise omit target.projectId, or add target.environmentId to run in a linked environment's project.`,
         );
       }
       const parentRun = parent.runs
@@ -2563,7 +2594,10 @@ const make = Effect.gen(function* () {
           })
           .pipe(
             Effect.mapError(() =>
-              failure("invalid_request", "Unable to resolve the parent checkout commit."),
+              failure(
+                "invalid_request",
+                `isolation "worktree" needs a commit in the parent checkout (${parent.thread.worktreePath ?? project.workspaceRoot}), and none resolved. Use isolation "shared", or commit first.`,
+              ),
             ),
           );
         // Launch preparation creates the worktree from the project root, so a
@@ -3135,17 +3169,14 @@ const make = Effect.gen(function* () {
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
     }),
-    threadResult: Effect.fn("OrchestratorMcpService.threadResult")(function* (scope, input) {
+    threadResult: Effect.fn("OrchestratorMcpService.threadResult")(function* (scope, request) {
       yield* loadCaller(scope, []);
-      const shell = yield* threadManagement
-        .getThreadShell(input.threadId)
-        .pipe(Effect.mapError(threadManagementFailure));
-      if (shell === null || shell.deletedAt !== null)
-        return yield* threadNotFound(
-          threadManagement,
-          input.threadId,
-          `Thread ${input.threadId} is no longer available.`,
-        );
+      const { threadId, shell } = yield* resolveReadableThread(
+        threadManagement,
+        scope.environmentId,
+        request.threadId,
+      );
+      const input = { ...request, threadId };
       const revision = yield* threadManagement
         .getThreadEventSequence(input.threadId)
         .pipe(Effect.mapError(threadManagementFailure));
@@ -3226,8 +3257,12 @@ const make = Effect.gen(function* () {
         revision,
       };
     }),
-    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, input) {
-      const { parent, target, shell, revision } = yield* loadReadableThread(scope, input.threadId);
+    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, request) {
+      const { parent, target, shell, revision, threadId } = yield* loadReadableThread(
+        scope,
+        request.threadId,
+      );
+      const input = { ...request, threadId };
       const view = input.view ?? "messages";
       const afterPosition = input.afterPosition ?? -1;
       const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
@@ -3351,10 +3386,12 @@ const make = Effect.gen(function* () {
       const key = yield* requestKey(input.clientRequestId);
       const operation = "thread-post";
       const messageId = stableOperationMessageId({ scope, requestKey: key, operation });
+      const respectSnooze = input.respectSnooze ?? true;
       yield* threadManagement
         .dispatch({
           type: "message.dispatch",
           postOnly: true,
+          ...(respectSnooze ? { respectSnooze: true } : {}),
           commandId: stableCommandId({ scope, requestKey: key, operation }),
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
@@ -3374,6 +3411,7 @@ const make = Effect.gen(function* () {
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,
+        ...(yield* snoozeOutcome(input.threadId, target.thread.snoozedUntil, "posted")),
       };
     }),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
@@ -3471,6 +3509,7 @@ const make = Effect.gen(function* () {
           attachments: [],
           mode,
           ...(input.freshContext || input.coordinatorRollover ? { freshContext: true } : {}),
+          ...((input.respectSnooze ?? true) ? { respectSnooze: true } : {}),
           createdBy: "agent",
           creationSource: "mcp",
         })
@@ -3490,8 +3529,18 @@ const make = Effect.gen(function* () {
         result.run.id,
         input.clientRequestId,
       ).pipe(Effect.provideService(Invocation.McpInvocationContext, scope));
+      const queue =
+        result.delivery === "queued"
+          ? yield* readQueueStanding(input.threadId, result.run.id)
+          : undefined;
       return {
         ...(notify === undefined ? {} : { notify }),
+        ...(queue === undefined ? {} : { queue }),
+        ...(yield* snoozeOutcome(
+          input.threadId,
+          target.thread.snoozedUntil,
+          result.run.snoozeDeferred === true ? "held" : "steered",
+        )),
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,
