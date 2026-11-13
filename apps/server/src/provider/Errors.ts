@@ -1,3 +1,4 @@
+import * as NodeOS from "node:os";
 import * as Schema from "effect/Schema";
 
 export class ProviderInstanceNotFoundError extends Schema.TaggedError<ProviderInstanceNotFoundError>()(
@@ -22,6 +23,12 @@ export class ProviderWorkspaceMissingError extends Schema.TaggedError<ProviderWo
   },
 ) {
   override get message(): string {
-    return `This thread's workspace folder no longer exists or is not a directory: ${this.cwd}. Restore the folder at this path before retrying.`;
+    // The system clears these at reboot; a project that must last belongs in a folder that persists.
+    const temporary = [NodeOS.tmpdir(), "/tmp", "/var/tmp"].some((directory) =>
+      this.cwd.startsWith(`${directory}/`),
+    )
+      ? "It is under a temporary folder, which the system clears at reboot. "
+      : "";
+    return `This thread's workspace folder no longer exists or is not a directory: ${this.cwd}. ${temporary}Restore the folder at this path before retrying.`;
   }
 }
