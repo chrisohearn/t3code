@@ -387,7 +387,9 @@ export const layer = Layer.mergeAll(
 
 export const layerProduction = Layer.mergeAll(
   ApprovalAutoReview.layer.pipe(
-    Layer.provide(Layer.merge(layerThreadManagementProvided, TextGenerators.layer)),
+    Layer.provide(
+      Layer.mergeAll(layerThreadManagementProvided, TextGenerators.layer, layerEventSink),
+    ),
   ),
   WorktreeBranchSync.layer.pipe(
     Layer.provide(Layer.merge(layerThreadManagementProvided, ProjectionStore.layer)),

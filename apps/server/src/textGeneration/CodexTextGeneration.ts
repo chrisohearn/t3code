@@ -270,14 +270,23 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         )?.slug ??
         listed.find((candidate) => codexModelFamily(candidate.slug) === requestedFamily)?.slug;
       const model =
-        matchedModel ??
-        listed.find((candidate) => candidate.isDefault)?.slug ??
-        listed.find((candidate) => !candidate.isLegacy)?.slug ??
-        listed[0]?.slug ??
-        requestedModel;
+        operation === "reviewApproval"
+          ? requestedModel
+          : (matchedModel ??
+            listed.find((candidate) => candidate.isDefault)?.slug ??
+            listed.find((candidate) => !candidate.isLegacy)?.slug ??
+            listed[0]?.slug ??
+            requestedModel);
       // The selection's options were chosen for the requested model and may not fit a fallback.
       const fellBack = matchedModel === undefined && model !== requestedModel;
       const launchArgs = resolveCodexLaunchArgs(effectiveConfig.launchArgs, effectiveEnvironment);
+      if (operation === "reviewApproval" && !resolved && launchArgs.trim()) {
+        return yield* new TextGenerationError({
+          operation,
+          detail:
+            "Reviewer cannot inherit custom Codex launch settings. Use a managed provider instance or a standard sign-in.",
+        });
+      }
       const reasoningEffort =
         (fellBack
           ? undefined
@@ -297,6 +306,34 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
             }
           : {}),
       };
+      if (operation === "reviewApproval") {
+        const sourceHome = env.CODEX_HOME ?? path.join(yield* HostProcess.HomeDirectory, ".codex");
+        const isolatedHome = yield* fileSystem
+          .makeTempDirectoryScoped({ prefix: "t3code-codex-review-home-" })
+          .pipe(
+            Effect.mapError((cause) =>
+              normalizeCliError("codex", operation, cause, "Cannot isolate reviewer home"),
+            ),
+          );
+        yield* Effect.gen(function* () {
+          yield* fileSystem.chmod(isolatedHome, 0o700);
+          const authPath = path.join(sourceHome, "auth.json");
+          if (!resolved && (yield* fileSystem.exists(authPath))) {
+            yield* fileSystem.copyFile(authPath, path.join(isolatedHome, "auth.json"));
+            yield* fileSystem.chmod(path.join(isolatedHome, "auth.json"), 0o600);
+          }
+        }).pipe(
+          Effect.mapError((cause) =>
+            normalizeCliError(
+              "codex",
+              operation,
+              cause,
+              "Cannot prepare isolated reviewer sign-in",
+            ),
+          ),
+        );
+        env.CODEX_HOME = isolatedHome;
+      }
       const mcpServers = yield* listEnabledMcpServers({
         binary,
         cwd: workingDirectory,
@@ -328,6 +365,10 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
                 'approvals_reviewer="user"',
                 "--config",
                 'web_search="disabled"',
+                "--config",
+                "project_doc_max_bytes=0",
+                "--config",
+                "project_doc_fallback_filenames=[]",
               ]
             : []),
           ...(mcpServersOff ? ["--config", mcpServersOff] : []),

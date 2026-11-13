@@ -9,6 +9,7 @@ import {
   type RunId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -22,11 +23,19 @@ import { forkParked } from "../serverActivation.ts";
 import * as Config from "./ApprovalAutoReviewConfig.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import * as EventSink from "./EventSink.ts";
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 
 const involvesMoney = (text: string) =>
-  /\b(buy|buying|purchas\w*|pay|paying|payment\w*|paid|checkout|charge\w*|billing|invoice\w*|subscri\w*|renew\w*|spend\w*|donat\w*|transfer\w*|credit.?card|stripe|paypal|usd|cad|eur|gbp|aud|bitcoin|crypto)\b|[$€£¥]/iu.test(
-    text.normalize("NFKC"),
+  /\b(buy|buying|purchas\w*|pay\w*|paid|book\w*|order\w*|checkout|charge\w*|bill\w*|invoice\w*|subscri\w*|renew\w*|spend\w*|donat\w*|transfer\w*|wire\w*|sponsor\w*|price\w*|fee\w*|refund\w*|credit.?card|stripe\w*|paypal\w*|square\w*|letsfg\w*|shopify\w*|quickbooks\w*|usd|cad|eur|gbp|aud|bitcoin|crypto)\b|[$€£¥]/iu.test(
+    text
+      .normalize("NFKC")
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z])([A-Z][a-z])/g, "$1 $2")
+      .replace(/[_\-.]+/g, " "),
   );
+
+const auditText = (text: string) => makeProviderFailure({ message: text }).message.slice(0, 2000);
 
 const isApproval = Schema.is(ProviderRequestKind);
 const fingerprint = (item: OrchestrationV2TurnItem) => JSON.stringify(item);
@@ -67,6 +76,12 @@ export const make = Effect.gen(function* () {
         creationSource,
         senderClient,
         senderThreadId,
+        grantsAuthority:
+          role === "user" &&
+          createdBy === "user" &&
+          (creationSource === "web" || creationSource === "mobile") &&
+          senderClient == null &&
+          senderThreadId == null,
       }));
   });
 
@@ -99,8 +114,16 @@ export const make = Effect.gen(function* () {
         threadId,
         requestId,
         decision: "escalate" as const,
+        requestKind: request.kind,
+        prompt: auditText(
+          item.type === "approval_request"
+            ? (item.prompt ?? "")
+            : item.type === "user_input_request"
+              ? yield* encodeJson(item.questions)
+              : "",
+        ),
         answeredAt: DateTime.formatIso(yield* DateTime.now),
-        reviewer: { modelSelection, reason },
+        reviewer: { modelSelection, reason: auditText(reason) },
       };
       const json = yield* encodeJson(record);
       yield* sql`INSERT INTO mcp_approval_answers (thread_id, request_id, outcome, answer_json)
@@ -117,12 +140,14 @@ export const make = Effect.gen(function* () {
       }
       const messages = yield* readMessages(threadId, item.runId);
       const evidence = yield* encodeJson({ request: item, messages });
+      if (/[^\x00-\x7f]/u.test((yield* encodeJson(item)).replace(/[^\p{L}]/gu, "")))
+        return yield* escalate("Non-ASCII letters in the action require human review.");
       if (involvesMoney(evidence))
         return yield* escalate("Possible spending money: fresh human approval is required.");
       if (
         evidence.length > 24000 ||
         !item.prompt?.trim() ||
-        !messages.some((message) => message.role === "user" && message.text.trim())
+        !messages.some((message) => message.grantsAuthority && message.text.trim())
       ) {
         return yield* escalate("The action or context is missing or exceeds the review budget.");
       }
@@ -193,15 +218,13 @@ export const make = Effect.gen(function* () {
           Effect.provideService(McpApprovalAnswerContext, {
             sessionId: "auto-review",
             clientLabel: "T3 approval reviewer",
-            reviewer: { modelSelection, reason: result.reason },
-            note: result.reason,
+            reviewer: { modelSelection, reason: auditText(result.reason) },
+            note: auditText(result.reason),
           }),
         );
     }).pipe(
-      Effect.catchCause(() =>
-        escalate(
-          "Reviewer failed or its response could not be applied; no automatic approval was granted.",
-        ),
+      Effect.catchCause((cause) =>
+        escalate(`Reviewer failed; no automatic approval was granted. ${Cause.pretty(cause)}`),
       ),
     );
   });
@@ -209,17 +232,23 @@ export const make = Effect.gen(function* () {
 
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
-    const threads = yield* ThreadManagement.ThreadManagementService;
     const sql = yield* SqlClient.SqlClient;
+    const events = yield* EventSink.EventSinkV2;
+    const afterSequence = yield* events.latestSequence();
     const review = yield* make;
     const safelyReview = (threadId: ThreadId, requestId: RuntimeRequestId) =>
       review(threadId, requestId).pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("Approval auto-review failed closed", { threadId, requestId, cause }),
+          Effect.logWarning("Approval auto-review failed closed", {
+            threadId,
+            requestId,
+            cause: auditText(Cause.pretty(cause)),
+          }),
         ),
       );
     yield* forkParked(
-      threads.streamDomainEvents.pipe(
+      events.stream({ afterSequence, bounded: true }).pipe(
+        Stream.map((stored) => stored.event),
         Stream.mapEffect(
           (event) => {
             if (event.type === "runtime-request.updated" && event.payload.status === "pending") {
@@ -237,6 +266,12 @@ export const layer = Layer.effectDiscard(
           { concurrency: 4 },
         ),
         Stream.runDrain,
+        Effect.catchCause((cause) =>
+          Effect.logWarning(
+            "Approval auto-review event stream stopped; pending requests remain human-owned",
+            { cause: auditText(Cause.pretty(cause)) },
+          ),
+        ),
       ),
     );
     yield* forkParked(

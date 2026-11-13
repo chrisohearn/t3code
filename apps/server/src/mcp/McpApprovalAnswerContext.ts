@@ -12,6 +12,8 @@ export const ApprovalReviewEscalation = Schema.Struct({
   threadId: ThreadId,
   requestId: RuntimeRequestId,
   decision: Schema.Literal("escalate"),
+  requestKind: Schema.optional(Schema.String),
+  prompt: Schema.optional(Schema.String),
   answeredAt: OrchestrationV2McpApprovalAnswer.fields.answeredAt,
   reviewer: Schema.Struct({ modelSelection: ModelSelection, reason: Schema.String }),
 });

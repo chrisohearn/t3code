@@ -61,7 +61,7 @@ export const decodeJsonReply = <S extends Schema.Top>(
   text: string,
 ) => {
   const decodeOutput = Schema.decodeEffect(Schema.fromJsonString(request.outputSchema));
-  return decodeOutput(extractJsonObject(text)).pipe(
+  return decodeOutput(request.operation === "reviewApproval" ? text : extractJsonObject(text)).pipe(
     Effect.mapError(
       (cause) =>
         new TextGenerationError({

@@ -2282,7 +2282,7 @@ it.effect(
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const outbox = yield* EffectOutbox.EffectOutboxV2;
       const now = yield* DateTime.now;
-      for (const [kind, decision, standingOnly, autoReview] of [
+      for (const [kind, decision, standingOnly, autoReview, approvalPrompt] of [
         ["user_input", "cancel"],
         ["command", "accept"],
         ["command", "decline"],
@@ -2295,7 +2295,38 @@ it.effect(
         ["command", "decline", false, "decline"],
         ["command", "accept", false, "escalate"],
         ["command", "accept", false, "error"],
+        ["command", "accept", false, "timeout"],
         ["command", "accept", false, "money"],
+        ...[
+          "mcp__stripe__create_payment_link",
+          "mcp__letsfg__book_flight",
+          "pay_invoice",
+          "stripe_charge",
+          "createPayment()",
+          "buyNow",
+          "bill_payment",
+          "mcp__square__list",
+          "mcp__shopify__list",
+          "mcp__quickbooks__list",
+          "mcp__paypal__list",
+          "tool.payout",
+          "check-booking",
+          "createOrder",
+          "checkout",
+          "wire",
+          "transfer",
+          "sponsor",
+          "price",
+          "fee",
+          "purchase",
+          "subscribe",
+          "invoice",
+          "refund",
+          "charge",
+          "mcp__strіpe__list",
+          "printf café",
+        ].map((prompt) => ["command", "accept", false, "money", prompt] as const),
+        ["command", "accept", false, "agent-context"],
         ["command", "accept", false, "disabled"],
         ["command", "accept", false, "inherit"],
         ["command", "accept", false, "opt-out"],
@@ -2307,7 +2338,7 @@ it.effect(
         ["command", "accept", true, "approve"],
       ] as const) {
         const sql = yield* SqlClient.SqlClient;
-        const suffix = `${kind}-${decision}${standingOnly ? "-standing-only" : ""}-${autoReview ?? "manual"}`;
+        const suffix = `${kind}-${decision}${standingOnly ? "-standing-only" : ""}-${autoReview ?? "manual"}-${approvalPrompt ?? "default"}`;
         const threadId = ThreadId.make(`thread:snoozed-live-${suffix}`);
         const requestId = RuntimeRequestId.make(`request:snoozed-live-${suffix}`);
         const sessionId = ProviderSessionId.make(`session:snoozed-live-${suffix}`);
@@ -2397,9 +2428,10 @@ it.effect(
                     options: [{ decision, label: decision === "accept" ? "Run once" : "Reject" }],
                   }),
               prompt:
-                autoReview === "money"
+                approvalPrompt ??
+                (autoReview === "money"
                   ? "Purchase the annual subscription for 100 USD"
-                  : "Run project tests",
+                  : "Run project tests"),
               reason: "Needs process access",
             },
           });
@@ -2413,8 +2445,8 @@ it.effect(
             attachments: [],
             postOnly: true,
             dispatchMode: { type: "defer_start" },
-            createdBy: "user",
-            creationSource: "web",
+            createdBy: autoReview === "agent-context" ? "agent" : "user",
+            creationSource: autoReview === "agent-context" ? "mcp" : "web",
           });
           if (kind === "user_input")
             yield* projections.apply({
@@ -2459,7 +2491,11 @@ it.effect(
                 Effect.succeed((input) =>
                   Effect.gen(function* () {
                     calls += 1;
-                    if (autoReview === "error") return yield* Effect.die("reviewer unavailable");
+                    if (autoReview === "timeout") return yield* Effect.never;
+                    if (autoReview === "error")
+                      return yield* Effect.die(
+                        `reviewer unavailable password=sentinel ${"detail ".repeat(600)}`,
+                      );
                     if (autoReview === "revoked")
                       yield* ApprovalAutoReviewConfig.write(threadId, null);
                     if (autoReview === "context-changed")
@@ -2502,7 +2538,13 @@ it.effect(
               );
             }
             const review = yield* ApprovalAutoReview.make;
-            yield* review(threadId, requestId);
+            if (autoReview === "timeout") {
+              const fiber = yield* review(threadId, requestId).pipe(Effect.forkChild);
+              yield* TestClock.adjust("60 seconds");
+              yield* Fiber.join(fiber);
+            } else {
+              yield* review(threadId, requestId);
+            }
             yield* review(threadId, requestId);
           }).pipe(Effect.provide(reviewLayers));
           const disabled = autoReview === "disabled" || autoReview === "opt-out";
@@ -2527,11 +2569,26 @@ it.effect(
           }>`SELECT answer_json FROM mcp_approval_answers WHERE thread_id = ${threadId}`;
           assert.equal(audit.length, disabled ? 0 : 1);
           if (!approved && !disabled) {
-            assert.equal(JSON.parse(audit[0]!.answer_json).decision, "escalate");
+            const entry = JSON.parse(audit[0]!.answer_json);
+            assert.equal(entry.decision, "escalate");
+            assert.equal(entry.requestKind, kind);
+            assert.isString(entry.prompt);
+            assert.isAtMost(entry.reviewer.reason.length, 2000);
+            assert.notInclude(entry.reviewer.reason, "sentinel");
+            if (autoReview === "error")
+              assert.include(entry.reviewer.reason, "reviewer unavailable");
+            if (autoReview === "invalid")
+              assert.include(entry.reviewer.reason, "invalid structured output");
+            if (autoReview === "timeout") assert.include(entry.reviewer.reason, "Timeout");
           }
           assert.equal(
             calls,
-            autoReview === "money" || disabled || autoReview === "question" ? 0 : 1,
+            autoReview === "money" ||
+              disabled ||
+              autoReview === "question" ||
+              autoReview === "agent-context"
+              ? 0
+              : 1,
           );
           continue;
         }

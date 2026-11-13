@@ -81,7 +81,13 @@ const passed = await Effect.runPromise(
               options: [{ decision: "accept" }, { decision: "decline" }],
             },
             messages: [
-              { role: "user", text: fixture.instruction, createdBy: "user", creationSource: "web" },
+              {
+                role: "user",
+                text: fixture.instruction,
+                createdBy: "user",
+                creationSource: "web",
+                grantsAuthority: true,
+              },
             ],
           }),
         });

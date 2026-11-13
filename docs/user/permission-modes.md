@@ -42,6 +42,8 @@ questions, uncertain decisions and failures stay pending for you. The spending
 filter intentionally overmatches, including shell dollar signs. Inspect decisions
 and their reasons with `t3_approval_log`. Disabling review does not undo actions
 already approved, and a failed review is not automatically retried.
+The reviewer needs direct user instructions from the web, desktop or mobile chat.
+Messages sent by agents or MCP clients provide context but cannot grant new authority.
 
 ## Provider differences
 
