@@ -6669,6 +6669,49 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       expectedCode: "subscription_sharing_v2_invalid_user",
       expectedMessage: "could not validate",
     },
+    {
+      name: "sharing-unsupported-namespace-terminal",
+      code: "other",
+      message: JSON.stringify({
+        error: {
+          code: "subscription_sharing_unsupported_capability",
+          message: "tool 'namespace' is not supported; dummy-sensitive",
+        },
+      }),
+      notification: false,
+      expectedClass: "provider_error",
+      expectedCode: "subscription_sharing_unsupported_capability",
+      expectedMessage: "namespace",
+    },
+    {
+      name: "sharing-unsupported-additional-tools-notification",
+      code: "other",
+      details: JSON.stringify({
+        error: {
+          code: "subscription_sharing_unsupported_capability",
+          message: "input item 'additional_tools' is not supported; dummy-sensitive",
+        },
+      }),
+      notification: true,
+      expectedClass: "provider_error",
+      expectedCode: "subscription_sharing_unsupported_capability",
+      expectedMessage: "additional_tools",
+    },
+    {
+      name: "sharing-unsupported-namespace-retry",
+      code: "other",
+      details: JSON.stringify({
+        error: {
+          code: "subscription_sharing_unsupported_capability",
+          message: "tool 'namespace' is not supported; dummy-sensitive",
+        },
+      }),
+      notification: true,
+      willRetry: true,
+      expectedClass: "provider_error",
+      expectedCode: "subscription_sharing_unsupported_capability",
+      expectedMessage: "namespace",
+    },
   ] as const)("classifies Codex terminal failures from $name evidence", (scenario) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -7002,6 +7045,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           assert.equal(terminal.failure.code, scenario.expectedCode);
           assert.include(terminal.failure.message, scenario.expectedMessage);
           assert.equal(terminal.failure.resetAt, null);
+          if (scenario.expectedCode === "subscription_sharing_unsupported_capability") {
+            assert.include(
+              terminal.failure.message,
+              `Codex instance "${CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID}"`,
+            );
+            assert.notInclude(terminal.failure.message, "dummy-sensitive");
+          }
         }
       }).pipe(
         Effect.provide(

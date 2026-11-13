@@ -1187,13 +1187,17 @@ function codexUsageLimitError(
 function withCodexManagedFailure(
   failure: OrchestrationV2ProviderFailure,
   nativeError: unknown,
+  instanceId: ProviderInstanceId,
 ): OrchestrationV2ProviderFailure {
   const managed = classifyCodexManagedError(nativeError);
   return managed === undefined
     ? failure
     : {
         ...failure,
-        message: managed.message,
+        message:
+          managed.code === "subscription_sharing_unsupported_capability"
+            ? `Codex instance "${instanceId}": ${managed.message}`
+            : managed.message,
         code: managed.code,
         ...(managed.usageLimit ? { class: "usage_limit" } : {}),
       };
@@ -4999,6 +5003,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       : "provider_error",
                   }),
                   payload.error,
+                  adapterOptions.instanceId,
                 ),
               };
               return;
@@ -5029,6 +5034,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 retryable: true,
               }),
               payload.error,
+              adapterOptions.instanceId,
             );
             const itemOrdinal =
               previous?.itemOrdinal ??
@@ -6173,6 +6179,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                         class: failureClass,
                       }),
                       input.failureMessage,
+                      adapterOptions.instanceId,
                     );
               const accountFailure = codexAccountFailure(failure);
               return {
