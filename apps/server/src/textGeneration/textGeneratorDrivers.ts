@@ -28,6 +28,7 @@ export interface TextGeneratorDriver {
     connection: TextGeneratorConnection,
     model: string,
     prompt: string,
+    systemPrompt?: string,
   ) => Effect.Effect<string, TextGeneratorRequestError, HttpClient.HttpClient>;
   readonly listModels: (
     connection: TextGeneratorConnection,
@@ -137,10 +138,16 @@ const OpenAIModelList = Schema.Struct({
 
 const openAICompatible: TextGeneratorDriver = {
   kind: "openaiCompatible",
-  generate: (connection, model, prompt) => {
+  generate: (connection, model, prompt, systemPrompt) => {
     const { label } = connection;
     let request = HttpClientRequest.post(endpoint(connection, "/chat/completions")).pipe(
-      HttpClientRequest.bodyJsonUnsafe({ model, messages: [{ role: "user", content: prompt }] }),
+      HttpClientRequest.bodyJsonUnsafe({
+        model,
+        messages: [
+          ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+          { role: "user", content: prompt },
+        ],
+      }),
     );
     if (connection.apiKey) request = HttpClientRequest.bearerToken(request, connection.apiKey);
     return sendJson(label, request, ChatCompletion).pipe(
@@ -193,12 +200,13 @@ const anthropicRequest = (request: HttpClientRequest.HttpClientRequest, apiKey: 
 
 const anthropic: TextGeneratorDriver = {
   kind: "anthropic",
-  generate: (connection, model, prompt) => {
+  generate: (connection, model, prompt, systemPrompt) => {
     const { label } = connection;
     const request = anthropicRequest(
       HttpClientRequest.post(endpoint(connection, "/messages")).pipe(
         HttpClientRequest.bodyJsonUnsafe({
           model,
+          ...(systemPrompt ? { system: systemPrompt } : {}),
           max_tokens: 8192,
           messages: [{ role: "user", content: prompt }],
         }),

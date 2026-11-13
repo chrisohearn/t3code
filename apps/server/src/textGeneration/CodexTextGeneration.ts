@@ -193,7 +193,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           reason: "exit",
           exitCode,
         });
-        return [];
+        return null;
       }
       const servers = yield* decodeCodexMcpServers(stdout).pipe(
         Effect.tapError(() =>
@@ -211,17 +211,18 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         onNone: () =>
           Effect.logWarning("codex mcp list failed; text generation keeps its MCP servers", {
             reason: "timeout",
-          }).pipe(Effect.as<ReadonlyArray<string>>([])),
+          }).pipe(Effect.as(null)),
         onSome: (names) => Effect.succeed(names),
       }),
     ),
-    Effect.orElseSucceed((): ReadonlyArray<string> => []),
+    Effect.orElseSucceed(() => null),
   );
 
   const runCodexJson = Effect.fn("runCodexJson")(function* <S extends Schema.Top>({
     operation,
     cwd,
     prompt,
+    systemPrompt,
     outputSchema: outputSchemaJson,
     modelSelection,
     attachments,
@@ -237,6 +238,11 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       toJsonSchemaObject(outputSchemaJson),
     );
     const schemaPath = yield* writeTempFile(operation, "codex-schema", schemaJson);
+    const systemConfig =
+      systemPrompt === undefined
+        ? undefined
+        : yield* encodeJsonForOperation(operation, systemPrompt);
+    const workingDirectory = operation === "reviewApproval" ? path.dirname(schemaPath) : cwd;
     const outputPath = yield* writeTempFile(operation, "codex-output", "").pipe(
       Effect.onError(() => removeTempFileDir(schemaPath)),
     );
@@ -291,12 +297,19 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
             }
           : {}),
       };
-      const mcpServersOff = yield* listEnabledMcpServers({
+      const mcpServers = yield* listEnabledMcpServers({
         binary,
-        cwd,
+        cwd: workingDirectory,
         env,
         launchArgs: codexMcpListLaunchArgs(launchArgs),
-      }).pipe(Effect.map(codexMcpServersOff));
+      });
+      if (mcpServers === null && operation === "reviewApproval") {
+        return yield* new TextGenerationError({
+          operation,
+          detail: "Cannot isolate reviewer MCP tools.",
+        });
+      }
+      const mcpServersOff = codexMcpServersOff(mcpServers ?? []);
       const spawnCommand = yield* resolveSpawnCommand(
         binary,
         [
@@ -304,6 +317,19 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           ...codexExecLaunchArgs(launchArgs),
           // A user's MCP server could act on the text-generation prompt.
           ...CODEX_NO_PLUGIN_ARGS,
+          ...(systemConfig ? ["--config", `developer_instructions=${systemConfig}`] : []),
+          ...(operation === "reviewApproval"
+            ? [
+                "--config",
+                "features.shell_tool=false",
+                "--config",
+                'approval_policy="never"',
+                "--config",
+                'approvals_reviewer="user"',
+                "--config",
+                'web_search="disabled"',
+              ]
+            : []),
           ...(mcpServersOff ? ["--config", mcpServersOff] : []),
           "--ephemeral",
           "--skip-git-repo-check",
@@ -325,7 +351,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       );
       const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
         env,
-        cwd,
+        cwd: workingDirectory,
         shell: spawnCommand.shell,
         stdin: {
           stream: Stream.encodeText(Stream.make(prompt)),

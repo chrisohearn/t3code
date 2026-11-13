@@ -57,6 +57,7 @@ interface FakeCodexInput {
   stdinMustNotContain?: string;
   mcpServers?: ReadonlyArray<{ name: string; enabled: boolean }> | number;
   requiredCwd?: string;
+  forbiddenCwd?: string;
   requireInstructions?: string;
 }
 
@@ -72,6 +73,7 @@ function makeFakeCodexBinary(dir: string, input: FakeCodexInput) {
     stdinMustNotContain: input.stdinMustNotContain ?? null,
     mcpServers: input.mcpServers ?? [],
     requiredCwd: input.requiredCwd ?? null,
+    forbiddenCwd: input.forbiddenCwd ?? null,
     requireInstructions: input.requireInstructions ?? null,
     stderr: input.stderr ?? null,
     output: input.output,
@@ -130,6 +132,7 @@ function makeFakeCodexBinary(dir: string, input: FakeCodexInput) {
         "  process.exit(code);",
         "}",
         'if (check.requiredCwd !== null && process.cwd() !== check.requiredCwd) fail("cannot inspect checkout", 10);',
+        'if (process.cwd() === check.forbiddenCwd) fail("reviewer entered the checkout", 12);',
         'if (check.requireInstructions !== null && !instructions.includes(check.requireInstructions)) fail("missing writer task", 11);',
         "if (check.requireArg !== null && !originalArgs.includes(` ${check.requireArg} `)) {",
         '  fail("missing arg: " + check.requireArg, 8);',
@@ -382,6 +385,33 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
           expect(result.title).toBe("Remove default shapes");
         }),
     ),
+  );
+
+  it.effect.each([false, true])(
+    "isolates approval review and fails closed on MCP discovery failure (%s)",
+    (discoveryFails) =>
+      withFakeCodexEnv(
+        {
+          output: '{"decision":"approve","reason":"Requested tests"}',
+          mcpServers: discoveryFails ? 2 : [{ name: "actions", enabled: true }],
+          requireInstructions: "independent approval reviewer",
+          requireArg:
+            '--config features.shell_tool=false --config approval_policy="never" --config approvals_reviewer="user" --config web_search="disabled" --config mcp_servers={"actions"={enabled=false}}',
+          forbiddenCwd: process.cwd(),
+          stdinMustContain: '"command":"vp test"',
+        },
+        (textGeneration) =>
+          Effect.gen(function* () {
+            const review = textGeneration.reviewApproval!({
+              cwd: process.cwd(),
+              evidence: '{"command":"vp test"}',
+              modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+            });
+            if (discoveryFails)
+              expect((yield* Effect.flip(review)).detail).toContain("Cannot isolate");
+            else expect(yield* review).toEqual({ decision: "approve", reason: "Requested tests" });
+          }),
+      ),
   );
 
   it.effect("still generates when Codex cannot list its MCP servers", () =>

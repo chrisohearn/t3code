@@ -184,6 +184,31 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
       ),
   );
 
+  it.effect("isolates approval review with a fixed system policy and no tools", () =>
+    withFakeClaudeEnv(
+      {
+        output: JSON.stringify({
+          structured_output: { decision: "decline", reason: "Outside scope" },
+        }),
+        argsMustContain: "--system-prompt You are an independent approval reviewer",
+        cwdMustNotBe: process.cwd(),
+        stdinMustContain: '"command":"delete"',
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const result = yield* textGeneration.reviewApproval!({
+            cwd: process.cwd(),
+            evidence: '{"command":"delete"}',
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claudeAgent"),
+              model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+            },
+          });
+          expect(result).toEqual({ decision: "decline", reason: "Outside scope" });
+        }),
+    ),
+  );
+
   it.effect("sends thread title instructions to the provider prompt", () =>
     withFakeClaudeEnv(
       {

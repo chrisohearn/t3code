@@ -91,6 +91,21 @@ describe("fallbackTextGenerationModelSelection", () => {
 });
 
 describe("serverSettings helpers", () => {
+  it("defaults approval auto-review off and replaces or clears its entire selection", () => {
+    expect(decodeServerSettings({}).approvalAutoReview).toBeNull();
+    const selection = { instanceId: ProviderInstanceId.make("codex"), model: "reviewer" };
+    const enabled = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+      approvalAutoReview: {
+        ...selection,
+        options: [{ id: "effort", value: "high" }],
+      },
+    });
+    const replaced = applyServerSettingsPatch(enabled, { approvalAutoReview: selection });
+    expect(replaced.approvalAutoReview).toEqual(selection);
+    expect(
+      applyServerSettingsPatch(replaced, { approvalAutoReview: null }).approvalAutoReview,
+    ).toBeNull();
+  });
   it("translates a shipped client's idle compaction switch into a mode", () => {
     const off = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, { idleCompaction: "off" });
     expect([off.idleCompaction, off.compactIdleThreads]).toEqual(["off", false]);

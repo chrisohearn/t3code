@@ -75,7 +75,7 @@ import * as McpInvocationContext from "../McpInvocationContext.ts";
 import * as McpToolAccessTestkit from "../McpToolAccess.testkit.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { dispatchFailure } from "../threadAccess.ts";
-import { McpApprovalAnswerContext } from "../McpApprovalAnswerContext.ts";
+import { ApprovalReviewEscalation, McpApprovalAnswerContext } from "../McpApprovalAnswerContext.ts";
 import * as EnvironmentHandlers from "./environment/handlers.ts";
 import * as AttachmentHandlers from "./attachment/handlers.ts";
 import { ThreadToolkit } from "./thread/tools.ts";
@@ -103,12 +103,14 @@ const decodeMcpAttachmentInput = Schema.decodeUnknownEffect(McpAttachmentInput);
 const encodeApprovalAnswer = Schema.encodeSync(
   Schema.fromJsonString(OrchestrationV2McpApprovalAnswer),
 );
+const encodeEscalation = Schema.encodeEffect(Schema.fromJsonString(ApprovalReviewEscalation));
 const decodeThreadReadResult = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadResult);
 const decodeThreadSearchResult = Schema.decodeUnknownEffect(
   ThreadToolkit.tools.t3_thread_search.successSchema,
 );
 
 const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
+  Layer.provide(ServerSettings.layerTest()),
   Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
   Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
   Layer.provide(Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({})),
@@ -420,10 +422,24 @@ it.effect("only outside full-access sign-ins answer approvals, with attribution"
       answeredAt: "2026-11-12T00:00:00.000Z",
       note: "Chris said yes.",
     };
+    const reviewer = {
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "reviewer" },
+      reason: "Requested work",
+    };
     yield* sql`INSERT INTO mcp_approval_answers (thread_id, request_id, answer_json)
-      VALUES (${shell.id}, ${requestId}, ${encodeApprovalAnswer(record)})`;
+      VALUES (${shell.id}, ${requestId}, ${encodeApprovalAnswer({ ...record, reviewer })})`;
+    const escalation = {
+      threadId: shell.id,
+      requestId,
+      answeredAt: record.answeredAt,
+      decision: "escalate" as const,
+      reviewer: { ...reviewer, reason: "Possible spending" },
+    };
+    const escalationJson = yield* encodeEscalation(escalation);
+    yield* sql`INSERT INTO mcp_approval_answers (thread_id, request_id, outcome, answer_json)
+      VALUES (${shell.id}, ${requestId}, 'refused', ${escalationJson})`;
     expect((yield* log(outside("full-access"))).structuredContent).toEqual({
-      records: [...refused.records, record],
+      records: [...refused.records, { ...record, reviewer }, escalation],
       nextCursor: null,
     });
   }).pipe(
@@ -884,6 +900,7 @@ it.effect("requires a projectId to file a scratch thread and returns the moved s
   }).pipe(
     Effect.provide(
       McpHttpServer.layerThreadToolkit.pipe(
+        Layer.provide(ServerSettings.layerTest()),
         Layer.provide(Sqlite.layerMemory),
         Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
         Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
@@ -1190,6 +1207,48 @@ it.effect("a read-only client reads threads and is refused every write before it
     });
     expect(configuration.isError).toBe(false);
     expect(configuration.structuredContent).toMatchObject({ runtimeMode: "auto" });
+    expect(configuration.structuredContent).toMatchObject({
+      autoReview: { override: "inherit", effective: null },
+    });
+    for (const access of ["read-only", "approval-required", "auto"] as const) {
+      const denied = yield* server
+        .callTool({
+          name: "t3_thread_configure",
+          arguments: {
+            threadId: "other-project-thread",
+            autoReview: { instanceId: "codex", model: "reviewer" },
+          },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, clientScope(access)),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(declaredFailure(denied)).toMatchObject({ code: "capability_denied" });
+    }
+    for (const override of [{ instanceId: "codex", model: "reviewer" }, null, "inherit"] as const) {
+      const changed = yield* server
+        .callTool({
+          name: "t3_thread_configure",
+          arguments: {
+            threadId: "other-project-thread",
+            autoReview: override,
+          },
+        })
+        .pipe(
+          Effect.provideService(
+            McpInvocationContext.McpInvocationContext,
+            clientScope("full-access"),
+          ),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(changed.isError).toBe(false);
+      expect(changed.structuredContent).toMatchObject({
+        autoReview: {
+          override,
+          effective: override === "inherit" ? null : override,
+        },
+      });
+    }
 
     const pinned = yield* call("t3_thread_organize", {
       action: "pin",
@@ -1412,6 +1471,7 @@ it.effect.each([
   }).pipe(
     Effect.provide(
       McpHttpServer.layerThreadToolkit.pipe(
+        Layer.provide(ServerSettings.layerTest()),
         Layer.provide(Sqlite.layerMemory),
         Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
         Layer.provide(NodeCrypto.layer),

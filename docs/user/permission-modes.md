@@ -24,6 +24,25 @@ Approve or reject requests in the conversation to let the agent continue. Permis
 not prevent the agent from asking questions about the task. Subagent approval requests appear in
 the parent conversation with the subagent's name, so you can respond without switching threads.
 
+## Optional approval reviewer
+
+Keep a thread supervised while a separate model reviews its runtime approvals.
+This is off by default and separate from the provider's **Auto** mode. A
+full-access MCP caller can use `t3_thread_configure` with `autoReview` set to a
+reviewer selection, such as `{ "instanceId": "codex", "model": "<available-model>" }`.
+Set it to `null` to disable review on that thread, or `"inherit"` to use the
+server's `approvalAutoReview` setting. That setting accepts the same selection or
+`null` in the server's `userdata/settings.json`. Reading `t3_thread_configure`
+returns both the override and effective selection.
+
+Choose a signed-in Codex or Claude instance, or a configured text generator.
+Review consumes that model's allowance and API-backed models may incur charges.
+Approvals allow only the requested action once. Spending indicators, human
+questions, uncertain decisions and failures stay pending for you. The spending
+filter intentionally overmatches, including shell dollar signs. Inspect decisions
+and their reasons with `t3_approval_log`. Disabling review does not undo actions
+already approved, and a failed review is not automatically retried.
+
 ## Provider differences
 
 Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.

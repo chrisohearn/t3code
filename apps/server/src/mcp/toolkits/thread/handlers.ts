@@ -18,8 +18,10 @@ import { modelSelectionCommandType } from "@t3tools/shared/model";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as PendingApproval from "../../PendingApprovalMcpService.ts";
+import * as AutoReviewConfig from "../../../orchestration-v2/ApprovalAutoReviewConfig.ts";
 import {
   dispatchFailure,
+  assertFullAccess,
   newCommandId,
   readCaller,
   readThread,
@@ -224,7 +226,10 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     ),
   ),
   t3_thread_configure: McpToolAccess.either(
-    (input) => input.modelSelection === undefined && input.runtimeMode === undefined,
+    (input) =>
+      input.modelSelection === undefined &&
+      input.runtimeMode === undefined &&
+      input.autoReview === undefined,
     McpToolAccess.reads((input) =>
       Effect.gen(function* () {
         const {
@@ -235,6 +240,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           modelSelection: thread.modelSelection,
           runtimeMode: thread.runtimeMode,
           interactionMode: thread.interactionMode,
+          autoReview: yield* AutoReviewConfig.read(thread.id).pipe(Effect.mapError(unavailable)),
         };
       }),
     ),
@@ -244,6 +250,25 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           threads,
           projection: { thread },
         } = yield* readThread(input.threadId);
+        if (input.autoReview !== undefined) {
+          yield* assertFullAccess(yield* readCaller(), "configure approval auto-review");
+          if (input.modelSelection !== undefined || input.runtimeMode !== undefined) {
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "Set autoReview separately from model and runtimeMode.",
+            });
+          }
+          const autoReview = yield* AutoReviewConfig.write(thread.id, input.autoReview).pipe(
+            Effect.mapError(unavailable),
+          );
+          return {
+            threadId: thread.id,
+            modelSelection: thread.modelSelection,
+            runtimeMode: thread.runtimeMode,
+            interactionMode: thread.interactionMode,
+            autoReview,
+          };
+        }
         if (input.runtimeMode !== undefined) {
           if (input.modelSelection !== undefined) {
             return yield* new OrchestratorMcpFailure({

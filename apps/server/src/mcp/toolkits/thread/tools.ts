@@ -24,6 +24,8 @@ import {
 } from "@t3tools/contracts";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as ServerSettings from "../../../serverSettings.ts";
 import { Tool, Toolkit } from "effect/ai";
 
 import * as ScratchThreadPromotion from "../../../project/ScratchThreadPromotion.ts";
@@ -32,6 +34,7 @@ import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskServ
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as PendingApproval from "../../PendingApprovalMcpService.ts";
+import { AutoReviewOverride } from "../../../orchestration-v2/ApprovalAutoReviewConfig.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
@@ -202,6 +205,10 @@ const ApprovalLogTool = Tool.make("t3_approval_log", {
   .annotate(Tool.Destructive, false);
 
 const threadConfiguration = Schema.Struct({
+  autoReview: Schema.Struct({
+    override: AutoReviewOverride,
+    effective: Schema.NullOr(ModelSelection),
+  }),
   threadId: ThreadId,
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
@@ -209,13 +216,19 @@ const threadConfiguration = Schema.Struct({
 });
 const ThreadConfigureTool = Tool.make("t3_thread_configure", {
   ...commandTool,
+  dependencies: [
+    ...commandTool.dependencies,
+    SqlClient.SqlClient,
+    ServerSettings.ServerSettingsService,
+  ],
   description:
-    "Read a thread's provider, model, and modes, or set its provider, model, and options with `modelSelection`. Omit `threadId` for this thread. Set `runtimeMode` alone to lower permissions on an idle thread; raises and active runs are refused. Values from `orchestrator_capabilities`.",
+    "Read or set a thread's model and modes. Omit threadId for this thread. Set runtimeMode alone to lower permissions on an idle thread; raises and active runs are refused. autoReview alone sets a reviewer model selection, null disables it, or 'inherit' uses the server default (off initially). Only a full-access caller can change auto-review. Reviews allow once or deny; money, human questions and errors remain pending. Values from orchestrator_capabilities.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
     modelSelection: Schema.optional(ModelSelection),
     runtimeMode: Schema.optional(RuntimeMode),
+    autoReview: Schema.optional(AutoReviewOverride),
   }),
   success: Schema.Union([threadConfiguration, OrchestrationV2DispatchCommandResult]),
 }).annotate(Tool.Destructive, true);

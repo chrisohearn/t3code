@@ -6,6 +6,7 @@ import { formatGeneratedBranchName, sanitizeFeatureBranchName } from "@t3tools/s
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
 
 import type { ProviderTextGeneration } from "./textGeneration.ts";
+import { APPROVAL_REVIEW_POLICY, ApprovalReviewOutput } from "./approvalReview.ts";
 import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
@@ -27,6 +28,7 @@ export interface Request<S extends Schema.Top> {
   readonly operation: Operation;
   readonly cwd: string;
   readonly prompt: string;
+  readonly systemPrompt?: string;
   readonly outputSchema: S;
   readonly modelSelection: ModelSelection;
   readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;
@@ -195,6 +197,16 @@ export function fromRunner(name: string, run: Runner): ProviderTextGeneration {
   });
 
   return {
+    reviewApproval: Effect.fn(`${name}.reviewApproval`)(function (input) {
+      return run({
+        operation: "reviewApproval",
+        cwd: input.cwd,
+        modelSelection: input.modelSelection,
+        systemPrompt: APPROVAL_REVIEW_POLICY,
+        prompt: input.evidence,
+        outputSchema: ApprovalReviewOutput,
+      });
+    }),
     generateCommitMessage,
     generatePrContent,
     generateBranchName,

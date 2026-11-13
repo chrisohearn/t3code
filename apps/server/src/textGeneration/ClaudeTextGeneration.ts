@@ -140,6 +140,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     operation,
     cwd,
     prompt,
+    systemPrompt,
     outputSchema: outputSchemaJson,
     modelSelection,
     investigate,
@@ -201,7 +202,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       noSessionPersistence: boolean,
     ) {
       const workingDirectory =
-        operation === "generateThreadTitle"
+        operation === "generateThreadTitle" || operation === "reviewApproval"
           ? yield* fileSystem
               .makeTempDirectoryScoped({ prefix: "t3code-claude-title-" })
               .pipe(
@@ -211,10 +212,17 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
               )
           : cwd;
       const managedMcpConfig = yield* hasClaudeManagedMcpConfig();
+      if (operation === "reviewApproval" && managedMcpConfig) {
+        return yield* new TextGenerationError({
+          operation,
+          detail: "Cannot isolate reviewer from managed MCP tools.",
+        });
+      }
       const spawnCommand = yield* resolveSpawnCommand(
         claudeSettings.binaryPath || "claude",
         [
           "-p",
+          ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
           "--output-format",
           "json",
           "--json-schema",
