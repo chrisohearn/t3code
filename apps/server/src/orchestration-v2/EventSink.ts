@@ -450,11 +450,18 @@ const layerBase: Layer.Layer<
             latestInBatch.set(candidate.payload.id, candidate.payload);
           }
         }
-        const stored = yield* projectionStore.getThreadRecords(run.threadId, ["turnItems"], {
-          turnItemRunId: run.id,
-          turnItemTypes: [...RUN_BOUND_ITEM_TYPES],
-          turnItemStatuses: ["pending", "running", "waiting"],
-        });
+        const stored = yield* projectionStore
+          .getThreadRecords(run.threadId, ["turnItems"], {
+            turnItemRunId: run.id,
+            turnItemTypes: [...RUN_BOUND_ITEM_TYPES],
+            turnItemStatuses: ["pending", "running", "waiting"],
+          })
+          // The thread's creation can share this batch.
+          .pipe(
+            Effect.catchTags({
+              ProjectionStoreThreadNotFoundError: () => Effect.succeed({ turnItems: [] }),
+            }),
+          );
         for (const item of stored.turnItems) {
           if (!latestInBatch.has(item.id)) latestInBatch.set(item.id, item);
         }
