@@ -48,6 +48,8 @@ A conflict opens (or updates) an issue labelled `upstream-sync`, or comments on 
 
 To release by hand from a clean, merged integration commit: `scripts/fork/build-release.sh <version>`, then `scripts/fork/publish-release.sh <version> <artifacts-dir> <merge-commit> "<notes>"`. Versions must sort above every earlier fork release under `sort -V`, because the guard installs the newest one.
 
+The host update guard that installs these releases lives in `scripts/fork/host/t3-update-guard/` (see its README). It waits up to 30 min for an idle server, then forces the update after a bounded wait for pending approvals and in-flight tool calls. It never stops the service while the kernel shows the exit hang, and it reports which interrupted threads continued. Change it here, run `test-guard.sh`, then install it.
+
 The service's `T3CODE_RELEASE_BASE_URL` selects the fork feed for both metadata and
 self-update targets. An upstream desktop's exact nightly target resolves to the
 newest published fork archive for the host platform; exact fork versions remain
