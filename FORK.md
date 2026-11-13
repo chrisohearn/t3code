@@ -1,6 +1,6 @@
 # Fork notes (chrisohearn/t3code)
 
-This fork follows `pingdotgg/t3code` `main`. Its integration branch is `integration/mcp-events-20261109`, and the live server on Chris's machine runs its fork preview releases. Keep fork changes small and in fork-only files where possible, so upstream merges stay cheap.
+This fork follows `pingdotgg/t3code` stable release tags (see Upstream sync and releases). Its integration branch is `integration/mcp-events-20261109`, and the live server on Chris's machine runs its fork preview releases. Keep fork changes small and in fork-only files where possible, so upstream merges stay cheap.
 
 ## Database migrations
 
@@ -36,10 +36,18 @@ Upstream's `ci.yml` runs on pull requests and on pushes to `main`, and this fork
 
 ## Upstream sync and releases
 
+Stable-tag tracking (Chris's decision, 2026-11-13): `UPSTREAM_TRACK` selects the upstream target. The default, `stable`, targets the newest upstream release that is neither a prerelease nor a draft and is named `vX.Y.Z` (`scripts/fork/upstream-stable-tag.sh` prints it, sorted by version). `UPSTREAM_TRACK=nightly` targets upstream `main`, for an explicit manual run only. The sync never merges upstream `main` otherwise. In stable mode the script fetches the tag and uses its commit wherever `main` was used, and PR titles, bodies and logs name the tag:
+
+- The integration branch already contains the tag: nothing to merge. It publishes an unpublished integration tree, otherwise exits 0.
+- The tag is newer and contains the branch's current upstream merge-base: it merges the tag.
+- The tag does not contain that base (the fork is ahead of stable): it logs `waiting for a stable tag that contains <base>` and takes the same release-only path as the first case.
+
+Releases keep the `<upstream core>-preview.<UTC date>.<n>` naming, whatever the track. `scripts/fork/test-upstream-stable-tag.sh` tests the tag selection and these decisions against throwaway repositories and runs in `fork-host-guard.yml`.
+
 `scripts/fork/upstream-sync.sh` runs hourly from a T3 scheduled task on Chris's machine (it needs Chris's `gh` login, Docker, and read access to the live database for the preflight). It:
 
-1. Fetches upstream `main`. If the integration branch already contains it, it verifies that the integration tree is published and retries an unfinished publication.
-2. Merges it on a `sync/upstream-<UTC stamp>` branch, or re-checks an open `sync/upstream-*` PR (one a failed run opened, or an agent's conflict fix). `agentContextBudget.json` conflicts are taken from upstream and re-measured.
+1. Fetches the target (the newest stable tag; see above). If the integration branch already contains it, or is ahead of every stable tag, it verifies that the integration tree is published and retries an unfinished publication.
+2. Merges a newer tag on a `sync/upstream-<UTC stamp>` branch, or re-checks an open `sync/upstream-*` PR (one a failed run opened, or an agent's conflict fix). `agentContextBudget.json` conflicts are taken from upstream and re-measured.
 3. Runs format, lint, typecheck and the server tests. Every test must pass; pre-existing failures still block publication.
 4. Builds the release in a container (`scripts/fork/build-release.sh`, the recipe every `v0.1.9-preview.*` release used) and smoke-tests it, then runs the built CLI's `__service-preflight` read-only against the live database for launcher protocols 3 and 4.
 5. When all of that and the hosted checks pass, it merges the PR and publishes `v<upstream nightly core>-preview.<UTC date>.<n>` with the tarball and `SHA256SUMS` (`scripts/fork/publish-release.sh`). The host's update guard then installs it when no threads are running.
