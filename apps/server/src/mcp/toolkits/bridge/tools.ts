@@ -11,6 +11,7 @@ import {
   OrchestratorMcpFailure,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
+import * as AgentRegistry from "../../../persistence/AgentRegistry.ts";
 import * as RequestLog from "../../../persistence/McpRequestLog.ts";
 import * as Bridge from "../../BridgeStatusService.ts";
 import * as Invocation from "../../McpInvocationContext.ts";
@@ -34,6 +35,17 @@ export const BridgeToolkit = Toolkit.make(
     failure: OrchestratorMcpFailure,
     failureMode: "return",
     dependencies: [Invocation.McpInvocationContext, Bridge.BridgeStatusService],
+  })
+    .annotate(Tool.Readonly, true)
+    .annotate(Tool.Destructive, false),
+  Tool.make("agent_registry", {
+    description:
+      "List agents that called in 14 days, newest first: sign-ins, threads, scheduled tasks, delegates. 'shared, unattributable': a sign-in on overlapping MCP connections, so calls can't be tied to one agent. Others see only their own. Page with nextCursor.",
+    parameters: AgentRegistry.RegistryInput,
+    success: AgentRegistry.RegistryResult,
+    failure: OrchestratorMcpFailure,
+    failureMode: "return",
+    dependencies: [Invocation.McpInvocationContext, AgentRegistry.AgentRegistry],
   })
     .annotate(Tool.Readonly, true)
     .annotate(Tool.Destructive, false),

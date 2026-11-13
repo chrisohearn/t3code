@@ -75,4 +75,5 @@ export * from "./secretReference.ts";
 export * from "./settingsSecretValue.ts";
 export * from "./clientRpcPermissions.ts";
 
+export * from "./threadFreeze.ts";
 export * from "./workLedger.ts";
