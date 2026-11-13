@@ -1181,6 +1181,7 @@ it.effect("search names the calling thread, so an agent can tell its own match a
         Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
         Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
         Layer.provide(Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({})),
+        Layer.provide(ServerSettings.layerTest()),
         Layer.provide(Sqlite.layerMemory),
         Layer.provide(NodeServices.layer),
       ),
