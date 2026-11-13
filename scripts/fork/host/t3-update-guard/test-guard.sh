@@ -202,20 +202,46 @@ restore_db "$root/snap" >/dev/null 2>&1 || fail 'restore failed'
 [[ "$(cat "$T3HOME/userdata/state.sqlite")" == old && -e "$T3HOME/userdata/extra.sqlite-wal" ]] || fail 'restore incomplete'
 pass 'a database restore is staged first, so a failed copy leaves the live files untouched'
 unset -f cp
+echo live2 > "$T3HOME/userdata/state.sqlite"; echo livewal > "$T3HOME/userdata/state.sqlite-wal"
+cp() { command cp "${@/--reflink=always/--reflink=auto}"; }
+mv() { [[ "$1" == "-f" && "$2" == *state.sqlite-wal && "$3" == "$SNAPSHOTS"/replaced-* ]] && return 1; command mv "$@"; }
+restore_db "$root/snap" >/dev/null 2>&1 && fail 'restore with a failed rename reported success'
+[[ "$(cat "$T3HOME/userdata/state.sqlite")" == live2 && "$(cat "$T3HOME/userdata/state.sqlite-wal")" == livewal ]] || fail 'failed rename left an incomplete live set'
+unset -f cp mv
+pass 'a rename that fails part-way puts every live file back'
 # --- Provider canary (2026-11-13 incident) and release archive check.
+sqlite3 "$DB" "alter table orchestration_v2_projection_runs add column provider_instance_id text;" 2>/dev/null || true
 sqlite3 "$DB" "create table if not exists orchestration_v2_projection_turn_items (turn_item_id text, thread_id text, run_id text, type text, status text, updated_at text, payload_json text);" 2>/dev/null || true
-sqlite3 "$DB" "delete from orchestration_v2_projection_turn_items;"
-fail_item() { sqlite3 "$DB" "insert into orchestration_v2_projection_turn_items (turn_item_id, type, status, updated_at) values ('turn-item:run:$1:signal:provider-session-open-failure','error','failed','$2');"; }
-service_uptime() { echo 400; }; CANARY_POLL_SECONDS=0
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
+run_row() { # id instance status requested started
+  sqlite3 "$DB" "insert into orchestration_v2_projection_runs (run_id, thread_id, status, requested_at, payload_json, provider_instance_id)
+    values ('$1','T','$3','$4','$( [[ -n "${5:-}" ]] && echo "{\"startedAt\":\"$5\"}" || echo '{}')','$2');"
+}
+open_fail() { run_row "$1" "$2" failed "$3"; sqlite3 "$DB" "insert into orchestration_v2_projection_turn_items (turn_item_id, run_id, type, status, updated_at) values ('turn-item:run:$1:signal:provider-session-open-failure','$1','error','failed','$3');"; }
 at=$(now '-3 minutes')
-provider_canary "$at" >/dev/null || fail 'canary failed with no session failures'
-fail_item a "$(now '-2 minutes')"; fail_item b "$(now '-1 minute')"
-r=$(provider_canary "$at") && fail 'canary passed with 2 new session failures'
-[[ "$r" == '2 provider session(s) failed to open after the restart (0 in the 30 min before)' ]] || fail "canary reason: $r"
-fail_item c "$(now '-10 minutes')"; fail_item d "$(now '-8 minutes')"; fail_item e "$(now '-6 minutes')"
-provider_canary "$at" >/dev/null || fail 'canary blamed the new build for failures that were already happening'
-pass 'provider canary fails on new session-open failures, not on ones that predate the restart'
-sqlite3 "$DB" "delete from orchestration_v2_projection_turn_items;"
+run_row ok1 P completed "$(now '-2 hours')" "$(now '-2 hours')"
+[[ -z "$(broken_instances "$at")" ]] || fail 'canary flagged an instance with no failures'
+open_fail f1 P "$(now '-2 minutes')"; open_fail f2 P "$(now '-1 minute')"
+[[ "$(broken_instances "$at")" == 'P:2' ]] || fail "worked-before instance failing every session not flagged: $(broken_instances "$at")"
+run_row ok2 P completed "$(now '-90 seconds')" "$(now '-80 seconds')"
+[[ -z "$(broken_instances "$at")" ]] || fail 'instance that still starts sessions flagged'
+open_fail g1 Q "$(now '-2 minutes')"; open_fail g2 Q "$(now '-1 minute')"
+[[ -z "$(broken_instances "$at")" ]] || fail 'instance that never worked before (signed out, bad config) flagged'
+pass 'canary flags only an instance that worked before the restart and now fails every session'
+service_uptime() { echo 400; }; service_version() { echo 2; }; CANARY_POLL_SECONDS=0
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs where run_id = 'ok2';"
+r=$(provider_canary "$at" 2) && fail 'canary passed a broken instance'
+[[ "$r" == *'P:2'* ]] || fail "canary reason: $r"
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
+provider_canary "$at" 2 >/dev/null || fail 'canary failed with nothing broken'
+service_version() { echo 1; }
+r=$(provider_canary "$at" 2) && fail 'canary passed after the build stopped serving'
+[[ "$r" == *'stopped serving'* ]] || fail "reason: $r"
+service_version() { echo 2; }; service_uptime() { echo 0; }; CANARY_SECONDS=1; CANARY_DEADLINE_SLACK=0
+r=$(provider_canary "$at" 2) && fail 'canary did not end at its deadline'
+[[ "$r" == *'did not stay up'* ]] || fail "deadline reason: $r"
+CANARY_SECONDS=300; unset CANARY_DEADLINE_SLACK; service_uptime() { echo 400; }
+pass 'canary fails if the build stops serving, and a wall-clock deadline bounds it'
 
 # A build that serves but fails the canary is marked bad and rolled back, with the reason reported.
 latest_release() { echo 2; }; active_runs() { echo 0; }; quiet_seconds() { echo 99999; }
