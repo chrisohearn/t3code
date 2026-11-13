@@ -664,6 +664,9 @@ it.effect.each(["empty", "newer", "same", "pruned"] as const)(
           runs: [
             {
               ...event.payload,
+              status: "queued",
+              startedAt: null,
+              completedAt: null,
               requestedAt: DateTime.makeUnsafe(
                 history === "newer" ? 2000 : history === "same" ? 1234 : 1,
               ),
@@ -686,6 +689,50 @@ it.effect.each(["empty", "newer", "same", "pruned"] as const)(
             ? { status: "failed", reason: "source_history_pruned" }
             : { status: "bound" },
         );
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["completed", "failed", "cancelled", "interrupted", "rolled_back"] as const)(
+  "refuses a finished run with pruned events despite an older retained sentinel (%s)",
+  (status) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const threadId = ThreadId.make("finished-missing-history");
+        const runId = RunId.make("finished-missing-run");
+        const [stored] = yield* f.outcome(threadId, runId);
+        const event = stored!.event;
+        if (event.type !== "run.updated") return yield* Effect.die("expected run update");
+        f.projections.set(threadId, {
+          ...idleThreadProjection(liveThreadShell(threadId)),
+          runs: [
+            {
+              ...event.payload,
+              status,
+              requestedAt: DateTime.makeUnsafe(2000),
+              startedAt: DateTime.makeUnsafe(2000),
+              completedAt: DateTime.makeUnsafe(2001),
+            },
+          ],
+        });
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`DELETE FROM orchestration_events`;
+        yield* f.append([ThreadId.make("retained-sentinel")]);
+        yield* f.call(f.service.setInbox({ threadId: ThreadId.make("inbox") }));
+        const notification = yield* f.call(
+          ThreadNotifications.prepare({}).pipe(
+            Effect.provideService(McpEvents.McpEvents, f.service),
+          ),
+        );
+        expect(
+          yield* f.call(ThreadNotifications.finish(notification, threadId, runId)),
+        ).toMatchObject({
+          status: "failed",
+          reason: "source_history_pruned",
+        });
+        expect(yield* sql`SELECT id FROM mcp_event_relay_bindings`).toEqual([]);
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );

@@ -455,6 +455,8 @@ const make = Effect.gen(function* () {
         Effect.mapError(storage),
       );
       if (run !== undefined && start?.firstSequence == null) {
+        if (Threads.isTerminalRunStatus(run.status))
+          return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
         const [oldest] = yield* sql<{ occurredAt: string }>`SELECT occurred_at AS "occurredAt"
           FROM orchestration_events
           WHERE aggregate_kind = 'project'

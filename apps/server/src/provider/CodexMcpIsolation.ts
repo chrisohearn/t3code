@@ -18,16 +18,11 @@ const table = (value: unknown): Record<string, unknown> => (Predicate.isObject(v
 
 const configuredServers = (source: string, launchArgs: string) => {
   const args = codexMcpListLaunchArgs(launchArgs);
-  let config: Record<string, unknown> = parse(source);
+  const config: Record<string, unknown> = parse(source);
   let overrides: Record<string, unknown> = {};
-  let profile: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
-    if (arg === "--profile" || arg === "-p") {
-      profile = args[++index];
-    } else if (arg.startsWith("--profile=") || arg.startsWith("-p=")) {
-      profile = arg.slice(arg.indexOf("=") + 1);
-    } else if (
+    if (
       arg === "--config" ||
       arg === "-c" ||
       arg.startsWith("--config=") ||
@@ -36,12 +31,7 @@ const configuredServers = (source: string, launchArgs: string) => {
       const override =
         arg === "--config" || arg === "-c" ? args[++index]! : arg.slice(arg.indexOf("=") + 1);
       const key = override.slice(0, override.indexOf("="));
-      if (
-        key === "profile" ||
-        key === "mcp_servers" ||
-        key.startsWith("mcp_servers.") ||
-        key.startsWith("profiles.")
-      ) {
+      if (key === "mcp_servers" || key.startsWith("mcp_servers.")) {
         let parsed: Record<string, unknown>;
         try {
           parsed = parse(override);
@@ -51,11 +41,6 @@ const configuredServers = (source: string, launchArgs: string) => {
         overrides = deepMerge(overrides, parsed);
       }
     }
-  }
-  config = deepMerge(config, overrides);
-  const selectedProfile = profile ?? config.profile;
-  if (typeof selectedProfile === "string") {
-    config = deepMerge(config, table(table(config.profiles)[selectedProfile]));
   }
   return Object.keys(table(deepMerge(config, overrides).mcp_servers));
 };

@@ -9,55 +9,62 @@ import * as TestClock from "effect/testing/TestClock";
 import { makeIsolatedCodexAppServerArgs } from "./CodexMcpIsolation.ts";
 import { codexAppServerArgs } from "./codexLaunchArgs.ts";
 
-it.live("reads the selected home and profile offline, caching until configuration changes", () =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const directory = yield* fs.makeTempDirectoryScoped();
-    const configPath = `${directory}/config.toml`;
-    const source = `profile = "work"
-[mcp_servers.other]
+it.live(
+  "reads home MCP servers offline and ignores profile tables, caching until configuration changes",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      const configPath = `${directory}/config.toml`;
+      const source = `profile = "work"
+[mcp_servers.t3_omarchy]
 command = "unused"
-[profiles.work.mcp_servers.t3_omarchy]
+[profiles.work.mcp_servers.t3_macbook]
 url = "http://127.0.0.1:1"
 [profiles.travel.mcp_servers.t3_macbook]
 command = "unused"`;
-    yield* fs.writeFileString(configPath, source);
-    let reads = 0;
-    const isolate = yield* makeIsolatedCodexAppServerArgs.pipe(
-      Effect.provideService(FileSystem.FileSystem, {
-        ...fs,
-        readFileString: (path, encoding) => {
-          reads++;
-          return fs.readFileString(path, encoding);
-        },
-      }),
-    );
-    const input = { instanceId: "one", env: { CODEX_HOME: directory }, launchArgs: "" };
-    assert.deepEqual(yield* isolate(input), codexAppServerArgs("", ["t3_omarchy"]));
-    yield* isolate(input);
-    assert.equal(reads, 1);
-    assert.deepEqual(
-      yield* isolate({ ...input, launchArgs: "--profile travel" }),
-      codexAppServerArgs("--profile travel", ["t3_macbook"]),
-    );
-    assert.deepEqual(
-      yield* isolate({ ...input, launchArgs: "-c profile=travel" }),
-      codexAppServerArgs("-c profile=travel", ["t3_macbook"]),
-    );
-    yield* fs.writeFileString(configPath, '[mcp_servers.t3_macbook]\ncommand="unused"\n');
-    assert.deepEqual(yield* isolate(input), codexAppServerArgs("", ["t3_macbook"]));
-    yield* fs.writeFileString(configPath, source);
-    assert.equal(yield* fs.readFileString(configPath), source);
-    yield* fs.makeDirectory(`${directory}/.codex`);
-    yield* fs.writeFileString(
-      `${directory}/.codex/config.toml`,
-      '[mcp_servers.t3_macbook]\ncommand="unused"',
-    );
-    assert.deepEqual(
-      yield* isolate({ ...input, env: { HOME: directory } }),
-      codexAppServerArgs("", ["t3_macbook"]),
-    );
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      yield* fs.writeFileString(configPath, source);
+      let reads = 0;
+      const isolate = yield* makeIsolatedCodexAppServerArgs.pipe(
+        Effect.provideService(FileSystem.FileSystem, {
+          ...fs,
+          readFileString: (path, encoding) => {
+            reads++;
+            return fs.readFileString(path, encoding);
+          },
+        }),
+      );
+      const input = { instanceId: "one", env: { CODEX_HOME: directory }, launchArgs: "" };
+      assert.deepEqual(yield* isolate(input), codexAppServerArgs("", ["t3_omarchy"]));
+      yield* isolate(input);
+      assert.equal(reads, 1);
+      assert.deepEqual(
+        yield* isolate({ ...input, launchArgs: "--profile travel" }),
+        codexAppServerArgs("--profile travel", ["t3_omarchy"]),
+      );
+      assert.deepEqual(
+        yield* isolate({ ...input, launchArgs: "-c profile=travel" }),
+        codexAppServerArgs("-c profile=travel", ["t3_omarchy"]),
+      );
+      const profileOverride = String.raw`-c profiles.work.mcp_servers.t3_macbook.command=\"unused\"`;
+      assert.deepEqual(
+        yield* isolate({ ...input, launchArgs: profileOverride }),
+        codexAppServerArgs(profileOverride, ["t3_omarchy"]),
+      );
+      yield* fs.writeFileString(configPath, '[mcp_servers.t3_macbook]\ncommand="unused"\n');
+      assert.deepEqual(yield* isolate(input), codexAppServerArgs("", ["t3_macbook"]));
+      yield* fs.writeFileString(configPath, source);
+      assert.equal(yield* fs.readFileString(configPath), source);
+      yield* fs.makeDirectory(`${directory}/.codex`);
+      yield* fs.writeFileString(
+        `${directory}/.codex/config.toml`,
+        '[mcp_servers.t3_macbook]\ncommand="unused"',
+      );
+      assert.deepEqual(
+        yield* isolate({ ...input, env: { HOME: directory } }),
+        codexAppServerArgs("", ["t3_macbook"]),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.effect("never holds startup behind stalled configuration IO", () =>
