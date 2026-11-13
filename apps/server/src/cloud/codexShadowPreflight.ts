@@ -45,11 +45,21 @@ export const inspectConfiguredCodexShadowHomes = Effect.fn("inspectConfiguredCod
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const settingsPath = path.join(stateDir, "settings.json");
-    const raw = yield* fileSystem.readFileString(settingsPath).pipe(Effect.option);
-    if (Option.isNone(raw)) {
+    const raw = yield* fileSystem.readFileString(settingsPath).pipe(
+      Effect.asSome,
+      Effect.catchTags({
+        PlatformError: (cause) =>
+          cause.reason._tag === "NotFound" ? Effect.succeedNone : Effect.fail(cause),
+      }),
+      Effect.result,
+    );
+    if (raw._tag === "Success" && Option.isNone(raw.success)) {
       return { status: "ready", instances: [] } satisfies CodexShadowHomesPreflight;
     }
-    const settings = decodeSettingsFileContents(raw.value);
+    const settings =
+      raw._tag === "Success" && Option.isSome(raw.success)
+        ? decodeSettingsFileContents(raw.success.value)
+        : undefined;
     if (settings === undefined) {
       return {
         status: "not-ready",
@@ -59,7 +69,8 @@ export const inspectConfiguredCodexShadowHomes = Effect.fn("inspectConfiguredCod
             shadowHomePath: settingsPath,
             status: "unknown",
             conflicts: [],
-            detail: "settings.json does not decode, so Codex instances cannot be checked.",
+            detail:
+              "settings.json cannot be read or decoded, so Codex instances cannot be checked.",
           },
         ],
       } satisfies CodexShadowHomesPreflight;

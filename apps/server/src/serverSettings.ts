@@ -381,13 +381,6 @@ const PersistedServerSettings = Schema.Struct({
 const decodeSettingsFileJsonExit = Schema.decodeUnknownExit(fromLenientJson(Schema.Unknown));
 const decodePersistedServerSettingsExit = Schema.decodeUnknownExit(PersistedServerSettings);
 
-/** A settings file decoded as the server reads it, before any managed policy; undefined when it does not decode. */
-export function decodeSettingsFileContents(raw: string): ServerSettings | undefined {
-  const parsed = decodeSettingsFileJsonExit(raw);
-  if (Exit.isFailure(parsed)) return undefined;
-  const decoded = decodePersistedServerSettingsExit(parsed.value);
-  return Exit.isSuccess(decoded) ? decoded.value : undefined;
-}
 const LegacyProviderSettingsJson = fromLenientJson(
   Schema.Struct({
     providers: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
@@ -501,6 +494,22 @@ function migrateLegacyProviderSettings(
     ...settings,
     providerInstances,
   };
+}
+
+/**
+ * A settings file decoded as the server reads it, legacy `providers` blobs included, before any
+ * managed policy; undefined when it does not decode.
+ */
+export function decodeSettingsFileContents(raw: string): ServerSettings | undefined {
+  const parsed = decodeSettingsFileJsonExit(raw);
+  if (Exit.isFailure(parsed)) return undefined;
+  const decoded = decodePersistedServerSettingsExit(parsed.value);
+  const legacy = decodeLegacyProviderSettingsJsonExit(raw);
+  if (Exit.isFailure(decoded) || Exit.isFailure(legacy)) return undefined;
+  const { providers } = legacy.value;
+  return providers === undefined
+    ? decoded.value
+    : migrateLegacyProviderSettings(decoded.value, providers, []);
 }
 
 const ACP_REGISTRY_DRIVER = ProviderDriverKind.make("acpRegistry");

@@ -506,13 +506,18 @@ export interface CodexShadowHomeConflict {
   readonly autoSettle: boolean;
 }
 
-function sqliteHomeIsShared(
+// Real paths see through symlinked parents, and on Windows the native call returns the stored case.
+const sqliteHomeIsShared = Effect.fnUntraced(function* (
+  fileSystem: FileSystem.FileSystem,
   path: Path.Path,
   layout: CodexHomeLayout,
   sqliteHome: string | undefined,
-): boolean {
-  return sqliteHome !== undefined && path.resolve(sqliteHome) === layout.sharedHomePath;
-}
+) {
+  if (sqliteHome === undefined) return false;
+  const identity = (value: string) =>
+    fileSystem.realPath(value).pipe(Effect.orElseSucceed(() => path.resolve(value)));
+  return (yield* identity(sqliteHome)) === (yield* identity(layout.sharedHomePath));
+});
 
 /** Read-only: what materializing this shadow home would have to move aside or refuse. */
 export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(function* (
@@ -541,7 +546,7 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
             }),
     }),
   );
-  const autoSettle = sqliteHomeIsShared(path, layout, options.sqliteHome);
+  const autoSettle = yield* sqliteHomeIsShared(fileSystem, path, layout, options.sqliteHome);
   const conflicts: Array<CodexShadowHomeConflict> = [];
   for (const entryName of shadowLinkEntryNames(sharedEntryNames)) {
     if (PRIVATE_ENTRY_NAMES.has(entryName) || REPLACEABLE_SHARED_RUNTIME_ENTRIES.has(entryName)) {
