@@ -3,16 +3,27 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeModule from "node:module";
 import * as NodeSea from "node:sea";
 
-import type { FileFinder, InitOptions, Result } from "@ff-labs/fff-node";
+import type {
+  FileFinder,
+  InitOptions,
+  Result,
+  WatchEvent,
+  WatchUnsubscribe,
+} from "@ff-labs/fff-node";
 import * as Context from "effect/Context";
 
 type FinderMethod =
   | "destroy"
   | "directorySearch"
+  | "directorySearchAsync"
   | "fileSearch"
+  | "fileSearchAsync"
+  | "getScanProgressAsync"
   | "grep"
+  | "grepAsync"
   | "isScanning"
   | "mixedSearch"
+  | "mixedSearchAsync"
   | "scanFiles"
   | "scanFilesAsync"
   | "waitForIndexReady";
@@ -22,6 +33,9 @@ export interface ProcessFinder {
     method: Method,
     ...args: Parameters<FileFinder[Method]>
   ) => Promise<Awaited<ReturnType<FileFinder[Method]>>>;
+  readonly watch: (
+    onBatch: (events: ReadonlyArray<WatchEvent>) => void,
+  ) => Promise<Result<WatchUnsubscribe>>;
   readonly close: () => Promise<void>;
 }
 
@@ -37,9 +51,20 @@ process.once("message", (options) => {
   process.send({ created: created.ok ? { ok: true } : created });
   if (!created.ok) return;
   const finder = created.value;
+  let unwatch;
   process.on("message", async ({ id, method, args }) => {
     try {
-      process.send({ id, value: await finder[method](...args) });
+      if (method === "watch") {
+        const watched = finder.watch((events) => process.send({ events }));
+        if (watched.ok) unwatch = watched.value;
+        process.send({ id, value: watched.ok ? { ok: true } : watched });
+      } else if (method === "unwatch") {
+        unwatch?.();
+        unwatch = undefined;
+        process.send({ id });
+      } else {
+        process.send({ id, value: await finder[method](...args) });
+      }
     } catch (cause) {
       process.send({ id, failed: true, cause });
     }
@@ -48,6 +73,7 @@ process.once("message", (options) => {
 `;
 
 type FinderMessage =
+  | { readonly events: ReadonlyArray<WatchEvent> }
   | { readonly created: Result<undefined> }
   | { readonly id: number; readonly value: unknown }
   | { readonly id: number; readonly failed: true; readonly cause: unknown };
@@ -83,6 +109,7 @@ const openProcessFinder: OpenFinder = (options) =>
       { readonly resolve: (value: never) => void; readonly reject: (cause: unknown) => void }
     >();
     let nextId = 0;
+    let onWatchBatch: ((events: ReadonlyArray<WatchEvent>) => void) | undefined;
     let failure: unknown;
     const fail = (cause: unknown) => {
       failure ??= cause;
@@ -96,8 +123,8 @@ const openProcessFinder: OpenFinder = (options) =>
       fail(new Error(`The fff process exited with ${signal ?? `code ${code}`}.`)),
     );
 
-    const call: ProcessFinder["call"] = (method, ...args) =>
-      new Promise((resolveCall, rejectCall) => {
+    const request = (method: string, args: ReadonlyArray<unknown>) =>
+      new Promise<never>((resolveCall, rejectCall) => {
         if (failure !== undefined) {
           rejectCall(failure);
           return;
@@ -110,6 +137,10 @@ const openProcessFinder: OpenFinder = (options) =>
       });
 
     child.on("message", (message: FinderMessage) => {
+      if ("events" in message) {
+        onWatchBatch?.(message.events);
+        return;
+      }
       if ("created" in message) {
         if (!message.created.ok) {
           resolve(message.created);
@@ -119,7 +150,19 @@ const openProcessFinder: OpenFinder = (options) =>
         resolve({
           ok: true,
           value: {
-            call,
+            call: (method, ...args) => request(method, args),
+            watch: async (onBatch) => {
+              onWatchBatch = onBatch;
+              const result = (await request("watch", [])) as Result<undefined>;
+              if (!result.ok) return result;
+              return {
+                ok: true,
+                value: () => {
+                  onWatchBatch = undefined;
+                  void request("unwatch", []).catch(() => undefined);
+                },
+              };
+            },
             close: () => {
               child.kill();
               return exited;
@@ -128,11 +171,11 @@ const openProcessFinder: OpenFinder = (options) =>
         });
         return;
       }
-      const request = pending.get(message.id);
-      if (!request) return;
+      const pendingRequest = pending.get(message.id);
+      if (!pendingRequest) return;
       pending.delete(message.id);
-      if ("failed" in message) request.reject(message.cause);
-      else request.resolve(message.value as never);
+      if ("failed" in message) pendingRequest.reject(message.cause);
+      else pendingRequest.resolve(message.value as never);
     });
     child.send(options, (error) => {
       if (error) fail(error);
