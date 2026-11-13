@@ -2033,6 +2033,7 @@ it.layer(
       variable: "CODEX_HOME",
       config: { homePath: "/configured/codex" },
       expectedHome: "/configured/codex",
+      expectedSqliteHome: undefined,
     },
     {
       name: "Codex shadow home",
@@ -2040,6 +2041,7 @@ it.layer(
       variable: "CODEX_HOME",
       config: { homePath: "/configured/codex", shadowHomePath: "/configured/codex-shadow" },
       expectedHome: "/configured/codex-shadow",
+      expectedSqliteHome: "/configured/codex",
     },
     {
       name: "Claude home",
@@ -2047,32 +2049,40 @@ it.layer(
       variable: "CLAUDE_CONFIG_DIR",
       config: { homePath: "/configured/claude" },
       expectedHome: "/configured/claude",
+      expectedSqliteHome: undefined,
     },
-  ])("prefers $name over the instance environment", ({ driver, variable, config, expectedHome }) =>
-    Effect.gen(function* () {
-      const path = yield* Path.Path;
-      const serverSettings = yield* ServerSettings.ServerSettingsService;
-      const environment = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
-        serverSettings,
-        path,
-        rawProviderInstanceId: "configured_home",
-        env: undefined,
-      });
+  ])(
+    "prefers $name over the instance environment",
+    ({ driver, variable, config, expectedHome, expectedSqliteHome }) =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const serverSettings = yield* ServerSettings.ServerSettingsService;
+        const environment = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
+          serverSettings,
+          path,
+          rawProviderInstanceId: "configured_home",
+          env: undefined,
+        });
 
-      expect(environment[variable]).toBe(path.resolve(expectedHome));
-    }).pipe(
-      Effect.provide(
-        ServerSettings.layerTest({
-          providerInstances: {
-            [ProviderInstanceId.make("configured_home")]: {
-              driver: ProviderDriverKind.make(driver),
-              environment: [{ name: variable, value: "~/.environment-account", sensitive: false }],
-              config,
+        expect(environment[variable]).toBe(path.resolve(expectedHome));
+        expect(environment.CODEX_SQLITE_HOME).toBe(
+          expectedSqliteHome && path.resolve(expectedSqliteHome),
+        );
+      }).pipe(
+        Effect.provide(
+          ServerSettings.layerTest({
+            providerInstances: {
+              [ProviderInstanceId.make("configured_home")]: {
+                driver: ProviderDriverKind.make(driver),
+                environment: [
+                  { name: variable, value: "~/.environment-account", sensitive: false },
+                ],
+                config,
+              },
             },
-          },
-        }),
+          }),
+        ),
       ),
-    ),
   );
 
   it.effect("restarts a running terminal when the resolved provider environment changes", () =>

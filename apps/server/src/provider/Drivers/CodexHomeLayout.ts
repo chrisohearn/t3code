@@ -346,6 +346,12 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
     readonly effectiveHomePath: string;
   }): Effect.fn.Return<void, CodexShadowHomeError, Path.Path> {
     const path = yield* Path.Path;
+    // A Codex process from before this fix may still hold the file open on Windows.
+    const warnUnsettled = (sidecarPath: string) => (cause: PlatformError.PlatformError) =>
+      Effect.logWarning("Could not settle a leftover SQLite file in a Codex shadow home.", {
+        path: sidecarPath,
+        cause,
+      });
     const shadowEntryNames = yield* input.fileSystem.readDirectory(input.effectiveHomePath).pipe(
       Effect.catchTags({
         PlatformError: (cause) =>
@@ -371,19 +377,9 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
         const sidecarPath = path.join(input.effectiveHomePath, entryName);
         const state = yield* readLinkState({ ...input, entryName, linkPath: sidecarPath });
         if (state._tag === "Symlink") {
-          yield* input.fileSystem.remove(sidecarPath).pipe(
-            Effect.catchTags({
-              PlatformError: (cause) =>
-                new CodexShadowHomeFileSystemError({
-                  sharedHomePath: input.sharedHomePath,
-                  effectiveHomePath: input.effectiveHomePath,
-                  operation: "remove",
-                  path: sidecarPath,
-                  entryName,
-                  cause,
-                }),
-            }),
-          );
+          yield* input.fileSystem
+            .remove(sidecarPath)
+            .pipe(Effect.catchTags({ PlatformError: warnUnsettled(sidecarPath) }));
         } else if (state._tag === "NotSymlink") {
           const info = yield* input.fileSystem.stat(sidecarPath).pipe(Effect.option);
           if (Option.isSome(info)) regularSidecars.push({ name: entryName, size: info.value.size });
@@ -401,16 +397,7 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
         const settle = holdsData
           ? input.fileSystem.rename(sidecarPath, `${sidecarPath}${suffix}`)
           : input.fileSystem.remove(sidecarPath);
-        // A Codex process from before this fix may still hold the file open on Windows.
-        yield* settle.pipe(
-          Effect.catchTags({
-            PlatformError: (cause) =>
-              Effect.logWarning("Could not settle a leftover SQLite file in a Codex shadow home.", {
-                path: sidecarPath,
-                cause,
-              }),
-          }),
-        );
+        yield* settle.pipe(Effect.catchTags({ PlatformError: warnUnsettled(sidecarPath) }));
       }
       if (holdsData) {
         yield* Effect.logWarning(
