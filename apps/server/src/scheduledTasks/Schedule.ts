@@ -80,3 +80,51 @@ export function isMissedFixedTimeRun(
   if (schedule.type !== "fixed_time") return false;
   return DateTime.toEpochMillis(now) - DateTime.toEpochMillis(dueAt) > MISSED_FIXED_TIME_GRACE_MS;
 }
+
+export interface MissedScheduleRun {
+  readonly dueAt: string;
+  readonly overdueMs: number;
+  /** The run that should have fired later is still going, or nothing started it. */
+  readonly reason: "run_in_progress" | "not_dispatched";
+}
+
+const DAY_MS = 24 * 60 * MINUTE_MS;
+
+/**
+ * An enabled task whose `nextRunAt` passed by more than one interval without a new run.
+ * A task stuck in `running` counts: its later slots are skipped while the run lasts.
+ */
+export function missedScheduleRun(
+  task: {
+    readonly enabled: boolean;
+    readonly schedule: ScheduledTaskSchedule;
+    readonly nextRunAt: string | null;
+    readonly lastRunStatus: string;
+  },
+  now: DateTime.DateTime,
+): MissedScheduleRun | null {
+  if (!task.enabled || task.nextRunAt === null || task.schedule.type === "webhook") return null;
+  const dueAt = DateTime.make(task.nextRunAt);
+  if (Option.isNone(dueAt)) return null;
+  const dueMs = DateTime.toEpochMillis(dueAt.value);
+  const overdueMs = DateTime.toEpochMillis(now) - dueMs;
+  let intervalMs: number;
+  if (task.schedule.type === "interval") {
+    intervalMs = Math.max(task.schedule.everyMs, MIN_SCHEDULED_TASK_INTERVAL_MS);
+  } else if (task.schedule.type === "once") {
+    intervalMs = MISSED_FIXED_TIME_GRACE_MS;
+  } else {
+    // Slots are wall-clock times in the scheduler's zone, so the gap to the next one is too.
+    const zone = DateTime.isZoned(now) ? now.zone : DateTime.zoneMakeLocal();
+    const following = nextScheduledRunAt(task.schedule, DateTime.setZone(dueAt.value, zone));
+    intervalMs =
+      following === null ? DAY_MS : Math.max(DateTime.toEpochMillis(following) - dueMs, MINUTE_MS);
+  }
+  return overdueMs > intervalMs
+    ? {
+        dueAt: DateTime.formatIso(dueAt.value),
+        overdueMs,
+        reason: task.lastRunStatus === "running" ? "run_in_progress" : "not_dispatched",
+      }
+    : null;
+}

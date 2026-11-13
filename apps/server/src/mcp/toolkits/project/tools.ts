@@ -75,7 +75,11 @@ const ProjectCreateTool = Tool.make("t3_project_create", {
     ...ProjectCreatePayload.fields,
     workspaceRoot: Schema.optional(ProjectCreatePayload.fields.workspaceRoot),
   }),
-  success: Schema.Struct({ ...Project.fields, commitError: Schema.optional(Schema.String) }),
+  success: Schema.Struct({
+    ...Project.fields,
+    commitError: Schema.optional(Schema.String),
+    warning: Schema.optional(Schema.String),
+  }),
   dependencies: [...shared.dependencies, ManagedProjectFolders.ManagedProjectFolders],
 }).annotate(Tool.Destructive, true);
 const ProjectUpdateTool = Tool.make("t3_project_update", {
