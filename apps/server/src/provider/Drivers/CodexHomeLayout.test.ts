@@ -10,6 +10,7 @@ import { CodexSettings } from "@t3tools/contracts";
 import {
   CodexShadowHomeEntryConflictError,
   CodexShadowHomePathConflictError,
+  inspectCodexShadowHome,
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
   withCodexSqliteHome,
@@ -670,6 +671,48 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
     );
 
     it.effect.skipIf(!symlinksSupported)(
+      "refuses before moving a shadow's own database when another entry blocks setup",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const { sharedHome, shadowHome, layout, backup } = yield* prepareOwnDatabaseShadow();
+          yield* writeTextFile(path.join(sharedHome, "config.toml"), "shared");
+          yield* writeTextFile(path.join(shadowHome, "config.toml"), "local");
+
+          const error = yield* materializeCodexShadowHome(layout, { sqliteHome: sharedHome }).pipe(
+            Effect.flip,
+          );
+
+          assert.instanceOf(error, CodexShadowHomeEntryConflictError);
+          expect(error.entryName).toBe("config.toml");
+          for (const name of ownDatabaseFiles) {
+            expect(yield* fileSystem.readFileString(path.join(shadowHome, name))).toBe(
+              `own ${name}`,
+            );
+          }
+          expect(yield* fileSystem.exists(backup)).toBe(false);
+        }),
+    );
+
+    it.effect("reports a thread-writer-locks entry that setup cannot list", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+        const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+        const shadowHome = path.join(shadowRoot, "shadow");
+        yield* writeTextFile(path.join(shadowHome, "thread-writer-locks"), "not a directory");
+        const layout = yield* resolveCodexHomeLayout(
+          decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+        );
+
+        const conflicts = yield* inspectCodexShadowHome(layout, noSqliteHome);
+
+        expect(conflicts.map((conflict) => conflict.entryName)).toEqual(["thread-writer-locks"]);
+      }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
       "refuses a shadow path that resolves to the shared home",
       () =>
         Effect.gen(function* () {
@@ -700,25 +743,33 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
       !symlinksSupported ||
         HostProcess.Platform.defaultValue() === "win32" ||
         process.getuid?.() === 0,
-    )("refuses to move a shadow's own database when the backup's parent is read-only", () =>
-      Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const { sharedHome, shadowHome, layout, backup } = yield* prepareOwnDatabaseShadow();
-        const parent = path.dirname(shadowHome);
-        yield* fileSystem.chmod(parent, 0o555);
+    )(
+      "refuses to move a shadow's own database when the shadow or the backup's parent is read-only",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          for (const pick of [path.dirname, (shadow: string) => shadow]) {
+            const { sharedHome, shadowHome, layout, backup } = yield* prepareOwnDatabaseShadow();
+            const readOnly = pick(shadowHome);
+            yield* fileSystem.chmod(readOnly, 0o555);
 
-        const error = yield* materializeCodexShadowHome(layout, { sqliteHome: sharedHome }).pipe(
-          Effect.flip,
-          Effect.ensuring(fileSystem.chmod(parent, 0o755).pipe(Effect.orDie)),
-        );
+            const error = yield* materializeCodexShadowHome(layout, {
+              sqliteHome: sharedHome,
+            }).pipe(
+              Effect.flip,
+              Effect.ensuring(fileSystem.chmod(readOnly, 0o755).pipe(Effect.orDie)),
+            );
 
-        assert.instanceOf(error, CodexShadowHomeEntryConflictError);
-        expect(error.backupCommand).toContain(backup);
-        for (const name of ownDatabaseFiles) {
-          expect(yield* fileSystem.readFileString(path.join(shadowHome, name))).toBe(`own ${name}`);
-        }
-      }),
+            assert.instanceOf(error, CodexShadowHomeEntryConflictError);
+            expect(error.backupCommand).toContain(backup);
+            for (const name of ownDatabaseFiles) {
+              expect(yield* fileSystem.readFileString(path.join(shadowHome, name))).toBe(
+                `own ${name}`,
+              );
+            }
+          }
+        }),
     );
   });
 });

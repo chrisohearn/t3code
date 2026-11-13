@@ -521,23 +521,27 @@ const sameDirectory = Effect.fnUntraced(function* (
   );
 });
 
-// A sibling backup needs a writable parent on the shadow's filesystem, or rename cannot reach it.
+// Renaming out of the shadow into a sibling backup needs both directories writable and on one filesystem.
 const backupParentAccepts = Effect.fnUntraced(function* (
   fileSystem: FileSystem.FileSystem,
   path: Path.Path,
   effectiveHomePath: string,
 ) {
   const parent = path.dirname(effectiveHomePath);
-  const [shadowInfo, parentInfo, writable] = yield* Effect.all([
-    fileSystem.stat(effectiveHomePath).pipe(Effect.option),
-    fileSystem.stat(parent).pipe(Effect.option),
-    fileSystem.access(parent, { writable: true }).pipe(
+  const writable = (directory: string) =>
+    fileSystem.access(directory, { writable: true }).pipe(
       Effect.as(true),
       Effect.orElseSucceed(() => false),
-    ),
+    );
+  const [shadowInfo, parentInfo, shadowWritable, parentWritable] = yield* Effect.all([
+    fileSystem.stat(effectiveHomePath).pipe(Effect.option),
+    fileSystem.stat(parent).pipe(Effect.option),
+    writable(effectiveHomePath),
+    writable(parent),
   ]);
   return (
-    writable &&
+    shadowWritable &&
+    parentWritable &&
     Option.isSome(shadowInfo) &&
     Option.isSome(parentInfo) &&
     shadowInfo.value.dev === parentInfo.value.dev
@@ -599,11 +603,19 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
     });
   }
   for (const entryName of shadowLinkEntryNames(sharedEntryNames)) {
-    if (PRIVATE_ENTRY_NAMES.has(entryName) || REPLACEABLE_SHARED_RUNTIME_ENTRIES.has(entryName)) {
-      continue;
-    }
+    if (PRIVATE_ENTRY_NAMES.has(entryName)) continue;
     const entryPath = path.join(effectiveHomePath, entryName);
     const state = yield* readLinkState({ ...context, entryName, linkPath: entryPath });
+    if (REPLACEABLE_SHARED_RUNTIME_ENTRIES.has(entryName)) {
+      // ensureSymlink lists a local thread-writer-locks before replacing it.
+      if (state._tag === "NotSymlink" && entryName === "thread-writer-locks") {
+        const info = yield* fileSystem.stat(entryPath).pipe(Effect.option);
+        if (Option.isNone(info) || info.value.type !== "Directory") {
+          conflicts.push({ entryName, path: entryPath, sqliteFiles: undefined, autoSettle: false });
+        }
+      }
+      continue;
+    }
     if (state._tag !== "NotSymlink") continue;
     if (!SQLITE_DATABASE_PATTERN.test(entryName)) {
       conflicts.push({ entryName, path: entryPath, sqliteFiles: undefined, autoSettle: false });
@@ -785,7 +797,26 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
     effectiveHomePath,
     yield* Clock.currentTimeMillis,
   );
-  for (const conflict of conflicts) {
+  // Refuse before moving anything, so a failed setup leaves the shadow as it found it.
+  const blocker = conflicts.find((conflict) => !conflict.autoSettle);
+  if (blocker !== undefined && blocker.sqliteFiles === undefined) {
+    return yield* blocker.entryName === "auth.json"
+      ? new CodexShadowHomePrivateEntrySymlinkError({
+          sharedHomePath: layout.sharedHomePath,
+          effectiveHomePath,
+          entryName: blocker.entryName,
+          path: blocker.path,
+        })
+      : new CodexShadowHomeEntryConflictError({
+          sharedHomePath: layout.sharedHomePath,
+          effectiveHomePath,
+          entryName: blocker.entryName,
+          linkPath: blocker.path,
+          targetPath: path.join(layout.sharedHomePath, blocker.entryName),
+        });
+  }
+  const sqliteConflicts = blocker === undefined ? conflicts : [blocker];
+  for (const conflict of sqliteConflicts) {
     if (conflict.sqliteFiles === undefined) continue;
     const sqliteConflict = { ...conflict, sqliteFiles: conflict.sqliteFiles };
     const result = conflict.autoSettle
