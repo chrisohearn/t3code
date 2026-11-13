@@ -1,6 +1,6 @@
 # Server-verified approvals
 
-Accepted 2026-11-12.
+Accepted 2026-11-12. [0016](0016-no-human-in-the-loop.md) adds how intake answers authorize a task; this mechanism still carries every approval from T3 to Jarvis and every money go-ahead.
 
 ## Decision
 
