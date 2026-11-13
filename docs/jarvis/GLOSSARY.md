@@ -44,7 +44,7 @@ A published build of Chris's personal T3 fork that includes his changes and upst
 A service update that checks the fork release, waits for a suitable time, and restores a healthy build if the new build fails.
 
 **intake grill**:
-The one set of questions an agent asks Chris before a task starts. His answers authorize the task's sensitive actions.
+The one set of questions an agent asks Chris before a task starts. His answers authorize the sensitive actions they spell out, except spending money, which always needs his fresh go-ahead.
 
 **completion supervisor**:
 The scheduled task that re-drives idle ledger work every 30 minutes and posts a digest to Jarvis's inbox.
