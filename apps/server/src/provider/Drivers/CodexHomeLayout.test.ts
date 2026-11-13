@@ -235,6 +235,18 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           for (const name of ["logs_2.sqlite", "goals_1.sqlite"]) {
             yield* writeTextFile(path.join(sharedHome, name), "shared");
           }
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          yield* materializeCodexShadowHome(layout);
+
+          // A link left pointing at another home is re-pointed, so its sidecars are stale too.
+          const otherHome = yield* makeTempDir("t3code-codex-other-");
+          yield* fileSystem.remove(path.join(shadowHome, "logs_2.sqlite"));
+          yield* fileSystem.symlink(
+            path.join(otherHome, "logs_2.sqlite"),
+            path.join(shadowHome, "logs_2.sqlite"),
+          );
           // Windows SQLite leaves these beside the symlinked database (#79).
           yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-wal"), "");
           yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-shm"), "index");
@@ -244,16 +256,13 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
             path.join(sharedHome, "goals_1.sqlite-wal"),
             path.join(shadowHome, "goals_1.sqlite-wal"),
           );
-
-          const layout = yield* resolveCodexHomeLayout(
-            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
-          );
-          yield* materializeCodexShadowHome(layout);
           yield* materializeCodexShadowHome(layout);
 
-          expect(yield* fileSystem.readLink(path.join(shadowHome, "state_5.sqlite"))).toBe(
-            path.join(sharedHome, "state_5.sqlite"),
-          );
+          for (const name of ["state_5.sqlite", "logs_2.sqlite"]) {
+            expect(yield* fileSystem.readLink(path.join(shadowHome, name))).toBe(
+              path.join(sharedHome, name),
+            );
+          }
           const shadowEntries = yield* fileSystem.readDirectory(shadowHome);
           expect(shadowEntries.filter((name) => /-(?:wal|shm|journal)$/.test(name))).toEqual([]);
           const staleEntries = shadowEntries.filter((name) => name.includes(".stale-")).toSorted();

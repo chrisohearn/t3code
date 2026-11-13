@@ -373,18 +373,14 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
 
     for (const [database, sidecarNames] of sidecarsByDatabase) {
       // A shadow's own database (say, from an older Codex) may be open; its sidecars are live.
+      // Beside any link they are stale, and ensureSymlink re-points a foreign link at the shared database.
       const databasePath = path.join(input.effectiveHomePath, database);
       const databaseState = yield* readLinkState({
         ...input,
         entryName: database,
         linkPath: databasePath,
       });
-      const sharesDatabase =
-        databaseState._tag === "Missing" ||
-        (databaseState._tag === "Symlink" &&
-          path.resolve(input.effectiveHomePath, databaseState.target) ===
-            path.join(input.sharedHomePath, database));
-      if (!sharesDatabase) {
+      if (databaseState._tag === "NotSymlink") {
         yield* Effect.logWarning(
           "Left SQLite files alone in a Codex shadow home because its database is not the shared one.",
           { path: databasePath },
