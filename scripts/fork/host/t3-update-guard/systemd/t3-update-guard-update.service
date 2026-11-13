@@ -1,0 +1,9 @@
+[Unit]
+Description=Install the newest verified T3 Code fork release when no thread is running
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/t3-update-guard/guard update
+TimeoutStartSec=90min
+Nice=10

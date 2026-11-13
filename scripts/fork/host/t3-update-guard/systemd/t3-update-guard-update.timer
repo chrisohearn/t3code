@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep T3 Code on the newest verified fork release
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

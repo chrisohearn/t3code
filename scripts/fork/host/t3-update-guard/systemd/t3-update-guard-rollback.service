@@ -1,0 +1,6 @@
+[Unit]
+Description=Roll T3 Code back to its last healthy build after a failed start
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/t3-update-guard/guard rollback
