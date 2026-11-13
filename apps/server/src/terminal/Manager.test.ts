@@ -2301,6 +2301,7 @@ it.layer(
         const path = yield* Path.Path;
         const serverSettings = yield* ServerSettings.ServerSettingsService;
         const environment = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
+          deriveProviderInstanceConfigMap,
           serverSettings,
           path,
           rawProviderInstanceId: "configured_home",
