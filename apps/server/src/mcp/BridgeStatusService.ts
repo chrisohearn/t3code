@@ -48,7 +48,6 @@ export const BridgeStatusResult = Schema.Struct({
       scheduledTaskId: ScheduledTaskId,
       dueAt: IsoDateTime,
       overdueMs: NonNegativeInt,
-      reason: Schema.Literals(["not_dispatched", "run_in_progress"]),
     }),
   ),
   toolCalls: Schema.Array(
@@ -111,7 +110,13 @@ export const layer = Layer.effect(
             entries.flatMap(({ taskId, missedRun }) =>
               missedRun === undefined
                 ? []
-                : [{ scheduledTaskId: ScheduledTaskId.make(taskId), ...missedRun }],
+                : [
+                    {
+                      scheduledTaskId: ScheduledTaskId.make(taskId),
+                      dueAt: missedRun.dueAt,
+                      overdueMs: missedRun.overdueMs,
+                    },
+                  ],
             ),
           ),
           Effect.orElseSucceed(() => []),

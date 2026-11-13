@@ -29,7 +29,7 @@ export const BridgeToolkit = Toolkit.make(
     .annotate(Tool.Destructive, false),
   Tool.make("bridge_status", {
     description:
-      "Read this outside MCP sign-in's expiry, event subscriptions, last successful webhook, exhausted retries and scheduled runs that missed their slot. Per-tool calls, errors and response bytes count since this server started. Never returns callback secrets.",
+      "Read this outside MCP sign-in's expiry, event subscriptions, last successful webhook and exhausted retries. Per-tool calls, errors and response bytes count since this server started. Never returns callback secrets.",
     parameters: Tool.EmptyParams,
     success: Bridge.BridgeStatusResult,
     failure: OrchestratorMcpFailure,

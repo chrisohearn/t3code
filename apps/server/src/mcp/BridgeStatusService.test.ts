@@ -87,7 +87,6 @@ it.effect(
             scheduledTaskId: "scheduled-task:late",
             dueAt: "1969-12-31T00:00:00.000Z",
             overdueMs: 86_400_000,
-            reason: "not_dispatched",
           },
         ]);
         expect(status.linkedEnvironments).toMatchObject({
