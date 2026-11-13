@@ -1,5 +1,6 @@
 import {
   backgroundWorkHoldsCompletion,
+  isPullRequestWatchTask,
   turnItemUpdateCanEndBackgroundWork,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -36,6 +37,9 @@ import * as ProjectStore from "./ProjectStore.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { isSnoozed } from "./SnoozeState.ts";
+
+export { isSnoozed };
 
 export interface SettlementPullRequest {
   readonly state: "open" | "closed" | "merged";
@@ -154,43 +158,13 @@ export function isAutoSettlementCandidate(
   // A guest is waiting on the owner; settling would hide the Request.
   if ((thread.pendingGuestMessageCount ?? 0) > 0) return false;
   if (thread.activityRunStatus != null) return false;
-  if (backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks ?? [])) return false;
+  const pendingTasks = thread.pendingBackgroundTasks ?? [];
+  if (backgroundWorkHoldsCompletion(pendingTasks)) return false;
+  // Settling ends a watch, which would silently drop a reviewer's later comments.
+  if (pendingTasks.some(isPullRequestWatchTask)) return false;
   if (threadHasQueuedTurnStart(thread, nowMs)) return false;
   // Interrupted runs must keep the same snooze protection the sidebar shows.
   return !isSnoozed(thread, nowMs);
-}
-
-/** Match client effectiveSnoozed so agents and sidebar agree. */
-export function isSnoozed(
-  thread: Pick<
-    ProjectionStore.ProjectionSettlementCandidate,
-    | "snoozedUntil"
-    | "snoozedAt"
-    | "latestRunCompletedAt"
-    | "status"
-    | "pendingRuntimeRequest"
-    | "pendingGuestMessageCount"
-  >,
-  nowMs: number,
-): boolean {
-  const snoozedUntilMs = toMillis(thread.snoozedUntil);
-  if (snoozedUntilMs === null || snoozedUntilMs <= nowMs) return false;
-  // Same as the client: a waiting guest message wakes the thread, and the snooze stays stored.
-  if ((thread.pendingGuestMessageCount ?? 0) > 0) return false;
-  const snoozedAtMs = toMillis(thread.snoozedAt);
-  if (
-    thread.pendingRuntimeRequest !== null &&
-    (thread.pendingRuntimeRequest.kind !== "user_input" ||
-      snoozedAtMs === null ||
-      DateTime.toEpochMillis(thread.pendingRuntimeRequest.createdAt) > snoozedAtMs)
-  ) {
-    return false;
-  }
-  const completedAtMs = toMillis(thread.latestRunCompletedAt);
-  const wokeOnError =
-    thread.status === "failed" &&
-    (snoozedAtMs === null || (completedAtMs !== null && completedAtMs > snoozedAtMs));
-  return !wokeOnError;
 }
 
 export function resolveAutoSettlementAt(input: {
@@ -542,7 +516,15 @@ export const make = Effect.gen(function* () {
         return yield* Effect.die(new Error("thread project not found"));
       }
       const refresh = group.filter((member) => shellClosedThreads.delete(member.id)).length > 0;
-      return yield* git.branchPullRequest({ cwd, branch: thread.branch }, { refresh });
+      // Remembered git state is enough to rule a thread out; only an answer
+      // that would settle it is confirmed against fresh git state.
+      const remembered = yield* git.branchPullRequest(
+        { cwd, branch: thread.branch },
+        { refresh, confirmTerminal: false },
+      );
+      if (refresh || remembered === null || remembered.state === "open") return remembered;
+      if (!(yield* wouldSettle(group, remembered))) return undefined;
+      return yield* git.branchPullRequest({ cwd, branch: thread.branch }, { freshGitState: true });
     });
 
     yield* Effect.forEach(

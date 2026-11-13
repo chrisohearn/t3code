@@ -186,7 +186,7 @@ const make = Effect.gen(function* () {
     if (key === undefined) {
       return yield* new OrchestratorMcpFailure({
         code: "target_required",
-        message: "Pass target.projectId: this thread's project has no repository to match there.",
+        message: `Pass target.projectId: this thread's project has no repository to match in environment ${environmentId}. t3_project_list with environmentId: "${environmentId}" lists its projects.`,
       });
     }
     const matches: Array<{ readonly id: ProjectId; readonly title: string }> = [];
@@ -613,6 +613,7 @@ const make = Effect.gen(function* () {
         view: failed ? "activity" : "messages",
         limit: 100,
         runLimit: 50,
+        maxCharsPerItem: 20_000,
         ...(afterPosition === undefined ? {} : { afterPosition }),
       });
       run ??= read.recentRuns.find((candidate) => candidate.runId === runId);
@@ -638,7 +639,7 @@ const make = Effect.gen(function* () {
         threadId: remote.threadId,
         itemId: reply.itemId,
         textOffset,
-        maxCharsPerItem: 50_000,
+        maxCharsPerItem: 20_000,
       });
       const part = rest.items[0];
       if (part === undefined) break;

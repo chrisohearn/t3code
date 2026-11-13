@@ -64,6 +64,7 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import { latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
 import { findGitEntry } from "../mcp/gitEntryProbe.ts";
 import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
+import { readTaskReliability, type ScheduledTaskReliability } from "./ScheduledTaskReliability.ts";
 import {
   redactHeaders,
   redactQuery,
@@ -269,6 +270,11 @@ export class ScheduledTaskService extends Context.Service<
   {
     readonly list: () => Effect.Effect<ScheduledTaskListResult, ScheduledTaskError>;
     readonly subscribeList: () => Stream.Stream<ScheduledTaskListResult, ScheduledTaskError>;
+    /** Recent failures and missed runs, for tasks that have any. Read on demand, never streamed. */
+    readonly reliability: () => Effect.Effect<
+      ReadonlyArray<ScheduledTaskReliability>,
+      ScheduledTaskError
+    >;
     readonly upsert: (
       input: ScheduledTaskUpsertInput,
     ) => Effect.Effect<ScheduledTaskMutationResult, ScheduledTaskError>;
@@ -1578,6 +1584,21 @@ export const layer = Layer.effect(
         Effect.mapError((cause) => taskError("Could not list schedule tasks.", { cause })),
       );
 
+    const reliability: ScheduledTaskService["Service"]["reliability"] = Effect.fn(
+      "ScheduledTaskService.reliability",
+    )(
+      function* () {
+        const tasks = yield* listRows();
+        return yield* readTaskReliability(tasks, yield* localNow);
+      },
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.mapError((cause) =>
+        isScheduledTaskError(cause)
+          ? cause
+          : taskError("Could not read schedule task history.", { cause }),
+      ),
+    );
+
     const subscribeList: ScheduledTaskService["Service"]["subscribeList"] = () =>
       Stream.unwrap(
         Effect.gen(function* () {
@@ -2859,6 +2880,7 @@ export const layer = Layer.effect(
     return ScheduledTaskService.of({
       list,
       subscribeList,
+      reliability,
       upsert,
       setEnabled,
       delete: deleteTask,

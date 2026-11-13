@@ -71,16 +71,24 @@ const layerTest = Layer.mergeAll(
   ),
 );
 
-it.effect.each(
-  (["provider.switch", "thread.model-selection.set"] as const).flatMap((type) =>
+it.effect.each([
+  ...(["provider.switch", "thread.model-selection.set"] as const).flatMap((type) =>
     [
       { active: true, selectionChange: "instance" },
       { active: false, selectionChange: "instance" },
       { active: true, selectionChange: "next-turn" },
       { active: true, selectionChange: "restart" },
-    ].map((scenario) => ({ type, ...scenario })),
+    ].map((scenario) => ({ type, ...scenario, applyAt: undefined })),
   ),
-)("$type $selectionChange ($active)", ({ type, active, selectionChange }) =>
+  ...(["instance", "restart"] as const).flatMap((selectionChange) =>
+    [true, false].map((active) => ({
+      type: "thread.model-selection.set" as const,
+      active,
+      selectionChange,
+      applyAt: "next_turn" as const,
+    })),
+  ),
+])("$type $selectionChange ($active) $applyAt", ({ type, active, selectionChange, applyAt }) =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -208,10 +216,26 @@ it.effect.each(
         commandId,
         threadId,
         modelSelection: target,
+        ...(applyAt === undefined ? {} : { applyAt }),
       })
       .pipe(Effect.result);
     const after = yield* projections.getThreadProjection(threadId);
-    if (active && selectionChange !== "next-turn") {
+    if (active && applyAt === "next_turn") {
+      assert.ok(Result.isSuccess(outcome));
+      assert.deepEqual(after.thread.modelSelection, before.thread.modelSelection);
+      assert.deepEqual(after.thread.scheduledModelSelection, {
+        modelSelection: target,
+        afterRunId: runId,
+        queuedThroughOrdinal: 1,
+      });
+      assert.deepEqual(after.runs, before.runs);
+      assert.deepEqual(after.providerSessions, before.providerSessions);
+      assert.deepEqual(
+        yield* outbox.listByCommandId(commandId),
+        [],
+        "a scheduled switch must not touch the running session",
+      );
+    } else if (active && selectionChange !== "next-turn") {
       assert.deepEqual(
         after,
         before,

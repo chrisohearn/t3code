@@ -44,6 +44,7 @@ import { ProjectCloneTracker } from "../project/ProjectCloneTracker.ts";
 import { ProjectService } from "../project/ProjectService.ts";
 import { ProjectSetupScriptRunner } from "../project/ProjectSetupScriptRunner.ts";
 import { PullRequestReviewGuideService } from "../pullRequest/PullRequestReviewGuideService.ts";
+import { PullRequestService } from "../pullRequest/PullRequestService.ts";
 import { ScheduledTaskService } from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
 import { SecretRequests } from "../secrets/SecretRequests.ts";
@@ -84,6 +85,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(ProviderAdapterRegistryV2)({}),
   Layer.mock(ProviderRegistry)({}),
   Layer.mock(PullRequestReviewGuideService)({}),
+  Layer.mock(PullRequestService)({}),
   Layer.mock(RemoteDelegation)({}),
   Layer.mock(ScheduledTaskService)({}),
   Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
@@ -167,6 +169,7 @@ it.effect("only request_secret asks Claude Code to load it up front", () =>
     expect(resource.contents).toEqual([
       {
         uri: JarvisPlaybook.URI,
+        mimeType: "text/markdown",
         text: yield* JarvisPlaybook.read().pipe(Effect.provide(NodeServices.layer)),
       },
     ]);

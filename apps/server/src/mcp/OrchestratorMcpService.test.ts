@@ -69,6 +69,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import type { ScheduledTaskReliability } from "../scheduledTasks/ScheduledTaskReliability.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
@@ -1985,8 +1986,22 @@ describe("OrchestratorMcpService provider resolution", () => {
           })
           .pipe(Effect.flip);
         assert.equal(byDriver.code, "provider_unavailable");
-        assert.isTrue(
-          byDriver.message.includes("No V2 provider adapter is registered for driver forkOnly."),
+        assert.include(
+          byDriver.message,
+          "No V2 provider adapter is registered for target.driverKind forkOnly. Drivers here: ",
+        );
+
+        const elsewhere = yield* service
+          .delegateTask(scope, {
+            task: "Summarize the diff.",
+            target: { projectId: ProjectId.make("project:elsewhere") },
+            mode: "async",
+          })
+          .pipe(Effect.flip);
+        assert.equal(elsewhere.code, "invalid_request");
+        assert.include(
+          elsewhere.message,
+          'use t3_thread_launch with projectId: "project:elsewhere"',
         );
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
@@ -2846,6 +2861,7 @@ describe("OrchestratorMcpService provider resolution", () => {
       tasks: ReadonlyArray<ScheduledTask>,
       boundThread: OrchestrationV2ThreadShell | null,
       upserted: Ref.Ref<number>,
+      reliability: ReadonlyArray<ScheduledTaskReliability> = [],
     ) =>
       layerOrchestratorService.pipe(
         Layer.provide(
@@ -2866,6 +2882,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             Layer.mock(RemoteDelegation.RemoteDelegation)({}),
             Layer.mock(ScheduledTaskService.ScheduledTaskService)({
               list: () => Effect.succeed({ tasks }),
+              reliability: () => Effect.succeed(reliability),
               upsert: () =>
                 Ref.update(upserted, (count) => count + 1).pipe(Effect.as({ task: tasks[0]! })),
             }),
@@ -2892,6 +2909,41 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.deepEqual(
           listed.tasks.map((summary) => summary.webhookUrl),
           [undefined, "https://t3.example/hooks/secret"],
+        );
+      }),
+    );
+
+    it.effect("adds recent failures and missed runs to the listed task they belong to", () =>
+      Effect.gen(function* () {
+        const upserted = yield* Ref.make(0);
+        const failing = task({ id: ScheduledTaskId.make("scheduled-task:failing") });
+        const quiet = task({ id: ScheduledTaskId.make("scheduled-task:quiet") });
+        const recentFailures = {
+          failed: 3,
+          cancelled: 6,
+          lastAt: "2026-11-12T07:11:28.827Z",
+          lastStatus: "failed" as const,
+          lastError: "Workspace preparation failed",
+        };
+        const missedRun = {
+          dueAt: "2026-11-12T01:00:00.000Z",
+          overdueMs: 7_200_000,
+          reason: "not_dispatched" as const,
+        };
+        const listed = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((mcp) => mcp.listScheduledTasks(supervisedClient, { projectId })),
+          Effect.provide(
+            service([failing, quiet], null, upserted, [
+              { taskId: failing.id, recentFailures, missedRun },
+            ]),
+          ),
+        );
+        assert.deepEqual(
+          listed.tasks.map((summary) => [summary.recentFailures, summary.missedRun]),
+          [
+            [recentFailures, missedRun],
+            [undefined, undefined],
+          ],
         );
       }),
     );
@@ -2938,6 +2990,7 @@ describe("OrchestratorMcpService provider resolution", () => {
                   Layer.mock(RemoteDelegation.RemoteDelegation)({}),
                   Layer.mock(ScheduledTaskService.ScheduledTaskService)({
                     list: () => Effect.succeed({ tasks: [task({})] }),
+                    reliability: () => Effect.succeed([]),
                   }),
                 ),
               ),
@@ -3943,6 +3996,7 @@ describe("OrchestratorMcpService thread lookup", () => {
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             getThreadShell: (threadId) =>
               Effect.succeed(shells.find((shell) => shell.id === threadId) ?? null),
+            listActiveShellIndex: () => Effect.succeed([]),
             sendToThread: () => Ref.update(sent, (count) => count + 1).pipe(Effect.as({} as never)),
             ...overrides,
           }),
@@ -3963,7 +4017,11 @@ describe("OrchestratorMcpService thread lookup", () => {
       const sent = yield* Ref.make(0);
       return yield* Effect.gen(function* () {
         const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const read = yield* mcp.readThread(client, { threadId: bareId }).pipe(Effect.flip);
+        // Reads resolve a bare uuid to its mcp: thread, so only a miss fails.
+        const read = yield* mcp.readThread(client, { threadId: bareId }).pipe(
+          Effect.match({ onFailure: (error) => error, onSuccess: () => null }),
+          Effect.catchDefect(() => Effect.succeed(null)),
+        );
         const send = yield* mcp
           .sendToThread(client, { threadId: bareId, message: "hello" })
           .pipe(Effect.flip);
@@ -4122,6 +4180,125 @@ describe("OrchestratorMcpService thread lookup", () => {
       }),
   );
 
+  it.effect("keeps a target's snooze unless told to wake it, and says so", () =>
+    Effect.gen(function* () {
+      const sent = yield* Ref.make(0);
+      const snoozedUntil = DateTime.makeUnsafe("2099-01-01T00:00:00Z");
+      const snoozed = { ...launched, snoozedUntil };
+      const dispatched: Array<unknown> = [];
+      const results = yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return [
+          yield* mcp.sendToThread(client, { threadId: launched.id, message: "held" }),
+          yield* mcp.postToThread(client, { threadId: launched.id, message: "posted" }),
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "wake",
+            respectSnooze: false,
+          }),
+        ];
+      }).pipe(
+        Effect.provide(
+          service([snoozed], sent, {
+            // The orchestrator keeps the snooze only for a sender that respects it.
+            getThreadShell: () =>
+              Effect.succeed(
+                dispatched.length === 0 ||
+                  (dispatched.at(-1) as { respectSnooze?: boolean }).respectSnooze === true
+                  ? snoozed
+                  : launched,
+              ),
+            getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(snoozed)),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: 1, storedEvents: [] };
+              }),
+            sendToThread: (input) =>
+              Effect.sync(() => {
+                dispatched.push(input);
+                return {
+                  delivery: "queued",
+                  run: {
+                    id: RunId.make("run:held"),
+                    status: "queued",
+                    ...(input.respectSnooze ? { snoozeDeferred: true } : {}),
+                  },
+                } as never;
+              }),
+            getThreadRecords: () =>
+              Effect.succeed(idleThreadProjection(snoozed) as OrchestrationV2ThreadProjection),
+          }),
+        ),
+      );
+      expect(dispatched).toMatchObject([
+        { respectSnooze: true },
+        { postOnly: true, respectSnooze: true },
+        { text: "wake" },
+      ]);
+      expect((dispatched[2] as { respectSnooze?: boolean }).respectSnooze).toBeUndefined();
+      const [held, posted, woke] = results;
+      for (const result of results) {
+        expect(result.snoozedUntil).toBe("2099-01-01T00:00:00.000Z");
+      }
+      expect(held!.warning).toContain("waits, held, until it wakes");
+      expect(posted!.warning).toContain("stays snoozed");
+      expect(woke!.warning).toContain("ended the snooze");
+    }),
+  );
+
+  it.effect("reports where a queued send waits behind the active run", () =>
+    Effect.gen(function* () {
+      const sent = yield* Ref.make(0);
+      const startedAt = DateTime.makeUnsafe(0);
+      const runs = [
+        {
+          id: RunId.make("run:active"),
+          ordinal: 1,
+          status: "running",
+          requestedAt: startedAt,
+          startedAt,
+        },
+        { id: RunId.make("run:ahead"), ordinal: 2, status: "queued", userMessageId: "m:ahead" },
+        { id: RunId.make("run:mine"), ordinal: 3, status: "queued", userMessageId: "m:mine" },
+      ];
+      const filters: Array<unknown> = [];
+      yield* TestClock.adjust("90 seconds");
+      const result = yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* mcp.sendToThread(client, { threadId: launched.id, message: "hello" });
+      }).pipe(
+        Effect.provide(
+          service([launched], sent, {
+            getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(launched)),
+            sendToThread: () =>
+              Effect.succeed({
+                delivery: "queued",
+                run: { id: RunId.make("run:mine"), status: "queued" },
+              } as never),
+            getThreadRecords: (_threadId, _fields, filter) => {
+              filters.push(filter);
+              return Effect.succeed({
+                runs,
+                messages: [{ id: "m:ahead" }, { id: "m:mine" }],
+              } as unknown as OrchestrationV2ThreadProjection);
+            },
+          }),
+        ),
+      );
+      assert.deepEqual(result.queue, {
+        position: 2,
+        messagesAhead: 1,
+        activeRunId: RunId.make("run:active"),
+        activeRunAgeSeconds: 90,
+      });
+      assert.deepEqual(filters, [
+        { runStatuses: ["preparing", "starting", "running", "waiting", "queued"] },
+        { messageIds: ["m:ahead", "m:mine"] },
+      ]);
+    }),
+  );
+
   it.effect(
     "seeds coordinator rollover while leaving ordinary sends and clean resets unchanged",
     () =>
@@ -4238,8 +4415,8 @@ describe("OrchestratorMcpService thread lookup", () => {
 
   it.effect("points a bare uuid at the mcp: thread it belongs to", () =>
     Effect.gen(function* () {
-      const { read, send, wait, sends } = yield* failuresFor([launched]);
-      for (const error of [read, send, wait]) {
+      const { send, wait, sends } = yield* failuresFor([launched]);
+      for (const error of [send, wait]) {
         assert.equal(error.code, "thread_not_found");
         assert.include(error.message, `mcp:${bareId}`);
       }
@@ -4250,8 +4427,8 @@ describe("OrchestratorMcpService thread lookup", () => {
   it.effect("keeps the plain message for an id that matches nothing", () =>
     Effect.gen(function* () {
       const { read, send, wait } = yield* failuresFor([]);
-      assert.equal(read.code, "thread_not_found");
-      assert.equal(read.message, `Thread ${bareId} is no longer available.`);
+      assert.equal(read?.code, "thread_not_found");
+      assert.include(read?.message, `No thread ${bareId} in this environment`);
       assert.equal(send.code, "thread_not_found");
       assert.equal(send.message, `Thread ${bareId} was not found.`);
       assert.equal(wait.code, "thread_not_found");
@@ -4262,7 +4439,7 @@ describe("OrchestratorMcpService thread lookup", () => {
   it.effect("does not name an mcp: thread that was deleted", () =>
     Effect.gen(function* () {
       const { read, send, wait } = yield* failuresFor([deletedLaunched]);
-      assert.equal(read.message, `Thread ${bareId} is no longer available.`);
+      assert.equal(read?.message, `Thread mcp:${bareId} was deleted.`);
       assert.equal(send.message, `Thread ${bareId} was not found.`);
       assert.equal(wait.message, send.message);
     }),
@@ -4428,16 +4605,30 @@ describe("OrchestratorMcpService thread list", () => {
     capabilities: new Set(["orchestration"]),
     issuedAt: 1,
   };
-  const shell = (id: string, projectId: string, snoozed: boolean) => ({
+  const shell = (id: string, projectId: string, snoozed: boolean, waiting = false) => ({
     ...liveThreadShell(ThreadId.make(id)),
     projectId: ProjectId.make(projectId),
     status: "completed" as const,
     snoozedUntil: snoozed ? DateTime.makeUnsafe("2099-01-01T00:00:00Z") : null,
+    blockedOnThreadWait: waiting,
+    pendingBackgroundTasks: waiting
+      ? [
+          {
+            taskId: "task-subagent",
+            kind: "subagent" as const,
+            description: "Review the diff",
+            parentTaskId: "task-parent",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            childThreadId: ThreadId.make("thread:b-child"),
+          },
+          { taskId: "task-tests", kind: "command" as const, awaited: true as const },
+        ]
+      : [],
   });
   const shells = [
     shell("thread:a-snoozed", "project:a", true),
     shell("thread:a-awake", "project:a", false),
-    shell("thread:b-snoozed", "project:b", true),
+    shell("thread:b-snoozed", "project:b", true, true),
     {
       ...shell("thread:a-awaiting-command", "project:a", false),
       activityRunStatus: null,
@@ -4528,6 +4719,24 @@ describe("OrchestratorMcpService thread list", () => {
         [
           ["thread:a-snoozed", "project:a"],
           ["thread:b-snoozed", "project:b"],
+        ],
+      );
+      assert.deepStrictEqual(
+        listed.threads.map((thread) => [thread.blockedOnThreadWait, thread.pendingBackgroundTasks]),
+        [
+          [false, []],
+          [
+            true,
+            [
+              {
+                taskId: "task-subagent",
+                kind: "subagent",
+                description: "Review the diff",
+                childThreadId: ThreadId.make("thread:b-child"),
+              },
+              { taskId: "task-tests", kind: "command", awaited: true },
+            ],
+          ],
         ],
       );
     }).pipe(Effect.provide(service)),

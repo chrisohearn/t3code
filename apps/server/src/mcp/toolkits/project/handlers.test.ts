@@ -412,7 +412,11 @@ it.effect("a launch with a model its provider does not advertise creates no thre
     ] as const) {
       expect(yield* launchWith(instanceId, model)).toMatchObject({
         code: "model_unavailable",
-        message: `Model ${model} is not advertised by provider ${instanceId}.`,
+        message: expect.stringMatching(
+          new RegExp(
+            `^Model ${model} is not advertised by provider ${instanceId}\\. Use one of: \\S`,
+          ),
+        ),
       });
     }
     expect(launched).toHaveLength(0);
@@ -421,6 +425,32 @@ it.effect("a launch with a model its provider does not advertise creates no thre
       modelSelection: { instanceId: "claudeAgent", model: "Opus" },
     });
     expect(launched).toHaveLength(1);
+  }),
+);
+
+it.effect.each([
+  ["/tmp/review", true],
+  ["/projects/client-target", false],
+] as const)("a launch into a project rooted at %s warns: %s", ([workspaceRoot, warns]) =>
+  Effect.gen(function* () {
+    const { projectId, dependencies } = clientLaunchHarness({
+      runtimeModeCeiling: "auto",
+      launched: [],
+      workspaceRoot,
+    });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const result = yield* toolkit.handle("t3_thread_launch", { title: "Fix", projectId }).pipe(
+      Stream.unwrap,
+      Stream.runCollect,
+      Effect.map((chunk) => chunk.at(-1)?.result),
+      Effect.provide(dependencies),
+    );
+    expect(result).toMatchObject(warns ? { warning: expect.stringContaining(workspaceRoot) } : {});
+    expect(warns || (result as { warning?: string }).warning === undefined).toBe(true);
   }),
 );
 

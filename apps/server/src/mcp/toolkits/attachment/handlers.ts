@@ -107,6 +107,8 @@ export const layer = McpToolAccess.toLayer(
               text: input.message ?? "",
               attachments,
               mode: "auto",
+              // As with t3_thread_send, an agent's message leaves a snoozed thread asleep.
+              respectSnooze: true,
               createdBy: "agent",
               creationSource: "mcp",
             }).pipe(
