@@ -55,6 +55,7 @@ import {
   codexContinuationIdentity,
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
+  withCodexSqliteHome,
 } from "./CodexHomeLayout.ts";
 import { makeManagedCodexProvider } from "./CodexManagedProvider.ts";
 import { codexUsageReader } from "./codexUsage.ts";
@@ -185,16 +186,17 @@ export const CodexDriver: ProviderDriver<
     const installation = yield* CodexInstallation.CodexInstallation;
     const modelCatalog = yield* ModelCatalog.ModelCatalog;
     const currentCatalog = modelCatalog.current(DRIVER_KIND);
-    const processEnv = yield* mergeProviderInstanceEnvironment(
+    const instanceEnv = yield* mergeProviderInstanceEnvironment(
       environment,
       yield* HostProcess.Environment,
     );
-    const environmentHome = processEnv.CODEX_HOME;
+    const environmentHome = instanceEnv.CODEX_HOME;
     const homeLayout = yield* resolveCodexHomeLayout(
       !config.homePath.trim() && !config.shadowHomePath.trim() && environmentHome?.trim()
         ? { ...config, homePath: environmentHome }
         : config,
     );
+    const processEnv = withCodexSqliteHome(homeLayout, instanceEnv);
     const continuationIdentity = codexContinuationIdentity(homeLayout);
     const stampIdentity = withInstanceIdentity({
       instanceId,

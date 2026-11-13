@@ -119,6 +119,7 @@ import {
 import {
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
+  withCodexSqliteHome,
 } from "../../provider/Drivers/CodexHomeLayout.ts";
 import {
   boundProviderEventForLogging,
@@ -1749,7 +1750,10 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
   return yield* makeCodexAdapterV2({
     instanceId,
     settings,
-    environment: yield* mergeProviderInstanceEnvironment(environment, hostEnvironment),
+    environment: withCodexSqliteHome(
+      homeLayout,
+      yield* mergeProviderInstanceEnvironment(environment, hostEnvironment),
+    ),
     clientFactory,
     digest,
     fileSystem,

@@ -205,6 +205,9 @@ const ApprovalLogTool = Tool.make("t3_approval_log", {
 const threadConfiguration = Schema.Struct({
   threadId: ThreadId,
   modelSelection: ModelSelection,
+  scheduledModelSelection: Schema.optional(
+    Schema.Struct({ modelSelection: ModelSelection, afterRunId: RunId }),
+  ),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   // Optional: a linked environment on another build does not report it.
@@ -218,10 +221,24 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
     modelSelection: Schema.optional(ModelSelection),
+    applyAt: Schema.optional(
+      Schema.Literal("next_turn").annotate({
+        description: "Busy thread: apply from the next turn, queued messages included.",
+      }),
+    ),
     runtimeMode: Schema.optional(RuntimeMode),
     acknowledgeOnly: Schema.optional(Schema.Boolean),
   }),
-  success: Schema.Union([threadConfiguration, OrchestrationV2DispatchCommandResult]),
+  // The scheduled result goes before the plain one, which would match it and drop its fields.
+  success: Schema.Union([
+    threadConfiguration,
+    Schema.Struct({
+      status: Schema.Literal("scheduled"),
+      afterRunId: RunId,
+      sequence: OrchestrationV2DispatchCommandResult.fields.sequence,
+    }),
+    OrchestrationV2DispatchCommandResult,
+  ]),
 }).annotate(Tool.Destructive, true);
 
 const ThreadTransferTool = Tool.make("t3_thread_transfer", {

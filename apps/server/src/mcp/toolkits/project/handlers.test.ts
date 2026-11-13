@@ -412,7 +412,11 @@ it.effect("a launch with a model its provider does not advertise creates no thre
     ] as const) {
       expect(yield* launchWith(instanceId, model)).toMatchObject({
         code: "model_unavailable",
-        message: `Model ${model} is not advertised by provider ${instanceId}.`,
+        message: expect.stringMatching(
+          new RegExp(
+            `^Model ${model} is not advertised by provider ${instanceId}\\. Use one of: \\S`,
+          ),
+        ),
       });
     }
     expect(launched).toHaveLength(0);

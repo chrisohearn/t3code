@@ -37,6 +37,9 @@ import * as ProjectStore from "./ProjectStore.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { isSnoozed } from "./SnoozeState.ts";
+
+export { isSnoozed };
 
 export interface SettlementPullRequest {
   readonly state: "open" | "closed" | "merged";
@@ -162,39 +165,6 @@ export function isAutoSettlementCandidate(
   if (threadHasQueuedTurnStart(thread, nowMs)) return false;
   // Interrupted runs must keep the same snooze protection the sidebar shows.
   return !isSnoozed(thread, nowMs);
-}
-
-/** Match client effectiveSnoozed so agents and sidebar agree. */
-export function isSnoozed(
-  thread: Pick<
-    ProjectionStore.ProjectionSettlementCandidate,
-    | "snoozedUntil"
-    | "snoozedAt"
-    | "latestRunCompletedAt"
-    | "status"
-    | "pendingRuntimeRequest"
-    | "pendingGuestMessageCount"
-  >,
-  nowMs: number,
-): boolean {
-  const snoozedUntilMs = toMillis(thread.snoozedUntil);
-  if (snoozedUntilMs === null || snoozedUntilMs <= nowMs) return false;
-  // Same as the client: a waiting guest message wakes the thread, and the snooze stays stored.
-  if ((thread.pendingGuestMessageCount ?? 0) > 0) return false;
-  const snoozedAtMs = toMillis(thread.snoozedAt);
-  if (
-    thread.pendingRuntimeRequest !== null &&
-    (thread.pendingRuntimeRequest.kind !== "user_input" ||
-      snoozedAtMs === null ||
-      DateTime.toEpochMillis(thread.pendingRuntimeRequest.createdAt) > snoozedAtMs)
-  ) {
-    return false;
-  }
-  const completedAtMs = toMillis(thread.latestRunCompletedAt);
-  const wokeOnError =
-    thread.status === "failed" &&
-    (snoozedAtMs === null || (completedAtMs !== null && completedAtMs > snoozedAtMs));
-  return !wokeOnError;
 }
 
 export function resolveAutoSettlementAt(input: {

@@ -13,7 +13,12 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { modelSelectionCommandType } from "@t3tools/shared/model";
+import * as Option from "effect/Option";
+import { modelSelectionCommandType, withLegacyUltracodeEffort } from "@t3tools/shared/model";
+
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
+import { invalidOptionSelections } from "../../OrchestratorMcpService.ts";
+import { advertisedModel, requireAdvertisedModel } from "../../providerModels.ts";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -118,13 +123,18 @@ const configureAcknowledgeOnly = Effect.fn("mcp.configureAcknowledgeOnly")(funct
     readonly acknowledgeOnly?: boolean | undefined;
     readonly modelSelection?: unknown;
     readonly runtimeMode?: unknown;
+    readonly applyAt?: unknown;
   },
 ) {
   yield* McpToolAccess.requireFullAccess("change who answers a thread");
-  if (input.modelSelection !== undefined || input.runtimeMode !== undefined) {
+  if (
+    input.modelSelection !== undefined ||
+    input.runtimeMode !== undefined ||
+    input.applyAt !== undefined
+  ) {
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
-      message: "Set acknowledgeOnly separately from modelSelection and runtimeMode.",
+      message: "Set acknowledgeOnly separately from modelSelection, runtimeMode and applyAt.",
     });
   }
   const acknowledgeOnly = yield* required(input.acknowledgeOnly, "acknowledgeOnly");
@@ -258,6 +268,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     (input) =>
       input.modelSelection === undefined &&
       input.runtimeMode === undefined &&
+      input.applyAt === undefined &&
       input.acknowledgeOnly === undefined,
     McpToolAccess.reads((input) =>
       Effect.gen(function* () {
@@ -268,6 +279,14 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         return {
           threadId: thread.id,
           modelSelection: thread.modelSelection,
+          ...(thread.scheduledModelSelection == null
+            ? {}
+            : {
+                scheduledModelSelection: {
+                  modelSelection: thread.scheduledModelSelection.modelSelection,
+                  afterRunId: thread.scheduledModelSelection.afterRunId,
+                },
+              }),
           runtimeMode: thread.runtimeMode,
           interactionMode: thread.interactionMode,
           acknowledgeOnly: yield* threads
@@ -292,6 +311,13 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               message: "Set runtimeMode separately from modelSelection.",
             });
           }
+          if (input.applyAt !== undefined) {
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message:
+                "applyAt schedules a modelSelection; runtimeMode changes only on an idle thread.",
+            });
+          }
           const scope = yield* McpInvocationContext.McpInvocationContext;
           const actor =
             scope.thread !== undefined
@@ -314,10 +340,53 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         }
         const modelSelection = yield* required(input.modelSelection, "modelSelection");
         const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
+        if (input.applyAt !== undefined && type === "provider.switch") {
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: `applyAt schedules a model or option change on this thread's provider instance (${thread.providerInstanceId}). Switch to ${modelSelection.instanceId} while the thread is idle.`,
+          });
+        }
+        const applyAt = input.applyAt;
+        // A scheduled selection is checked now: a bad one would fail each queued message in turn.
+        const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
+        if (applyAt !== undefined && Option.isSome(registry)) {
+          const provider = (yield* registry.value.getProviders).find(
+            (candidate) => candidate.instanceId === modelSelection.instanceId,
+          );
+          if (provider !== undefined) {
+            yield* requireAdvertisedModel(provider, modelSelection.model);
+            const descriptors = advertisedModel(provider, modelSelection.model)?.capabilities
+              ?.optionDescriptors;
+            const invalid = invalidOptionSelections(
+              withLegacyUltracodeEffort(descriptors, modelSelection.options) ?? [],
+              descriptors,
+            );
+            if (invalid.length > 0) {
+              return yield* new OrchestratorMcpFailure({
+                code: "invalid_request",
+                message: `modelSelection.options rejected: ${invalid.join(" ")}`,
+              });
+            }
+          }
+        }
         const result = yield* threads
-          .dispatch({ type, threadId: thread.id, commandId: yield* newCommandId(), modelSelection })
+          .dispatch({
+            type,
+            threadId: thread.id,
+            commandId: yield* newCommandId(),
+            modelSelection,
+            ...(applyAt === undefined ? {} : { applyAt }),
+          })
           .pipe(Effect.mapError(dispatchFailure));
-        return { sequence: result.sequence };
+        if (applyAt === undefined) return { sequence: result.sequence };
+        const scheduled = (yield* readThread(thread.id)).projection.thread.scheduledModelSelection;
+        return scheduled == null
+          ? { sequence: result.sequence }
+          : {
+              status: "scheduled" as const,
+              afterRunId: scheduled.afterRunId,
+              sequence: result.sequence,
+            };
       }),
     ),
   ),

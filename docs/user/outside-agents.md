@@ -99,6 +99,24 @@ T3 Code.
   `runtimeMode` alone. It cannot raise permissions or change them during an active
   run, and the thread must be within the calling agent's permission limits. The
   change and caller appear in thread activity.
+- To change a busy thread's model or options, such as an inbox thread's effort,
+  call `t3_thread_configure` with `modelSelection` and `applyAt: "next_turn"`.
+  Messages already queued start with it, and so do later agent messages,
+  except a message that named its own model, such as one sent from the T3 app
+  with the composer's model. The change stays pending until a message on the
+  default model starts with it.
+  Reading the configuration shows the pending change; scheduling the current
+  model cancels it. Switching to another provider instance still needs an idle
+  thread.
+- When `t3_thread_send` queues behind a busy run, its `queue` result gives the
+  message's position, the messages ahead of it, and how long the active run has
+  been going.
+- A snoozed thread stays snoozed. `t3_thread_send` holds the message until the
+  snooze ends or someone wakes the thread, and `t3_thread_post` only records it.
+  A thread that counts as awake, such as one waiting on a request, gets the
+  message at once and keeps its snooze.
+  Both return `snoozedUntil` and a warning. Pass `respectSnooze: false` to wake
+  the thread now. Messages sent from the T3 app still wake it.
 
 ## Claude Code
 
@@ -136,7 +154,7 @@ Add the environment as a custom MCP app in ChatGPT's apps settings:
 ### Check results and decisions
 
 Use `t3_thread_result` for a thread's latest run, or pass `runId` for a specific
-run. It returns status, the last assistant reply, pending request IDs, linked
+run. `threadId` also accepts a thread link, including the hosted links T3 returns. It returns status, the last assistant reply, pending request IDs, linked
 pull requests, and a revision. `latestMessage` also returns the thread’s most recent
 message, including inbox posts without a run. Replies default to 4,000 characters. Increase
 `maxChars` up to 50,000 when `truncated` is true. This read does not acknowledge

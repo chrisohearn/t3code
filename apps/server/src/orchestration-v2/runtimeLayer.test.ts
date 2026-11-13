@@ -99,6 +99,7 @@ import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as SnoozeDeferredDelivery from "./SnoozeDeferredDelivery.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as DeviceHost from "../device/DeviceHost.ts";
 import * as DeviceService from "../device/DeviceService.ts";
@@ -360,7 +361,7 @@ const makeLayerTest = (settings?: Parameters<typeof ServerSettings.layerTest>[0]
   ).pipe(
     Layer.provide(McpSessionRegistryTestkit.layer),
     Layer.provide(McpProviderSessions.layer),
-    Layer.provide(SqlitePersistence.layerMemory),
+    Layer.provideMerge(SqlitePersistence.layerMemory),
     Layer.provide(layerCheckpointStoreTest),
     Layer.provide(layerServerConfig),
     Layer.provide(ServerSettings.layerTest(settings)),
@@ -8366,6 +8367,274 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect(
+    "a later completed run releases snooze-held messages only once the thread is awake",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threadId = ThreadId.make("runtime-layer-snooze-held-release");
+        const { send, runFor, end, releasedAfter } = yield* queueTestThread(threadId);
+        const message = (key: string, extra: object) =>
+          orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId: CommandId.make(`${threadId}:message:${key}`),
+            threadId,
+            messageId: MessageId.make(`${threadId}:message:${key}`),
+            text: key,
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            ...extra,
+          });
+        yield* send("first", "agent", true);
+        yield* end("first", "completed");
+        yield* orchestrator.dispatch({
+          type: "thread.snooze",
+          commandId: CommandId.make(`${threadId}:snooze`),
+          threadId,
+          snoozedUntil: "2099-01-01T00:00:00.000Z",
+        });
+        yield* message("held", { respectSnooze: true });
+        assert.isTrue((yield* runFor("held")).snoozeDeferred);
+
+        // A background wake runs and completes while the thread sleeps: the held turn stays held.
+        yield* message("wake", {
+          createdBy: "agent",
+          creationSource: "provider",
+          dispatchMode: { type: "queue_after_active" },
+          notification: {
+            source: { kind: "background_task" },
+            outcome: "updated",
+            summary: "Background activity updated",
+          },
+        });
+        yield* end("wake", "completed");
+        const stillHeld = yield* runFor("held");
+        assert.isTrue(stillHeld.queueHeld);
+        assert.isTrue(stillHeld.snoozeDeferred);
+
+        // Awake, the next completed run (a usage limit's resume, say) releases it like the others.
+        yield* orchestrator.dispatch({
+          type: "thread.unsnooze",
+          commandId: CommandId.make(`${threadId}:unsnooze`),
+          threadId,
+          reason: "user",
+        });
+        yield* send("resume", "agent", true);
+        yield* end("resume", "completed");
+        yield* releasedAfter("held", "resume");
+        assert.isUndefined((yield* runFor("held")).snoozeDeferred);
+      }),
+  );
+
+  it.effect("keeps a scheduled model change through server continuations on the old model", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const scheduledSelection = { ...modelSelection, model: "gpt-5.5" };
+      const scenario = (name: string) =>
+        Effect.gen(function* () {
+          const threadId = ThreadId.make(`runtime-layer-schedule-server-${name}`);
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`${threadId}:create`),
+            threadId,
+            projectId: ProjectId.make(`${threadId}:project`),
+            createdBy: "user",
+            creationSource: "web",
+            title: "Scheduled change and a restart",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: process.cwd(),
+          });
+          // A restart continuation names the run's own model and comes from the server.
+          const send = (key: string, kind: "agent" | "server", queue: boolean) =>
+            orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`${threadId}:${key}`),
+              threadId,
+              messageId: MessageId.make(`${threadId}:${key}`),
+              text: key,
+              attachments: [],
+              ...(kind === "server" ? { modelSelection } : {}),
+              dispatchMode: { type: queue ? "queue_after_active" : "start_immediately" },
+              createdBy: "agent",
+              creationSource: kind === "server" ? "server" : "mcp",
+            });
+          const run = (key: string) =>
+            orchestrator
+              .getThreadProjection(threadId)
+              .pipe(
+                Effect.map((projection) =>
+                  projection.runs.find(
+                    (candidate) => candidate.userMessageId === MessageId.make(`${threadId}:${key}`),
+                  )!,
+                ),
+              );
+          const complete = (key: string) =>
+            Effect.gen(function* () {
+              const current = yield* run(key);
+              yield* eventSink.write({
+                events: [
+                  {
+                    id: EventId.make(`${current.id}:completed`),
+                    type: "run.updated",
+                    threadId,
+                    runId: current.id,
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...current, status: "completed", completedAt: yield* DateTime.now },
+                  },
+                ],
+              });
+              yield* orchestrator.resumeQueuedRuns;
+            });
+          const scheduledNow = () =>
+            orchestrator
+              .getThreadProjection(threadId)
+              .pipe(Effect.map(({ thread }) => thread.scheduledModelSelection ?? null));
+          yield* send("active", "agent", false);
+          yield* orchestrator.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make(`${threadId}:schedule`),
+            threadId,
+            modelSelection: scheduledSelection,
+            applyAt: "next_turn",
+          });
+          return { threadId, send, run, complete, scheduledNow };
+        });
+
+      // Queued behind the busy run.
+      const queued = yield* scenario("queued");
+      yield* queued.send("continuation", "server", true);
+      yield* queued.send("after", "agent", true);
+      assert.deepEqual((yield* queued.run("after")).modelSelection, scheduledSelection);
+      yield* queued.complete("active");
+      const continuation = yield* queued.run("continuation");
+      assert.equal(continuation.status, "starting");
+      assert.deepEqual(continuation.modelSelection, modelSelection);
+      assert.isNotNull(yield* queued.scheduledNow());
+      yield* queued.complete("continuation");
+      const after = yield* queued.run("after");
+      assert.equal(after.status, "starting");
+      assert.deepEqual(after.modelSelection, scheduledSelection);
+      assert.isNull(yield* queued.scheduledNow());
+
+      // Started at once on the idle thread, after the busy run ended.
+      const immediate = yield* scenario("immediate");
+      yield* immediate.complete("active");
+      yield* immediate.send("continuation", "server", false);
+      assert.deepEqual((yield* immediate.run("continuation")).modelSelection, modelSelection);
+      assert.isNotNull(yield* immediate.scheduledNow());
+      yield* immediate.complete("continuation");
+      yield* immediate.send("next", "agent", false);
+      assert.deepEqual((yield* immediate.run("next")).modelSelection, scheduledSelection);
+      assert.isNull(yield* immediate.scheduledNow());
+    }),
+  );
+
+  it.effect("keeps the snooze of a thread that never ran while delivering to it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-layer-snooze-never-ran");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        createdBy: "user",
+        creationSource: "web",
+        title: "Never ran",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make(`${threadId}:snooze`),
+        threadId,
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${threadId}:first`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:first`),
+        text: "first",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        respectSnooze: true,
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(projection.runs[0]?.status, "starting");
+      assert.isUndefined(projection.runs[0]?.snoozeDeferred);
+      assert.isNotNull(projection.thread.snoozedUntil ?? null);
+    }),
+  );
+
+  it.effect("delivers to a snoozed thread that counts as awake without ending its snooze", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-layer-snooze-awake-on-error");
+      const { send, runFor, end } = yield* queueTestThread(threadId);
+      yield* send("first", "agent", true);
+      yield* end("first", "completed");
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make(`${threadId}:snooze`),
+        threadId,
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
+      yield* TestClock.adjust("1 second");
+      // A background wake fails after the snooze, which wakes the thread as the sidebar shows it.
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "provider",
+        commandId: CommandId.make(`${threadId}:message:wake`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:message:wake`),
+        text: "wake",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        notification: {
+          source: { kind: "background_task" },
+          outcome: "updated",
+          summary: "Background activity updated",
+        },
+      });
+      yield* end("wake", "failed");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "mcp",
+        commandId: CommandId.make(`${threadId}:message:respect`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:message:respect`),
+        text: "respect",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        respectSnooze: true,
+      });
+      const delivered = yield* runFor("respect");
+      assert.equal(delivered.status, "starting");
+      assert.isUndefined(delivered.snoozeDeferred);
+      const thread = (yield* orchestrator.getThreadProjection(threadId)).thread;
+      assert.equal(
+        thread.snoozedUntil === null || thread.snoozedUntil === undefined
+          ? null
+          : DateTime.formatIso(thread.snoozedUntil),
+        "2099-01-01T00:00:00.000Z",
+      );
+    }),
+  );
+
   it.effect("keeps held agent messages while the thread's worktree setup is unresolved", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -9005,6 +9274,213 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(delivered.status, "starting");
       assert.deepEqual(delivered.modelSelection, pickedSelection);
       assert.deepEqual(after.thread.modelSelection, pickedSelection);
+    }),
+  );
+
+  it.effect("holds a send that respects a snooze until the thread wakes", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("runtime-layer-respect-snooze");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        createdBy: "user",
+        creationSource: "web",
+        title: "Snoozed hold",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      const message = (key: string, extra: { postOnly?: true; respectSnooze?: true } = {}) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}:${key}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:${key}`),
+          text: key,
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "agent",
+          creationSource: "mcp",
+          ...extra,
+        });
+      yield* message("first");
+      const [first] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:first-completed`),
+            type: "run.updated",
+            threadId,
+            runId: first!.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...first!, status: "completed", completedAt: yield* DateTime.now },
+          },
+        ],
+      });
+      const snooze = (until: string) =>
+        orchestrator.dispatch({
+          type: "thread.snooze",
+          commandId: CommandId.make(`${threadId}:snooze:${until}`),
+          threadId,
+          snoozedUntil: until,
+        });
+      yield* snooze("2099-01-01T00:00:00.000Z");
+
+      yield* message("post", { postOnly: true, respectSnooze: true });
+      yield* message("held", { respectSnooze: true });
+      const held = yield* orchestrator.getThreadProjection(threadId);
+      assert.isNotNull(held.thread.snoozedUntil);
+      const heldRun = held.runs.find((run) => run.userMessageId === `${threadId}:held`)!;
+      assert.equal(heldRun.status, "queued");
+      assert.isTrue(heldRun.queueHeld);
+      assert.isTrue(heldRun.snoozeDeferred);
+      // Its own held turn does not stop the thread from being snoozed again.
+      yield* snooze("2099-02-01T00:00:00.000Z");
+      const ownDeferrals = () =>
+        SnoozeDeferredDelivery.readSnoozeDeferredThreads().pipe(
+          Effect.map((rows) => rows.filter((row) => row.threadId === threadId)),
+        );
+      assert.deepEqual(yield* ownDeferrals(), [
+        { threadId, snoozedUntil: "2099-02-01T00:00:00.000Z", firstRunId: heldRun.id },
+      ]);
+
+      yield* orchestrator.dispatch({
+        type: "thread.unsnooze",
+        commandId: CommandId.make(`${threadId}:unsnooze`),
+        threadId,
+        reason: "user",
+      });
+      const [awake] = yield* ownDeferrals();
+      assert.equal(
+        SnoozeDeferredDelivery.snoozeDeferredReleases(
+          [awake!],
+          DateTime.toEpochMillis(yield* DateTime.now),
+        ).due.length,
+        1,
+      );
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make(`snooze-deferred-release:${heldRun.id}`),
+        threadId,
+      });
+      const released = yield* orchestrator.getThreadProjection(threadId);
+      const releasedRun = released.runs.find((run) => run.id === heldRun.id)!;
+      assert.equal(releasedRun.status, "starting");
+      // Released, it is no longer the snooze's: a failure hold later must not release it again.
+      assert.isUndefined(releasedRun.snoozeDeferred);
+      assert.deepEqual(yield* ownDeferrals(), []);
+    }),
+  );
+
+  it.effect("starts every message queued behind a scheduled model change with it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("runtime-layer-scheduled-model-change");
+      const scheduledSelection = { ...modelSelection, model: "gpt-5.5" };
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        createdBy: "user",
+        creationSource: "web",
+        title: "Scheduled model change",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      const pickedSelection = { ...modelSelection, model: "gpt-5.3" };
+      const send = (key: string) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}:${key}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:${key}`),
+          text: key,
+          attachments: [],
+          ...(key === "picked" ? { modelSelection: pickedSelection } : {}),
+          dispatchMode: { type: key === "active" ? "start_immediately" : "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+      // "picked" named its own model before the change was scheduled, so it keeps it.
+      for (const key of ["active", "before-1", "before-2", "picked"]) yield* send(key);
+      yield* orchestrator.dispatch({
+        type: "thread.model-selection.set",
+        commandId: CommandId.make(`${threadId}:schedule`),
+        threadId,
+        modelSelection: scheduledSelection,
+        applyAt: "next_turn",
+      });
+      yield* send("after");
+      const scheduled = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(scheduled.thread.modelSelection, modelSelection);
+      assert.deepEqual(
+        scheduled.thread.scheduledModelSelection?.modelSelection,
+        scheduledSelection,
+      );
+      const [active, before1, before2, picked, after] = scheduled.runs;
+      assert.deepEqual(after?.modelSelection, scheduledSelection);
+
+      const complete = (runId: RunId) =>
+        Effect.gen(function* () {
+          const current = yield* orchestrator.getThreadProjection(threadId);
+          yield* eventSink.write({
+            events: [
+              {
+                id: EventId.make(`${runId}:completed`),
+                type: "run.updated",
+                threadId,
+                runId,
+                occurredAt: yield* DateTime.now,
+                payload: {
+                  ...current.runs.find((run) => run.id === runId)!,
+                  status: "completed",
+                  completedAt: yield* DateTime.now,
+                },
+              },
+            ],
+          });
+          yield* orchestrator.resumeQueuedRuns;
+          return yield* orchestrator.getThreadProjection(threadId);
+        });
+      const firstBoundary = yield* complete(active!.id);
+      const started1 = firstBoundary.runs.find((run) => run.id === before1!.id)!;
+      assert.equal(started1.status, "starting");
+      assert.deepEqual(started1.modelSelection, scheduledSelection);
+      assert.deepEqual(firstBoundary.thread.modelSelection, scheduledSelection);
+      assert.isNotNull(firstBoundary.thread.scheduledModelSelection ?? null);
+
+      const secondBoundary = yield* complete(before1!.id);
+      const started2 = secondBoundary.runs.find((run) => run.id === before2!.id)!;
+      assert.equal(started2.status, "starting");
+      assert.deepEqual(started2.modelSelection, scheduledSelection);
+      // The pick still waits, so the change stays for the default turns after it.
+      assert.isNotNull(secondBoundary.thread.scheduledModelSelection ?? null);
+
+      const thirdBoundary = yield* complete(before2!.id);
+      const startedPick = thirdBoundary.runs.find((run) => run.id === picked!.id)!;
+      assert.equal(startedPick.status, "starting");
+      assert.deepEqual(startedPick.modelSelection, pickedSelection);
+      assert.deepEqual(thirdBoundary.thread.modelSelection, pickedSelection);
+      assert.isNotNull(thirdBoundary.thread.scheduledModelSelection ?? null);
+
+      // The next default turn goes back to the scheduled model, and that uses the change up.
+      const fourthBoundary = yield* complete(picked!.id);
+      const startedAfter = fourthBoundary.runs.find((run) => run.id === after!.id)!;
+      assert.equal(startedAfter.status, "starting");
+      assert.deepEqual(startedAfter.modelSelection, scheduledSelection);
+      assert.deepEqual(fourthBoundary.thread.modelSelection, scheduledSelection);
+      assert.isNull(fourthBoundary.thread.scheduledModelSelection ?? null);
     }),
   );
 

@@ -464,6 +464,18 @@ const OrchestrationV2LastTitleRegeneration = Schema.Struct({
   completedAt: Schema.DateTimeUtc,
 });
 
+/**
+ * A model change asked for while a run was active. Runs queued through `queuedThroughOrdinal`
+ * and every later turn start with it; the first start that leaves none of those queued clears it.
+ */
+export const OrchestrationV2ScheduledModelSelection = Schema.Struct({
+  modelSelection: ModelSelection,
+  afterRunId: RunId,
+  queuedThroughOrdinal: NonNegativeInt,
+});
+export type OrchestrationV2ScheduledModelSelection =
+  typeof OrchestrationV2ScheduledModelSelection.Type;
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
   id: ThreadId,
@@ -471,6 +483,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   title: TrimmedNonEmptyString,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
+  scheduledModelSelection: Schema.optional(Schema.NullOr(OrchestrationV2ScheduledModelSelection)),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   branch: Schema.NullOr(TrimmedNonEmptyString),
@@ -784,6 +797,10 @@ export const OrchestrationV2Run = Schema.Struct({
   status: OrchestrationV2RunStatus,
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
   queueHeld: Schema.optional(Schema.Boolean),
+  /** Held by a send that respected a snooze; released when the thread wakes. */
+  snoozeDeferred: Schema.optional(Schema.Boolean),
+  /** Queued with a model its sender named; a scheduled model change leaves it alone. */
+  explicitModelSelection: Schema.optional(Schema.Boolean),
   steerWhenReadyRunId: Schema.optional(RunId),
   requestedAt: Schema.DateTimeUtc,
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
@@ -3372,6 +3389,8 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+    /** While a run is active, schedule the change for the next turn start instead of refusing. */
+    applyAt: Schema.optional(Schema.Literal("next_turn")),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
@@ -3395,6 +3414,8 @@ export const OrchestrationV2Command = Schema.Union([
     idleCompaction: Schema.optional(OrchestrationV2IdleCompaction),
     /** Start a new provider session without the thread's earlier context. Never steers. */
     freshContext: Schema.optional(Schema.Boolean),
+    /** On a snoozed thread: keep the snooze and hold the turn until it ends. */
+    respectSnooze: Schema.optional(Schema.Boolean),
     commandId: CommandId,
     threadId: ThreadId,
     messageId: MessageId,

@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
@@ -11,6 +12,7 @@ import {
   CodexShadowHomePathConflictError,
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
+  withCodexSqliteHome,
 } from "./CodexHomeLayout.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 const decodeCodexSettingsValue = Schema.decodeSync(CodexSettings);
@@ -60,6 +62,31 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           effectiveHomePath: shadowHome,
           continuationKey: `codex:home:${sharedHome}`,
         });
+      }),
+    );
+  });
+
+  describe("withCodexSqliteHome", () => {
+    it.effect("points only auth overlay homes at the shared SQLite home", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const sharedHome = path.resolve("codex-shared");
+        const overlay = yield* resolveCodexHomeLayout(
+          decodeCodexSettings({
+            homePath: sharedHome,
+            shadowHomePath: path.resolve("codex-shadow"),
+          }),
+        );
+        const direct = yield* resolveCodexHomeLayout(decodeCodexSettings({ homePath: sharedHome }));
+
+        expect(withCodexSqliteHome(overlay, { PATH: "bin" })).toEqual({
+          PATH: "bin",
+          CODEX_SQLITE_HOME: sharedHome,
+        });
+        expect(withCodexSqliteHome(overlay, { CODEX_SQLITE_HOME: "custom" })).toEqual({
+          CODEX_SQLITE_HOME: "custom",
+        });
+        expect(withCodexSqliteHome(direct, { PATH: "bin" })).toEqual({ PATH: "bin" });
       }),
     );
   });
@@ -191,6 +218,161 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
 
           expect(yield* fileSystem.readLink(shadowLock)).toBe(sharedLock);
         }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "links SQLite databases but settles shadow sidecars instead of linking them",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          for (const name of ["state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"]) {
+            yield* writeTextFile(path.join(sharedHome, name), "shared");
+          }
+          for (const name of ["logs_2.sqlite", "goals_1.sqlite"]) {
+            yield* writeTextFile(path.join(sharedHome, name), "shared");
+          }
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          yield* materializeCodexShadowHome(layout);
+
+          // Windows SQLite leaves these beside the symlinked database (#79).
+          yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-wal"), "");
+          yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-shm"), "index");
+          yield* writeTextFile(path.join(shadowHome, "logs_2.sqlite-wal"), "frames");
+          yield* writeTextFile(path.join(shadowHome, "logs_2.sqlite-shm"), "index");
+          yield* fileSystem.symlink(
+            path.join(sharedHome, "goals_1.sqlite-wal"),
+            path.join(shadowHome, "goals_1.sqlite-wal"),
+          );
+          yield* materializeCodexShadowHome(layout);
+
+          for (const name of ["state_5.sqlite", "logs_2.sqlite"]) {
+            expect(yield* fileSystem.readLink(path.join(shadowHome, name))).toBe(
+              path.join(sharedHome, name),
+            );
+          }
+          const shadowEntries = yield* fileSystem.readDirectory(shadowHome);
+          expect(shadowEntries.filter((name) => /-(?:wal|shm|journal)$/.test(name))).toEqual([]);
+          const staleEntries = shadowEntries.filter((name) => name.includes(".stale-")).toSorted();
+          expect(staleEntries.map((name) => name.replace(/\.stale-\d+$/, ""))).toEqual([
+            "logs_2.sqlite-shm",
+            "logs_2.sqlite-wal",
+          ]);
+          const staleWal = staleEntries.find((name) => name.startsWith("logs_2.sqlite-wal"))!;
+          expect(yield* fileSystem.readFileString(path.join(shadowHome, staleWal))).toBe("frames");
+          expect(
+            yield* fileSystem.readFileString(path.join(sharedHome, "state_5.sqlite-wal")),
+          ).toBe("shared");
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "keeps a link to another home while SQLite files sit beside it",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const otherHome = yield* makeTempDir("t3code-codex-other-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          // Goals_1 differs only in case, so it is the same entry where names ignore case.
+          const databases = ["state_5.sqlite", "logs_2.sqlite", "Goals_1.sqlite", "jobs_1.sqlite"];
+          for (const name of databases) {
+            yield* writeTextFile(path.join(sharedHome, name), "shared");
+          }
+          yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
+          for (const name of [
+            "state_5.sqlite",
+            "logs_2.sqlite",
+            "goals_1.sqlite",
+            "jobs_1.sqlite",
+          ]) {
+            yield* fileSystem.symlink(path.join(otherHome, name), path.join(shadowHome, name));
+          }
+          for (const name of ["logs_2.sqlite-wal", "goals_1.sqlite-wal"]) {
+            yield* writeTextFile(path.join(shadowHome, name), "frames");
+          }
+          // An older build linked sidecars too; this one's target is gone.
+          yield* fileSystem.symlink(
+            path.join(otherHome, "jobs_1.sqlite-wal"),
+            path.join(shadowHome, "jobs_1.sqlite-wal"),
+          );
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          yield* materializeCodexShadowHome(layout);
+
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "state_5.sqlite"))).toBe(
+            path.join(sharedHome, "state_5.sqlite"),
+          );
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "jobs_1.sqlite"))).toBe(
+            path.join(otherHome, "jobs_1.sqlite"),
+          );
+          for (const name of ["logs_2.sqlite", "goals_1.sqlite"]) {
+            expect(yield* fileSystem.readLink(path.join(shadowHome, name))).toBe(
+              path.join(otherHome, name),
+            );
+            expect(yield* fileSystem.readFileString(path.join(shadowHome, `${name}-wal`))).toBe(
+              "frames",
+            );
+          }
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "leaves sidecars alone beside a shadow's own database or a link it cannot re-point",
+      () => {
+        const warnings: unknown[] = [];
+        const logger = Logger.make(({ message, logLevel }) => {
+          if (logLevel === "Warn") warnings.push(message);
+        });
+        return Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          const ownFiles = ["queue_1.sqlite", "queue_1.sqlite-wal", "queue_1.sqlite-shm"];
+          for (const name of ownFiles) {
+            yield* writeTextFile(path.join(shadowHome, name), `live ${name}`);
+          }
+          // The shared home has no jobs_1.sqlite, so nothing re-points this link.
+          const otherHome = yield* makeTempDir("t3code-codex-other-");
+          const foreignTarget = path.join(otherHome, "jobs_1.sqlite");
+          yield* fileSystem.symlink(foreignTarget, path.join(shadowHome, "jobs_1.sqlite"));
+          yield* writeTextFile(path.join(shadowHome, "jobs_1.sqlite-wal"), "frames");
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          yield* materializeCodexShadowHome(layout);
+
+          for (const name of ownFiles) {
+            expect(yield* fileSystem.readFileString(path.join(shadowHome, name))).toBe(
+              `live ${name}`,
+            );
+          }
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "jobs_1.sqlite"))).toBe(
+            foreignTarget,
+          );
+          expect(yield* fileSystem.readFileString(path.join(shadowHome, "jobs_1.sqlite-wal"))).toBe(
+            "frames",
+          );
+          const message =
+            "Left SQLite files alone in a Codex shadow home because its database is not the shared one.";
+          expect(warnings).toHaveLength(2);
+          for (const database of ["queue_1.sqlite", "jobs_1.sqlite"]) {
+            expect(warnings).toContainEqual([message, { path: path.join(shadowHome, database) }]);
+          }
+        }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+      },
     );
 
     it.effect.skipIf(!symlinksSupported)(
