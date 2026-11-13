@@ -43,10 +43,15 @@ export function isTemporaryPath(path: string): boolean {
 }
 
 export interface FolderProbe {
-  /** The path with symlinks resolved, and whether its filesystem is a tmpfs. */
-  readonly inspect: (
-    path: string,
-  ) => Promise<{ readonly resolved: string; readonly tmpfs: boolean }>;
+  /**
+   * The path with symlinks resolved, and whether its filesystem is a tmpfs. No answer means the
+   * caller goes by the name.
+   */
+  readonly inspect: (path: string) => Promise<FolderInspection | undefined>;
+}
+interface FolderInspection {
+  readonly resolved: string;
+  readonly tmpfs: boolean;
 }
 
 const exists = (path: string) =>
@@ -59,41 +64,39 @@ const RESULT_TTL_MS = 30_000;
 const MAX_CACHED_PATHS = 256;
 
 /**
- * One probe per path at a time, and a settled answer reused for a short while. A probe on a dead
- * network mount never settles and pins a libuv thread, so a retry must join it, not add another.
+ * One probe per path at a time. A probe on a dead mount never settles and pins a libuv thread, so
+ * a retry during an unanswered probe gets no answer at once (the caller goes by name) and adds no
+ * reaction to it. Unanswered probes are kept apart from the bounded cache of settled answers.
  */
 export function dedupeProbe(
   probe: FolderProbe,
   now: () => number = Date.now,
   resultTtlMs = RESULT_TTL_MS,
 ): FolderProbe {
-  const entries = new Map<
-    string,
-    { readonly answer: ReturnType<FolderProbe["inspect"]>; settledAt: number | null }
-  >();
+  const unanswered = new Set<string>();
+  const settled = new Map<string, { readonly answer: FolderInspection | undefined; at: number }>();
   return {
     inspect: (path) => {
-      const known = entries.get(path);
-      if (
-        known !== undefined &&
-        (known.settledAt === null || now() - known.settledAt < resultTtlMs)
-      ) {
-        return known.answer;
+      if (unanswered.has(path)) return Promise.resolve(undefined);
+      const known = settled.get(path);
+      if (known !== undefined && now() - known.at < resultTtlMs) {
+        return Promise.resolve(known.answer);
       }
-      const entry = { answer: probe.inspect(path), settledAt: null as number | null };
-      entries.delete(path);
-      entries.set(path, entry);
-      // Map order is insertion order, so the first key is the oldest.
-      if (entries.size > MAX_CACHED_PATHS) entries.delete(entries.keys().next().value!);
-      entry.answer.then(
-        () => {
-          entry.settledAt = now();
+      unanswered.add(path);
+      return probe.inspect(path).then(
+        (answer) => {
+          unanswered.delete(path);
+          settled.delete(path);
+          settled.set(path, { answer, at: now() });
+          // Map order is insertion order, so the first key is the oldest.
+          if (settled.size > MAX_CACHED_PATHS) settled.delete(settled.keys().next().value!);
+          return answer;
         },
         () => {
-          if (entries.get(path) === entry) entries.delete(path);
+          unanswered.delete(path);
+          return undefined;
         },
       );
-      return entry.answer;
     },
   };
 }

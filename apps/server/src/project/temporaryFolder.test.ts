@@ -76,7 +76,7 @@ it.effect("resolves symlinks, and ignores a persistent TMPDIR", () =>
   }).pipe(Effect.scoped),
 );
 
-it("joins an unanswered probe for the same path and reuses a settled answer until it expires", async () => {
+it("sends a retry to the name while a probe is unanswered, and reuses a settled answer until it expires", async () => {
   let clock = 0;
   let calls = 0;
   const answers = [new Promise<never>(() => {})];
@@ -90,15 +90,30 @@ it("joins an unanswered probe for the same path and reuses a settled answer unti
     () => clock,
     1_000,
   );
-  // The first probe never settles, as on a dead mount: later calls join it, not add another.
-  probe.inspect("/mnt/dead/a");
-  probe.inspect("/mnt/dead/a");
+  // The first probe never settles, as on a dead mount: later calls get no answer, not another probe.
+  void probe.inspect("/mnt/dead/a");
+  expect(await probe.inspect("/mnt/dead/a")).toBeUndefined();
+  expect(await probe.inspect("/mnt/dead/a")).toBeUndefined();
   expect(calls).toBe(1);
-  // A different path is its own probe, and its answer is reused until the TTL passes.
-  await probe.inspect("/home/a");
+  // Another path probes on its own, and its answer is reused until the TTL passes.
+  expect(await probe.inspect("/home/a")).toEqual({ resolved: "/home/a", tmpfs: false });
   await probe.inspect("/home/a");
   expect(calls).toBe(2);
   clock = 1_001;
   await probe.inspect("/home/a");
   expect(calls).toBe(3);
+});
+
+it("keeps an unanswered probe when many other paths fill the result cache", async () => {
+  let calls = 0;
+  const probe = dedupeProbe({
+    inspect: (path) => {
+      calls += 1;
+      return path === "/mnt/dead" ? new Promise<never>(() => {}) : Promise.resolve(undefined);
+    },
+  });
+  void probe.inspect("/mnt/dead");
+  for (let index = 0; index < 300; index += 1) await probe.inspect(`/home/p${index}`);
+  expect(await probe.inspect("/mnt/dead")).toBeUndefined();
+  expect(calls).toBe(301);
 });
