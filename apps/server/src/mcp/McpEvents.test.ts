@@ -399,7 +399,9 @@ it.effect(
           threadTitle: expect.any(String),
           resultExcerpt: "é".repeat(512),
           pullRequestUrls: ["https://github.com/acme/app/pull/1"],
+          state: "failed",
         });
+        expect(body).not.toHaveProperty("stopReason");
         yield* f.call(rebuilt.setInbox({ threadId: null }));
         expect(yield* f.call(rebuilt.prepareNotify({}))).toMatchObject({
           reason: "no_pinned_inbox",
@@ -1131,6 +1133,27 @@ it("says why a cancelled run stopped, so a restart cancel does not read as a fai
     observe({ ...run, stop: { reason: "server_shutdown", actor: { kind: "server" } } }),
   ).toMatchObject({ state: "cancelled", stopReason: "server_shutdown" });
   expect(observe(run)).not.toHaveProperty("stopReason");
+  // The inbox relay says the same, so a restart cancel reads as one on that route too.
+  const relayed = (payload: Parameters<typeof observe>[0]) =>
+    Relay.relayEventState({
+      id: EventId.make("restart-event"),
+      threadId,
+      runId: run.id,
+      occurredAt: DateTime.makeUnsafe(0),
+      type: "run.updated",
+      payload,
+    });
+  expect(
+    relayed({ ...run, stop: { reason: "server_shutdown", actor: { kind: "server" } } }),
+  ).toEqual({ state: "cancelled", stopReason: "server_shutdown" });
+  expect(relayed(run)).toEqual({ state: "cancelled" });
+  expect(
+    relayed({
+      ...run,
+      status: "rolled_back",
+      stop: { reason: "server_shutdown", actor: { kind: "server" } },
+    }),
+  ).toEqual({ state: "rolled_back" });
   expect(
     observe({
       ...run,

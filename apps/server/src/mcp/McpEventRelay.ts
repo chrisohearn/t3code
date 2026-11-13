@@ -12,6 +12,7 @@ import {
   ThreadId,
   RunId,
   type McpThreadNotify,
+  type OrchestrationV2DomainEvent,
   mcpClientScopes,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -38,6 +39,30 @@ const DELIVERED_RETENTION_MS = 86400_000;
 const denied = () => new McpEventsError({ code: -32001, reason: "access_denied" });
 const storage = () => new McpEventsError({ code: -32603, reason: "storage" });
 const encode = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
+/**
+ * The relayed event's state, and why a cancelled or interrupted run stopped, as webhook event
+ * data carries them; `server_shutdown` / `server_restart` mark a restart, not a real cancel.
+ */
+export function relayEventState(event: OrchestrationV2DomainEvent): {
+  readonly state?: string;
+  readonly stopReason?: string;
+} {
+  switch (event.type) {
+    case "run.updated": {
+      const { status, stop } = event.payload;
+      return (status === "cancelled" || status === "interrupted") && stop !== undefined
+        ? { state: status, stopReason: stop.reason }
+        : { state: status };
+    }
+    case "runtime-request.updated":
+      return { state: event.payload.status };
+    case "provider-session.detached":
+      return { state: "detached" };
+    default:
+      return {};
+  }
+}
 const Modes = { runtimeMode: RuntimeMode, interactionMode: ProviderInteractionMode };
 const Pin = Schema.Struct({ inboxThreadId: ThreadId, ...Modes });
 const Binding = Schema.Struct({
@@ -302,6 +327,7 @@ const make = Effect.gen(function* () {
             threadId: binding.threadId,
             threadTitle: excerpt(records.thread.title),
             runId: runId ?? null,
+            ...relayEventState(event),
             ...(threadLevelRelease ? { boundRunId: binding.runId } : {}),
             ledgerKey: binding.ledgerKey === null ? null : excerpt(binding.ledgerKey),
             occurredAt: DateTime.formatIso(event.occurredAt),
