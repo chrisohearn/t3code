@@ -123,13 +123,18 @@ const configureAcknowledgeOnly = Effect.fn("mcp.configureAcknowledgeOnly")(funct
     readonly acknowledgeOnly?: boolean | undefined;
     readonly modelSelection?: unknown;
     readonly runtimeMode?: unknown;
+    readonly applyAt?: unknown;
   },
 ) {
   yield* McpToolAccess.requireFullAccess("change who answers a thread");
-  if (input.modelSelection !== undefined || input.runtimeMode !== undefined) {
+  if (
+    input.modelSelection !== undefined ||
+    input.runtimeMode !== undefined ||
+    input.applyAt !== undefined
+  ) {
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
-      message: "Set acknowledgeOnly separately from modelSelection and runtimeMode.",
+      message: "Set acknowledgeOnly separately from modelSelection, runtimeMode and applyAt.",
     });
   }
   const acknowledgeOnly = yield* required(input.acknowledgeOnly, "acknowledgeOnly");
