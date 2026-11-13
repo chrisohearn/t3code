@@ -1,0 +1,825 @@
+#!/bin/bash
+# t3-update-guard: keeps the T3 Code background service on the newest build that can run on
+# this machine's database, whatever installs it.
+#
+# Why: the service runs Chris's fork (chrisohearn/t3code), whose database has fork-only
+# migrations. Upstream nightly desktop apps ask for upstream server installs ("launcher speaks
+# protocol 3 ... install this exact CLI"), and an upstream `t3 service install` reports
+# "Service updated" even when the new build cannot open the database. That took the server
+# down twice on 2026-11-11.
+#
+# How:
+#   launch    systemd ExecStart (drop-in). Starts the active build only if it is a verified
+#             release from a trusted repo; otherwise restores the newest build that has run
+#             here and starts that.
+#   prove     Run ~90 s after each start. Records the active build as healthy once it serves.
+#   rollback  systemd OnFailure. If a build that never proved healthy crash-loops, go back to
+#             the newest healthy build and start it.
+#   update    Timer and `t3-service-update`. Installs the newest trusted release when no
+#             thread is running, verifies it serves, and rolls back if not.
+#   status    Show what is active, trusted, healthy and blocked.
+#   trust V   Verify version V against its release and record it as trusted.
+#
+# Every launch path ends in exec of some build: an error in this script never leaves the
+# service down where the old ExecStart would have run.
+
+set -u
+umask 022
+
+T3HOME="${T3CODE_HOME:-$HOME/.t3}"
+STATE_FILE="$T3HOME/runtime/service-state.json"
+VERSIONS="$T3HOME/runtime/versions"
+UNIT="t3code.service"
+UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT"
+GUARD_STATE="${T3_GUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/t3-update-guard}"
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/t3-update-guard/config"
+LOCK="$T3HOME/runtime/service-change.lock"
+DB="$T3HOME/userdata/statev2.sqlite"
+PORT="${T3CODE_PORT:-3773}"
+SELF="$(readlink -f "$0")"
+
+# Repos whose GitHub releases may run as the service. First one is where updates come from.
+TRUSTED_REPOS="chrisohearn/t3code"
+# Release tags that count as server builds.
+TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-(preview|nightly)\.[0-9]{8}\.[0-9]+)?$'
+PLATFORM="linux-x64"
+HEALTH_WAIT_SECONDS=180
+# shellcheck disable=SC1090
+[[ -r "$CONFIG" ]] && . "$CONFIG"
+
+mkdir -p "$GUARD_STATE/trusted" "$GUARD_STATE/healthy" "$GUARD_STATE/bad" 2>/dev/null
+
+# Bound service-manager calls: a kernel-stalled user manager must not hang the updater.
+systemctl() { timeout --kill-after=2 15 /usr/bin/systemctl "$@" 6>&- 7>&-; }
+manager_ready() { systemctl --user show-environment >/dev/null 2>&1; }
+AUTO_HOLD="$GUARD_STATE/automatic-updates-held"
+hold_updates() {
+  printf '%s %s\n' "$(date -Is)" "$*" >"$AUTO_HOLD"
+  log "automatic updates held: $*"
+  # Written to disk at once, with no lock to wait on, so it never delays the recovery start that
+  # usually follows a hold and survives a killed update. It joins the queue when cmd_update
+  # returns (dispatch) or at the next flush.
+  printf '%s %s\n' "$(date -Is)" "automatic updates held: $*" >>"$REPORTS_DEFERRED"
+  # So the "serving again" line follows, even when the build recovers inside cmd_update.
+  [[ -e "$OUTAGE" ]] && touch "$GUARD_STATE/outage-reported"
+  return 0
+}
+report_deferred() {
+  with_reports_lock _reports_adopt_deferred || log "deferred reports wait for the next flush"
+}
+
+# Failures go to Jarvis's T3 inbox, one line each. `report` only queues: nothing is sent while
+# the service lock is held or before a recovery start. The queue is flushed after `update` and
+# `prove` finish (lock released), and by `guard flush`. The inbox lives on this
+# server, so lines queued while it is down go out once a verified build serves again.
+# Set JARVIS_INBOX_THREAD in the host config; reports stay queued until it is set.
+JARVIS_INBOX_THREAD="${JARVIS_INBOX_THREAD:-}"
+REPORTS="$GUARD_STATE/pending-reports"
+REPORTS_SENDING="$GUARD_STATE/pending-reports.sending"
+REPORTS_DEFERRED="$GUARD_STATE/pending-reports.deferred"
+OUTAGE="$GUARD_STATE/outage-since"
+RECOVERIES="$GUARD_STATE/recoveries.log"
+FATAL_BREADCRUMB="$T3HOME/userdata/logs/last-fatal.json"
+REPORT_SEND_SECONDS=10
+REPORT_FLUSH_SECONDS=45   # total per flush
+REPORT_FLUSH_LINES=20     # lines per flush
+STATE_LOG_LINES=200       # pending-reports and recoveries.log keep their newest lines
+
+# Appends and the flush's take/requeue serialize on this lock; prove runs outside the service lock.
+with_reports_lock() {
+  ( flock -w 10 8 || exit 1; "$@" ) 8>>"$REPORTS.lock"
+}
+_reports_append() {
+  printf '%s %s\n' "$(date -Is)" "$1" >>"$REPORTS"
+  cap_lines "$REPORTS"
+}
+# Keep only a file's newest $STATE_LOG_LINES lines.
+cap_lines() {
+  local file="$1" tmp
+  (( $(wc -l <"$file") > STATE_LOG_LINES )) || return 0
+  tmp=$(mktemp "$file.XXXXXX") || return 0
+  if tail -n "$STATE_LOG_LINES" "$file" >"$tmp" && mv -f "$tmp" "$file"; then return 0; fi
+  rm -f "$tmp"
+}
+# Moves deferred hold lines into the queue. Lines held meanwhile land in a new deferred file.
+_reports_adopt_deferred() {
+  local taking="$REPORTS_DEFERRED.taking" pass
+  for pass in 1 2; do
+    [[ -e "$taking" ]] || mv -f "$REPORTS_DEFERRED" "$taking" 2>/dev/null || return 0
+    cat "$taking" >>"$REPORTS" && rm -f "$taking" || return 1
+  done
+  cap_lines "$REPORTS"
+}
+_reports_take() { [[ -s "$REPORTS" ]] && mv -f "$REPORTS" "$REPORTS_SENDING"; return 0; }
+# Unsent lines go back in front of anything queued meanwhile, keeping order.
+# Moves the unsent lines (now all that $REPORTS_SENDING holds) back in front of the queue. On any
+# failure they stay in $REPORTS_SENDING, which the next flush sends first: none lost or repeated.
+_reports_requeue() {
+  local tmp
+  [[ -s "$REPORTS_SENDING" ]] || { rm -f "$REPORTS_SENDING"; return 0; }
+  tmp=$(mktemp "$REPORTS.XXXXXX") || return 1
+  if cat "$REPORTS_SENDING" >"$tmp" && { [[ ! -e "$REPORTS" ]] || cat "$REPORTS" >>"$tmp"; } &&
+    mv -f "$tmp" "$REPORTS"; then
+    rm -f "$REPORTS_SENDING"
+    cap_lines "$REPORTS"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+report() {
+  with_reports_lock _reports_append "$*" || log "report not queued: $*"
+  [[ -e "$OUTAGE" ]] && touch "$GUARD_STATE/outage-reported"
+  return 0
+}
+
+# A version the flush may run: a release tag, the selected build, and verified. The serving
+# version comes from whatever answers on the port, so it is never used as a path unchecked.
+sendable_version() {
+  local v="$1"
+  [[ -n "$v" && "v$v" =~ $TAG_RE && "$v" == "$(active_version)" ]] || return 1
+  installed "$v" && is_trusted "$v"
+}
+
+# The CLI opens the database before it looks for a server, and migrates it when no server owns
+# the home. So each send holds the service lock (skipped if busy: no guard stop, restore or
+# restart can run meanwhile) and re-checks that the selected build still serves. That CLI is
+# the build that owns the database, so it has nothing to migrate. The message goes on stdin.
+send_report() {
+  local v="$1" line="$2"
+  if [[ -n "${T3_GUARD_DRY_RUN:-}" ]]; then echo "SEND $JARVIS_INBOX_THREAD $line"; return 0; fi
+  (
+    flock -n 6 || exit 75
+    # Something else can answer on the port; the unit itself must be up.
+    [[ "$(service_version)" == "$v" ]] && service_uptime >/dev/null && sendable_version "$v" ||
+      exit 75
+    printf 'T3 update guard: %s\n' "$line" |
+      timeout --kill-after=2 "$REPORT_SEND_SECONDS" "$(binary_of "$v")" thread send \
+        --base-dir "$T3HOME" "$JARVIS_INBOX_THREAD" - >/dev/null 2>&1 6>&- 7>&- 8>&- 9>&-
+  ) 6>>"$LOCK"
+}
+
+flush_reports() {
+  local v line unsent failures=0 sent=0 deadline=$((SECONDS + REPORT_FLUSH_SECONDS))
+  [[ -n "$JARVIS_INBOX_THREAD" ]] || return 0
+  [[ -s "$REPORTS" || -s "$REPORTS_SENDING" || -e "$REPORTS_DEFERRED" ]] || return 0
+  v=$(service_version)
+  # Never run an unverified build's CLI.
+  sendable_version "$v" || return 0
+  # One flusher at a time; a batch a crashed flush left behind is sent first (at least once).
+  exec 7>>"$REPORTS.flush"
+  flock -n 7 || { exec 7>&-; return 0; }
+  # Left by a flush that died mid-batch; this flusher owns the queue now.
+  rm -f "$REPORTS".unsent.*
+  # Holds an update deferred, including one that was killed before it could queue them.
+  with_reports_lock _reports_adopt_deferred || true
+  [[ -s "$REPORTS_SENDING" ]] || with_reports_lock _reports_take
+  if [[ -s "$REPORTS_SENDING" ]] && unsent=$(mktemp "$REPORTS.unsent.XXXXXX"); then
+    while IFS= read -r line; do
+      # Two failures, the line cap or the time cap end the attempt; the rest wait for the next.
+      if (( failures < 2 && sent < REPORT_FLUSH_LINES && SECONDS < deadline )) &&
+        send_report "$v" "$line"; then
+        sent=$((sent + 1))
+        continue
+      fi
+      failures=$((failures + 1))
+      printf '%s\n' "$line" >>"$unsent"
+    done <"$REPORTS_SENDING"
+    # The batch now holds only what was not sent, so a failed requeue repeats nothing.
+    if mv -f "$unsent" "$REPORTS_SENDING"; then
+      with_reports_lock _reports_requeue || log "report requeue deferred to the next flush"
+    else
+      rm -f "$unsent"
+    fi
+  fi
+  exec 7>&-
+}
+
+# The outage clock starts at the first confirmed failure only; prove stops it.
+outage_begin() {
+  [[ -e "$OUTAGE" ]] || printf '%s %s\n' "$(date +%s)" "$*" >"$OUTAGE"
+}
+
+# The server's own record of a recent fatal error: one written within LAST_FATAL_WINDOW seconds
+# before the outage began (crashes come before the start limit that starts the clock) or since.
+LAST_FATAL_WINDOW=1800
+last_fatal() {
+  local since at crashed version error
+  [[ -r "$FATAL_BREADCRUMB" ]] || return 0
+  since=$(cut -d' ' -f1 "$OUTAGE" 2>/dev/null)
+  [[ "$since" =~ ^[0-9]+$ ]] || since=$(date +%s)
+  at=$(jq -r '.at // empty' "$FATAL_BREADCRUMB" 2>/dev/null | head -c 40)
+  # The server writes ISO-8601 UTC (2026-11-13T05:00:00.123Z); date -d "" would mean midnight.
+  [[ "$at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$ ]] ||
+    return 0
+  crashed=$(date -d "$at" +%s 2>/dev/null) || return 0
+  (( crashed >= 10#$since - LAST_FATAL_WINDOW )) || return 0
+  # The server writes its package version without a leading v; accept one anyway.
+  version=$(jq -r '.version // empty' "$FATAL_BREADCRUMB" 2>/dev/null | head -c 64)
+  version="${version#v}"
+  [[ "v$version" =~ $TAG_RE ]] || version="unknown version"
+  # One short line leaves the machine. Order matters: whole long tokens first (so the path rule
+  # cannot split one and leave pieces), then known credential prefixes, URL userinfo, then paths.
+  error=$(jq -r '.error // "" | split("\n")[0]
+      | gsub("[A-Za-z0-9+/=_-]{32,}"; "<redacted>")
+      | gsub("(glpat-|gh[pousr]_|github_pat_|xox[abposr]-|sk-|AKIA|ASIA|AIza)[A-Za-z0-9_-]*"; "<redacted>")
+      | gsub("(?<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/@ ]+@"; "\(.scheme)<redacted>@")
+      | gsub("(/[A-Za-z0-9._@-]+)+"; "<path>")
+      | .[0:100]' "$FATAL_BREADCRUMB" 2>/dev/null) || return 0
+  [[ -n "$error" ]] && printf 'last fatal error (%s): %s' "$version" "$error"
+  return 0
+}
+
+# Serving again: record time to recovery, and queue a line for Jarvis when the outage was reported.
+outage_end() {
+  local v="$1" since="" reason="" secs claim="$OUTAGE.claim.$$"
+  # Claim the clock atomically: prove and update can both reach here.
+  mv -f "$OUTAGE" "$claim" 2>/dev/null || return 0
+  read -r since reason <"$claim" || true
+  rm -f "$claim"
+  [[ "$since" =~ ^[0-9]+$ ]] || { log "outage clock unreadable; time to recovery not recorded"; return 0; }
+  reason="${reason:-unknown}"
+  secs=$(( $(date +%s) - 10#$since ))
+  printf '%s %s %s %s\n' "$(date -Is)" "$v" "$secs" "$reason" >>"$RECOVERIES"
+  cap_lines "$RECOVERIES"
+  log "recovered on $v after $secs s ($reason)"
+  if [[ -e "$GUARD_STATE/outage-reported" ]]; then
+    rm -f "$GUARD_STATE/outage-reported"
+    report "serving $v again after $(( secs / 60 )) min $(( secs % 60 )) s (outage began: $reason)"
+  fi
+}
+
+log() {
+  local msg="$*"
+  printf '%s %s\n' "$(date -Is)" "$msg" >>"$GUARD_STATE/events.log" 2>/dev/null
+  printf 't3-update-guard: %s\n' "$msg" >&2
+}
+
+notify() {
+  log "$*"
+  [[ -n "${T3_GUARD_DRY_RUN:-}" ]] && return 0
+  # The whole group runs in a background subshell; it must hold none of the guard's lock fds.
+  { command -v notify-send >/dev/null 2>&1 &&
+    timeout 5 notify-send -a "T3 update guard" "T3 Code service" "$*"; } >/dev/null 2>&1 \
+    6>&- 7>&- 8>&- 9>&- &
+  return 0
+}
+
+active_version() {
+  local v=""
+  [[ -r "$STATE_FILE" ]] && v=$(jq -r '.activeVersion // empty' "$STATE_FILE" 2>/dev/null)
+  if [[ -z "$v" && -r "$UNIT_FILE" ]]; then
+    v=$(sed -n 's#^ExecStart=.*/runtime/versions/\([^/]*\)/t3 .*#\1#p' "$UNIT_FILE" | head -n1)
+  fi
+  printf '%s' "$v"
+}
+
+binary_of() { printf '%s/%s/t3' "$VERSIONS" "$1"; }
+
+installed() {
+  [[ -n "$1" && -x "$(binary_of "$1")" && -f "$VERSIONS/$1/.install-complete" ]]
+}
+
+is_trusted() {
+  local v="$1" want have
+  installed "$v" || return 1
+  [[ -f "$GUARD_STATE/trusted/$v.sha256" ]] || return 1
+  want=$(cut -d' ' -f1 "$GUARD_STATE/trusted/$v.sha256")
+  have=$(sha256sum "$(binary_of "$v")" 6>&- 7>&- | cut -d' ' -f1)
+  [[ -n "$want" && "$want" == "$have" ]]
+}
+
+is_bad() { [[ -f "$GUARD_STATE/bad/$1" ]]; }
+is_healthy() { [[ -f "$GUARD_STATE/healthy/$1.json" ]]; }
+
+# Download a release's archive and checksum list from a trusted repo, check the archive, and
+# print the sha256 of the t3 binary inside it. Tries each trusted repo in order.
+release_binary_sha() {
+  local v="$1" repo tmp base archive sum ok=1
+  archive="t3-$v-$PLATFORM.tar.gz"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/t3-guard.XXXXXX") || return 1
+  for repo in $TRUSTED_REPOS; do
+    base="https://github.com/$repo/releases/download/v$v"
+    if curl -fsSL --max-time 30 -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" &&
+      curl -fsSL --max-time 600 -o "$tmp/$archive" "$base/$archive"; then
+      sum=$(awk -v f="$archive" '$2 == f || $2 == "*" f {print $1}' "$tmp/SHA256SUMS")
+      if [[ -n "$sum" ]] && [[ "$(sha256sum "$tmp/$archive" | cut -d' ' -f1)" == "$sum" ]]; then
+        tar xzOf "$tmp/$archive" "t3-$v-$PLATFORM/t3" 2>/dev/null | sha256sum | cut -d' ' -f1
+        ok=0
+        printf '%s' "$repo" >"$tmp/repo"
+        break
+      fi
+      log "checksum mismatch for $archive from $repo"
+    fi
+  done
+  rm -rf "$tmp"
+  return $ok
+}
+
+# Verify an installed version against its release and record it as trusted.
+trust() {
+  local v="$1" sha have
+  installed "$v" || { log "trust $v: not installed"; return 1; }
+  is_trusted "$v" && return 0
+  sha=$(release_binary_sha "$v") || { log "trust $v: no matching release in $TRUSTED_REPOS"; return 1; }
+  have=$(sha256sum "$(binary_of "$v")" 6>&- 7>&- | cut -d' ' -f1)
+  if [[ "$sha" != "$have" ]]; then
+    log "trust $v: installed binary does not match the release (want $sha, have $have)"
+    return 1
+  fi
+  printf '%s  %s\n' "$sha" "$v" >"$GUARD_STATE/trusted/$v.sha256"
+  log "trusted $v"
+}
+
+# Whether build $1 says it can run on the current database. A release can migrate the
+# database one way (e.g. the fork's migration-namespace repair), after which older builds
+# refuse it; never fall back to one of those. Unknown answers count as yes.
+can_open() {
+  local v="$1" proto out status
+  proto=$(jq -r '.protocol // 3' "$GUARD_STATE/healthy/$v.json" 2>/dev/null)
+  [[ "$proto" =~ ^[0-9]+$ ]] || proto=$(jq -r '.protocol // 3' "$STATE_FILE" 2>/dev/null)
+  [[ "$proto" =~ ^[0-9]+$ ]] || proto=3
+  out=$(timeout 120 "$(binary_of "$v")" __service-preflight --database-path "$DB" \
+    --launcher-protocol "$proto" 2>/dev/null | tail -n1)
+  status=$(jq -r '.status // empty' <<<"$out" 2>/dev/null)
+  # The guard runs each build's own launcher, so a launcher-protocol refusal does not apply.
+  if [[ "$status" == "blocked" ]] && ! jq -re '.reason | startswith("The installed service launcher speaks protocol")' <<<"$out" >/dev/null 2>&1; then
+    log "preflight: $v cannot run on this database: $(jq -r '.reason // ""' <<<"$out" | cut -c1-240)"
+    return 1
+  fi
+  return 0
+}
+
+# Newest version that has served here, is installed, trusted, not excluded, and can open the
+# current database.
+newest_healthy_except() {
+  local skip="$1" f v
+  for v in $(for f in "$GUARD_STATE"/healthy/*.json; do
+    [[ -e "$f" ]] && basename "$f" .json
+  done | sort -rV); do
+    [[ "$v" == "$skip" ]] && continue
+    is_bad "$v" && continue
+    is_trusted "$v" || continue
+    can_open "$v" || continue
+    printf '%s\n' "$v"
+    return 0
+  done
+}
+
+write_state_for() {
+  local v="$1" tmp
+  tmp=$(mktemp "$STATE_FILE.guard.XXXXXX") || return 1
+  if is_healthy "$v"; then
+    jq --arg v "$v" '.activeVersion = $v | del(.update)' "$GUARD_STATE/healthy/$v.json" >"$tmp"
+  else
+    jq --arg v "$v" '.activeVersion = $v | del(.update)' "$STATE_FILE" >"$tmp"
+  fi && mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+exec_launcher() {
+  local v="$1"
+  if [[ -n "${T3_GUARD_DRY_RUN:-}" ]]; then
+    echo "EXEC $(binary_of "$v") __service-launcher"
+    exit 0
+  fi
+  exec "$(binary_of "$v")" __service-launcher
+}
+
+cmd_launch() {
+  local v fallback
+  v=$(active_version)
+  if [[ -z "$v" ]]; then
+    log "launch: no active version recorded"
+    fallback=$(newest_healthy_except "")
+    [[ -n "$fallback" ]] && { write_state_for "$fallback"; exec_launcher "$fallback"; }
+    exit 1
+  fi
+
+  if installed "$v" && ! is_bad "$v" && { is_trusted "$v" || trust "$v"; }; then
+    can_open "$v" && exec_launcher "$v"
+    fallback=$(newest_healthy_except "$v")
+    if [[ -n "$fallback" ]] && write_state_for "$fallback"; then
+      notify "$v refused this database at preflight. Started $fallback instead."
+      exec_launcher "$fallback"
+    fi
+    exec_launcher "$v"
+  fi
+
+  fallback=$(newest_healthy_except "$v")
+  if [[ -n "$fallback" ]]; then
+    local why="not a verified release from $TRUSTED_REPOS"
+    installed "$v" || why="not installed"
+    is_bad "$v" && why="marked failed earlier"
+    if write_state_for "$fallback"; then
+      notify "Blocked $v ($why). Started $fallback instead. Fix: t3-service-update"
+      exec_launcher "$fallback"
+    fi
+    log "launch: could not write service state for $fallback"
+  else
+    log "launch: $v is unverified and no healthy build is recorded; starting it anyway"
+  fi
+  installed "$v" && exec_launcher "$v"
+  exit 1
+}
+
+# Change the service; dry runs only print.
+svc() {
+  if [[ -n "${T3_GUARD_DRY_RUN:-}" ]]; then echo "SYSTEMCTL $*"; return 0; fi
+  systemctl --user "$@"
+}
+
+service_version() {
+  curl -fsS --max-time 5 "http://127.0.0.1:$PORT/.well-known/t3/environment" 2>/dev/null 6>&- 7>&- |
+    jq -r '.serverVersion // empty' 2>/dev/null
+}
+
+# Seconds the service's main process has been up, or empty.
+service_uptime() {
+  local ts now
+  ts=$(systemctl --user show -p ActiveEnterTimestampMonotonic --value "$UNIT" 2>/dev/null)
+  [[ "$(systemctl --user is-active "$UNIT" 2>/dev/null)" == "active" && "${ts:-0}" != "0" ]] || return 1
+  now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+  echo $(((now - ts) / 1000000))
+}
+
+record_healthy() {
+  local v="$1"
+  cp -f "$STATE_FILE" "$GUARD_STATE/healthy/$v.json"
+  rm -f "$GUARD_STATE/bad/$v"
+  log "healthy $v"
+}
+
+# Once the service has served the active version for a minute, record it as healthy.
+cmd_prove() {
+  local v up i
+  for i in $(seq 1 20); do
+    v=$(active_version)
+    up=$(service_uptime) || up=0
+    if (( up >= 60 )) && [[ "$(service_version)" == "$v" ]]; then
+      is_trusted "$v" || trust "$v" || { log "prove: $v serves but is unverified"; return 1; }
+      is_healthy "$v" || record_healthy "$v"
+      cp -f "$STATE_FILE" "$GUARD_STATE/healthy/$v.json"
+      outage_end "$v"
+      return 0
+    fi
+    sleep 15
+  done
+  log "prove: $v did not serve within 5 minutes"
+  outage_begin "$v did not serve after a start"
+  report "$v did not serve within 5 minutes of a start. $(last_fatal)"
+  return 1
+}
+
+# ExecStartPost: schedule prove without holding up the start.
+cmd_prove_later() {
+  [[ -n "${T3_GUARD_DRY_RUN:-}" ]] && return 0
+  systemd-run --user --collect --quiet --on-active=75 \
+    --unit="t3-update-guard-prove-$(date +%s)" "$SELF" prove >/dev/null 2>&1 || true
+  return 0
+}
+
+restart_on() {
+  local v="$1"
+  write_state_for "$v" || return 1
+  svc reset-failed "$UNIT" 2>/dev/null
+  svc restart --no-block "$UNIT"
+}
+
+# OnFailure: the unit hit its start limit.
+cmd_rollback() {
+  exec 9>>"$LOCK"
+  flock -w 120 9 || { log "rollback: lock busy; no state changes made"; return 1; }
+  local v fallback last now
+  v=$(active_version)
+  now=$(date +%s)
+  last=$(cat "$GUARD_STATE/last-rollback" 2>/dev/null || echo 0)
+  if (( now - last < 600 )); then
+    notify "T3 service failed again within 10 minutes of a rollback; leaving it for a person. Check: journalctl --user -u $UNIT"
+    outage_begin "$v failed again after a rollback"
+    report "$v failed again within 10 minutes of a rollback; the guard is leaving it for a person. Check: journalctl --user -u $UNIT. $(last_fatal)"
+    return 1
+  fi
+  echo "$now" >"$GUARD_STATE/last-rollback"
+  # OnFailure runs after the start limit is hit, so the service is confirmed down. The report is
+  # queued after each restart request below, so it never delays one.
+  outage_begin "$v hit its start limit"
+  local note="$v hit its start limit (crash loop)."
+  if is_healthy "$v" && ! is_bad "$v"; then
+    notify "T3 service ($v) failed to start; it ran fine here before, so retrying it once."
+    [[ -n "${T3_GUARD_DRY_RUN:-}" ]] || sleep 20
+    svc reset-failed "$UNIT"
+    svc start --no-block "$UNIT"
+    report "$note Retrying it once; it ran here before. $(last_fatal)"
+    return 0
+  fi
+  date -Is >"$GUARD_STATE/bad/$v"
+  fallback=$(newest_healthy_except "$v")
+  if [[ -z "$fallback" ]]; then
+    rm -f "$GUARD_STATE/bad/$v"
+    notify "T3 service ($v) is failing and no other build can run on this database, so it was not rolled back. Retrying $v once. Check: journalctl --user -u $UNIT"
+    [[ -n "${T3_GUARD_DRY_RUN:-}" ]] || sleep 20
+    svc reset-failed "$UNIT"
+    svc start --no-block "$UNIT"
+    report "$note No other build can open this database; retrying it once. $(last_fatal)"
+    return 1
+  fi
+  if restart_on "$fallback"; then
+    notify "T3 $v failed to start. Restart on $fallback requested; awaiting health verification."
+    report "$note Rolling back to $fallback. $(last_fatal)"
+  else
+    notify "T3 $v failed to start and restart on $fallback failed; manual recovery required."
+    report "$note Restart on $fallback failed; manual recovery required. $(last_fatal)"
+    return 1
+  fi
+}
+
+latest_release() {
+  local repo="${TRUSTED_REPOS%% *}"
+  {
+    curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/$repo/releases?per_page=50" 2>/dev/null ||
+      gh api "repos/$repo/releases?per_page=50" 2>/dev/null
+  } | jq -r --arg plat "$PLATFORM" '.[] | select(.draft | not)
+        | select(any(.assets[]; .name == "SHA256SUMS"))
+        | select(any(.assets[]; .name | endswith("-" + $plat + ".tar.gz")))
+        | .tag_name' 2>/dev/null |
+    grep -E "$TAG_RE" | sed 's/^v//' | sort -V | tail -n1
+}
+
+active_runs() {
+  timeout 10 sqlite3 -readonly "$DB" \
+    "select count(*) from orchestration_v2_projection_runs where status in ('running','starting','waiting');" 2>/dev/null
+}
+
+# Seconds since the last thread run finished or was requested. Deploys wait for a quiet
+# period so a restart does not land between turns of an active session (Chris, 2026-11-11).
+IDLE_QUIET_SECONDS="${IDLE_QUIET_SECONDS:-900}"
+MAX_DEFER_SECONDS="${MAX_DEFER_SECONDS:-10800}"   # 3 h; see cmd_update
+quiet_seconds() {
+  timeout 10 sqlite3 -readonly "$DB" \
+    "select cast((julianday('now') - julianday(max(max(coalesce(completed_at,'')), max(requested_at)))) * 86400 as int) from orchestration_v2_projection_runs;" 2>/dev/null
+}
+
+SNAPSHOTS="$T3HOME/runtime/guard-db-snapshots"
+
+# Copy-on-write snapshot of the databases (btrfs reflink: instant, shares blocks). The service
+# must be stopped so the copy is consistent. Prints the snapshot directory.
+snapshot_db() {
+  local label="$1" dir f
+  dir="$SNAPSHOTS/$(date +%Y%m%dT%H%M%S)-$label"
+  mkdir -p "$dir" || return 1
+  for f in "$T3HOME"/userdata/*.sqlite "$T3HOME"/userdata/*.sqlite-wal "$T3HOME"/userdata/*.sqlite-shm; do
+    [[ -e "$f" ]] || continue
+    cp --reflink=always -p "$f" "$dir/" || { rm -rf "$dir"; return 1; }
+  done
+  # Keep the newest three.
+  ls -1d "$SNAPSHOTS"/2* 2>/dev/null | sort | head -n -3 | xargs -r rm -rf
+  printf '%s' "$dir"
+}
+
+# Put a snapshot back. The current files move aside, never deleted. Service must be stopped.
+restore_db() {
+  local dir="$1" aside f
+  aside="$SNAPSHOTS/replaced-$(date +%Y%m%dT%H%M%S)"
+  mkdir -p "$aside" || return 1
+  for f in "$T3HOME"/userdata/*.sqlite "$T3HOME"/userdata/*.sqlite-wal "$T3HOME"/userdata/*.sqlite-shm; do
+    [[ -e "$f" ]] && mv -f "$f" "$aside/"
+  done
+  for f in "$dir"/*; do
+    cp --reflink=always -p "$f" "$T3HOME/userdata/" || return 1
+  done
+  log "restored databases from $dir; replaced files kept in $aside"
+}
+
+wait_inactive() {
+  local state rc deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
+    state=$(systemctl --user is-active "$UNIT" 2>/dev/null); rc=$?
+    [[ "$state" =~ ^(inactive|failed)$ ]] && return 0
+    # Timeout / unavailable manager: do not spend minutes repeating a stuck request.
+    (( rc == 124 || rc == 137 )) && return 1
+    [[ -z "$state" ]] && return 1
+    sleep 1
+  done
+  return 1
+}
+
+# Install the newest trusted release (or $1), verify it serves, roll back if not.
+cmd_update() {
+  local now_flag="" target="" cur latest runs sha
+  while (( $# )); do
+    case "$1" in
+      --now) now_flag=1 ;;
+      -*) echo "usage: t3-service-update [--now] [version]" >&2; return 2 ;;
+      *) target="$1" ;;
+    esac
+    shift
+  done
+  # Keep a failed update from repeatedly disrupting a recovered server. Explicit manual
+  # version / --now calls remain possible, but still require a responsive manager.
+  if [[ -z "$target$now_flag" && -f "$AUTO_HOLD" ]]; then
+    echo "Automatic updates held: $(cat "$AUTO_HOLD"). Review before a manual update."
+    return 0
+  fi
+  if ! manager_ready; then
+    hold_updates "user service manager unavailable; no service stop or install attempted"
+    return 1
+  fi
+  cur=$(active_version)
+  # Never run an unverified build's CLI; compare and roll back against a verified one.
+  if ! is_trusted "$cur" && ! trust "$cur"; then
+    local good
+    good=$(newest_healthy_except "$cur")
+    [[ -n "$good" ]] || { log "update: active $cur is unverified and no healthy build is recorded"; return 1; }
+    log "update: active $cur is unverified; using $good"
+    cur="$good"
+  fi
+  latest=${target:-$(latest_release)}
+  [[ -n "$latest" ]] || { log "update: could not read releases"; return 1; }
+  if [[ -z "$target" && "$cur" == "$(active_version)" ]] &&
+    [[ "$(printf '%s\n%s\n' "$cur" "$latest" | sort -V | tail -n1)" == "$cur" ]]; then
+    rm -f "$GUARD_STATE/deferred" "$GUARD_STATE/deferred-since"
+    if [[ "$(service_version)" != "$cur" ]]; then
+      hold_updates "selected newest build $cur is not serving; recovery required"
+      log "update: refusing to report success for an unhealthy selected build"
+      return 1
+    fi
+    echo "T3 service is on the newest release ($cur) and serving."
+    return 0
+  fi
+  if [[ "$latest" == "$cur" ]]; then
+    if [[ "$(active_version)" == "$cur" ]]; then
+      if [[ "$(service_version)" == "$cur" ]]; then echo "Already on $cur and serving."; return 0; fi
+      hold_updates "selected build $cur is not serving; recovery required"
+      return 1
+    fi
+    exec 9>>"$LOCK"
+    flock -n 9 || { echo "Another service change holds $LOCK." >&2; return 1; }
+    if [[ "$(service_version)" == "$cur" ]]; then
+      # Still serving the verified build; only the recorded selection was changed.
+      write_state_for "$cur" && notify "Reset the T3 service selection to $cur; an unverified build had been selected."
+    else
+      restart_on "$cur" && notify "Switched the T3 service back to $cur from an unverified build."
+    fi
+    return
+  fi
+  if is_bad "$latest" && [[ -z "$target" ]]; then
+    log "update: $latest failed here before; skipping (run t3-service-update $latest to retry)"
+    return 0
+  fi
+  if [[ -z "$now_flag" ]]; then
+    local quiet why=""
+    runs=$(active_runs)
+    quiet=$(quiet_seconds)
+    if [[ "$runs" != "0" ]]; then
+      why="${runs:-unknown} running thread(s)"
+    elif ! [[ "$quiet" =~ ^[0-9]+$ ]] || (( quiet < IDLE_QUIET_SECONDS )); then
+      why="last thread activity ${quiet:-unknown} s ago; waiting for $IDLE_QUIET_SECONDS s of quiet"
+    fi
+    # Max wait (Chris, 2026-11-12): agent-to-agent threads keep some run active nearly all
+    # day, so the idle rule alone starved deploys for 7+ hours. Once an update has waited
+    # MAX_DEFER_SECONDS since its first deferral, deploy anyway; threads resume after restart.
+    if [[ -n "$why" ]]; then
+      [[ -e "$GUARD_STATE/deferred-since" ]] || touch "$GUARD_STATE/deferred-since"
+      local waited=$(( $(date +%s) - $(stat -c %Y "$GUARD_STATE/deferred-since") ))
+      if (( waited >= MAX_DEFER_SECONDS )); then
+        log "update: $latest waited $(( waited / 60 )) min ($why); max wait reached, deploying anyway"
+        why=""
+      fi
+    fi
+    if [[ -n "$why" ]]; then
+      # Log each deferral reason once per version, not every timer tick.
+      if [[ "$(cat "$GUARD_STATE/deferred" 2>/dev/null)" != "$latest" ]]; then
+        log "update: $latest available; deferred ($why)"
+        echo "$latest" >"$GUARD_STATE/deferred"
+      fi
+      echo "Deferred: $why. Use --now to restart anyway."
+      return 0
+    fi
+    rm -f "$GUARD_STATE/deferred" "$GUARD_STATE/deferred-since"
+  fi
+
+  exec 9>>"$LOCK"
+  flock -n 9 || { echo "Another service change holds $LOCK." >&2; return 1; }
+  rm -f "$GUARD_STATE/deferred" "$GUARD_STATE/deferred-since"
+
+  is_healthy "$cur" || { is_trusted "$cur" && [[ "$(service_version)" == "$cur" ]] && record_healthy "$cur"; }
+  sha=$(release_binary_sha "$latest") || { log "update: $latest is not a verified release in $TRUSTED_REPOS"; return 1; }
+  printf '%s  %s\n' "$sha" "$latest" >"$GUARD_STATE/trusted/$latest.sha256"
+  rm -f "$GUARD_STATE/bad/$latest"
+
+  log "update: $cur -> $latest"
+  if [[ -n "${T3_GUARD_DRY_RUN:-}" ]]; then echo "RUN $(binary_of "$cur") update $latest --yes"; return 0; fi
+  local snap="" t0
+  if ! svc stop --no-block "$UNIT"; then
+    hold_updates "could not confirm stop request for $UNIT; install aborted"
+    manager_ready && svc start --no-block "$UNIT"
+    return 1
+  fi
+  if wait_inactive; then
+    outage_begin "update $cur -> $latest"
+    t0=$(date +%s)
+    if ! snap=$(snapshot_db "before-$latest"); then
+      log "update: database snapshot failed; aborting update and restarting $cur"
+      restart_on "$cur"
+      return 1
+    fi
+    log "snapshot $snap ($(( $(date +%s) - t0 )) s)"
+  else
+    hold_updates "service did not stop within 120 s; aborting update"
+    manager_ready && svc start --no-block "$UNIT"
+    return 1
+  fi
+  if ! T3CODE_RELEASE_BASE_URL="https://github.com/${TRUSTED_REPOS%% *}/releases/download" \
+    timeout 900 "$(binary_of "$cur")" update "$latest" --yes --allow-downgrade </dev/null; then
+    hold_updates "t3 update $latest exited with an error; verify recovery before further automatic upgrades"
+  fi
+  if ! manager_ready; then
+    hold_updates "user manager became unavailable during update to $latest; recovery required"
+    return 1
+  fi
+  if ! installed "$latest" || ! is_trusted "$latest"; then
+    hold_updates "update to $latest did not install a verified build; restoring $cur"
+    # The service was stopped before installation even when activeVersion never changed.
+    restart_on "$cur" || log "update: failed to restart $cur; manual recovery required"
+    return 1
+  fi
+  [[ "$(active_version)" == "$latest" ]] || { write_state_for "$latest" && svc restart "$UNIT"; }
+  [[ "$(systemctl --user is-active "$UNIT" 2>/dev/null)" =~ ^(active|activating)$ ]] || {
+    svc reset-failed "$UNIT" 2>/dev/null; svc start --no-block "$UNIT"; }
+
+  local up deadline=$((SECONDS + HEALTH_WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
+    sleep 10
+    up=$(service_uptime) || up=0
+    if (( up >= 60 )) && [[ "$(service_version)" == "$latest" ]]; then
+      record_healthy "$latest"
+      outage_end "$latest"
+      notify "T3 service updated to $latest and serving."
+      return 0
+    fi
+  done
+  date -Is >"$GUARD_STATE/bad/$latest"
+  # Reported once the rollback has decided (below), so the report never delays a stop or restart.
+  local outcome
+  if ! svc stop --no-block "$UNIT" || ! wait_inactive; then
+    hold_updates "failed to confirm service stopped for rollback; databases left untouched"
+    manager_ready && svc start --no-block "$UNIT"
+    return 1
+  fi
+  if can_open "$cur"; then
+    if restart_on "$cur"; then
+      notify "T3 $latest did not serve within $HEALTH_WAIT_SECONDS seconds. Restart on $cur requested; awaiting health verification."
+      outcome="restart on $cur requested"
+    else
+      notify "T3 $latest failed health checks and restart on $cur failed; manual recovery required."
+      outcome="restart on $cur failed; manual recovery required"
+    fi
+  elif [[ -n "$snap" ]] && restore_db "$snap"; then
+    if restart_on "$cur"; then
+      notify "T3 $latest failed health checks after migration. Pre-update snapshot restored; restart on $cur requested, awaiting health verification."
+      outcome="pre-update snapshot restored; restart on $cur requested"
+    else
+      notify "Pre-update snapshot restored, but restart on $cur failed; manual recovery required."
+      outcome="pre-update snapshot restored, but restart on $cur failed; manual recovery required"
+    fi
+  else
+    rm -f "$GUARD_STATE/bad/$latest"
+    svc reset-failed "$UNIT" 2>/dev/null
+    svc start --no-block "$UNIT"
+    notify "T3 $latest did not serve within $HEALTH_WAIT_SECONDS seconds, and $cur cannot run on the migrated database (no snapshot). Left on $latest. Check: journalctl --user -u $UNIT"
+    outcome="$cur cannot run on the migrated database and no snapshot exists; left on $latest"
+  fi
+  report "$latest did not serve within $HEALTH_WAIT_SECONDS s of its install: $outcome. $(last_fatal)"
+  return 1
+}
+
+cmd_status() {
+  local v f
+  v=$(active_version)
+  echo "active:   $v (serving: $(service_version || true))"
+  echo "latest:   $(latest_release || true)"
+  echo "trusted repos: $TRUSTED_REPOS"
+  for f in "$VERSIONS"/*/; do
+    f=$(basename "$f")
+    printf '  %-34s %s%s%s\n' "$f" \
+      "$(is_trusted "$f" && echo trusted || echo UNVERIFIED)" \
+      "$(is_healthy "$f" && echo ', healthy')" \
+      "$(is_bad "$f" && echo ', FAILED')"
+  done
+  echo "recent events:"
+  tail -n 8 "$GUARD_STATE/events.log" 2>/dev/null | sed 's/^/  /'
+}
+
+case "${1:-}" in
+  launch) cmd_launch ;;
+  prove) cmd_prove; rc=$?; flush_reports; exit $rc ;;
+  prove-later) cmd_prove_later ;;
+  rollback) cmd_rollback ;;
+  update) shift; cmd_update "$@"; rc=$?; exec 9>&-; report_deferred; flush_reports; exit $rc ;;
+  flush) flush_reports ;;
+  status) cmd_status ;;
+  trust) trust "${2:?version}" ;;
+  *) echo "usage: guard {launch|prove|prove-later|rollback|update [--now] [version]|status|trust <version>|flush}" >&2; exit 2 ;;
+esac

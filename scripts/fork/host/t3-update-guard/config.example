@@ -1,0 +1,7 @@
+# t3-update-guard settings (sourced by ~/.local/libexec/t3-update-guard/guard).
+# GitHub repos whose releases may run as the T3 background service. Updates come from the
+# first. Add pingdotgg/t3code only once this database can run upstream builds (no fork-only
+# migrations), or the guard will allow builds that crash on start.
+TRUSTED_REPOS="chrisohearn/t3code"
+# Jarvis's T3 inbox thread id, where the guard sends one-line reports.
+# JARVIS_INBOX_THREAD="mcp:launch:<inbox id>"

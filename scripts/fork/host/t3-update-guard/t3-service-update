@@ -1,0 +1,10 @@
+#!/bin/sh
+# The supported way to change the T3 Code background service on this machine.
+# Installs the newest verified fork release (or the version given), checks that it serves,
+# and rolls back if it does not. Waits for running threads unless --now is given.
+#   t3-service-update [--now] [version]
+#   t3-service-update status
+case "${1:-}" in
+  status) exec "$HOME/.local/libexec/t3-update-guard/guard" status ;;
+esac
+exec "$HOME/.local/libexec/t3-update-guard/guard" update "$@"
