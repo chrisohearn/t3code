@@ -9,13 +9,13 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
-import * as Stream from "effect/Stream";
+import * as Scope from "effect/Scope";
 
 export class ProviderCooldown extends Context.Service<
   ProviderCooldown,
   {
     readonly getAll: Effect.Effect<ReadonlyMap<ProviderInstanceId, string>>;
-    readonly changes: Stream.Stream<void>;
+    readonly subscribeChanges: Effect.Effect<PubSub.Subscription<void>, never, Scope.Scope>;
     readonly observe: (
       instanceId: ProviderInstanceId,
       terminal: {
@@ -55,7 +55,7 @@ const make = Effect.gen(function* () {
   });
   return {
     getAll,
-    changes: Stream.fromPubSub(changes),
+    subscribeChanges: PubSub.subscribe(changes),
     observe: Effect.fn("ProviderCooldown.observe")(function* (instanceId, terminal) {
       if (terminal.status === "completed") return yield* clear(instanceId);
       const failure = terminal.failure;

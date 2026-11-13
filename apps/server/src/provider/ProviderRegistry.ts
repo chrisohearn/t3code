@@ -1176,6 +1176,15 @@ export const layer = Layer.effect(
       return ProviderCooldown.withProviderCooldowns(providers, yield* cooldown.getAll);
     });
     const getProviders = Ref.get(providersRef).pipe(Effect.flatMap(withCooldowns));
+    const cooldownUpdates = yield* cooldown.subscribeChanges;
+    yield* Stream.fromSubscription(cooldownUpdates).pipe(
+      Stream.runForEach(() =>
+        Ref.get(providersRef).pipe(
+          Effect.flatMap((providers) => PubSub.publish(changesPubSub, providers)),
+        ),
+      ),
+      Effect.forkIn(serviceScope),
+    );
     return {
       getProviders,
       refresh: (provider?: ProviderDriverKind) =>
@@ -1208,10 +1217,7 @@ export const layer = Layer.effect(
       getProviderMaintenanceCapabilitiesForInstance,
       setProviderMaintenanceActionState,
       get streamChanges() {
-        return Stream.merge(
-          Stream.fromPubSub(changesPubSub).pipe(Stream.mapEffect(withCooldowns)),
-          cooldown.changes.pipe(Stream.mapEffect(() => getProviders)),
-        );
+        return Stream.fromPubSub(changesPubSub).pipe(Stream.mapEffect(withCooldowns));
       },
     } satisfies ProviderRegistry["Service"];
   }),
