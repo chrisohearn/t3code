@@ -7,6 +7,10 @@ import * as Schema from "effect/Schema";
 
 import { CRASH_BREADCRUMB_FILE, CrashBreadcrumb, recordFatalExit } from "./crashBreadcrumb.ts";
 
+class MigrationError extends Schema.TaggedError<MigrationError>()("MigrationError", {
+  message: Schema.String,
+}) {}
+
 const decode = Schema.decodeUnknownEffect(Schema.fromJsonString(CrashBreadcrumb));
 
 it.effect("records a fatal error, and a normal stop by interruption leaves it in place", () =>
@@ -17,13 +21,14 @@ it.effect("records a fatal error, and a normal stop by interruption leaves it in
     const record = recordFatalExit({ logsDir, version: "0.1.10-test" });
     const breadcrumb = path.join(logsDir, CRASH_BREADCRUMB_FILE);
 
-    yield* Effect.fail(new Error("MigrationError: 81_ProjectionMessageSearchText")).pipe(
+    yield* Effect.fail(new MigrationError({ message: "81_ProjectionMessageSearchText" })).pipe(
       record,
       Effect.ignore,
     );
     const written = yield* decode(yield* fs.readFileString(breadcrumb));
     assert.equal(written.version, "0.1.10-test");
-    assert.include(written.error, "MigrationError: 81_ProjectionMessageSearchText");
+    assert.include(written.error, "MigrationError");
+    assert.include(written.error, "81_ProjectionMessageSearchText");
 
     yield* Effect.interrupt.pipe(record, Effect.exit);
     assert.deepEqual(yield* decode(yield* fs.readFileString(breadcrumb)), written);

@@ -2,7 +2,6 @@ import { assert, it } from "@effect/vitest";
 import {
   EventId,
   MessageId,
-  type OrchestrationV2Command,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2Run,
   type OrchestrationV2RunStop,
@@ -48,7 +47,7 @@ const notices = (
   message: Partial<OrchestrationV2ConversationMessage> = {},
 ) =>
   Effect.gen(function* () {
-    const dispatched: Array<OrchestrationV2Command> = [];
+    const dispatched: Array<Parameters<Orchestrator.OrchestratorV2["Service"]["dispatch"]>[0]> = [];
     const layer = QueuedSendCancelNotice.layer.pipe(
       Layer.provide(
         Layer.mergeAll(
