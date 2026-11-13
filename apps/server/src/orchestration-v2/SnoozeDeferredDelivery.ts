@@ -65,7 +65,7 @@ export const readSnoozeDeferredThreads = Effect.fn("SnoozeDeferredDelivery.read"
 export class SnoozeDeferredStore extends Context.Service<
   SnoozeDeferredStore,
   { readonly read: Effect.Effect<ReadonlyArray<SnoozeDeferredThread>> }
->()("t3/orchestration-v2/SnoozeDeferredStore") {}
+>()("t3/orchestration-v2/SnoozeDeferredDelivery/SnoozeDeferredStore") {}
 
 const layerStore = Layer.effect(
   SnoozeDeferredStore,

@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { OrchestrationV2Command, OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -42,7 +42,7 @@ it.effect("resumes a held turn when its snooze ends or the thread is woken, once
   Effect.gen(function* () {
     yield* TestClock.setTime(startMs);
     const rows = yield* Ref.make([deferred("snoozed", "2026-11-13T03:01:00.000Z")]);
-    const released = yield* Queue.unbounded<OrchestrationV2Command>();
+    const released = yield* Queue.unbounded<Readonly<Record<string, string>>>();
     const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
     const layer = SnoozeDeferredDelivery.layerWorker.pipe(
       Layer.provide(
@@ -53,13 +53,15 @@ it.effect("resumes a held turn when its snooze ends or the thread is woken, once
           }),
           Layer.mock(ThreadManagement.ThreadManagementService)({
             // A release clears the turn's deferral, so the store stops listing it.
-            dispatch: (command) =>
-              Ref.update(rows, (current) =>
-                current.filter((row) => row.threadId !== command.threadId),
+            dispatch: (command) => {
+              const resumed = command as unknown as Readonly<Record<string, string>>;
+              return Ref.update(rows, (current) =>
+                current.filter((row) => row.threadId !== resumed["threadId"]),
               ).pipe(
-                Effect.andThen(Queue.offer(released, command)),
+                Effect.andThen(Queue.offer(released, resumed)),
                 Effect.as({ sequence: 1, storedEvents: [] }),
-              ),
+              );
+            },
           }),
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.fromQueue(events),
@@ -73,12 +75,12 @@ it.effect("resumes a held turn when its snooze ends or the thread is woken, once
         type: "queue.resume",
         commandId: "snooze-deferred-release:run:snoozed",
         threadId: "snoozed",
-      } as never);
+      });
 
       yield* Ref.set(rows, [deferred("woken", null)]);
       yield* Queue.offer(events, { type: "thread.unsnoozed" } as never);
       yield* TestClock.adjust("5 seconds");
-      assert.equal((yield* Queue.take(released)).threadId, "woken");
+      assert.equal((yield* Queue.take(released))["threadId"], "woken");
 
       yield* TestClock.adjust("10 minutes");
       assert.equal(yield* Queue.size(released), 0);
