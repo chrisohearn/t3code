@@ -209,11 +209,13 @@ const threadConfiguration = Schema.Struct({
   ),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  // Optional: a linked environment on another build does not report it.
+  acknowledgeOnly: Schema.optional(Schema.Boolean),
 });
 const ThreadConfigureTool = Tool.make("t3_thread_configure", {
   ...commandTool,
   description:
-    "Read a thread's provider, model, and modes, or set its provider, model, and options with `modelSelection`. Omit `threadId` for this thread. Set `runtimeMode` alone to lower permissions on an idle thread; raises and active runs are refused. Values from `orchestrator_capabilities`.",
+    "Read a thread's provider, model, and modes, or set its provider, model, and options with `modelSelection`. Omit `threadId` for this thread. Set `runtimeMode` alone to lower permissions on an idle thread; raises and active runs are refused. Values from `orchestrator_capabilities`. Full access: `acknowledgeOnly` alone makes the server, not the agent, acknowledge each message.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
@@ -224,6 +226,7 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
       }),
     ),
     runtimeMode: Schema.optional(RuntimeMode),
+    acknowledgeOnly: Schema.optional(Schema.Boolean),
   }),
   // The scheduled result goes before the plain one, which would match it and drop its fields.
   success: Schema.Union([

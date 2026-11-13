@@ -17,6 +17,7 @@ import { OrchestratorRuntimeModeAboveCeilingError } from "../orchestration-v2/Or
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "../orchestration-v2/ThreadMessageIntake.ts";
 import * as Claims from "../orchestration-v2/AttachmentClaims.ts";
+import { temporaryFolderWarning } from "../project/temporaryFolder.ts";
 import * as Project from "../project/ProjectService.ts";
 
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -90,6 +91,7 @@ export const launchResult = Schema.Struct({
   modelSelection: ModelSelection,
   runId: Schema.NullOr(RunId),
   status: Schema.NullOr(OrchestrationV2RunStatus),
+  warning: Schema.optional(Schema.String),
 });
 function worktreeCheckHint(
   error:
@@ -370,6 +372,8 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           .pipe(Effect.ignore({ log: true }));
       }
       const run = result.projection.runs.find((run) => run.userMessageId === messageId);
+      const warning =
+        project === undefined ? undefined : yield* temporaryFolderWarning(project.workspaceRoot);
       const notify = yield* ThreadNotifications.finish(
         notification,
         thread.id,
@@ -384,6 +388,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         modelSelection: thread.modelSelection,
         runId: run?.id ?? null,
         status: run?.status ?? null,
+        ...(warning === undefined ? {} : { warning }),
       };
     }),
 );

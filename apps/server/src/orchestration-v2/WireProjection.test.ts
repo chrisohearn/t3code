@@ -31,6 +31,7 @@ import {
   projectTurnItemForDetail,
   projectDomainEventForWire,
   projectStoredEventForWire,
+  projectThreadProjectionForWire,
 } from "./WireProjection.ts";
 import { threadShellFromProjection } from "./ProjectionStore.ts";
 import { MAX_TOOL_OUTPUT_IMAGES, toolOutputImages } from "@t3tools/shared/toolOutput";
@@ -492,5 +493,36 @@ describe("live body deduper", () => {
   it("ships a reply whole when its message arrives after it", () => {
     const first = reply(1, "a");
     expect([first, message(2, "a")].map(makeLiveBodyDeduper())[0]).toBe(first);
+  });
+});
+
+describe("projectThreadProjectionForWire", () => {
+  it("shows run-bound items stuck on ended runs as finished and keeps background tools running", () => {
+    const item = (id: string, type: "todo_list" | "dynamic_tool", runId: string | null) =>
+      ({
+        ...base,
+        id: TurnItemId.make(id),
+        type,
+        runId,
+        status: "running",
+        ...(type === "todo_list" ? { planId: "plan-1", steps: [] } : {}),
+      }) as unknown as OrchestrationV2TurnItem;
+    const todoDone = item("todo-done", "todo_list", "run-done");
+    const todoLive = item("todo-live", "todo_list", "run-live");
+    const toolDone = item("tool-done", "dynamic_tool", "run-done");
+    const projection = {
+      runs: [
+        { id: "run-done", status: "completed" },
+        { id: "run-live", status: "running" },
+      ],
+      checkpoints: [],
+      contextHandoffs: [],
+      turnItems: [todoDone, todoLive, toolDone],
+      visibleTurnItems: [],
+    } as unknown as OrchestrationV2ThreadProjection;
+
+    const projected = projectThreadProjectionForWire(projection).turnItems;
+
+    expect(projected.map((entry) => entry.status)).toEqual(["completed", "running", "running"]);
   });
 });

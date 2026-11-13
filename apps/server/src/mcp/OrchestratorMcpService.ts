@@ -2163,10 +2163,26 @@ const make = Effect.gen(function* () {
               failure("orchestration_error", `Could not list scheduled tasks: ${error.message}`),
             ),
           );
+        // History is extra: a failed read must not hide the tasks themselves.
+        const reliability = new Map(
+          (yield* scheduledTasks.reliability().pipe(Effect.orElseSucceed(() => []))).map(
+            (entry) => [entry.taskId, entry] as const,
+          ),
+        );
         return {
           tasks: yield* Effect.forEach(
             tasks.filter((task) => projectId === undefined || task.projectId === projectId),
-            (task) => summarizeScheduledTask(scope, { parent, limits }, task),
+            (task) =>
+              summarizeScheduledTask(scope, { parent, limits }, task).pipe(
+                Effect.map((summary) => {
+                  const { recentFailures, missedRun } = reliability.get(task.id) ?? {};
+                  return {
+                    ...summary,
+                    ...(recentFailures === undefined ? {} : { recentFailures }),
+                    ...(missedRun === undefined ? {} : { missedRun }),
+                  };
+                }),
+              ),
           ),
         };
       },

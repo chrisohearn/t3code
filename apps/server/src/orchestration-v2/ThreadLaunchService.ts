@@ -515,6 +515,16 @@ const make = Effect.gen(function* () {
             })
             .pipe(Effect.mapError(mapError(input, "update-thread", threadId)));
         }
+        // Scheduled tasks and retries skip the entry points' check; without it, a folder that is
+        // not a repository, or a base found nowhere, reaches Git as an opaque failure.
+        yield* checkWorktreeBase({
+          projectId: input.projectId,
+          workspaceStrategy: input.workspaceStrategy,
+        }).pipe(
+          // Provisioning flattens a temporary branch name that collides.
+          Effect.catchTags({ ThreadLaunchBranchConflictError: () => Effect.void }),
+          Effect.mapError(mapError(input, "provision-worktree", threadId)),
+        );
         let startRef = input.workspaceStrategy.baseRef;
         let baseRefName = input.workspaceStrategy.baseRef;
         const remote =

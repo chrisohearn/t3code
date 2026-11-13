@@ -270,7 +270,11 @@ with `event_inbox_set: { threadId: "<thread-id>" }`. Then include `notify: {}` i
 `t3_thread_launch` or `t3_thread_send`. T3 queues a message to that inbox when the
 source run produces a matching event. This creates no event subscription or
 ChatGPT watch. Your existing inbox watch receives the inbox run's normal event.
-Keep the inbox's run-per-message acknowledger enabled.
+Keep the inbox's run-per-message acknowledger enabled. To acknowledge without a
+model, a full-access caller can call `t3_thread_configure` with
+`acknowledgeOnly: true` on the inbox thread. The server then answers each message
+with ``Queued: `<first 120 characters>` `` and ends its run, so the inbox
+watch still wakes. `acknowledgeOnly: false` returns the thread to its agent.
 
 The response reports `bound` with the inbox thread id, or `unavailable` or `failed`
 with a reason. Without a pin it reports `no_pinned_inbox`; the launch or send still
