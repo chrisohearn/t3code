@@ -92,6 +92,7 @@ function Picker(props: {
     supportsProviderSwitchingViaHandoff: true,
     multipleModelSelections: null,
     runtimeMode: "full-access",
+    isWorking: false,
     isLocalDraftThread: false,
     canOverrideServerThreadEnvMode: false,
     setPendingServerThreadEnvModeEntry: () => {},
