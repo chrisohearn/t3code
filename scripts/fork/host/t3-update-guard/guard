@@ -856,26 +856,11 @@ cmd_update() {
   rm -f "$GUARD_STATE/deferred" "$GUARD_STATE/deferred-since"
 
   # Never stop the service while the kernel shows the exit hang: the stop would hang too. Defer
-  # instead; a reboot clears the signs and the next timer run proceeds. Checked before the
-  # release download, so a long deferral does not download the archive every tick.
+  # instead; a reboot clears the signs and the next timer run proceeds. Checked here, before
+  # the release download, and again just before the stop (the download can take minutes).
   if hang=$(kernel_hang_signs); then
-    if [[ "$(cat "$GUARD_STATE/kernel-deferred" 2>/dev/null)" != "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]]; then
-      log "update: $latest deferred: $hang; a service stop could hang until reboot"
-      report "update to $latest deferred: $hang. Stopping T3 now could hang until a reboot; it proceeds after one."
-      cat /proc/sys/kernel/random/boot_id >"$GUARD_STATE/kernel-deferred" 2>/dev/null
-    fi
-    # Keep the deferral clock, so after the reboot a busy server does not wait the whole cap
-    # again, but never older than the cap: the grace window for blockers must still apply when
-    # the restarted threads begin their continuations.
-    if [[ "$deferred_epoch" =~ ^[0-9]+$ ]]; then
-      local floor=$(( $(date +%s) - MAX_DEFER_SECONDS ))
-      (( deferred_epoch < floor )) && deferred_epoch=$floor
-      touch -d "@$deferred_epoch" "$GUARD_STATE/deferred-since"
-    fi
-    echo "Deferred: $hang. Reboot, then the update proceeds."
-    # A person running it by hand gets a failure, since nothing was installed; the timer does not.
-    [[ -n "$target$now_flag" ]] && return 3
-    return 0
+    kernel_defer "$hang"
+    return
   fi
   is_healthy "$cur" || { is_trusted "$cur" && [[ "$(service_version)" == "$cur" ]] && record_healthy "$cur"; }
   sha=$(release_binary_sha "$latest") || { log "update: $latest is not a verified release in $TRUSTED_REPOS"; return 1; }
@@ -897,6 +882,10 @@ cmd_update() {
       echo "Deferred: waiting for ${blockers//;/, } before stopping. Use --now to restart anyway."
       return 0
     fi
+  fi
+  if hang=$(kernel_hang_signs); then
+    kernel_defer "$hang"
+    return
   fi
   record_pre_restart
 
@@ -991,6 +980,30 @@ cmd_update() {
   fi
   report "$latest did not serve within $HEALTH_WAIT_SECONDS s of its install: $outcome. $(last_fatal)"
   return 1
+}
+
+# Deferral for kernel hang signs ($1): report once per boot, keep the deferral clock (never
+# older than the cap, so the grace window still applies after the reboot), and tell the caller
+# what to return. Uses cmd_update's locals (latest, deferred_epoch, target, now_flag).
+kernel_defer() {
+  local hang="$1"
+  if [[ "$(cat "$GUARD_STATE/kernel-deferred" 2>/dev/null)" != "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]]; then
+    log "update: $latest deferred: $hang; a service stop could hang until reboot"
+    report "update to $latest deferred: $hang. Stopping T3 now could hang until a reboot; it proceeds after one."
+    cat /proc/sys/kernel/random/boot_id >"$GUARD_STATE/kernel-deferred" 2>/dev/null
+  fi
+  # Keep the deferral clock, so after the reboot a busy server does not wait the whole cap
+  # again, but never older than the cap: the grace window for blockers must still apply when
+  # the restarted threads begin their continuations.
+  if [[ "$deferred_epoch" =~ ^[0-9]+$ ]]; then
+    local floor=$(( $(date +%s) - MAX_DEFER_SECONDS ))
+    (( deferred_epoch < floor )) && deferred_epoch=$floor
+    touch -d "@$deferred_epoch" "$GUARD_STATE/deferred-since"
+  fi
+  echo "Deferred: $hang. Reboot, then the update proceeds."
+  # A person running it by hand gets a failure, since nothing was installed; the timer does not.
+  [[ -n "$target$now_flag" ]] && return 3
+  return 0
 }
 
 # Lift an automatic-updates hold after the cause is fixed. The hold file is archived, not

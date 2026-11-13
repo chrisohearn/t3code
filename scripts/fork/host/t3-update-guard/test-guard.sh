@@ -127,6 +127,13 @@ out=$(cmd_update 2>/dev/null)
 age=$(( $(date +%s) - $(stat -c %Y "$GUARD_STATE/deferred-since") ))
 (( age >= MAX_DEFER_SECONDS - 5 && age <= MAX_DEFER_SECONDS + 5 )) || fail "old clock not clamped to the cap: age $age"
 pass 'kernel hang signs defer even --now (rc 3) with no service touch or hold; the clock is kept but never older than the cap'
+# A hang that starts during the release download is caught just before the stop.
+kernel_hang_signs() { local c; c=$(cat "$root/kh" 2>/dev/null || echo 0); echo $((c + 1)) > "$root/kh"; (( c == 0 )) && return 1; echo 'T3 task(s) 1:2 stuck while exiting'; }
+rm -f "$root/kh" "$root/svc-kernel" "$GUARD_STATE/kernel-deferred"
+set +e; out=$(cmd_update --now 2>/dev/null); rc=$?; set -e
+[[ "$out" == Deferred:*'stuck while exiting'* && $rc == 3 ]] || fail "late hang not rechecked: rc=$rc $out"
+[[ "$(cat "$root/kh")" == 2 && ! -e "$root/svc-kernel" ]] || fail 'second kernel check missing or service touched'
+pass 'kernel hang signs are checked again just before the stop'
 kernel_hang_signs() { return 1; }
 unset T3_GUARD_DRY_RUN
 
