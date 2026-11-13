@@ -282,16 +282,27 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           const otherHome = yield* makeTempDir("t3code-codex-other-");
           const shadowHome = path.join(shadowRoot, "shadow");
           // Goals_1 differs only in case, so it is the same entry where names ignore case.
-          for (const name of ["state_5.sqlite", "logs_2.sqlite", "Goals_1.sqlite"]) {
+          const databases = ["state_5.sqlite", "logs_2.sqlite", "Goals_1.sqlite", "jobs_1.sqlite"];
+          for (const name of databases) {
             yield* writeTextFile(path.join(sharedHome, name), "shared");
           }
           yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
-          for (const name of ["state_5.sqlite", "logs_2.sqlite", "goals_1.sqlite"]) {
+          for (const name of [
+            "state_5.sqlite",
+            "logs_2.sqlite",
+            "goals_1.sqlite",
+            "jobs_1.sqlite",
+          ]) {
             yield* fileSystem.symlink(path.join(otherHome, name), path.join(shadowHome, name));
           }
           for (const name of ["logs_2.sqlite-wal", "goals_1.sqlite-wal"]) {
             yield* writeTextFile(path.join(shadowHome, name), "frames");
           }
+          // An older build linked sidecars too; this one's target is gone.
+          yield* fileSystem.symlink(
+            path.join(otherHome, "jobs_1.sqlite-wal"),
+            path.join(shadowHome, "jobs_1.sqlite-wal"),
+          );
 
           const layout = yield* resolveCodexHomeLayout(
             decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
@@ -300,6 +311,9 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
 
           expect(yield* fileSystem.readLink(path.join(shadowHome, "state_5.sqlite"))).toBe(
             path.join(sharedHome, "state_5.sqlite"),
+          );
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "jobs_1.sqlite"))).toBe(
+            path.join(otherHome, "jobs_1.sqlite"),
           );
           for (const name of ["logs_2.sqlite", "goals_1.sqlite"]) {
             expect(yield* fileSystem.readLink(path.join(shadowHome, name))).toBe(

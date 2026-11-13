@@ -322,12 +322,13 @@ const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (inpu
 
   const resolvedExisting = path.resolve(path.dirname(link), state.target);
   if (resolvedExisting !== target) {
-    // The filesystem's own lookup applies its case rules to the sidecar names.
-    const sidecarsRemain = SQLITE_DATABASE_PATTERN.test(input.entryName)
+    // The filesystem's own lookup applies its case rules; a dangling sidecar link still counts.
+    const sidecarStates = SQLITE_DATABASE_PATTERN.test(input.entryName)
       ? yield* Effect.forEach(SQLITE_SIDECAR_SUFFIXES, (suffix) =>
-          input.fileSystem.exists(`${link}${suffix}`).pipe(Effect.orElseSucceed(() => true)),
-        ).pipe(Effect.map((found) => found.some(Boolean)))
-      : false;
+          readLinkState({ ...input, linkPath: `${link}${suffix}` }),
+        )
+      : [];
+    const sidecarsRemain = sidecarStates.some((sidecar) => sidecar._tag !== "Missing");
     if (sidecarsRemain) {
       return yield* Effect.logWarning(
         "Kept a Codex shadow home database link pointing at another home because SQLite files beside it belong to that database.",
