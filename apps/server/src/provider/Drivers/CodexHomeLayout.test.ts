@@ -695,6 +695,34 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
         }),
     );
 
+    it.effect.skipIf(!symlinksSupported)(
+      "auto-settles only a regular database file under an absolute shared SQLite home",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const { sharedHome, shadowHome, layout } = yield* prepareOwnDatabaseShadow();
+          const settles = (sqliteHome: string) =>
+            inspectCodexShadowHome(layout, { sqliteHome }).pipe(
+              Effect.map((conflicts) => conflicts.map((conflict) => conflict.autoSettle)),
+            );
+
+          expect(yield* settles(sharedHome)).toEqual([true]);
+          // Codex reads a relative home against each session's working directory.
+          expect(yield* settles(path.relative(process.cwd(), sharedHome))).toEqual([false]);
+
+          yield* writeTextFile(path.join(sharedHome, "notes.sqlite"), "shared");
+          yield* writeTextFile(path.join(shadowHome, "notes.sqlite", "kept"), "local");
+          const conflicts = yield* inspectCodexShadowHome(layout, { sqliteHome: sharedHome });
+          expect(
+            conflicts.map(({ entryName, autoSettle, sqliteFiles }) => ({
+              entryName,
+              autoSettle,
+              isDatabase: sqliteFiles !== undefined,
+            })),
+          ).toContainEqual({ entryName: "notes.sqlite", autoSettle: false, isDatabase: false });
+        }),
+    );
+
     it.effect("reports a thread-writer-locks entry that setup cannot list", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

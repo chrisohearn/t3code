@@ -583,7 +583,9 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
     }),
   );
   const autoSettle =
+    // Codex resolves a relative CODEX_SQLITE_HOME against each session's working directory.
     options.sqliteHome !== undefined &&
+    path.isAbsolute(options.sqliteHome) &&
     (yield* sameDirectory(fileSystem, path, options.sqliteHome, layout.sharedHomePath)) &&
     (yield* backupParentAccepts(fileSystem, path, effectiveHomePath));
   const conflicts: Array<CodexShadowHomeConflict> = [];
@@ -617,7 +619,13 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
       continue;
     }
     if (state._tag !== "NotSymlink") continue;
-    if (!SQLITE_DATABASE_PATTERN.test(entryName)) {
+    const entryInfo = yield* fileSystem.stat(entryPath).pipe(Effect.option);
+    // Only a regular file is a database; a directory named *.sqlite stays a plain conflict.
+    if (
+      !SQLITE_DATABASE_PATTERN.test(entryName) ||
+      Option.isNone(entryInfo) ||
+      entryInfo.value.type !== "File"
+    ) {
       conflicts.push({ entryName, path: entryPath, sqliteFiles: undefined, autoSettle: false });
       continue;
     }
