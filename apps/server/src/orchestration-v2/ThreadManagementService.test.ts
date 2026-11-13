@@ -105,6 +105,28 @@ it("stamps authoritative provenance on commands that create threads or messages"
   expect(message).not.toHaveProperty("senderClient");
   expect(message).not.toHaveProperty("failoverOfRunId");
   expect(message).not.toHaveProperty("failoverNotice");
+  const handoff = ThreadManagementService.withCreationProvenance(
+    {
+      type: "thread.metadata.update",
+      commandId: CommandId.make("forged-handoff-sender"),
+      threadId: ThreadId.make("target"),
+      continuation: {
+        messageId: MessageId.make("forged-handoff-sender"),
+        text: "continue",
+        senderThreadId: ThreadId.make("forged-thread"),
+        senderClient: {
+          sessionId: "01234567",
+          clientLabel: "Jarvis",
+          kind: "outside-client",
+          access: "full-access",
+        },
+      },
+    },
+    { createdBy: "user", creationSource: "web" },
+  );
+  expect(handoff).toMatchObject({ continuation: { text: "continue" } });
+  expect(handoff).not.toHaveProperty("continuation.senderThreadId");
+  expect(handoff).not.toHaveProperty("continuation.senderClient");
 });
 
 const layerReceiptsTest = CommandReceiptStore.layer.pipe(

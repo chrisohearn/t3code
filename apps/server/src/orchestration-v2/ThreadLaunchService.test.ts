@@ -1377,6 +1377,7 @@ it.effect("shows the fetch diagnosis when preparing a worktree from origin fails
 it.effect("rejects a preparation retry after the project disables its provider", () => {
   let fetchAttempts = 0;
   const harness = makeHarness({
+    hasCommit: ({ refName }) => Effect.succeed(refName === "main"),
     fetchWorktreeBaseCommit: () =>
       fetchAttempts++ === 0
         ? Effect.fail(
@@ -1476,6 +1477,7 @@ it.effect.each(["fails", "is interrupted"] as const)(
       const allowFetch = yield* Deferred.make<void>();
       let fetchFailures = 1;
       const harness = makeHarness({
+        hasCommit: ({ refName }) => Effect.succeed(refName === "main"),
         fetchWorktreeBaseCommit: () =>
           fetchFailures-- <= 0
             ? Effect.succeed({ commitSha: "remote-main-sha", remoteRefName: "origin/main" })
@@ -2844,6 +2846,12 @@ it.effect.each([
     origin: false,
   },
   {
+    name: "was deleted on its remote",
+    baseRef: "origin/development",
+    startFromOrigin: true,
+    origin: true,
+  },
+  {
     name: "is a previous checkout there never was",
     baseRef: "-",
     startFromOrigin: false,
@@ -2853,6 +2861,7 @@ it.effect.each([
   Effect.gen(function* () {
     const harness = makeHarness({
       hasCommit: ({ refName }) => Effect.succeed(refName === "HEAD"),
+      fetchWorktreeBaseCommit: () => Effect.succeed(null),
       git: {
         resolveWorktreeBaseRemote: () =>
           Effect.succeed(testCase.origin ? { remoteName: "origin", branchName: "main" } : null),
