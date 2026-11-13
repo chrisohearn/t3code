@@ -3943,6 +3943,7 @@ describe("OrchestratorMcpService thread lookup", () => {
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             getThreadShell: (threadId) =>
               Effect.succeed(shells.find((shell) => shell.id === threadId) ?? null),
+            listActiveShellIndex: () => Effect.succeed([]),
             sendToThread: () => Ref.update(sent, (count) => count + 1).pipe(Effect.as({} as never)),
             ...overrides,
           }),
@@ -3963,7 +3964,11 @@ describe("OrchestratorMcpService thread lookup", () => {
       const sent = yield* Ref.make(0);
       return yield* Effect.gen(function* () {
         const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const read = yield* mcp.readThread(client, { threadId: bareId }).pipe(Effect.flip);
+        // Reads resolve a bare uuid to its mcp: thread, so only a miss fails.
+        const read = yield* mcp.readThread(client, { threadId: bareId }).pipe(
+          Effect.match({ onFailure: (error) => error, onSuccess: () => null }),
+          Effect.catchDefect(() => Effect.succeed(null)),
+        );
         const send = yield* mcp
           .sendToThread(client, { threadId: bareId, message: "hello" })
           .pipe(Effect.flip);
@@ -4238,8 +4243,8 @@ describe("OrchestratorMcpService thread lookup", () => {
 
   it.effect("points a bare uuid at the mcp: thread it belongs to", () =>
     Effect.gen(function* () {
-      const { read, send, wait, sends } = yield* failuresFor([launched]);
-      for (const error of [read, send, wait]) {
+      const { send, wait, sends } = yield* failuresFor([launched]);
+      for (const error of [send, wait]) {
         assert.equal(error.code, "thread_not_found");
         assert.include(error.message, `mcp:${bareId}`);
       }
@@ -4250,8 +4255,8 @@ describe("OrchestratorMcpService thread lookup", () => {
   it.effect("keeps the plain message for an id that matches nothing", () =>
     Effect.gen(function* () {
       const { read, send, wait } = yield* failuresFor([]);
-      assert.equal(read.code, "thread_not_found");
-      assert.equal(read.message, `Thread ${bareId} is no longer available.`);
+      assert.equal(read?.code, "thread_not_found");
+      assert.include(read?.message, `No thread ${bareId} in this environment`);
       assert.equal(send.code, "thread_not_found");
       assert.equal(send.message, `Thread ${bareId} was not found.`);
       assert.equal(wait.code, "thread_not_found");
@@ -4262,7 +4267,7 @@ describe("OrchestratorMcpService thread lookup", () => {
   it.effect("does not name an mcp: thread that was deleted", () =>
     Effect.gen(function* () {
       const { read, send, wait } = yield* failuresFor([deletedLaunched]);
-      assert.equal(read.message, `Thread ${bareId} is no longer available.`);
+      assert.equal(read?.message, `Thread mcp:${bareId} was deleted.`);
       assert.equal(send.message, `Thread ${bareId} was not found.`);
       assert.equal(wait.message, send.message);
     }),

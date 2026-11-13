@@ -140,6 +140,7 @@ import {
   taskPrompt,
 } from "./delegatedTaskModes.ts";
 import { isLiveCallerShell, threadNotFound } from "./threadAccess.ts";
+import { resolveReadableThread } from "./threadReference.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
@@ -1279,19 +1280,14 @@ const make = Effect.gen(function* () {
 
   const loadReadableThread = Effect.fn("OrchestratorMcpService.loadReadableThread")(function* (
     scope: McpInvocationScope,
-    threadId: ThreadId,
+    reference: ThreadId,
   ) {
     const { parent } = yield* loadCaller(scope, []);
-    const shell = yield* threadManagement
-      .getThreadShell(threadId)
-      .pipe(Effect.mapError(threadManagementFailure));
-    if (shell === null || shell.deletedAt !== null) {
-      return yield* threadNotFound(
-        threadManagement,
-        threadId,
-        `Thread ${threadId} is no longer available.`,
-      );
-    }
+    const { threadId, shell } = yield* resolveReadableThread(
+      threadManagement,
+      scope.environmentId,
+      reference,
+    );
     const revision = yield* threadManagement
       .getThreadEventSequence(threadId)
       .pipe(Effect.mapError(threadManagementFailure));
@@ -1309,7 +1305,7 @@ const make = Effect.gen(function* () {
             "contextTransfers",
           ]);
     const target = yield* records.pipe(Effect.mapError(threadManagementFailure));
-    return { parent, target, shell, revision } as const;
+    return { parent, target, shell, revision, threadId } as const;
   });
 
   const loadProviders = providerRegistry.getProviders;
@@ -3118,17 +3114,14 @@ const make = Effect.gen(function* () {
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
     }),
-    threadResult: Effect.fn("OrchestratorMcpService.threadResult")(function* (scope, input) {
+    threadResult: Effect.fn("OrchestratorMcpService.threadResult")(function* (scope, request) {
       yield* loadCaller(scope, []);
-      const shell = yield* threadManagement
-        .getThreadShell(input.threadId)
-        .pipe(Effect.mapError(threadManagementFailure));
-      if (shell === null || shell.deletedAt !== null)
-        return yield* threadNotFound(
-          threadManagement,
-          input.threadId,
-          `Thread ${input.threadId} is no longer available.`,
-        );
+      const { threadId, shell } = yield* resolveReadableThread(
+        threadManagement,
+        scope.environmentId,
+        request.threadId,
+      );
+      const input = { ...request, threadId };
       const revision = yield* threadManagement
         .getThreadEventSequence(input.threadId)
         .pipe(Effect.mapError(threadManagementFailure));
@@ -3209,8 +3202,12 @@ const make = Effect.gen(function* () {
         revision,
       };
     }),
-    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, input) {
-      const { parent, target, shell, revision } = yield* loadReadableThread(scope, input.threadId);
+    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, request) {
+      const { parent, target, shell, revision, threadId } = yield* loadReadableThread(
+        scope,
+        request.threadId,
+      );
+      const input = { ...request, threadId };
       const view = input.view ?? "messages";
       const afterPosition = input.afterPosition ?? -1;
       const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
