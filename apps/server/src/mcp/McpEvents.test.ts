@@ -1109,7 +1109,7 @@ it("says why a cancelled run stopped, so a restart cancel does not read as a fai
   };
   const observe = (
     payload: Omit<typeof run, "status"> & {
-      readonly status: "cancelled" | "rolled_back";
+      readonly status: "cancelled" | "interrupted" | "rolled_back";
       readonly stop?: { reason: string; actor: { kind: string } };
     },
   ) =>
@@ -1147,6 +1147,13 @@ it("says why a cancelled run stopped, so a restart cancel does not read as a fai
     relayed({ ...run, stop: { reason: "server_shutdown", actor: { kind: "server" } } }),
   ).toEqual({ state: "cancelled", stopReason: "server_shutdown" });
   expect(relayed(run)).toEqual({ state: "cancelled" });
+  expect(
+    relayed({
+      ...run,
+      status: "interrupted",
+      stop: { reason: "provider_interrupted", actor: { kind: "server" } },
+    }),
+  ).toEqual({ state: "interrupted", stopReason: "provider_interrupted" });
   expect(
     relayed({
       ...run,
