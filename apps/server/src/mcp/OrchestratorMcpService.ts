@@ -1,5 +1,8 @@
 import * as JarvisPlaybook from "./JarvisPlaybook.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
+import * as LaunchPresets from "../persistence/LaunchPresets.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { advertisedModel, listChoices, requireAdvertisedModel } from "./providerModels.ts";
 import { hasGitEntry } from "./gitEntryProbe.ts";
 import * as Invocation from "./McpInvocationContext.ts";
@@ -29,6 +32,7 @@ import {
   type OrchestratorMcpCreateThreadsResult,
   type OrchestratorMcpCreatedThread,
   type OrchestratorMcpDelegateTaskInput,
+  composeStandingRole,
   type OrchestratorMcpDelegateTaskResult,
   type OrchestratorMcpDeleteScheduledTaskInput,
   type OrchestratorMcpRequestSecretInput,
@@ -1133,6 +1137,18 @@ const make = Effect.gen(function* () {
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const remoteDelegation = yield* RemoteDelegation.RemoteDelegation;
+  // Optional so a build without the fork's role and preset stores still serves the rest.
+  const threadRoles = yield* Effect.serviceOption(ThreadRoles.ThreadRoles);
+  const launchPresets = yield* Effect.serviceOption(LaunchPresets.LaunchPresets);
+
+  const loadPreset = Effect.fn("OrchestratorMcpService.loadPreset")(function* (
+    name: string | undefined,
+  ) {
+    if (name === undefined) return undefined;
+    if (Option.isNone(launchPresets))
+      return yield* failure("orchestration_error", "Launch presets are unavailable.");
+    return yield* launchPresets.value.get(name);
+  });
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -2605,15 +2621,47 @@ const make = Effect.gen(function* () {
         operation: "delegate-task",
       });
       const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
+      // A retry of an accepted delegation replays it, so a preset deleted since cannot fail it.
+      const preset = yield* loadPreset(input.preset).pipe(
+        Effect.catchIf(
+          () => isRetryOfAcceptedDelegation,
+          () => Effect.undefined,
+        ),
+      );
+      // Explicit fields win. A preset names a worktree only as the kind of checkout: a local
+      // task always branches from the parent's commit, so its baseRef does not apply.
+      const presetModel = preset?.modelSelection;
+      const delegateInput: OrchestratorMcpDelegateTaskInput = {
+        ...input,
+        ...(input.target === undefined && presetModel !== undefined
+          ? {
+              target: {
+                providerInstanceId: presetModel.instanceId,
+                model: presetModel.model,
+                ...(presetModel.options === undefined ? {} : { options: presetModel.options }),
+              },
+            }
+          : {}),
+        ...(input.runtimeMode === undefined && preset?.runtimeMode !== undefined
+          ? { runtimeMode: preset.runtimeMode }
+          : {}),
+        ...(input.isolation === undefined && preset?.workspaceStrategy?.type === "worktree"
+          ? { isolation: "worktree" as const }
+          : {}),
+      };
+      const standingRole = composeStandingRole({
+        standingRole: input.standingRole ?? preset?.standingRole,
+        doneFormat: preset?.doneFormat,
+      });
       const target = yield* resolveTargetRechecking({
         parent,
-        target: input.target,
+        target: delegateInput.target,
         providers,
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
       const runtimeMode = yield* resolveRuntimeMode(
         parent.thread.runtimeMode,
-        input.runtimeMode,
+        delegateInput.runtimeMode,
         target,
       );
       const interactionMode = yield* resolveInteractionMode(
@@ -2621,7 +2669,7 @@ const make = Effect.gen(function* () {
         input.interactionMode,
       );
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
-      if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
+      if (delegateInput.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
         const base = yield* gitDriver
           .resolveCommit({
@@ -2653,6 +2701,17 @@ const make = Effect.gen(function* () {
         }
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
+      // The child's first turn starts as soon as the command commits, so its role is stored
+      // first, under the thread id the command derives. A retry leaves a role changed since.
+      if (standingRole !== undefined && !isRetryOfAcceptedDelegation) {
+        if (Option.isNone(threadRoles))
+          return yield* failure("orchestration_error", "Standing roles are unavailable.");
+        yield* threadRoles.value.set(
+          IdAllocator.derive.delegatedTaskThread({ commandId }),
+          standingRole,
+          Invocation.actorLabel(scope),
+        );
+      }
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
@@ -2680,6 +2739,18 @@ const make = Effect.gen(function* () {
           completionWake: input.mode === "wait" ? "settled_only" : "always",
         })
         .pipe(
+          // A failure after the child committed leaves its role; only a child that never
+          // came to exist loses the one stored for it.
+          Effect.tapError(() =>
+            standingRole !== undefined && !isRetryOfAcceptedDelegation && Option.isSome(threadRoles)
+              ? Effect.gen(function* () {
+                  const childId = IdAllocator.derive.delegatedTaskThread({ commandId });
+                  const child = yield* threadManagement.getThreadShell(childId);
+                  if (child === null || child.deletedAt !== null)
+                    yield* threadRoles.value.set(childId, null, Invocation.actorLabel(scope));
+                }).pipe(Effect.ignore({ log: true }))
+              : Effect.void,
+          ),
           Effect.mapError((error) =>
             error._tag === "ThreadManagementProviderInstanceDisabledError"
               ? threadManagementFailure(error)
@@ -3342,16 +3413,30 @@ const make = Effect.gen(function* () {
         { concurrency: 1 },
       );
       const messagesByThreadId = new Map(sourceMessages);
-      const thread = threadDetail(
-        scope,
-        target,
-        timeline.totalItems,
-        shell,
-        yield* Clock.currentTimeMillis,
+      const firstPage =
         input.afterPosition === undefined &&
-          input.beforePosition === undefined &&
-          input.itemId === undefined,
-      );
+        input.beforePosition === undefined &&
+        input.itemId === undefined;
+      const standingRole =
+        firstPage && Option.isSome(threadRoles)
+          ? yield* threadRoles.value.get(target.thread.id)
+          : undefined;
+      const thread = {
+        ...threadDetail(
+          scope,
+          target,
+          timeline.totalItems,
+          shell,
+          yield* Clock.currentTimeMillis,
+          firstPage,
+        ),
+        ...(standingRole === undefined
+          ? {}
+          : {
+              standingRole: standingRole.text,
+              standingRoleSetBy: `${standingRole.updatedBy}, ${standingRole.updatedAt}`,
+            }),
+      };
       const recentRuns = target.runs
         .toSorted((left, right) => right.ordinal - left.ordinal)
         .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)

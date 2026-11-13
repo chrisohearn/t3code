@@ -9,6 +9,10 @@ import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
 import * as AgentRegistry from "../persistence/AgentRegistry.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
+import * as LaunchPresets from "../persistence/LaunchPresets.ts";
+import { PresetToolkit } from "./toolkits/preset/tools.ts";
+import * as PresetHandlers from "./toolkits/preset/handlers.ts";
 import { LedgerToolkit } from "./toolkits/ledger/tools.ts";
 import * as LedgerHandlers from "./toolkits/ledger/handlers.ts";
 import * as Cause from "effect/Cause";
@@ -1394,8 +1398,13 @@ export const layerOrchestratorToolkit = toolkitRegistration(
 
 export const layerLedgerToolkit = toolkitRegistration(LedgerToolkit, LedgerHandlers.layer);
 
+export const layerPresetToolkit = toolkitRegistration(PresetToolkit, PresetHandlers.layer).pipe(
+  Layer.provide(LaunchPresets.layer),
+);
+
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer).pipe(
   Layer.provide(PendingApproval.layer),
+  Layer.provide(ThreadRoles.layer),
 );
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
@@ -1416,7 +1425,10 @@ const layerEnvironmentToolkit = toolkitRegistration(
 export const layerProjectRegistration = toolkitRegistration(
   ProjectToolkit,
   ProjectHandlers.layer,
-).pipe(Layer.provide(ThreadLaunchMcp.layer));
+).pipe(
+  Layer.provide(ThreadLaunchMcp.layer),
+  Layer.provide(Layer.mergeAll(ThreadRoles.layer, LaunchPresets.layer)),
+);
 
 export const layerAttachmentToolkit = toolkitRegistration(
   AttachmentToolkit,
@@ -1494,6 +1506,7 @@ export const layerTools = Layer.mergeAll(
     Layer.provide(BridgeStatusService.layer),
   ),
   layerLedgerToolkit,
+  layerPresetToolkit,
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,
@@ -1571,6 +1584,8 @@ export const layer = Layer.merge(
 ).pipe(
   Layer.provide(layerEvents),
   Layer.provide(WorkLedger.layer),
+  Layer.provide(ThreadRoles.layer),
+  Layer.provide(LaunchPresets.layer),
   Layer.provide(McpClientThreads.layer),
   Layer.provide(McpBridgeMetrics.layer),
   Layer.provide(McpRequestLog.layer),

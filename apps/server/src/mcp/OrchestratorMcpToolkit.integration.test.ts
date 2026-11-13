@@ -38,6 +38,7 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretResolver";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
@@ -271,6 +272,7 @@ describe("orchestrator MCP toolkit", () => {
         ]);
         const layerTest = layerOrchestratorToolkit.pipe(
           Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provideMerge(ThreadRoles.layer),
           Layer.provideMerge(SqlitePersistence.layerMemory),
           Layer.provideMerge(layerOrchestration),
           Layer.provide(
@@ -722,6 +724,11 @@ describe("orchestrator MCP toolkit", () => {
           expect(
             messageReads.filter((query) => !query.includes("$.notification.source.kind")),
           ).toHaveLength(1);
+          yield* (yield* ThreadRoles.ThreadRoles).set(
+            delegated.childThreadId!,
+            "You are the reviewer.",
+            "test",
+          );
           const parentlessRead = yield* invoke(
             "t3_thread_read",
             {
@@ -745,6 +752,9 @@ describe("orchestrator MCP toolkit", () => {
             ...(result === "😀" ? { maxCharsPerItem: 1 } : {}),
           }).pipe(Effect.withTracer(tracer));
           expect(read.isError).not.toBe(true);
+          expect(read.structuredContent).toMatchObject({
+            thread: { standingRole: "You are the reviewer." },
+          });
           expect(transferReads.length).toBeGreaterThan(0);
           const firstPage = yield* decodeThreadRead(read.structuredContent);
           const finalItem = firstPage.items.find((item) => item.text === result.slice(0, 500));

@@ -172,6 +172,14 @@ export const messageSenderFor = (scope: McpInvocationScope) => {
   };
 };
 
+/** Who changed something, as ADR 0013 names a sender: a thread, or the first 8 characters of a session and its label. */
+export const actorLabel = (scope: McpInvocationScope) =>
+  scope.thread !== undefined
+    ? `thread ${scope.thread.threadId}`
+    : scope.client === undefined
+      ? "mcp"
+      : `${scope.client.sessionId.slice(0, 8)} (${scope.client.label})`;
+
 /** The command actor for an MCP call: an agent in a thread, or an outside sign-in. */
 export const mcpCommandActor = (scope: McpInvocationScope): CommandActor["Service"] => ({
   kind: scope.thread === undefined ? "mcp_client" : "agent",

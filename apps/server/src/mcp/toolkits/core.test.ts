@@ -1337,6 +1337,40 @@ it.effect("a read-only client reads threads and is refused every write before it
       acknowledgeOnly: false,
     });
     expect(dispatched).toHaveLength(1);
+    // A standing role is a write like any other, stored apart from the thread's events.
+    const roleArgs = { threadId: "other-project-thread", standingRole: "You are the build agent." };
+    expect(declaredFailure(yield* call("t3_thread_configure", roleArgs))).toMatchObject({
+      code: "capability_denied",
+    });
+    // Instructions for another agent need full access.
+    const roleAs = (access: McpInvocationContext.McpClientCaller["access"], args: object) =>
+      server
+        .callTool({ name: "t3_thread_configure", arguments: args })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, clientScope(access)),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+    expect(declaredFailure(yield* roleAs("auto", roleArgs))).toMatchObject({
+      code: "capability_denied",
+    });
+    expect(dispatched).toHaveLength(1);
+    const roleSet = yield* roleAs("full-access", roleArgs);
+    // The record names its setter by the first 8 characters of the session, never the whole id.
+    const recorded = {
+      standingRole: "You are the build agent.",
+      standingRoleSetBy: expect.stringMatching(/^session- \(Claude Code\), \d{4}-/),
+    };
+    expect(roleSet.structuredContent).toMatchObject(recorded);
+    expect(
+      (yield* call("t3_thread_configure", { threadId: "other-project-thread" })).structuredContent,
+    ).toMatchObject(recorded);
+    expect(dispatched.at(-1)).toBe("note:Standing role set by session- (Claude Code).");
+    expect(
+      declaredFailure(
+        yield* roleAs("full-access", { ...roleArgs, runtimeMode: "approval-required" }),
+      ),
+    ).toMatchObject({ code: "invalid_request" });
+    expect(dispatched).toHaveLength(2);
   }).pipe(
     Effect.provide(
       layerThreadToolkit.pipe(
@@ -1368,6 +1402,10 @@ it.effect("a read-only client reads threads and is refused every write before it
               }),
             dispatch: (command) =>
               Effect.gen(function* () {
+                if (command.type === "message.dispatch") {
+                  dispatched.push(`note:${command.text}`);
+                  return { sequence: 8 } as never;
+                }
                 const actor = yield* RuntimeModeChangeActor;
                 dispatched.push(
                   `${command.type}:${command.type === "thread.runtime-mode.set" ? command.runtimeMode : ""}:${actor}`,
@@ -2069,4 +2107,43 @@ it.effect(
       ),
     );
   },
+);
+
+it.effect("presets are read by any caller and changed only with full access", () =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const call = (args: object, access: McpInvocationContext.McpClientCaller["access"]) =>
+      server
+        .callTool({ name: "t3_preset", arguments: args })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, clientScope(access)),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+    const save = { action: "save", name: "worker", standingRole: "Be brief." };
+    expect(declaredFailure(yield* call(save, "read-only"))).toMatchObject({
+      code: "capability_denied",
+    });
+    expect(declaredFailure(yield* call(save, "auto"))).toMatchObject({
+      code: "capability_denied",
+    });
+    expect((yield* call({ action: "list" }, "read-only")).structuredContent).toEqual({
+      presets: [],
+    });
+    expect((yield* call(save, "full-access")).isError).toBe(false);
+    expect(
+      (yield* call({ action: "read", name: "worker" }, "read-only")).structuredContent,
+    ).toMatchObject({
+      name: "worker",
+      standingRole: "Be brief.",
+      updatedBy: "session- (Claude Code)",
+    });
+  }).pipe(
+    Effect.provide(
+      McpHttpServer.layerPresetToolkit.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  ),
 );

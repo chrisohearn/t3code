@@ -53,6 +53,8 @@ import {
   latestNativeContextUsage,
 } from "@t3tools/provider-core/server/handoffBudget";
 import { deliverContextHandoffs, withInlineContext } from "./ContextHandoffDelivery.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
+import { standingRoleDue } from "./standingRoleDelivery.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -126,6 +128,12 @@ export interface ProviderTurnStartServiceV2Shape {
   }) => Effect.Effect<void, ProviderTurnStartError>;
 }
 
+const STANDING_ROLE_HEADING =
+  "Standing role for this thread, set in T3 and sent with every turn (not part of the user's message):";
+/** A bare native slash command, such as /compact. A path like /home/x is a message. */
+const NATIVE_COMMAND =
+  /^\s*\/(?!(?:etc|usr|var|home|tmp|opt|bin|sbin|dev|proc|root|srv|mnt|boot|lib|lib64|sys|run|Users|Library|Applications)(?:\s|\/|$))[A-Za-z][\w-]*(\s|$)/;
+
 export class ProviderTurnStartServiceV2 extends Context.Service<
   ProviderTurnStartServiceV2,
   ProviderTurnStartServiceV2Shape
@@ -149,6 +157,7 @@ export const layer: Layer.Layer<
   | RunExecutionService.RunExecutionServiceV2
   | RuntimePolicy.RuntimePolicyV2
   | TurnItemPositionStore.TurnItemPositionStoreV2
+  | ThreadRoles.ThreadRoles
 > = Layer.effect(
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
@@ -164,6 +173,7 @@ export const layer: Layer.Layer<
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const restoreMissingWorktree = yield* makeRestoreMissingWorktree;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
+    const threadRoles = yield* ThreadRoles.ThreadRoles;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const resolveFailoverTarget = (
       input: Parameters<typeof ProviderFailover.resolveProviderFailoverTarget>[0],
@@ -831,6 +841,15 @@ export const layer: Layer.Layer<
         restartCancelledWork.length === 0
           ? ""
           : restartCancelledBackgroundWorkNote(restartCancelledWork);
+      // Read at every turn start: providers read AGENTS.md only when a session starts, so a role
+      // set later, or on a thread whose session predates it, still has to reach the provider.
+      // Native commands (/compact, /review, goals) go verbatim.
+      const standingRole =
+        goalCommand || NATIVE_COMMAND.test(userText)
+          ? undefined
+          : yield* threadRoles.get(projection.thread.id);
+      const standingRoleBlock =
+        standingRole === undefined ? "" : `${STANDING_ROLE_HEADING}\n${standingRole.text}`;
       const tokenCap = yield* handoffTokenCapConfig.pipe(
         Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
       );
@@ -976,7 +995,9 @@ export const layer: Layer.Layer<
             return handoffBudget({
               tokenCap,
               modelContextWindow,
-              userText: restartNote === "" ? userText : `${restartNote}\n\n${userText}`,
+              userText: [standingRoleBlock, restartNote, userText]
+                .filter((part) => part !== "")
+                .join("\n\n"),
               attachments: message.attachments,
               providerThread: budgetProviderThread,
               nativeContextEstimate:
@@ -1539,6 +1560,24 @@ export const layer: Layer.Layer<
         createdAt: providerThread.createdAt,
         updatedAt: now,
       };
+      const roleNativeThreadId = runningProviderThread.nativeThreadRef?.nativeId ?? null;
+      const compactionMessageIds = new Set(
+        projection.messages.filter(isCompactionCommandMessage).map((candidate) => candidate.id),
+      );
+      const standingRoleSend =
+        standingRole !== undefined &&
+        standingRoleDue({
+          role: standingRole,
+          nativeThreadId: roleNativeThreadId,
+          runOrdinal: run.ordinal,
+          compactedSinceDelivery: (after) =>
+            projection.runs.some(
+              (source) =>
+                source.ordinal > after &&
+                source.ordinal < run.ordinal &&
+                compactionMessageIds.has(source.userMessageId),
+            ),
+        });
       const runningRun: OrchestrationV2Run = {
         ...run,
         status: "running",
@@ -1711,7 +1750,8 @@ export const layer: Layer.Layer<
             sideChatHandoff === undefined || compact || goalCommand
               ? ""
               : sideChatHandoff.summaryText;
-          const context = [delivery.context, sideChatContext, restartNote]
+          const roleContext = compact || goalCommand || !standingRoleSend ? "" : standingRoleBlock;
+          const context = [roleContext, delivery.context, sideChatContext, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
@@ -1736,6 +1776,18 @@ export const layer: Layer.Layer<
             ),
           );
           // After provider acceptance, failed delivery bookkeeping must not stop live ingestion.
+          if (roleContext !== "" && standingRole !== undefined)
+            yield* threadRoles
+              .markDelivered(projection.thread.id, {
+                revision: standingRole.revision,
+                nativeThreadId: roleNativeThreadId,
+                runOrdinal: run.ordinal,
+              })
+              .pipe(
+                Effect.catchCause(() =>
+                  Effect.logWarning("Failed to record standing role delivery", { runId: run.id }),
+                ),
+              );
           const nativeThreadId = runningProviderThread.nativeThreadRef?.nativeId;
           yield* Effect.forEach(
             [
@@ -1779,6 +1831,7 @@ export const layer: Layer.Layer<
         retryHandoff.length === 0 &&
         sideChatHandoff === undefined &&
         restartNote === "" &&
+        !standingRoleSend &&
         !noteContinuation
           ? session
           : makeDeliverySession(session, startWithHandoffs);

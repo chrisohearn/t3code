@@ -56,6 +56,7 @@ import * as RunExecutionService from "./RunExecutionService.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
@@ -196,6 +197,7 @@ function startWithMissingWorktree(
         }),
         Layer.mock(RunExecutionService.RunExecutionServiceV2)({ startRootRun }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({}),
+        Layer.mock(ThreadRoles.ThreadRoles)({ get: () => Effect.undefined }),
       ),
     ),
   );
@@ -280,6 +282,14 @@ function makeLocalCommandHarness(input: {
   readonly gitWorkflow?: GitWorkflow.GitWorkflowService["Service"];
   readonly fileSystem?: FileSystem.FileSystem;
   readonly previousNativeSession?: boolean;
+  /** The thread's standing role, stored after its session started. */
+  readonly standingRole?: string;
+  /** Where the provider last took revision 2 of the role; defaults to never. */
+  readonly standingRoleDelivered?: {
+    readonly revision?: number;
+    readonly nativeThreadId?: string | null;
+    readonly runOrdinal?: number;
+  };
   readonly previousMessages?: ReadonlyArray<string>;
   readonly logoutFailure?: string;
   readonly openFailure?: unknown;
@@ -850,6 +860,11 @@ function makeLocalCommandHarness(input: {
     lastError: null,
   };
   const startTurn = vi.fn((_turn: ProviderAdapter.ProviderAdapterV2TurnInput) => Effect.void);
+  const roleDeliveries: Array<{
+    revision: number;
+    nativeThreadId: string | null;
+    runOrdinal: number;
+  }> = [];
   const sideChatThread = {
     ...providerThread,
     nativeThreadRef: {
@@ -898,13 +913,17 @@ function makeLocalCommandHarness(input: {
                     providerSession,
                     ensureThread: () => Effect.succeed(providerThread),
                     resumeThread: () => Effect.succeed(projection.providerThreads[0]),
+                    startTurn: (turn: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+                      startTurn(turn),
                   } as never)
                 : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >((runInput) =>
-    input.sideChat !== undefined || input.nativeThreadLastRanOn !== undefined
+    input.sideChat !== undefined ||
+    input.nativeThreadLastRanOn !== undefined ||
+    input.standingRole !== undefined
       ? runInput.session.startTurn(runInput as never).pipe(Effect.orDie)
       : input.failReadsAfterRunning === true || input.previousTurn !== undefined
         ? Effect.suspend(() =>
@@ -1116,11 +1135,37 @@ function makeLocalCommandHarness(input: {
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
           resolve: resolveRuntimePolicy,
         }),
+        Layer.mock(ThreadRoles.ThreadRoles)({
+          get: () =>
+            Effect.succeed(
+              input.standingRole === undefined
+                ? undefined
+                : {
+                    text: input.standingRole,
+                    revision: 2,
+                    updatedAt: "2026-01-01T00:00:00Z",
+                    updatedBy: "test",
+                    ...(input.standingRoleDelivered === undefined
+                      ? {}
+                      : {
+                          delivered: {
+                            revision: 2,
+                            nativeThreadId: "existing-native-conversation",
+                            runOrdinal: 1,
+                            ...input.standingRoleDelivered,
+                          },
+                        }),
+                  },
+            ),
+          markDelivered: (_threadId, delivery) =>
+            Effect.sync(() => void roleDeliveries.push(delivery)),
+        }),
       ),
     ),
   );
   return {
     settledRuns,
+    roleDeliveries,
     getThreadRecords,
     getTurnStartContext,
     getRuntimeRecoveryProjection,
@@ -1483,6 +1528,63 @@ effectIt.effect.each([
         !nativeGoals,
       );
     }),
+);
+
+effectIt.effect.each([
+  // A turn on a native session that began before the role was stored.
+  { text: "Continue", sent: "ROLE" },
+  { text: "/home/user/app fails to build", sent: "ROLE" },
+  { text: "/etc is full", sent: "ROLE" },
+  // Native commands run verbatim; a prefix would stop them being commands.
+  { text: "/review", sent: undefined },
+  { text: "/goal all tests pass", sent: undefined },
+] as const)("sends the standing role with a turn: %j", ({ text, sent }) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text,
+      previousTurn: { runStatus: "completed", turnStatus: "completed" },
+      standingRole: "You are the build agent.",
+    });
+    harness.tryHandlePromptCommand.mockReturnValue(Effect.succeed(false));
+
+    yield* harness.start;
+
+    const heading =
+      "Standing role for this thread, set in T3 and sent with every turn (not part of the user's message):";
+    expect(harness.startTurn.mock.calls.map(([turn]) => turn.message.text)).toEqual([
+      sent === undefined ? text : withInlineContext(`${heading}\nYou are the build agent.`, text),
+    ]);
+    expect(harness.roleDeliveries).toEqual(
+      sent === undefined
+        ? []
+        : [{ revision: 2, nativeThreadId: "existing-native-conversation", runOrdinal: 2 }],
+    );
+  }),
+);
+
+// Each copy of the role stays in the provider's history, so it is sent again only when needed.
+effectIt.effect.each([
+  { delivered: {}, sent: false },
+  { delivered: { revision: 1 }, sent: true },
+  { delivered: { nativeThreadId: "an-earlier-session" }, sent: true },
+  { delivered: { runOrdinal: -23 }, sent: true },
+] as const)("sends the standing role again only when needed: %j", ({ delivered, sent }) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      previousTurn: { runStatus: "completed", turnStatus: "completed" },
+      standingRole: "You are the build agent.",
+      standingRoleDelivered: delivered,
+    });
+    harness.tryHandlePromptCommand.mockReturnValue(Effect.succeed(false));
+
+    yield* harness.start;
+
+    expect(
+      harness.startTurn.mock.calls.map(([turn]) => turn.message.text.includes("Standing role")),
+    ).toEqual([sent]);
+    expect(harness.roleDeliveries).toHaveLength(sent ? 1 : 0);
+  }),
 );
 
 effectIt.effect.each([

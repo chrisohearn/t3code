@@ -21,6 +21,7 @@ import {
   NonNegativeInt,
   ProjectId,
   ThreadFreeze,
+  StandingRole,
 } from "@t3tools/contracts";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Schema from "effect/Schema";
@@ -32,6 +33,7 @@ import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskServ
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as PendingApproval from "../../PendingApprovalMcpService.ts";
+import * as ThreadRoles from "../../../persistence/ThreadRoles.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
@@ -212,11 +214,13 @@ const threadConfiguration = Schema.Struct({
   interactionMode: ProviderInteractionMode,
   // Optional: a linked environment on another build does not report it.
   acknowledgeOnly: Schema.optional(Schema.Boolean),
+  standingRole: Schema.optional(Schema.String),
+  standingRoleSetBy: Schema.optional(Schema.String),
 });
 const ThreadConfigureTool = Tool.make("t3_thread_configure", {
   ...commandTool,
   description:
-    "Read a thread's provider, model, and modes, or set its provider, model, and options with `modelSelection`. Omit `threadId` for this thread. Set `runtimeMode` alone to lower permissions on an idle thread; raises and active runs are refused. Values from `orchestrator_capabilities`. Full access: `acknowledgeOnly` alone makes the server, not the agent, acknowledge each message.",
+    'Read a thread\'s provider, model, and modes, or set its provider, model, and options with `modelSelection`. Omit `threadId` for this thread. Set `runtimeMode` alone to lower permissions on an idle thread; raises and active runs are refused. Values from `orchestrator_capabilities`. Full access: `acknowledgeOnly` alone makes the server, not the agent, acknowledge each message. `standingRole` (alone; "" clears) is sent with every turn.',
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
@@ -228,6 +232,7 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     ),
     runtimeMode: Schema.optional(RuntimeMode),
     acknowledgeOnly: Schema.optional(Schema.Boolean),
+    standingRole: Schema.optional(StandingRole),
   }),
   // The scheduled result goes before the plain one, which would match it and drop its fields.
   success: Schema.Union([
@@ -239,6 +244,7 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     }),
     OrchestrationV2DispatchCommandResult,
   ]),
+  dependencies: [...commandTool.dependencies, ThreadRoles.ThreadRoles],
 }).annotate(Tool.Destructive, true);
 
 const ThreadTransferTool = Tool.make("t3_thread_transfer", {
