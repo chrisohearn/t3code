@@ -10,11 +10,19 @@ export const resolveCodexLaunchArgs = (
 const codexLaunchArgv = (launchArgs?: string): ReadonlyArray<string> => tokenizeCliArgs(launchArgs);
 
 // T3 unsubscribes only when it unloads a thread; Codex's own unload delay would stack on that.
-export const codexAppServerArgs = (launchArgs?: string) => [
+export const codexAppServerArgs = (
+  launchArgs?: string,
+  inheritedMcpServers: ReadonlyArray<string> = [],
+) => [
   "app-server",
   "-c",
   "thread_unload_delay_secs=0",
   ...codexLaunchArgv(launchArgs),
+  ...inheritedMcpServers.flatMap((name) =>
+    name === "t3_omarchy" || name === "t3_macbook"
+      ? ["-c", `mcp_servers.${name}.enabled=false`]
+      : [],
+  ),
 ];
 
 interface LaunchArgFilter {
@@ -26,7 +34,7 @@ interface LaunchArgFilter {
 const SHARED_VALUE_FLAGS = ["--config", "-c", "--enable", "--disable"];
 const SHARED_INLINE_PREFIXES = ["--config=", "-c=", "--enable=", "--disable="];
 
-const MCP_LIST_FILTER: LaunchArgFilter = {
+const CONFIG_FILTER: LaunchArgFilter = {
   switches: new Set(),
   valueFlags: new Set([...SHARED_VALUE_FLAGS, "--profile", "-p"]),
   inlinePrefixes: [...SHARED_INLINE_PREFIXES, "--profile=", "-p="],
@@ -66,4 +74,4 @@ export const codexExecLaunchArgs = (launchArgs?: string) =>
   filterLaunchArgs(launchArgs, EXEC_FILTER);
 
 export const codexMcpListLaunchArgs = (launchArgs?: string) =>
-  filterLaunchArgs(launchArgs, MCP_LIST_FILTER);
+  filterLaunchArgs(launchArgs, CONFIG_FILTER);

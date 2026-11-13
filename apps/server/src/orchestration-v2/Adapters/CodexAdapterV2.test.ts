@@ -954,6 +954,7 @@ describe("CodexAdapterV2 process exit", () => {
 
   it.effect("counts the app-server as a running agent until its session closes", () => {
     let runningAgents = 0;
+    const commands: Array<ReadonlyArray<unknown>> = [];
     const factoryLayer = CodexAdapterV2.layerAppServerClientFactory.pipe(
       Layer.provide(
         Layer.mock(PortScanner.PortDiscovery)({
@@ -974,8 +975,10 @@ describe("CodexAdapterV2 process exit", () => {
       Layer.provide(
         Layer.succeed(
           ChildProcessSpawner.ChildProcessSpawner,
-          ChildProcessSpawner.make(() =>
-            Effect.succeed(
+          ChildProcessSpawner.make((command) => {
+            const args = ChildProcess.isStandardCommand(command) ? command.args : [];
+            commands.push(args);
+            return Effect.succeed(
               ChildProcessSpawner.makeHandle({
                 pid: ChildProcessSpawner.ProcessId(999_999_999),
                 exitCode: Effect.never,
@@ -989,12 +992,18 @@ describe("CodexAdapterV2 process exit", () => {
                 getInputFd: () => Sink.drain,
                 getOutputFd: () => Stream.empty,
               }),
-            ),
-          ),
+            );
+          }),
         ),
       ),
     );
     return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      yield* fs.writeFileString(
+        `${directory}/config.toml`,
+        '[mcp_servers.t3_omarchy]\ncommand="unused"\n[mcp_servers.t3_macbook]\ncommand="unused"\n',
+      );
       const factory = yield* CodexAdapterV2.CodexAppServerClientFactory;
       yield* Effect.scoped(
         factory
@@ -1003,13 +1012,27 @@ describe("CodexAdapterV2 process exit", () => {
             threadId: ThreadId.make("thread-codex-agent"),
             providerSessionId: ProviderSessionId.make("session-codex-agent"),
             runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
-            settings: DEFAULT_CODEX_SETTINGS,
+            settings: { ...DEFAULT_CODEX_SETTINGS, homePath: directory },
             environment: {},
           })
           .pipe(Effect.tap(() => Effect.sync(() => assert.equal(runningAgents, 1)))),
       );
       assert.equal(runningAgents, 0);
-    }).pipe(Effect.provide(factoryLayer));
+      assert.deepEqual(commands, [
+        [
+          "app-server",
+          "-c",
+          "thread_unload_delay_secs=0",
+          "-c",
+          "mcp_servers.t3_omarchy.enabled=false",
+          "-c",
+          "mcp_servers.t3_macbook.enabled=false",
+        ],
+      ]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(factoryLayer.pipe(Layer.provideMerge(NodeServices.layer))),
+    );
   });
 });
 

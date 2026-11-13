@@ -605,6 +605,7 @@ export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInp
 
 export const OrchestratorMcpThreadSendResult = Schema.Struct({
   notify: Schema.optional(McpThreadNotifyResult),
+  warning: Schema.optional(Schema.String),
   threadId: ThreadId,
   link: Schema.optional(Schema.String),
   messageId: MessageId,

@@ -382,6 +382,9 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       );
       return {
         ...(notify === undefined ? {} : { notify }),
+        ...(notify !== undefined && "warning" in notify && notify.warning !== undefined
+          ? { warning: notify.warning }
+          : {}),
         threadId: thread.id,
         link: McpInvocationContext.threadLinkFor(scope, thread.id, thread.title),
         projectId: thread.projectId,

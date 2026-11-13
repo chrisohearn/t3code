@@ -28,6 +28,28 @@ describe("codexAppServerArgs", () => {
       ...row.expected,
     ]);
   });
+  it("disables inherited T3 sign-ins after user overrides without disabling other MCPs", () => {
+    const args = codexAppServerArgs(
+      "-c mcp_servers.t3_omarchy.enabled=true -c mcp_servers.other.enabled=true",
+      ["t3_omarchy", "t3_macbook", "other", "t3-code", "t3-code-direct"],
+    );
+    NodeAssert.deepStrictEqual(args.slice(-4), [
+      "-c",
+      "mcp_servers.t3_omarchy.enabled=false",
+      "-c",
+      "mcp_servers.t3_macbook.enabled=false",
+    ]);
+    NodeAssert.ok(args.includes("mcp_servers.other.enabled=true"));
+  });
+  it("does not create a transport-less override for absent inherited entries", () => {
+    NodeAssert.deepStrictEqual(codexAppServerArgs(undefined, ["t3_macbook"]), [
+      "app-server",
+      "-c",
+      "thread_unload_delay_secs=0",
+      "-c",
+      "mcp_servers.t3_macbook.enabled=false",
+    ]);
+  });
 });
 
 describe("codexExecLaunchArgs", () => {
@@ -45,7 +67,7 @@ describe("codexExecLaunchArgs", () => {
   });
 });
 
-describe("codex exec and mcp list launch args", () => {
+describe("codex exec and config launch args", () => {
   const launchArgs =
     "--strict-config --oss --local-provider ollama --profile local -p=work --listen off --enable foo";
 
@@ -63,7 +85,7 @@ describe("codex exec and mcp list launch args", () => {
     ]);
   });
 
-  it("keeps the selected profile and drops exec-only flags for codex mcp list", () => {
+  it("keeps the selected profile and drops exec-only flags for config discovery", () => {
     NodeAssert.deepStrictEqual(codexMcpListLaunchArgs(launchArgs), [
       "--profile",
       "local",

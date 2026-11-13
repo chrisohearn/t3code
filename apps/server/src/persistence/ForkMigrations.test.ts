@@ -11,6 +11,8 @@ import { FORK_MIGRATIONS_TABLE, forkMigrationManifest, legacyForkRows } from "./
 import McpEvents from "./ForkMigrations/001_McpEvents.ts";
 import McpBridgeStatus from "./ForkMigrations/004_McpBridgeStatus.ts";
 import McpSubscriptionRenewal from "./ForkMigrations/006_McpSubscriptionRenewal.ts";
+import McpInboxRelay from "./ForkMigrations/009_McpInboxRelay.ts";
+import McpRelayDiagnostics from "./ForkMigrations/016_McpRelayDiagnostics.ts";
 import { hasPendingMigrations, migrationManifest, runMigrations } from "./Migrations.ts";
 
 // The last upstream id before fork builds started taking upstream's ids for fork migrations.
@@ -49,6 +51,39 @@ const seedLegacyForkDatabase = Effect.gen(function* () {
 const pendingUpstream = migrationManifest.filter(([id]) => id > LAST_SHARED_ID);
 
 describe("fork migrations", () => {
+  it.effect("makes relay expiry nullable while preserving terminal bindings and cursors", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: migrationManifest.at(-1)![0] });
+      yield* McpEvents;
+      yield* McpInboxRelay;
+      yield* sql`INSERT INTO auth_sessions (session_id, subject, scopes, method, issued_at, expires_at)
+        VALUES ('relay', 'mcp-client', '[]', 'bearer-access-token', '2026-11-12', '2026-12-12')`;
+      yield* sql`INSERT INTO mcp_event_relay_bindings
+        (id, principal, thread_id, inbox_thread_id, run_id, events, runtime_mode, interaction_mode, scan_cursor, expires_at, last_error)
+        VALUES ('closed', 'relay', 'source', 'inbox', 'run', '[]', 'full-access', 'default', 5, 0, 'denied'),
+          ('finite', 'relay', 'source', 'inbox', 'run2', '[]', 'full-access', 'default', 7, 123456, NULL)`;
+      yield* McpRelayDiagnostics;
+      const rows = yield* sql`SELECT id, scan_cursor, expires_at, closed_at, last_error
+        FROM mcp_event_relay_bindings ORDER BY id`;
+      assert.deepEqual(rows, [
+        {
+          id: "closed",
+          scan_cursor: 5,
+          expires_at: null,
+          closed_at: rows[0]!.closed_at,
+          last_error: "denied",
+        },
+        { id: "finite", scan_cursor: 7, expires_at: 123456, closed_at: null, last_error: null },
+      ]);
+      assert.isNumber(rows[0]!.closed_at);
+      yield* sql`UPDATE mcp_event_relay_bindings SET expires_at = NULL WHERE id = 'finite'`;
+      assert.deepEqual(
+        yield* sql`SELECT id FROM mcp_event_relay_bindings WHERE expires_at IS NULL AND closed_at IS NULL`,
+        [{ id: "finite" }],
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
   it("registers unique fork ids in strictly increasing order", () => {
     const ids = forkMigrationManifest.map(([id]) => id);
     assert.deepEqual(

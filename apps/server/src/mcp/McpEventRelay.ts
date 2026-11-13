@@ -74,6 +74,18 @@ export interface PreparedRelay {
   readonly events: ReadonlyArray<McpEventName>;
 }
 
+export const RelayDiagnostics = Schema.Struct({
+  relayAlerts: Schema.Array(Schema.Struct({ reason: Schema.String, day: Schema.Number })),
+  relayBindings: Schema.Array(
+    Schema.Struct({
+      threadId: ThreadId,
+      runId: Schema.String,
+      expiresAt: Schema.NullOr(Schema.String),
+      closedAt: Schema.NullOr(Schema.String),
+    }),
+  ),
+});
+
 export class McpEventRelay extends Context.Service<
   McpEventRelay,
   {
@@ -82,6 +94,7 @@ export class McpEventRelay extends Context.Service<
       threadId: ThreadId | null,
     ) => Effect.Effect<void, McpEventsError>;
     readonly inbox: (principal: string) => Effect.Effect<ThreadId | null, McpEventsError>;
+    readonly missingInbox: (principal: string) => Effect.Effect<string, McpEventsError>;
     readonly prepare: (
       scope: Invocation.McpInvocationScope,
       input: McpThreadNotify,
@@ -104,10 +117,12 @@ export class McpEventRelay extends Context.Service<
       threadId: ThreadId,
       reason: string,
     ) => Effect.Effect<void, McpEventsError>;
-    readonly status: (
-      principal: string,
-    ) => Effect.Effect<
-      { relayFailures: number; relayPending: number; relayLastError: string | null },
+    readonly status: (principal: string) => Effect.Effect<
+      {
+        relayFailures: number;
+        relayPending: number;
+        relayLastError: string | null;
+      } & typeof RelayDiagnostics.Type,
       McpEventsError
     >;
   }
@@ -203,8 +218,9 @@ const make = Effect.gen(function* () {
     yield* sql
       .withTransaction(
         Effect.gen(function* () {
-          const added = yield* sql`INSERT INTO mcp_event_relay_alerts (principal, source_key, day)
-        VALUES (${principal}, ${sourceKey}, ${day}) ON CONFLICT DO NOTHING RETURNING source_key`;
+          const added =
+            yield* sql`INSERT INTO mcp_event_relay_alerts (principal, source_key, day, reason)
+        VALUES (${principal}, ${sourceKey}, ${day}, ${reason}) ON CONFLICT DO NOTHING RETURNING source_key`;
           if (added.length === 0) return;
           yield* enqueue({
             ...pin,
@@ -225,7 +241,8 @@ const make = Effect.gen(function* () {
       yield* sql`SELECT id, principal, thread_id AS "threadId", inbox_thread_id AS "inboxThreadId",
       run_id AS "runId", events, ledger_key AS "ledgerKey", scan_cursor AS "scanCursor",
       runtime_mode AS "runtimeMode", interaction_mode AS "interactionMode"
-      FROM mcp_event_relay_bindings WHERE expires_at > ${yield* Clock.currentTimeMillis}`.pipe(
+      FROM mcp_event_relay_bindings WHERE closed_at IS NULL
+        AND (expires_at IS NULL OR expires_at > ${yield* Clock.currentTimeMillis})`.pipe(
         Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(Binding))),
         Effect.mapError(storage),
       );
@@ -238,7 +255,8 @@ const make = Effect.gen(function* () {
       }
       const allowed = yield* authorize(binding.principal, binding.threadId).pipe(Effect.result);
       if (allowed._tag === "Failure") {
-        yield* sql`UPDATE mcp_event_relay_bindings SET expires_at = 0, last_error = ${allowed.failure.reason} WHERE id = ${binding.id}`.pipe(
+        const now = yield* Clock.currentTimeMillis;
+        yield* sql`UPDATE mcp_event_relay_bindings SET closed_at = ${now}, expires_at = ${now}, last_error = ${allowed.failure.reason} WHERE id = ${binding.id}`.pipe(
           Effect.mapError(storage),
         );
         yield* alert(binding.principal, binding.id, binding.threadId, allowed.failure.reason);
@@ -323,7 +341,8 @@ const make = Effect.gen(function* () {
           break;
         }
       }
-      yield* sql`UPDATE mcp_event_relay_bindings SET scan_cursor = ${through}, expires_at = CASE WHEN ${finished ? 1 : 0} = 1 THEN 0 ELSE expires_at END WHERE id = ${binding.id}`.pipe(
+      const now = yield* Clock.currentTimeMillis;
+      yield* sql`UPDATE mcp_event_relay_bindings SET scan_cursor = ${through}, closed_at = CASE WHEN ${finished ? 1 : 0} = 1 THEN ${now} ELSE closed_at END, expires_at = CASE WHEN ${finished ? 1 : 0} = 1 THEN ${now} ELSE expires_at END WHERE id = ${binding.id}`.pipe(
         Effect.mapError(storage),
       );
       behind ||= !finished && through < latest;
@@ -389,6 +408,14 @@ const make = Effect.gen(function* () {
       },
       (effect) => pinGate.withPermit(effect),
     ),
+    missingInbox: Effect.fn("McpEventRelay.missingInbox")(function* (principal) {
+      const pins = yield* sql<{ count: number }>`SELECT count(*) AS count
+        FROM mcp_event_inboxes`.pipe(Effect.mapError(storage));
+      yield* sql`INSERT INTO mcp_event_relay_alerts (principal, source_key, day, reason)
+        VALUES (${principal}, 'no_pinned_inbox', ${Math.floor((yield* Clock.currentTimeMillis) / 86400_000)}, 'no_pinned_inbox')
+        ON CONFLICT DO NOTHING`.pipe(Effect.mapError(storage));
+      return `WARNING: Notifications are NOT bound. Caller sign-in ${principal.slice(0, 8)} has no pinned inbox. Pinned sign-ins: ${pins[0]?.count ?? 0}. Pin an inbox using the caller's own sign-in; pins are never shared across sign-ins.`;
+    }),
     prepare: Effect.fn("McpEventRelay.prepare")(function* (scope, input) {
       if (
         scope.client === undefined ||
@@ -424,11 +451,23 @@ const make = Effect.gen(function* () {
         firstSequence: number | null;
       }>`SELECT MIN(sequence) AS "firstSequence" FROM orchestration_events
         WHERE application_event_version = 2 AND aggregate_kind = 'thread' AND stream_id = ${threadId}
-          AND event_type = 'run.updated' AND json_extract(payload_json, '$.id') = ${runId}`.pipe(
+          AND event_type IN ('run.created', 'run.updated') AND json_extract(payload_json, '$.id') = ${runId}`.pipe(
         Effect.mapError(storage),
       );
-      if (run !== undefined && start?.firstSequence == null)
-        return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+      if (run !== undefined && start?.firstSequence == null) {
+        if (Threads.isTerminalRunStatus(run.status))
+          return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+        const [oldest] = yield* sql<{ occurredAt: string }>`SELECT occurred_at AS "occurredAt"
+          FROM orchestration_events
+          WHERE aggregate_kind = 'project'
+            OR (application_event_version = 2 AND aggregate_kind = 'thread')
+          ORDER BY sequence LIMIT 1`.pipe(Effect.mapError(storage));
+        if (
+          oldest !== undefined &&
+          DateTime.isLessThan(run.requestedAt, DateTime.makeUnsafe(oldest.occurredAt))
+        )
+          return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+      }
       const cursor = Math.min(
         prepared.cursor,
         start?.firstSequence == null ? prepared.cursor : Math.max(0, start.firstSequence - 1),
@@ -491,6 +530,11 @@ const make = Effect.gen(function* () {
       return { replayed };
     }),
     drain: Effect.fn("McpEventRelay.drain")(function* () {
+      yield* sql`DELETE FROM mcp_event_relay_bindings
+        WHERE closed_at <= ${(yield* Clock.currentTimeMillis) - DELIVERED_RETENTION_MS}
+          OR expires_at <= ${(yield* Clock.currentTimeMillis) - DELIVERED_RETENTION_MS}`.pipe(
+        Effect.mapError(storage),
+      );
       yield* sql`DELETE FROM mcp_event_relay_outbox WHERE status = 'delivered'
         AND next_attempt_at < ${(yield* Clock.currentTimeMillis) - DELIVERED_RETENTION_MS}`.pipe(
         Effect.mapError(storage),
@@ -564,16 +608,38 @@ const make = Effect.gen(function* () {
       Effect.mapError(storage),
     ),
     alert,
-    status: Effect.fn("McpEventRelay.status")((principal) =>
-      sql<{ relayFailures: number; relayPending: number; relayLastError: string | null }>`
+    status: Effect.fn("McpEventRelay.status")(function* (principal) {
+      const rows = yield* sql<{
+        relayFailures: number;
+        relayPending: number;
+        relayLastError: string | null;
+      }>`
       SELECT (SELECT COALESCE(SUM(attempts), 0) FROM mcp_event_relay_outbox WHERE principal = ${principal}) + (SELECT COUNT(*) FROM mcp_event_relay_bindings WHERE principal = ${principal} AND last_error IS NOT NULL) AS "relayFailures",
         (SELECT COUNT(*) FROM mcp_event_relay_outbox WHERE principal = ${principal} AND status = 'pending') AS "relayPending",
         COALESCE((SELECT last_error FROM mcp_event_relay_outbox WHERE principal = ${principal} AND last_error IS NOT NULL ORDER BY rowid DESC LIMIT 1),
-        (SELECT last_error FROM mcp_event_relay_bindings WHERE principal = ${principal} AND last_error IS NOT NULL ORDER BY rowid DESC LIMIT 1)) AS "relayLastError"`.pipe(
-        Effect.map((rows) => rows[0]!),
-        Effect.mapError(storage),
-      ),
-    ),
+        (SELECT last_error FROM mcp_event_relay_bindings WHERE principal = ${principal} AND last_error IS NOT NULL ORDER BY rowid DESC LIMIT 1)) AS "relayLastError"`;
+      const relayAlerts = yield* sql<{ reason: string; day: number }>`SELECT reason, day
+        FROM mcp_event_relay_alerts WHERE principal = ${principal} ORDER BY day DESC, source_key`;
+      const bindings = yield* sql<{
+        threadId: ThreadId;
+        runId: string;
+        expiresAt: number | null;
+        closedAt: number | null;
+      }>`
+        SELECT thread_id AS "threadId", run_id AS "runId", expires_at AS "expiresAt", closed_at AS "closedAt"
+        FROM mcp_event_relay_bindings WHERE principal = ${principal} ORDER BY rowid`;
+      const timestamp = (value: number | null) =>
+        value === null ? null : DateTime.formatIso(DateTime.makeUnsafe(value));
+      return {
+        ...rows[0]!,
+        relayAlerts,
+        relayBindings: bindings.map((binding) => ({
+          ...binding,
+          expiresAt: timestamp(binding.expiresAt),
+          closedAt: timestamp(binding.closedAt),
+        })),
+      };
+    }, Effect.mapError(storage)),
   });
 });
 export const layer = Layer.effect(McpEventRelay, make);
