@@ -4,31 +4,45 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ProviderFailoverReason,
+  type OrchestrationV2ProviderFailure,
   type OrchestrationV2Run,
   type OrchestrationV2RunFailover,
   type ProviderInstanceId,
   type RunId,
   type ServerProvider,
   type ThreadId,
+  resolveProjectProviderInstanceEnabled,
 } from "@t3tools/contracts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import * as ServerSettings from "../serverSettings.ts";
+import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import type { PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 
 /** What a terminal failure must prove before a run may move to the fallback model. */
 export interface ProviderFailoverEvidence {
   readonly noWorkObserved?: true | undefined;
   readonly accountFailure?: OrchestrationV2ProviderFailoverReason | undefined;
+  readonly failure?: OrchestrationV2ProviderFailure | undefined;
+}
+
+export interface ProviderFailoverTargets {
+  readonly account: ModelSelection | undefined;
+  readonly model: ModelSelection | undefined;
 }
 
 /**
  * Only a prompt someone sent is re-sent. Wakes, delegated results, compaction and slash
  * commands are provider-specific or have their own recovery.
  */
-function resendable(message: OrchestrationV2ConversationMessage): boolean {
+function resendable(
+  message: Pick<
+    OrchestrationV2ConversationMessage,
+    "role" | "notification" | "delegatedCompletion" | "idleCompaction" | "workflowScript" | "text"
+  >,
+): boolean {
   return (
     message.role === "user" &&
     message.notification === undefined &&
@@ -46,13 +60,13 @@ export function providerFailoverTarget(input: {
   /** Evidence covers one turn; a run that already ran an earlier attempt may have done work. */
   readonly firstAttempt: boolean;
   readonly fallback: ModelSelection | null;
+  readonly secondaryFallback?: ModelSelection | null;
+  readonly limitScope?: "account" | "model";
+  readonly available?: (selection: ModelSelection) => boolean;
 }): ModelSelection | undefined {
   const { run, message, fallback } = input;
   if (
     !input.firstAttempt ||
-    fallback === null ||
-    // The account that failed is the one the fallback would use.
-    fallback.instanceId === run.providerInstanceId ||
     run.failover !== undefined ||
     run.failoverOfRunId !== undefined ||
     run.restartContinuationOfRunId !== undefined ||
@@ -60,7 +74,17 @@ export function providerFailoverTarget(input: {
     !resendable(message)
   )
     return undefined;
-  return fallback;
+  const eligible = (target: ModelSelection | null | undefined) =>
+    target != null &&
+    (input.available?.(target) ?? true) &&
+    (target.instanceId !== run.providerInstanceId ||
+      (input.limitScope === "model" && target.model !== run.modelSelection.model));
+  if (fallback !== null && eligible(fallback)) return fallback;
+  return fallback?.instanceId === run.providerInstanceId &&
+    input.secondaryFallback != null &&
+    eligible(input.secondaryFallback)
+    ? input.secondaryFallback
+    : undefined;
 }
 
 export const resolveProviderFailoverTarget = Effect.fn("ProviderFailover.resolveTarget")(
@@ -75,19 +99,80 @@ export const resolveProviderFailoverTarget = Effect.fn("ProviderFailover.resolve
       Effect.option,
     );
     if (Option.isNone(settings)) return undefined;
-    return providerFailoverTarget({
+    const project = resolveProjectSettings(settings.value, input.thread.projectId).settings;
+    const cooldownService = yield* Effect.serviceOption(ProviderCooldown.ProviderCooldown);
+    const cooldowns = Option.isSome(cooldownService)
+      ? yield* cooldownService.value.getAll
+      : new Map();
+    const available = (selection: ModelSelection) =>
+      resolveProjectProviderInstanceEnabled(
+        settings.value,
+        input.thread.projectId,
+        selection.instanceId,
+      ) && !cooldowns.has(selection.instanceId);
+    const targetInput = {
       ...input,
-      fallback: resolveProjectSettings(settings.value, input.thread.projectId).settings
-        .fallbackModelSelection,
-    });
+      fallback: project.fallbackModelSelection,
+      secondaryFallback: settings.value.secondaryFallbackModelSelection,
+      available,
+    };
+    return {
+      account: providerFailoverTarget(targetInput),
+      model: providerFailoverTarget({ ...targetInput, limitScope: "model" }),
+    };
+  },
+);
+
+export const resolveProviderCooldownTarget = Effect.fn("ProviderFailover.resolveCooldownTarget")(
+  function* (input: {
+    readonly projectId: OrchestrationV2AppThread["projectId"];
+    readonly modelSelection: ModelSelection;
+    readonly run: Pick<
+      OrchestrationV2Run,
+      "failover" | "failoverOfRunId" | "restartContinuationOfRunId" | "bypassProviderCooldown"
+    >;
+    readonly message: Pick<
+      OrchestrationV2ConversationMessage,
+      "role" | "notification" | "delegatedCompletion" | "idleCompaction" | "workflowScript" | "text"
+    >;
+    readonly cooldown: ProviderCooldown.ProviderCooldown["Service"];
+    readonly settings: ServerSettings.ServerSettingsService["Service"];
+  }) {
+    if (
+      input.run.bypassProviderCooldown === true ||
+      input.run.failover !== undefined ||
+      input.run.failoverOfRunId !== undefined ||
+      input.run.restartContinuationOfRunId !== undefined ||
+      !resendable(input.message)
+    )
+      return input.modelSelection;
+    const cooldowns = yield* input.cooldown.getAll;
+    if (!cooldowns.has(input.modelSelection.instanceId)) return input.modelSelection;
+    const settingsOption = yield* input.settings.getSettings.pipe(Effect.option);
+    if (Option.isNone(settingsOption)) return input.modelSelection;
+    const settings = settingsOption.value;
+    const project = resolveProjectSettings(settings, input.projectId).settings;
+    return (
+      [project.fallbackModelSelection, settings.secondaryFallbackModelSelection].find(
+        (candidate) =>
+          candidate !== null &&
+          candidate.instanceId !== input.modelSelection.instanceId &&
+          !cooldowns.has(candidate.instanceId) &&
+          resolveProjectProviderInstanceEnabled(settings, input.projectId, candidate.instanceId),
+      ) ?? input.modelSelection
+    );
   },
 );
 
 /** The claim a failed terminal earns: the adapter must prove no work and name an account cause. */
 export function providerFailoverClaim(
-  target: ModelSelection | undefined,
+  targets: ProviderFailoverTargets | undefined,
   evidence: ProviderFailoverEvidence,
 ): OrchestrationV2RunFailover | undefined {
+  const target =
+    evidence.accountFailure === "usage_limit" && evidence.failure?.limitScope === "model"
+      ? targets?.model
+      : targets?.account;
   return target === undefined ||
     evidence.noWorkObserved !== true ||
     evidence.accountFailure === undefined

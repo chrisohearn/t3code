@@ -93,6 +93,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Schedule from "effect/Schedule";
 import * as FileSystem from "effect/FileSystem";
 import * as Function from "effect/Function";
 import * as Layer from "effect/Layer";
@@ -1201,13 +1202,17 @@ function codexUsageLimitError(
 function withCodexManagedFailure(
   failure: OrchestrationV2ProviderFailure,
   nativeError: unknown,
+  instanceId: ProviderInstanceId,
 ): OrchestrationV2ProviderFailure {
   const managed = classifyCodexManagedError(nativeError);
   return managed === undefined
     ? failure
     : {
         ...failure,
-        message: managed.message,
+        message:
+          managed.code === "subscription_sharing_unsupported_capability"
+            ? `Codex instance "${instanceId}": ${managed.message}`
+            : managed.message,
         code: managed.code,
         ...(managed.usageLimit ? { class: "usage_limit" } : {}),
       };
@@ -5018,6 +5023,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       : "provider_error",
                   }),
                   payload.error,
+                  adapterOptions.instanceId,
                 ),
               };
               return;
@@ -5048,6 +5054,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 retryable: true,
               }),
               payload.error,
+              adapterOptions.instanceId,
             );
             const itemOrdinal =
               previous?.itemOrdinal ??
@@ -6192,6 +6199,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                         class: failureClass,
                       }),
                       input.failureMessage,
+                      adapterOptions.instanceId,
                     );
               const accountFailure = codexAccountFailure(failure);
               return {
@@ -6211,6 +6219,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   failure.class === "usage_limit"
                     ? {
                         ...failure,
+                        limitScope: "account" as const,
                         resetAt: failureResetAt(failure, yield* Ref.get(rateLimitSnapshot)),
                       }
                     : failure,
@@ -7296,6 +7305,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }
                 return Effect.fail(cause);
               },
+            }),
+            Effect.retry({
+              while: isCodexActiveWriterError,
+              schedule: Schedule.exponential("250 millis"),
+              times: 3,
             }),
           );
         });

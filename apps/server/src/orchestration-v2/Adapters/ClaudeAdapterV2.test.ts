@@ -3265,6 +3265,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly text?: string;
     readonly parentToolUseId?: string | null;
     readonly apiErrorParams?: unknown;
+    readonly apiError?: string;
   }) =>
     claudeSdkFrame({
       type: "assistant",
@@ -3286,6 +3287,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       parent_tool_use_id: input.parentToolUseId ?? null,
       ...(input.error === undefined ? {} : { error: input.error }),
       ...(input.apiErrorParams === undefined ? {} : { api_error_params: input.apiErrorParams }),
+      ...(input.apiError === undefined ? {} : { api_error: input.apiError }),
       uuid: input.uuid,
       session_id: WAKE_NATIVE_SESSION,
     });
@@ -7362,9 +7364,18 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
-  it.effect("keeps a later future-window event-supplied Claude reset over the embedded reset", () =>
+  it.effect.each([
+    { rateLimitType: "five_hour", scope: "account", proseOnly: false },
+    { rateLimitType: "seven_day_overage_included", scope: "model", proseOnly: false },
+    { rateLimitType: "model_requires_usage_credits", scope: "model", proseOnly: false },
+    { rateLimitType: "unknown", scope: "model", proseOnly: true },
+  ] as const)("preserves Claude limit scope and the later reset: $rateLimitType", (scenario) =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;
+      const usageCredits = scenario.scope === "model" && !scenario.proseOnly;
+      const limitText = usageCredits
+        ? "You're out of usage credits. Switch to another model, or manage usage credits at https://claude.ai/admin-settings/usage, to continue."
+        : "Usage limit reached.";
       yield* harness.runtime.startTurn(
         makeClaudeTestTurnInput({
           threadId: harness.threadId,
@@ -7376,10 +7387,18 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         }),
       );
       yield* Queue.offerAll(harness.sdkMessages, [
+        ...["five_hour", "seven_day"].map((rateLimitType) =>
+          claudeSdkFrame({
+            type: "rate_limit_event",
+            rate_limit_info: { status: "allowed", rateLimitType },
+            uuid: `allowed-${rateLimitType}`,
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        ),
         claudeSdkFrame({
           type: "rate_limit_event",
           rate_limit_info: {
-            status: "rejected",
+            status: usageCredits ? "allowed" : "rejected",
             rateLimitType: "future_window",
             resetsAt: 1791807600,
           },
@@ -7389,17 +7408,31 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         makeAssistantErrorFrame({
           uuid: "00000000-0000-4000-8000-000000000684",
           error: "rate_limit",
-          apiErrorParams: {
-            rate_limit_info: {
-              status: "rejected",
-              rateLimitType: "five_hour",
-              resetsAt: 1791804000,
-            },
-          },
+          ...(usageCredits ? { apiError: "model_requires_usage_credits" } : {}),
+          text: scenario.proseOnly
+            ? "Usage limit reached until the 7-day Fable limit resets in 145h"
+            : limitText,
+          apiErrorParams:
+            scenario.proseOnly || scenario.rateLimitType === "model_requires_usage_credits"
+              ? undefined
+              : {
+                  rate_limit_info: {
+                    status: "rejected",
+                    rateLimitType: scenario.rateLimitType,
+                    resetsAt: usageCredits ? 1794985200 : 1791804000,
+                    ...(usageCredits
+                      ? {
+                          overageStatus: "rejected",
+                          overageDisabledReason: "out_of_credits",
+                          isUsingOverage: false,
+                        }
+                      : {}),
+                  },
+                },
         }),
         makeResultFrame({
           uuid: "00000000-0000-4000-8000-000000000685",
-          result: "Usage limit reached.",
+          result: limitText,
           isError: true,
           apiErrorStatus: 429,
           terminalReason: "api_error",
@@ -7409,7 +7442,15 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.equal(terminal.status, "failed");
       if (terminal.status !== "failed") return;
       assert.equal(terminal.failure.class, "usage_limit");
-      assert.equal(terminal.failure.resetAt, "2026-10-12T12:20:00.000Z");
+      assert.equal(
+        terminal.failure.resetAt,
+        usageCredits
+          ? scenario.rateLimitType === "model_requires_usage_credits"
+            ? null
+            : "2026-11-18T07:00:00.000Z"
+          : "2026-10-12T12:20:00.000Z",
+      );
+      assert.equal(terminal.failure.limitScope, scenario.scope);
       assert.equal(terminal.accountFailure, "usage_limit");
       assert.equal(terminal.noWorkObserved, true);
     }).pipe(

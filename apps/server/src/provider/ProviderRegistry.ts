@@ -27,6 +27,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ModelManifest from "./ModelManifest.ts";
+import * as ProviderCooldown from "./ProviderCooldown.ts";
 import { applyProviderCompatibility } from "./providerCompatibility.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
@@ -64,6 +65,7 @@ export class ProviderRegistry extends Context.Service<
     /** Unknown instance ids return the cached list without error. */
     readonly refreshInstance: (
       instanceId: ProviderInstanceId,
+      options?: { readonly clearCooldown?: boolean },
     ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
     /** Re-reads secret-backed environments first, so a fixed secret applies without a restart. */
@@ -388,6 +390,7 @@ export const layer = Layer.effect(
     const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
     const serviceScope = yield* Effect.scope;
     const config = yield* ServerConfig.ServerConfig;
+    const cooldown = yield* ProviderCooldown.ProviderCooldown;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
 
@@ -603,6 +606,7 @@ export const layer = Layer.effect(
         readonly publish?: boolean;
       },
     ) {
+      yield* cooldown.observeProvider(provider);
       // Latest-version status cannot resolve a failed recommended-version install.
       if (provider.versionAdvisory?.status === "current") {
         yield* Ref.update(maintenanceActionStatesRef, (previous) => {
@@ -1196,19 +1200,51 @@ export const layer = Layer.effect(
       }
     });
 
+    const withCooldowns = Effect.fn("ProviderRegistry.withCooldowns")(function* (
+      providers: ReadonlyArray<ServerProvider>,
+    ) {
+      return ProviderCooldown.withProviderCooldowns(providers, yield* cooldown.getAll);
+    });
+    const getProviders = Ref.get(providersRef).pipe(Effect.flatMap(withCooldowns));
+    const cooldownUpdates = yield* cooldown.subscribeChanges;
+    yield* Stream.fromSubscription(cooldownUpdates).pipe(
+      Stream.runForEach(() =>
+        Ref.get(providersRef).pipe(
+          Effect.flatMap((providers) => PubSub.publish(changesPubSub, providers)),
+        ),
+      ),
+      Effect.forkIn(serviceScope),
+    );
     return {
-      getProviders: Ref.get(providersRef),
+      getProviders,
       refresh: (provider?: ProviderDriverKind) =>
-        refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
-      refreshInstance: (instanceId: ProviderInstanceId) =>
-        refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+        refresh(provider).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
+      refreshInstance: (instanceId: ProviderInstanceId, options) =>
+        (options?.clearCooldown === true ? cooldown.clear(instanceId) : Effect.void).pipe(
+          Effect.andThen(refreshInstance(instanceId)),
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
       reloadSecretsAndRefresh: (instanceId?: ProviderInstanceId) =>
-        reloadSecretsAndRefresh(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+        reloadSecretsAndRefresh(instanceId).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
       applySecretAndRefresh: (reference: SecretReference, value: string) =>
-        applySecretAndRefresh(reference, value).pipe(Effect.catchCause(recoverRefreshFailure)),
+        applySecretAndRefresh(reference, value).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
       refreshWorkspaceSnapshot: (input) =>
-        refreshWorkspaceSnapshot(input).pipe(Effect.catchCause(recoverRefreshFailure)),
-      refreshAfterUpdate,
+        refreshWorkspaceSnapshot(input).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
+      refreshAfterUpdate: (...args) =>
+        refreshAfterUpdate(...args).pipe(Effect.flatMap(withCooldowns)),
       invalidateModelCaches,
       refreshModelCatalog: refreshModelCatalog().pipe(
         Effect.catchCause(recoverRefreshFailure),
@@ -1217,8 +1253,8 @@ export const layer = Layer.effect(
       getProviderMaintenanceCapabilitiesForInstance,
       setProviderMaintenanceActionState,
       get streamChanges() {
-        return Stream.fromPubSub(changesPubSub);
+        return Stream.fromPubSub(changesPubSub).pipe(Stream.mapEffect(withCooldowns));
       },
     } satisfies ProviderRegistry["Service"];
   }),
-);
+).pipe(Layer.provide(ProviderCooldown.layer));

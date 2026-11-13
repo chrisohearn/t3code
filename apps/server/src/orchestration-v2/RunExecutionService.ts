@@ -25,6 +25,7 @@ import {
   type TurnItemId,
 } from "@t3tools/contracts";
 import * as ProviderFailover from "./ProviderFailover.ts";
+import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -592,7 +593,7 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly message: ProviderAdapter.ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
   /** Where an account failure before any work moves this run; see ProviderFailover. */
-  readonly failoverTarget?: ModelSelection;
+  readonly failoverTarget?: ProviderFailover.ProviderFailoverTargets;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }
 
@@ -623,6 +624,7 @@ export const layer: Layer.Layer<
   RunExecutionServiceV2,
   Effect.gen(function* () {
     const scope = yield* Effect.scope;
+    const providerCooldown = yield* ProviderCooldown.ProviderCooldown;
     const checkpointService = yield* CheckpointService.CheckpointServiceV2;
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -652,7 +654,7 @@ export const layer: Layer.Layer<
         readonly terminal: ProviderTerminalEvent;
         readonly completedAt?: DateTime.Utc;
         readonly failureItemPersisted: boolean;
-        readonly failoverTarget?: ModelSelection;
+        readonly failoverTarget?: ProviderFailover.ProviderFailoverTargets;
         readonly refreshAfterTurn: Effect.Effect<void>;
         readonly writeIfRunCurrent?: {
           readonly activeAttemptId: RunAttemptId;
@@ -1131,6 +1133,7 @@ export const layer: Layer.Layer<
             return;
           }
           const providerThread = yield* Ref.get(latestProviderThread);
+          yield* providerCooldown.observe(input.run.providerInstanceId, terminal);
           const openSubagents = yield* Ref.get(openRunOwnedSubagents);
           const writeTerminal = (settledTerminal: ProviderTerminalEvent) =>
             writeFinalRunEvents({
@@ -1988,7 +1991,7 @@ export const layer: Layer.Layer<
       }),
     } satisfies RunExecutionServiceV2Shape);
   }),
-);
+).pipe(Layer.provide(ProviderCooldown.layer));
 
 /**
  * Clients send Stop without a reason; server callers acting for an agent

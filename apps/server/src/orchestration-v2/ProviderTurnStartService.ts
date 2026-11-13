@@ -36,6 +36,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as AcknowledgeOnly from "./AcknowledgeOnly.ts";
 import * as ProviderFailover from "./ProviderFailover.ts";
+import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeRestoreMissingWorktree } from "../workspace/restoreMissingWorktree.ts";
 import * as EventSink from "./EventSink.ts";
@@ -165,11 +166,13 @@ export const layer: Layer.Layer<
     const restoreMissingWorktree = yield* makeRestoreMissingWorktree;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
+    const providerCooldown = yield* ProviderCooldown.ProviderCooldown;
     const resolveFailoverTarget = (
       input: Parameters<typeof ProviderFailover.resolveProviderFailoverTarget>[0],
     ) =>
       ProviderFailover.resolveProviderFailoverTarget(input).pipe(
         Effect.provideService(ServerSettings.ServerSettingsService, serverSettings),
+        Effect.provideService(ProviderCooldown.ProviderCooldown, providerCooldown),
       );
 
     // Build draining callbacks outside startup scope so they cannot retain full thread history.
@@ -1864,4 +1867,4 @@ export const layer: Layer.Layer<
       ),
     });
   }),
-);
+).pipe(Layer.provide(ProviderCooldown.layer));

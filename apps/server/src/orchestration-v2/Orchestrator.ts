@@ -80,6 +80,7 @@ import {
   managedRuntimeModeCeilingMessage,
 } from "@t3tools/contracts";
 import * as ProviderFailover from "./ProviderFailover.ts";
+import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { modelSwitchSince } from "./modelSwitch.ts";
@@ -1526,6 +1527,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const providerCooldown = yield* ProviderCooldown.ProviderCooldown;
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
@@ -2440,7 +2442,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const queuedMessage = projection.messages.find(
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
-      const modelSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const requestedSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const modelSelection =
+        queuedMessage === undefined
+          ? requestedSelection
+          : yield* ProviderFailover.resolveProviderCooldownTarget({
+              cooldown: providerCooldown,
+              settings: serverSettings,
+              projectId: projection.thread.projectId,
+              modelSelection: requestedSelection,
+              run: {
+                ...storedQueuedRun,
+                bypassProviderCooldown:
+                  storedQueuedRun.bypassProviderCooldown === true ||
+                  projection.thread.bypassProviderCooldown === true ||
+                  (projection.thread.scheduledModelSelection != null &&
+                    modelSelectionsEqual(
+                      requestedSelection,
+                      projection.thread.scheduledModelSelection.modelSelection,
+                    )),
+              },
+              message: queuedMessage,
+            });
       const queuedRun = {
         ...storedQueuedRun,
         modelSelection,
@@ -3097,7 +3120,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : "Provider or model selection changed.";
       yield* writeSystemEvents(
         [
-          ...(selectionChanged || threadAtStart !== projection.thread
+          ...(selectionChanged ||
+          threadAtStart !== projection.thread ||
+          projection.thread.bypassProviderCooldown === true
             ? [
                 {
                   type: !selectionChanged
@@ -3112,6 +3137,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     ...threadAtStart,
                     providerInstanceId: queuedRun.providerInstanceId,
                     modelSelection: queuedRun.modelSelection,
+                    bypassProviderCooldown: false,
                     updatedAt: now,
                   },
                 },
@@ -5251,6 +5277,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...thread,
             providerInstanceId: command.modelSelection.instanceId,
             modelSelection: command.modelSelection,
+            bypassProviderCooldown: true,
             ...(thread.scheduledModelSelection == null ? {} : { scheduledModelSelection: null }),
             updatedAt: now,
           };
@@ -7791,6 +7818,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       modelSelection = queueTailModelSelection(projection);
     }
+    const bypassProviderCooldown =
+      (command.modelSelection !== undefined &&
+        !modelSelectionsEqual(command.modelSelection, projection.thread.modelSelection)) ||
+      projection.thread.bypassProviderCooldown === true ||
+      (projection.thread.scheduledModelSelection != null &&
+        modelSelectionsEqual(
+          modelSelection,
+          projection.thread.scheduledModelSelection.modelSelection,
+        ));
+    if (
+      command.failoverOfRunId === undefined &&
+      command.restartContinuationOfRunId === undefined &&
+      startsOrQueuesRun
+    ) {
+      modelSelection = yield* ProviderFailover.resolveProviderCooldownTarget({
+        cooldown: providerCooldown,
+        settings: serverSettings,
+        projectId: projection.thread.projectId,
+        modelSelection,
+        run: { bypassProviderCooldown },
+        message: { ...command, role: "user" },
+      });
+    }
+    if (projection.thread.bypassProviderCooldown === true && startsOrQueuesRun) {
+      const now = yield* DateTime.now;
+      const event = yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.metadata-updated",
+        threadId: command.threadId,
+        providerInstanceId: projection.thread.providerInstanceId,
+        occurredAt: now,
+        payload: { ...projection.thread, bypassProviderCooldown: false, updatedAt: now },
+      });
+      projection = applyToProjection(projection, event);
+    }
     yield* ensureGoalCommandSupported(command, command, modelSelection.instanceId);
     // Client messages resume held queues; server continuations and scheduled tasks do not.
     // Provider failure or usage limits re-hold the queue.
@@ -7974,6 +8038,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         rootNodeId,
         activeAttemptId: attemptId,
         status: "queued",
+        ...(bypassProviderCooldown ? { bypassProviderCooldown: true } : {}),
         ...(steerWhenReadyRunId === undefined ? {} : { steerWhenReadyRunId }),
         ...(respectsSnooze ? { snoozeDeferred: true } : {}),
         ...(command.modelSelection === undefined ? {} : { explicitModelSelection: true }),
@@ -8421,6 +8486,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         rootNodeId,
         activeAttemptId: attemptId,
         status: dispatchMode.type === "defer_start" ? "preparing" : "starting",
+        ...(bypassProviderCooldown ? { bypassProviderCooldown: true } : {}),
         queuePosition: null,
         requestedAt: now,
         startedAt: null,
@@ -16976,4 +17042,5 @@ export const layer: Layer.Layer<
   | ThreadForkServiceV2
 > = Layer.effect(OrchestratorV2, makeOrchestrator()).pipe(
   Layer.provide(ThreadCommandExecutor.layer),
+  Layer.provide(ProviderCooldown.layer),
 );

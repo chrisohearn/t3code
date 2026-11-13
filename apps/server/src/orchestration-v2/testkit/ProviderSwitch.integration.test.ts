@@ -38,6 +38,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as ProviderCooldown from "../../provider/ProviderCooldown.ts";
 import { CommandPolicyCapabilityUnsupportedError } from "../CommandPolicy.ts";
 import {
   ClaudeAgentSdkQueryRunnerError,
@@ -3826,11 +3827,15 @@ describe("orchestration v2 provider switching", () => {
             responseByRunOrdinal: { 1: "Queued for Jarvis: ready" },
             capturedTurns,
             failedRunOrdinals: new Set([2]),
-            failure: makeProviderFailure({
-              message: "You've hit your usage limit.",
-              code: "subscription_sharing_usage_limit_exceeded",
-              class: "usage_limit",
-            }),
+            failure: {
+              ...makeProviderFailure({
+                message: "You've hit your usage limit.",
+                code: "subscription_sharing_usage_limit_exceeded",
+                class: "usage_limit",
+              }),
+              limitScope: "account",
+              resetAt: "2099-01-01T00:00:00.000Z",
+            },
             failedTerminalEvidence: { noWorkObserved: true, accountFailure: "usage_limit" },
           }),
           makeTestAdapter({
@@ -3909,6 +3914,25 @@ describe("orchestration v2 provider switching", () => {
           assert.include(delivered, role);
           assert.include(delivered, "is this thread's first message");
           assert.equal(delivered.split("Queue: the audit finished.").length - 1, 1);
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("command:account-failover:cooldown"),
+            threadId,
+            messageId: MessageId.make("message:account-failover:cooldown"),
+            text: "Queue: another task.",
+            attachments: [],
+            modelSelection: CODEX_MODEL_SELECTION,
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "agent",
+            creationSource: "mcp",
+          });
+          yield* worker.drain();
+          const cooled = yield* waitForIdle(threadId);
+          assert.deepEqual(cooled.runs.at(-1)?.modelSelection, CODEX_MODEL_SELECTION);
+          assert.deepEqual(
+            (yield* Ref.get(capturedTurns)).map((turn) => turn.driver),
+            [CODEX_DRIVER, CODEX_DRIVER, CLAUDE_DRIVER, CODEX_DRIVER],
+          );
         }).pipe(
           Effect.provide(
             ProviderReplayHarness.layerWithRegistry(
@@ -3916,6 +3940,220 @@ describe("orchestration v2 provider switching", () => {
               layerRegistry,
               { settings: { fallbackModelSelection: CLAUDE_MODEL_SELECTION } },
             ),
+          ),
+        );
+      }),
+    ),
+  );
+
+  it.live.each([
+    "default",
+    "failover",
+    "restart",
+    "claimed",
+    "explicit",
+    "picker",
+    "scheduled",
+    "immediate-default",
+    "immediate-deferred",
+    "immediate-same",
+    "immediate-different",
+  ] as const)("keeps queued %s routing safe while its requested account is cooling", (kind) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace(`queued-cooldown-${kind}`);
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const started = yield* Deferred.make<void>();
+        const immediate = kind.startsWith("immediate");
+        const startsOnClaude = kind === "scheduled" || kind === "immediate-different";
+        const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+          makeTestAdapter({
+            instanceId: CODEX_MODEL_SELECTION.instanceId,
+            driver: CODEX_DRIVER,
+            capabilities: CodexProviderCapabilitiesV2,
+            modelSelection: CODEX_MODEL_SELECTION,
+            responseByRunOrdinal: {},
+            capturedTurns,
+            ...(!immediate && !startsOnClaude ? { holdFirstTurn: started } : {}),
+          }),
+          makeTestAdapter({
+            instanceId: CLAUDE_MODEL_SELECTION.instanceId,
+            driver: CLAUDE_DRIVER,
+            capabilities: ClaudeProviderCapabilitiesV2,
+            modelSelection: CLAUDE_MODEL_SELECTION,
+            responseByRunOrdinal: {},
+            capturedTurns,
+            ...(kind === "scheduled" ? { holdFirstTurn: started } : {}),
+          }),
+        ]);
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const eventSink = yield* EventSink.EventSinkV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const cooldown = yield* ProviderCooldown.ProviderCooldown;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("command:queued-cooldown:create"),
+            threadId,
+            projectId,
+            title: "Cooldown queue",
+            modelSelection: startsOnClaude ? CLAUDE_MODEL_SELECTION : CODEX_MODEL_SELECTION,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const armCooldown = cooldown.observe(CODEX_MODEL_SELECTION.instanceId, {
+            status: "failed",
+            failure: {
+              ...makeProviderFailure({ class: "usage_limit", message: "Account limit" }),
+              limitScope: "account",
+              resetAt: "2099-01-01T00:00:00.000Z",
+            },
+          });
+          if (immediate) {
+            yield* armCooldown;
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make("command:immediate-cooldown:send"),
+              threadId,
+              messageId: MessageId.make("message:immediate-cooldown:send"),
+              text: "Start directly on the usable account unless I picked another model.",
+              attachments: [],
+              ...(kind === "immediate-default" || kind === "immediate-deferred"
+                ? {}
+                : { modelSelection: CODEX_MODEL_SELECTION }),
+              dispatchMode: {
+                type: kind === "immediate-deferred" ? "defer_start" : "start_immediately",
+              },
+              createdBy: kind === "immediate-default" ? "agent" : "user",
+              creationSource: kind === "immediate-default" ? "mcp" : "web",
+            });
+            if (kind === "immediate-deferred") {
+              const prepared = yield* orchestrator.getThreadProjection(threadId);
+              assert.deepEqual(prepared.runs[0]?.modelSelection, CLAUDE_MODEL_SELECTION);
+              assert.equal(prepared.runs[0]?.status, "preparing");
+              yield* orchestrator.dispatch({
+                type: "prepared-run.release",
+                commandId: CommandId.make("command:immediate-cooldown:release"),
+                threadId,
+                runId: prepared.runs[0]!.id,
+              });
+            }
+            yield* worker.drain();
+            const after = yield* waitForIdle(threadId);
+            const expected =
+              kind === "immediate-different" ? CODEX_MODEL_SELECTION : CLAUDE_MODEL_SELECTION;
+            assert.deepEqual(
+              after.runs.map((run) => run.modelSelection),
+              [expected],
+            );
+            assert.deepEqual(
+              (yield* Ref.get(capturedTurns)).map((turn) => turn.modelSelection),
+              [expected],
+            );
+            assert.isFalse(after.runs.some((run) => run.status === "failed"));
+            return;
+          }
+          for (const position of ["first", "queued"] as const) {
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`command:queued-cooldown:${position}`),
+              threadId,
+              messageId: MessageId.make(`message:queued-cooldown:${position}`),
+              text: position,
+              attachments: [],
+              ...(position === "queued" && kind === "explicit"
+                ? { modelSelection: CODEX_MODEL_SELECTION }
+                : {}),
+              dispatchMode: {
+                type: position === "first" ? "start_immediately" : "queue_after_active",
+              },
+              createdBy: "user",
+              creationSource: "web",
+            });
+            if (position === "first") yield* Deferred.await(started);
+          }
+          if (kind === "picker" || kind === "scheduled") {
+            yield* orchestrator.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make("command:queued-cooldown:pick"),
+              threadId,
+              modelSelection: CODEX_MODEL_SELECTION,
+              ...(kind === "scheduled" ? { applyAt: "next_turn" as const } : {}),
+            });
+          }
+          const queued = yield* orchestrator.getThreadProjection(threadId);
+          const [active, pending] = queued.runs;
+          assert.equal(pending!.status, "queued");
+          yield* armCooldown;
+          const now = yield* DateTime.now;
+          yield* eventSink.write({
+            events: [
+              {
+                id: EventId.make("event:queued-cooldown:guard"),
+                type: "run.updated",
+                threadId,
+                runId: pending!.id,
+                providerInstanceId: pending!.providerInstanceId,
+                occurredAt: now,
+                payload: {
+                  ...pending!,
+                  ...(kind === "failover" ? { failoverOfRunId: active!.id } : {}),
+                  ...(kind === "restart" ? { restartContinuationOfRunId: active!.id } : {}),
+                  ...(kind === "claimed"
+                    ? {
+                        failover: {
+                          state: "skipped" as const,
+                          reason: "usage_limit" as const,
+                          modelSelection: CLAUDE_MODEL_SELECTION,
+                        },
+                      }
+                    : {}),
+                },
+              },
+              {
+                id: EventId.make("event:queued-cooldown:release"),
+                type: "run.updated",
+                threadId,
+                runId: active!.id,
+                providerInstanceId: active!.providerInstanceId,
+                occurredAt: now,
+                payload: { ...active!, status: "completed", completedAt: now },
+              },
+            ],
+          });
+          yield* orchestrator.resumeQueuedRuns;
+          yield* worker.drain();
+          yield* orchestrator.streamStoredEvents.pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "run.updated" &&
+                event.runId === pending!.id &&
+                event.payload.status === "completed",
+            ),
+            Stream.runHead,
+          );
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          const expected =
+            kind === "default" || kind === "explicit"
+              ? CLAUDE_MODEL_SELECTION
+              : CODEX_MODEL_SELECTION;
+          assert.deepEqual(
+            after.runs.find((run) => run.id === pending!.id)?.modelSelection,
+            expected,
+          );
+          assert.deepEqual((yield* Ref.get(capturedTurns)).at(-1)?.modelSelection, expected);
+          assert.isFalse(after.thread.bypassProviderCooldown === true);
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              { name: `queued-cooldown-${kind}`, runtimePolicyOverride: { cwd } },
+              layerRegistry,
+              { settings: { fallbackModelSelection: CLAUDE_MODEL_SELECTION } },
+            ).pipe(Layer.provideMerge(ProviderCooldown.layer)),
           ),
         );
       }),
