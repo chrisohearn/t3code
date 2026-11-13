@@ -7,7 +7,7 @@ Accepted 2026-11-13. Amends [0004](0004-approval-authority.md) for tasks with in
 Every task Chris gives runs to a verified finish without him.
 
 - **Intake grill.** Before starting, the agent asks Chris once, all together, every decision it can foresee: scope, defaults, accounts and routes, and each sensitive action (messages sent as him and their recipients, security or credential changes, deletes). The done-checks go on the task's ledger row.
-- **Only spending money stops.** Purchases, payments and subscriptions need Chris's fresh go-ahead every time.
+- **Spending money always stops.** Purchases, payments and subscriptions need Chris's fresh go-ahead every time, carried as a [server-verified approval](0015-server-verified-approvals.md), even when the T3 agent that asked spends directly. Intake answers never cover money. Apart from money, the only stops are security-control refusals (below), which are blockers, not approvals to seek.
 - **Fallback ladder.** Agents never park on a blocker with a known next step:
   - a failed hosted PR review gets an independent read-only Claude Opus review of the exact head, posted as the review of record;
   - usage limits fail over automatically;
@@ -29,10 +29,10 @@ Every task Chris gives runs to a verified finish without him.
 
 ### How intake answers authorize
 
-Intake answers authorize only the agent that heard them from Chris, for the actions they spell out:
+Intake answers authorize the actions they spell out, for the agent that asked and for workers it hands the task to, who read the dialog themselves:
 
 - **A T3 agent's intake** happens in a question dialog. The agent acts on Chris's answers as it sees them in its own thread. It links the dialog (thread and item id) on the ledger row so reviewers and relaunched workers can read the original. A relaunched worker reads that dialog itself. Handoff text or row text is never the grant.
-- **Jarvis's intake** happens in its chat. That is Chris instructing Jarvis directly, and Jarvis relays it to T3 agents as [0004](0004-approval-authority.md) allows.
+- **Jarvis's intake** happens in its chat. That is Chris instructing Jarvis directly, and Jarvis relays it to T3 agents as [0004](0004-approval-authority.md) allows. A T3 agent acts on such a grant only from a message whose [server-recorded sender](0013-server-recorded-message-senders.md) is Jarvis's sign-in. It links that message on the ledger row, so reviewers and relaunched workers can read the source.
 - **Passing a grant from T3 to Jarvis** still needs a [server-verified approval](0015-server-verified-approvals.md) for each action. A row's title, `nextAction` and `approvalNote` are never scope.
 
 ## Accepted residual
