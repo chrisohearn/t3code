@@ -340,6 +340,13 @@ export const afterForwarding = <P, A, E, R, E2, R2>(
 const fullAccessRequired =
   "Changing projects or environment settings needs a live full-access/default calling thread or a full-access client.";
 
+/** Fork: the `writesEnvironment` check, for one branch of a tool that otherwise writes a thread. */
+export const requireFullAccess = (what: string) =>
+  orchestratingCaller.pipe(
+    Effect.tap((caller) => assertNotLinked(caller, what)),
+    Effect.tap((caller) => assertFullAccess(caller, fullAccessRequired)),
+  );
+
 /** Recheck after waits before writing; caller modes may have changed. */
 export const writesEnvironment = <P, A, E, R>(
   handle: (

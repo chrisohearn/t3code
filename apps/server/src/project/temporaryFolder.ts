@@ -43,10 +43,15 @@ export function isTemporaryPath(path: string): boolean {
 }
 
 export interface FolderProbe {
-  /** The path with symlinks resolved, and whether its filesystem is a tmpfs. */
-  readonly inspect: (
-    path: string,
-  ) => Promise<{ readonly resolved: string; readonly tmpfs: boolean }>;
+  /**
+   * The path with symlinks resolved, and whether its filesystem is a tmpfs. No answer means the
+   * caller goes by the name.
+   */
+  readonly inspect: (path: string) => Promise<FolderInspection | undefined>;
+}
+interface FolderInspection {
+  readonly resolved: string;
+  readonly tmpfs: boolean;
 }
 
 const exists = (path: string) =>
@@ -55,7 +60,48 @@ const exists = (path: string) =>
     () => false,
   );
 
-const nodeProbe: FolderProbe = {
+const RESULT_TTL_MS = 30_000;
+const MAX_CACHED_PATHS = 256;
+
+/**
+ * One probe per path at a time. A probe on a dead mount never settles and pins a libuv thread, so
+ * a retry during an unanswered probe gets no answer at once (the caller goes by name) and adds no
+ * reaction to it. Unanswered probes are kept apart from the bounded cache of settled answers.
+ */
+export function dedupeProbe(
+  probe: FolderProbe,
+  now: () => number = Date.now,
+  resultTtlMs = RESULT_TTL_MS,
+): FolderProbe {
+  const unanswered = new Set<string>();
+  const settled = new Map<string, { readonly answer: FolderInspection | undefined; at: number }>();
+  return {
+    inspect: (path) => {
+      if (unanswered.has(path)) return Promise.resolve(undefined);
+      const known = settled.get(path);
+      if (known !== undefined && now() - known.at < resultTtlMs) {
+        return Promise.resolve(known.answer);
+      }
+      unanswered.add(path);
+      return probe.inspect(path).then(
+        (answer) => {
+          unanswered.delete(path);
+          settled.delete(path);
+          settled.set(path, { answer, at: now() });
+          // Map order is insertion order, so the first key is the oldest.
+          if (settled.size > MAX_CACHED_PATHS) settled.delete(settled.keys().next().value!);
+          return answer;
+        },
+        () => {
+          unanswered.delete(path);
+          return undefined;
+        },
+      );
+    },
+  };
+}
+
+const nodeProbe: FolderProbe = dedupeProbe({
   inspect: async (path) => {
     // A missing folder is the usual case here, so inspect its nearest existing ancestor.
     let existing = path;
@@ -72,7 +118,7 @@ const nodeProbe: FolderProbe = {
       return { resolved: path, tmpfs: false };
     }
   },
-};
+});
 
 /**
  * A folder the system clears at reboot: a tmpfs, or under a well-known temporary directory.

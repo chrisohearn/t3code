@@ -1262,7 +1262,10 @@ it.effect("a read-only client reads threads and is refused every write before it
       threadId: "other-project-thread",
     });
     expect(configuration.isError).toBe(false);
-    expect(configuration.structuredContent).toMatchObject({ runtimeMode: "auto" });
+    expect(configuration.structuredContent).toMatchObject({
+      runtimeMode: "auto",
+      acknowledgeOnly: false,
+    });
 
     const pinned = yield* call("t3_thread_organize", {
       action: "pin",
@@ -1301,6 +1304,39 @@ it.effect("a read-only client reads threads and is refused every write before it
     expect(dispatched).toEqual([
       'thread.runtime-mode.set:approval-required:MCP client "Claude Code" (session-)',
     ]);
+
+    // Who answers a thread's messages is environment policy: full access only, both ways.
+    const acknowledgeAs = (
+      access: "read-only" | "auto" | "full-access",
+      acknowledgeOnly: boolean,
+    ) =>
+      server
+        .callTool({
+          name: "t3_thread_configure",
+          arguments: { threadId: "other-project-thread", acknowledgeOnly },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, clientScope(access)),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+    for (const access of ["read-only", "auto"] as const) {
+      expect(declaredFailure(yield* acknowledgeAs(access, true))).toMatchObject({
+        code: "capability_denied",
+      });
+    }
+    expect((yield* acknowledgeAs("full-access", true)).structuredContent).toMatchObject({
+      acknowledgeOnly: true,
+    });
+    expect(
+      (yield* call("t3_thread_configure", { threadId: "other-project-thread" })).structuredContent,
+    ).toMatchObject({ acknowledgeOnly: true });
+    expect(declaredFailure(yield* acknowledgeAs("auto", false))).toMatchObject({
+      code: "capability_denied",
+    });
+    expect((yield* acknowledgeAs("full-access", false)).structuredContent).toMatchObject({
+      acknowledgeOnly: false,
+    });
+    expect(dispatched).toHaveLength(1);
   }).pipe(
     Effect.provide(
       layerThreadToolkit.pipe(
@@ -1325,6 +1361,11 @@ it.effect("a read-only client reads threads and is refused every write before it
                   deletedAt: null,
                 },
               } as never),
+            acknowledgeOnly: () => Effect.succeed(acknowledgeOnly),
+            setAcknowledgeOnly: (_, enabled) =>
+              Effect.sync(() => {
+                acknowledgeOnly = enabled;
+              }),
             dispatch: (command) =>
               Effect.gen(function* () {
                 const actor = yield* RuntimeModeChangeActor;
@@ -1340,6 +1381,7 @@ it.effect("a read-only client reads threads and is refused every write before it
   ),
 );
 const dispatched: Array<string> = [];
+let acknowledgeOnly = false;
 
 it.effect("refuses act-as-caller tools to a client caller", () =>
   Effect.gen(function* () {

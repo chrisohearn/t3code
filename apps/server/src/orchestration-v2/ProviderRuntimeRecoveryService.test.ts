@@ -512,13 +512,18 @@ it.effect("recovery closes a secret card's form but leaves a link card open", ()
 
 it.effect.each([
   "queued",
+  "queued-acknowledge-only",
   "preparing",
   "starting",
   "starting-other-request",
   "starting-own-request",
   "starting-scheduled",
 ] as const)("recovers $0 work after restart", (scenario) => {
-  const status = scenario.startsWith("starting") ? "starting" : scenario;
+  const status = scenario.startsWith("starting")
+    ? "starting"
+    : scenario.startsWith("queued")
+      ? "queued"
+      : scenario;
   const terminalized =
     status === "preparing" ||
     scenario === "starting-own-request" ||
@@ -604,7 +609,12 @@ it.effect.each([
     turnItems: [],
   } as unknown as OrchestrationV2ThreadProjection;
   const layer = ProviderRuntimeRecovery.layer.pipe(
-    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(
+      ServerSettings.layerTest(
+        // The server answers these runs itself, so a restart leaves their queue moving.
+        scenario === "queued-acknowledge-only" ? { acknowledgeOnlyThreadIds: [threadId] } : {},
+      ),
+    ),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
@@ -665,7 +675,10 @@ it.effect.each([
       );
     } else {
       assert.equal(runEvent?.type === "run.updated" ? runEvent.payload.queuePosition : null, 1);
-      assert.equal(runEvent?.type === "run.updated" ? runEvent.payload.queueHeld : false, true);
+      assert.equal(
+        runEvent?.type === "run.updated" ? runEvent.payload.queueHeld : null,
+        scenario !== "queued-acknowledge-only",
+      );
       assert.isUndefined(attemptEvent);
       assert.isUndefined(nodeEvent);
     }

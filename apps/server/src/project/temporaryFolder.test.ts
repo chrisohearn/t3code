@@ -3,12 +3,17 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import { assert, it } from "@effect/vitest";
+import { assert, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 
-import { isTemporaryFolder, isTemporaryPath, temporaryFolderWarning } from "./temporaryFolder.ts";
+import {
+  dedupeProbe,
+  isTemporaryFolder,
+  isTemporaryPath,
+  temporaryFolderWarning,
+} from "./temporaryFolder.ts";
 
 it.effect.each([
   ["/tmp/review", true],
@@ -70,3 +75,45 @@ it.effect("resolves symlinks, and ignores a persistent TMPDIR", () =>
     assert.isTrue(yield* isTemporaryFolder(NodePath.join(sandbox, "missing")));
   }).pipe(Effect.scoped),
 );
+
+it("sends a retry to the name while a probe is unanswered, and reuses a settled answer until it expires", async () => {
+  let clock = 0;
+  let calls = 0;
+  const answers = [new Promise<never>(() => {})];
+  const probe = dedupeProbe(
+    {
+      inspect: (path) => {
+        calls += 1;
+        return answers.shift() ?? Promise.resolve({ resolved: path, tmpfs: false });
+      },
+    },
+    () => clock,
+    1_000,
+  );
+  // The first probe never settles, as on a dead mount: later calls get no answer, not another probe.
+  void probe.inspect("/mnt/dead/a");
+  expect(await probe.inspect("/mnt/dead/a")).toBeUndefined();
+  expect(await probe.inspect("/mnt/dead/a")).toBeUndefined();
+  expect(calls).toBe(1);
+  // Another path probes on its own, and its answer is reused until the TTL passes.
+  expect(await probe.inspect("/home/a")).toEqual({ resolved: "/home/a", tmpfs: false });
+  await probe.inspect("/home/a");
+  expect(calls).toBe(2);
+  clock = 1_001;
+  await probe.inspect("/home/a");
+  expect(calls).toBe(3);
+});
+
+it("keeps an unanswered probe when many other paths fill the result cache", async () => {
+  let calls = 0;
+  const probe = dedupeProbe({
+    inspect: (path) => {
+      calls += 1;
+      return path === "/mnt/dead" ? new Promise<never>(() => {}) : Promise.resolve(undefined);
+    },
+  });
+  void probe.inspect("/mnt/dead");
+  for (let index = 0; index < 300; index += 1) await probe.inspect(`/home/p${index}`);
+  expect(await probe.inspect("/mnt/dead")).toBeUndefined();
+  expect(calls).toBe(301);
+});

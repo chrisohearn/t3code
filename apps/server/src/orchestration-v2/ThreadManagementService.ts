@@ -1,6 +1,7 @@
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
+  ServerSettingsError,
 } from "@t3tools/contracts";
 import type {
   ProjectionRecordField,
@@ -58,6 +59,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
+import * as AcknowledgeOnly from "./AcknowledgeOnly.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -379,6 +381,12 @@ export type ThreadManagementError = typeof ThreadManagementError.Type;
 type ThreadManagementFailure = ThreadManagementError | Orchestrator.OrchestratorV2Error;
 
 export interface ThreadManagementServiceShape {
+  /** Fork: whether the server, not the agent, answers the thread's messages. */
+  readonly acknowledgeOnly: (threadId: ThreadId) => Effect.Effect<boolean, ServerSettingsError>;
+  readonly setAcknowledgeOnly: (
+    threadId: ThreadId,
+    enabled: boolean,
+  ) => Effect.Effect<void, ServerSettingsError>;
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
   ) => Stream.Stream<OrchestrationV2SearchThreadResult, Orchestrator.OrchestratorV2Error>;
@@ -1632,7 +1640,20 @@ const make = Effect.gen(function* () {
     if (failures[0] !== undefined) return yield* failures[0];
   });
 
+  // Fork: toggles read and rewrite one settings list; one at a time so none is lost.
+  const acknowledgeOnlyLock = yield* Semaphore.make(1);
   return ThreadManagementService.of({
+    acknowledgeOnly: Effect.fn("ThreadManagementService.acknowledgeOnly")(function* (threadId) {
+      return AcknowledgeOnly.isAcknowledgeOnlyThread(yield* serverSettings.getSettings, threadId);
+    }),
+    setAcknowledgeOnly: Effect.fn("ThreadManagementService.setAcknowledgeOnly")(
+      function* (threadId, enabled) {
+        yield* AcknowledgeOnly.setAcknowledgeOnly(threadId, enabled).pipe(
+          Effect.provideService(ServerSettings.ServerSettingsService, serverSettings),
+          acknowledgeOnlyLock.withPermits(1),
+        );
+      },
+    ),
     ensureLegacyTranscript,
     searchThreadStream: (input) =>
       Stream.unwrap(
