@@ -2051,7 +2051,7 @@ it.effect(
         },
       ).pipe(Effect.forkScoped);
       assert.isFalse(yield* Deferred.await(active));
-    }).pipe(Effect.scoped),
+    }),
 );
 
 it.effect("keeps ingesting a failed root's background item when its work continues", () =>
