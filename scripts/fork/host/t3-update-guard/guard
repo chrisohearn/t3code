@@ -15,8 +15,12 @@
 #   prove     Run ~90 s after each start. Records the active build as healthy once it serves.
 #   rollback  systemd OnFailure. If a build that never proved healthy crash-loops, go back to
 #             the newest healthy build and start it.
-#   update    Timer and `t3-service-update`. Installs the newest trusted release when no
-#             thread is running, verifies it serves, and rolls back if not.
+#   update    Timer and `t3-service-update`. Installs the newest trusted release when no thread
+#             has run for a while, or after MAX_DEFER_SECONDS anyway (threads nearly always run);
+#             a forced update first waits a bounded time for pending approvals and in-flight
+#             tool calls, never stops the service while the kernel shows the exit hang, and
+#             reports afterwards which interrupted threads continued. Verifies the new build
+#             serves, and rolls back if not.
 #   status    Show what is active, trusted, healthy and blocked.
 #   trust V   Verify version V against its release and record it as trusted.
 #
@@ -555,10 +559,107 @@ active_runs() {
 # Seconds since the last thread run finished or was requested. Deploys wait for a quiet
 # period so a restart does not land between turns of an active session (Chris, 2026-11-11).
 IDLE_QUIET_SECONDS="${IDLE_QUIET_SECONDS:-900}"
-MAX_DEFER_SECONDS="${MAX_DEFER_SECONDS:-10800}"   # 3 h; see cmd_update
+# Threads run nearly all the time (Chris, 2026-11-13), so the idle wait is capped short. Past the
+# cap the update is forced, after a bounded extra wait for the things a restart cannot undo
+# (force_blockers). Was 3 h.
+MAX_DEFER_SECONDS="${MAX_DEFER_SECONDS:-1800}"     # 30 min; see cmd_update
+FORCE_GRACE_SECONDS="${FORCE_GRACE_SECONDS:-1200}" # extra wait for force_blockers past the cap
+TOOL_QUIET_SECONDS="${TOOL_QUIET_SECONDS:-120}"    # a tool call updated this recently is in flight
+PRE_RESTART="$GUARD_STATE/pre-restart"
 quiet_seconds() {
   timeout 10 sqlite3 -readonly "$DB" \
     "select cast((julianday('now') - julianday(max(max(coalesce(completed_at,'')), max(requested_at)))) * 86400 as int) from orchestration_v2_projection_runs;" 2>/dev/null
+}
+
+# What a restart now would break in a way restart recovery cannot undo (checked 2026-11-13):
+# pending approvals and questions are cancelled and must be asked again, and a tool call cut off
+# mid-way may already have acted outside T3 (a push, a merge, a sent message), so the thread's
+# continuation can repeat it. Prints one line per blocker; an unreadable count is a blocker.
+force_blockers() {
+  local n
+  n=$(timeout 10 sqlite3 -readonly "$DB" \
+    "select count(*) from orchestration_v2_projection_runtime_requests where status = 'pending';" 2>/dev/null)
+  [[ "$n" =~ ^[0-9]+$ ]] || n="unknown number of"
+  [[ "$n" == 0 ]] || echo "$n pending approval(s) or question(s)"
+  n=$(timeout 10 sqlite3 -readonly "$DB" \
+    "select count(*) from orchestration_v2_projection_turn_items i
+       join orchestration_v2_projection_runs r on r.run_id = i.run_id
+      where r.status in ('running','starting','waiting') and i.status in ('running','pending')
+        and i.type in ('command_execution','dynamic_tool','file_change')
+        and i.updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-$TOOL_QUIET_SECONDS seconds');" 2>/dev/null)
+  [[ "$n" =~ ^[0-9]+$ ]] || n="unknown number of"
+  [[ "$n" == 0 ]] || echo "$n tool call(s) active in the last $TOOL_QUIET_SECONDS s"
+  return 0
+}
+
+# T3 processes stuck while exiting: uninterruptible sleep with PF_EXITING (0x4) set. Plain D
+# state is ordinary disk I/O (a test run waiting on pages) and must not block updates. One pid
+# per line, sorted.
+t3_exit_hang_pids() {
+  local pid rest
+  for pid in $(ps -eo pid=,stat=,cgroup= 2>/dev/null | awk '$2 ~ /^D/ && $3 ~ /t3code/ {print $1}'); do
+    rest=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null) || continue
+    read -r -a f <<<"$rest"
+    [[ "${f[0]:-}" == D && "${f[6]:-0}" =~ ^[0-9]+$ ]] && (( f[6] & 4 )) && echo "$pid"
+  done | sort
+}
+
+# Signs of the kernel 7.2.15 hang seen on 2026-11-12: an exiting process sticks in
+# exit_mmap -> __vma_start_write and never releases its cgroup, so stopping the service hangs
+# and only a reboot recovers. Prints the reason and succeeds when a stop is unsafe now. The
+# journal check covers this boot only, so a reboot clears it. T3_GUARD_IGNORE_KERNEL=1 skips it.
+kernel_hang_signs() {
+  local n first again
+  [[ -n "${T3_GUARD_IGNORE_KERNEL:-}" ]] && return 1
+  n=$(timeout 10 journalctl -k -b 0 -q --no-pager 2>/dev/null |
+    grep -c -E 'blocked for more than [0-9]+ seconds|Bad page state')
+  if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then
+    echo "kernel logged $n hung-task or bad-page message(s) this boot"
+    return 0
+  fi
+  first=$(t3_exit_hang_pids)
+  [[ -n "$first" ]] || return 1
+  sleep 5
+  again=$(comm -12 <(printf '%s\n' "$first") <(t3_exit_hang_pids))
+  [[ -n "$again" ]] || return 1
+  echo "T3 process(es) $(printf '%s ' $again)stuck while exiting"
+  return 0
+}
+
+# Threads running at the restart, so the guard can check afterwards that each one continued.
+record_pre_restart() {
+  { date -u +%Y-%m-%dT%H:%M:%S.000Z
+    timeout 10 sqlite3 -readonly "$DB" \
+      "select distinct thread_id from orchestration_v2_projection_runs where status in ('running','starting','waiting');"
+  } >"$PRE_RESTART" 2>/dev/null || rm -f "$PRE_RESTART"
+}
+
+# After a restart: how many interrupted threads have a run requested since (restart recovery
+# queues one per thread), which do not, and how many requests the restart cancelled. Prints
+# nothing when nothing was running and nothing was cancelled.
+recovery_summary() {
+  local at t n total=0 continued=0 missing="" cancelled
+  [[ -r "$PRE_RESTART" ]] || return 0
+  at=$(head -n1 "$PRE_RESTART")
+  [[ "$at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$ ]] || { rm -f "$PRE_RESTART"; return 0; }
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    total=$((total + 1))
+    n=$(timeout 10 sqlite3 -readonly "$DB" \
+      "select count(*) from orchestration_v2_projection_runs where thread_id = '${t//\'/\'\'}' and requested_at >= '$at';" 2>/dev/null)
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then
+      continued=$((continued + 1))
+    else
+      missing+=" ${t:0:72}"
+    fi
+  done < <(tail -n +2 "$PRE_RESTART")
+  cancelled=$(timeout 10 sqlite3 -readonly "$DB" \
+    "select count(*) from orchestration_v2_projection_runtime_requests where status = 'cancelled' and resolved_at >= '$at';" 2>/dev/null)
+  [[ "$cancelled" =~ ^[0-9]+$ ]] || cancelled="unknown"
+  rm -f "$PRE_RESTART"
+  (( total > 0 )) || [[ "$cancelled" != 0 ]] || return 0
+  printf '%s/%s interrupted thread(s) continued%s; %s request(s) cancelled' \
+    "$continued" "$total" "${missing:+; not continued:$missing}" "$cancelled"
 }
 
 SNAPSHOTS="$T3HOME/runtime/guard-db-snapshots"
@@ -607,7 +708,7 @@ wait_inactive() {
 
 # Install the newest trusted release (or $1), verify it serves, roll back if not.
 cmd_update() {
-  local now_flag="" target="" cur latest runs sha
+  local now_flag="" target="" cur latest runs sha blockers="" forced="" hang
   while (( $# )); do
     case "$1" in
       --now) now_flag=1 ;;
@@ -684,8 +785,15 @@ cmd_update() {
       [[ -e "$GUARD_STATE/deferred-since" ]] || touch "$GUARD_STATE/deferred-since"
       local waited=$(( $(date +%s) - $(stat -c %Y "$GUARD_STATE/deferred-since") ))
       if (( waited >= MAX_DEFER_SECONDS )); then
-        log "update: $latest waited $(( waited / 60 )) min ($why); max wait reached, deploying anyway"
-        why=""
+        # Past the cap the update is forced, after a bounded wait for force_blockers.
+        blockers=$(force_blockers | paste -sd ';' -)
+        if [[ -n "$blockers" ]] && (( waited < MAX_DEFER_SECONDS + FORCE_GRACE_SECONDS )); then
+          why="max wait reached; waiting up to $(( (MAX_DEFER_SECONDS + FORCE_GRACE_SECONDS - waited + 59) / 60 )) min more for: ${blockers//;/, }"
+        else
+          log "update: $latest waited $(( waited / 60 )) min ($why); max wait reached, deploying anyway${blockers:+ (still: ${blockers//;/, })}"
+          forced="$why"
+          why=""
+        fi
       fi
     fi
     if [[ -n "$why" ]]; then
@@ -708,6 +816,23 @@ cmd_update() {
   sha=$(release_binary_sha "$latest") || { log "update: $latest is not a verified release in $TRUSTED_REPOS"; return 1; }
   printf '%s  %s\n' "$sha" "$latest" >"$GUARD_STATE/trusted/$latest.sha256"
   rm -f "$GUARD_STATE/bad/$latest"
+
+  # Never stop the service while the kernel shows the exit hang: the stop would hang too. Defer
+  # instead; a reboot clears the signs and the next timer run proceeds.
+  if hang=$(kernel_hang_signs); then
+    if [[ "$(cat "$GUARD_STATE/kernel-deferred" 2>/dev/null)" != "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]]; then
+      log "update: $latest deferred: $hang; a service stop could hang until reboot"
+      report "update to $latest deferred: $hang. Stopping T3 now could hang until a reboot; it proceeds after one."
+      cat /proc/sys/kernel/random/boot_id >"$GUARD_STATE/kernel-deferred" 2>/dev/null
+    fi
+    echo "Deferred: $hang. Reboot, then the update proceeds."
+    return 0
+  fi
+  if [[ -n "$now_flag" ]]; then
+    blockers=$(force_blockers | paste -sd ';' -)
+    forced="requested with --now"
+  fi
+  record_pre_restart
 
   log "update: $cur -> $latest"
   if [[ -n "${T3_GUARD_DRY_RUN:-}" ]]; then echo "RUN $(binary_of "$cur") update $latest --yes"; return 0; fi
@@ -756,6 +881,12 @@ cmd_update() {
     if (( up >= 60 )) && [[ "$(service_version)" == "$latest" ]]; then
       record_healthy "$latest"
       outage_end "$latest"
+      local recovered
+      recovered=$(recovery_summary)
+      if [[ -n "$recovered" ]]; then
+        log "update $cur -> $latest: $recovered${forced:+ (forced: $forced)}${blockers:+ (at restart: ${blockers//;/, })}"
+        report "updated $cur -> $latest${forced:+ while threads ran}: $recovered${blockers:+; at restart: ${blockers//;/, }}. Check the listed threads before repeating any outside action."
+      fi
       notify "T3 service updated to $latest and serving."
       return 0
     fi
