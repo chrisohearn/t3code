@@ -96,7 +96,7 @@ describe("fork migrations", () => {
     "record in their own table and finish %s",
     (pendingWork) => {
       const messages: unknown[] = [];
-      const logger = Logger.make(({ message }) => messages.push(...message));
+      const logger = Logger.make(({ message }) => messages.push(message));
 
       return Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
