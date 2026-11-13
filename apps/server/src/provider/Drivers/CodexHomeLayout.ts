@@ -339,20 +339,32 @@ const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (inpu
 
 // Codex now opens its databases in the shared home, so sidecars of a shared database are
 // leftovers. Empty ones go; any holding WAL or journal data is moved aside, never deleted.
+// Returns the database links that must keep their target because a sidecar stayed behind.
 const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqliteSidecars")(
   function* (input: {
     readonly fileSystem: FileSystem.FileSystem;
     readonly sharedHomePath: string;
     readonly effectiveHomePath: string;
-    readonly sharedEntryNames: ReadonlySet<string>;
-  }): Effect.fn.Return<void, CodexShadowHomeError, Path.Path> {
+    readonly sharedEntryNames: ReadonlyArray<string>;
+    readonly fileNameKey: (name: string) => string;
+  }): Effect.fn.Return<ReadonlySet<string>, CodexShadowHomeError, Path.Path> {
     const path = yield* Path.Path;
+    const { fileNameKey } = input;
     // A Codex process from before this fix may still hold the file open on Windows.
-    const warnUnsettled = (sidecarPath: string) => (cause: PlatformError.PlatformError) =>
-      Effect.logWarning("Could not settle a leftover SQLite file in a Codex shadow home.", {
-        path: sidecarPath,
-        cause,
-      });
+    const settleOrWarn = (
+      sidecarPath: string,
+      settle: Effect.Effect<void, PlatformError.PlatformError>,
+    ) =>
+      settle.pipe(
+        Effect.as(true),
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            Effect.logWarning("Could not settle a leftover SQLite file in a Codex shadow home.", {
+              path: sidecarPath,
+              cause,
+            }).pipe(Effect.as(false)),
+        }),
+      );
     const shadowEntryNames = yield* input.fileSystem.readDirectory(input.effectiveHomePath).pipe(
       Effect.catchTags({
         PlatformError: (cause) =>
@@ -365,6 +377,7 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
           }),
       }),
     );
+    const sharedDatabaseKeys = new Set(input.sharedEntryNames.map(fileNameKey));
     const sidecarsByDatabase = new Map<string, Array<string>>();
     for (const entryName of shadowEntryNames) {
       const database = SQLITE_SIDECAR_PATTERN.exec(entryName)?.[1];
@@ -372,6 +385,7 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
       sidecarsByDatabase.set(database, [...(sidecarsByDatabase.get(database) ?? []), entryName]);
     }
 
+    const keptLinks = new Set<string>();
     for (const [database, sidecarNames] of sidecarsByDatabase) {
       // A shadow's own database (say, from an older Codex) may be open; its sidecars are live.
       // So may a link to another home's database, unless ensureSymlink re-points it below.
@@ -381,12 +395,14 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
         entryName: database,
         linkPath: databasePath,
       });
+      const linksToShared =
+        databaseState._tag === "Symlink" &&
+        fileNameKey(path.resolve(input.effectiveHomePath, databaseState.target)) ===
+          fileNameKey(path.join(input.sharedHomePath, database));
       const sharesDatabase =
         databaseState._tag === "Missing" ||
-        (databaseState._tag === "Symlink" &&
-          (input.sharedEntryNames.has(database) ||
-            path.resolve(input.effectiveHomePath, databaseState.target) ===
-              path.join(input.sharedHomePath, database)));
+        linksToShared ||
+        (databaseState._tag === "Symlink" && sharedDatabaseKeys.has(fileNameKey(database)));
       if (!sharesDatabase) {
         yield* Effect.logWarning(
           "Left SQLite files alone in a Codex shadow home because its database is not the shared one.",
@@ -394,20 +410,20 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
         );
         continue;
       }
+      let settledAll = true;
       const regularSidecars: Array<{ readonly name: string; readonly size: bigint }> = [];
       for (const entryName of sidecarNames) {
         const sidecarPath = path.join(input.effectiveHomePath, entryName);
         const state = yield* readLinkState({ ...input, entryName, linkPath: sidecarPath });
         if (state._tag === "Symlink") {
-          yield* input.fileSystem
-            .remove(sidecarPath)
-            .pipe(Effect.catchTags({ PlatformError: warnUnsettled(sidecarPath) }));
+          settledAll =
+            (yield* settleOrWarn(sidecarPath, input.fileSystem.remove(sidecarPath))) && settledAll;
         } else if (state._tag === "NotSymlink") {
           const info = yield* input.fileSystem.stat(sidecarPath).pipe(Effect.option);
           if (Option.isSome(info)) regularSidecars.push({ name: entryName, size: info.value.size });
+          else settledAll = false;
         }
       }
-      if (regularSidecars.length === 0) continue;
 
       // -shm only indexes the WAL, so the group holds data only through -wal or -journal.
       const holdsData = regularSidecars.some(
@@ -419,7 +435,7 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
         const settle = holdsData
           ? input.fileSystem.rename(sidecarPath, `${sidecarPath}${suffix}`)
           : input.fileSystem.remove(sidecarPath);
-        yield* settle.pipe(Effect.catchTags({ PlatformError: warnUnsettled(sidecarPath) }));
+        settledAll = (yield* settleOrWarn(sidecarPath, settle)) && settledAll;
       }
       if (holdsData) {
         yield* Effect.logWarning(
@@ -427,7 +443,16 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
           { files: regularSidecars.map((sidecar) => `${sidecar.name}${suffix}`) },
         );
       }
+      // Re-pointing the link would leave another database's WAL beside the shared one.
+      if (!settledAll && databaseState._tag === "Symlink" && !linksToShared) {
+        keptLinks.add(fileNameKey(database));
+        yield* Effect.logWarning(
+          "Kept a Codex shadow home database link pointing at another home because SQLite files beside it could not be settled.",
+          { path: databasePath },
+        );
+      }
     }
+    return keptLinks;
   },
 );
 
@@ -534,17 +559,24 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
     { discard: true },
   );
 
-  yield* settleShadowSqliteSidecars({
+  // Windows and macOS file names ignore case by default.
+  const platform = yield* HostProcess.Platform;
+  const fileNameKey =
+    platform === "win32" || platform === "darwin"
+      ? (name: string) => name.toLowerCase()
+      : (name: string) => name;
+  const keptLinks = yield* settleShadowSqliteSidecars({
     fileSystem,
     sharedHomePath: layout.sharedHomePath,
     effectiveHomePath,
-    sharedEntryNames: new Set(sharedEntryNames),
+    sharedEntryNames,
+    fileNameKey,
   });
 
   yield* Effect.forEach(
     entries,
     (entryName) => {
-      if (PRIVATE_ENTRY_NAMES.has(entryName)) {
+      if (PRIVATE_ENTRY_NAMES.has(entryName) || keptLinks.has(fileNameKey(entryName))) {
         return Effect.void;
       }
       return ensureSymlink({
