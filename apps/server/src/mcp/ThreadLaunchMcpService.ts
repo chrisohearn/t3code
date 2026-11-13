@@ -85,7 +85,6 @@ export const launchInput = Schema.Struct({
 });
 export const launchResult = Schema.Struct({
   notify: Schema.optional(McpThreadNotifyResult),
-  warning: Schema.optional(Schema.String),
   threadId: ThreadId,
   link: Schema.optional(Schema.String),
   projectId: ProjectId,
