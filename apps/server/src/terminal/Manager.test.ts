@@ -2085,6 +2085,32 @@ it.layer(
       ),
   );
 
+  it.effect("keeps T3's own CODEX_SQLITE_HOME for a Codex shadow home terminal", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const environment = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
+        serverSettings,
+        path,
+        rawProviderInstanceId: "configured_home",
+        env: undefined,
+      }).pipe(Effect.provideService(HostProcess.Environment, { CODEX_SQLITE_HOME: "t3-sqlite" }));
+
+      expect(environment.CODEX_SQLITE_HOME).toBe("t3-sqlite");
+    }).pipe(
+      Effect.provide(
+        ServerSettings.layerTest({
+          providerInstances: {
+            [ProviderInstanceId.make("configured_home")]: {
+              driver: ProviderDriverKind.make("codex"),
+              config: { homePath: "/configured/codex", shadowHomePath: "/configured/codex-shadow" },
+            },
+          },
+        }),
+      ),
+    ),
+  );
+
   it.effect("restarts a running terminal when the resolved provider environment changes", () =>
     Effect.gen(function* () {
       const providerInstanceId = ProviderInstanceId.make("codex_work");

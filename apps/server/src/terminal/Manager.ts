@@ -1475,11 +1475,15 @@ export const resolveProviderInstanceTerminalEnvironment = Effect.fn(
       const layout = yield* resolveCodexHomeLayout(config.value).pipe(
         Effect.provideService(Path.Path, input.path),
       );
-      if (layout.effectiveHomePath)
-        resolved = withCodexSqliteHome(layout, {
+      if (layout.effectiveHomePath) {
+        resolved = { ...resolved, CODEX_HOME: layout.effectiveHomePath };
+        // The terminal inherits T3's own environment, so a CODEX_SQLITE_HOME there wins too.
+        const { CODEX_SQLITE_HOME } = withCodexSqliteHome(layout, {
+          ...(yield* HostProcess.Environment),
           ...resolved,
-          CODEX_HOME: layout.effectiveHomePath,
         });
+        if (CODEX_SQLITE_HOME !== undefined) resolved = { ...resolved, CODEX_SQLITE_HOME };
+      }
     }
   } else if (instance.driver === "claudeAgent") {
     const config = decodeClaudeSettings(instance.config ?? {});

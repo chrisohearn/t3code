@@ -337,8 +337,8 @@ const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (inpu
   }
 });
 
-// Codex now opens its databases in the shared home, so shadow sidecars are leftovers.
-// Empty ones go; any holding WAL or journal data is moved aside, never deleted.
+// Codex now opens its databases in the shared home, so sidecars of a shared database are
+// leftovers. Empty ones go; any holding WAL or journal data is moved aside, never deleted.
 const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqliteSidecars")(
   function* (input: {
     readonly fileSystem: FileSystem.FileSystem;
@@ -371,7 +371,26 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
       sidecarsByDatabase.set(database, [...(sidecarsByDatabase.get(database) ?? []), entryName]);
     }
 
-    for (const sidecarNames of sidecarsByDatabase.values()) {
+    for (const [database, sidecarNames] of sidecarsByDatabase) {
+      // A shadow's own database (say, from an older Codex) may be open; its sidecars are live.
+      const databasePath = path.join(input.effectiveHomePath, database);
+      const databaseState = yield* readLinkState({
+        ...input,
+        entryName: database,
+        linkPath: databasePath,
+      });
+      const sharesDatabase =
+        databaseState._tag === "Missing" ||
+        (databaseState._tag === "Symlink" &&
+          path.resolve(input.effectiveHomePath, databaseState.target) ===
+            path.join(input.sharedHomePath, database));
+      if (!sharesDatabase) {
+        yield* Effect.logWarning(
+          "Left SQLite files alone in a Codex shadow home because its database is not the shared one.",
+          { path: databasePath },
+        );
+        continue;
+      }
       const regularSidecars: Array<{ readonly name: string; readonly size: bigint }> = [];
       for (const entryName of sidecarNames) {
         const sidecarPath = path.join(input.effectiveHomePath, entryName);

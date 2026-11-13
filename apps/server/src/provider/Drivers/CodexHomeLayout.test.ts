@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
@@ -266,6 +267,44 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
             yield* fileSystem.readFileString(path.join(sharedHome, "state_5.sqlite-wal")),
           ).toBe("shared");
         }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "leaves the sidecars of a shadow's own database alone",
+      () => {
+        const warnings: unknown[] = [];
+        const logger = Logger.make(({ message, logLevel }) => {
+          if (logLevel === "Warn") warnings.push(message);
+        });
+        return Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          const ownFiles = ["queue_1.sqlite", "queue_1.sqlite-wal", "queue_1.sqlite-shm"];
+          for (const name of ownFiles) {
+            yield* writeTextFile(path.join(shadowHome, name), `live ${name}`);
+          }
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          yield* materializeCodexShadowHome(layout);
+
+          for (const name of ownFiles) {
+            expect(yield* fileSystem.readFileString(path.join(shadowHome, name))).toBe(
+              `live ${name}`,
+            );
+          }
+          expect(warnings).toEqual([
+            [
+              "Left SQLite files alone in a Codex shadow home because its database is not the shared one.",
+              { path: path.join(shadowHome, "queue_1.sqlite") },
+            ],
+          ]);
+        }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+      },
     );
 
     it.effect.skipIf(!symlinksSupported)(
