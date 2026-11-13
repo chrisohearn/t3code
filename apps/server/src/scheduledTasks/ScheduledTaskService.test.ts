@@ -1530,3 +1530,88 @@ it.effect("a run interrupted right after it reserves the task does not block the
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
+
+it.effect(
+  "reliability counts the last 7 days of failed and cancelled runs and the latest error",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const now = "2026-11-13T02:00:00.000Z";
+      yield* TestClock.setTime(Date.parse(now));
+      const threadId = "thread:history";
+      const run = (
+        task: string,
+        at: string,
+        status: string,
+        ordinal: number,
+        trigger = "scheduled",
+      ) =>
+        sql`
+        INSERT INTO orchestration_v2_projection_runs
+          (run_id, thread_id, ordinal, provider, status, requested_at, payload_json)
+        VALUES (${`run:${task}:${at}`}, ${threadId}, ${ordinal}, 'codex', ${status}, ${at},
+          ${JSON.stringify({
+            userMessageId: `scheduled-task-message:${task}:${Date.parse(at)}:${trigger}`,
+          })})
+      `;
+      const errorItem = (task: string, at: string, message: string) =>
+        sql`
+        INSERT INTO orchestration_v2_projection_turn_items
+          (turn_item_id, thread_id, run_id, ordinal, type, status, updated_at, payload_json)
+        VALUES (${`item:${task}:${at}`}, ${threadId}, ${`run:${task}:${at}`}, 1, 'error', 'failed',
+          ${at}, ${JSON.stringify({ failure: { message } })})
+      `;
+      for (const id of ["task:a", "task:folded", "task:matched", "task:clean"]) {
+        yield* insertRow(sql, { id, next: null, enabled: 1, status: "succeeded" }, now);
+      }
+      // 10 days old, outside the window.
+      yield* run("task:a", "2026-11-03T02:00:00.000Z", "failed", 1);
+      yield* run("task:a", "2026-11-11T02:00:00.000Z", "failed", 2);
+      yield* errorItem("task:a", "2026-11-11T02:00:00.000Z", "Earlier error");
+      yield* run("task:a", "2026-11-12T05:00:00.000Z", "failed", 3);
+      yield* errorItem("task:a", "2026-11-12T05:00:00.000Z", "Workspace preparation failed");
+      yield* run("task:a", "2026-11-12T06:00:00.000Z", "cancelled", 4, "manual");
+      yield* run("task:a", "2026-11-12T07:00:00.000Z", "completed", 5);
+      // A failed dispatch that never created a run leaves only the task row.
+      yield* sql`UPDATE scheduled_tasks SET last_run_status = 'failed', last_run_error = 'No such folder',
+      last_run_at = '2026-11-12T20:00:00.000Z' WHERE task_id = 'task:folded'`;
+      // The same failure is already counted from its run, so the row adds nothing.
+      yield* run("task:matched", "2026-11-12T21:00:00.000Z", "failed", 6);
+      yield* sql`UPDATE scheduled_tasks SET last_run_status = 'failed', last_run_error = 'Boom',
+      last_run_at = '2026-11-12T21:00:00.000Z' WHERE task_id = 'task:matched'`;
+
+      yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        const history = Object.fromEntries(
+          (yield* service.reliability()).map((entry) => [entry.taskId, entry.recentFailures]),
+        );
+        assert.deepEqual(history, {
+          "task:a": {
+            failed: 2,
+            cancelled: 1,
+            lastAt: "2026-11-12T06:00:00.000Z",
+            lastStatus: "cancelled",
+            lastError: "Workspace preparation failed",
+          },
+          "task:folded": {
+            failed: 1,
+            cancelled: 0,
+            lastAt: "2026-11-12T20:00:00.000Z",
+            lastStatus: "failed",
+            lastError: "No such folder",
+          },
+          "task:matched": {
+            failed: 1,
+            cancelled: 0,
+            lastAt: "2026-11-12T21:00:00.000Z",
+            lastStatus: "failed",
+            lastError: null,
+          },
+        });
+      }).pipe(
+        Effect.provide(
+          followerLayer(Layer.mock(ThreadManagementService.ThreadManagementService)({})),
+        ),
+      );
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);

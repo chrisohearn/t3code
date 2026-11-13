@@ -820,6 +820,28 @@ export const OrchestratorMcpScheduledTask = Schema.Struct({
   blockedByPolicy: Schema.optional(Schema.String).annotate({
     description: "Present when an administrator's policy stops this task from running.",
   }),
+  recentFailures: Schema.optional(
+    Schema.Struct({
+      failed: NonNegativeInt,
+      cancelled: NonNegativeInt,
+      lastAt: IsoDateTime,
+      lastStatus: Schema.Literals(["failed", "cancelled"]),
+      lastError: Schema.NullOr(Schema.String),
+    }),
+  ).annotate({
+    description:
+      "Only `list_scheduled_tasks`, when the last 7 days had a failed or cancelled run. `lastError` is the latest failed run's error.",
+  }),
+  missedRun: Schema.optional(
+    Schema.Struct({
+      dueAt: IsoDateTime,
+      overdueMs: NonNegativeInt,
+      reason: Schema.Literals(["not_dispatched", "run_in_progress"]),
+    }),
+  ).annotate({
+    description:
+      "Only `list_scheduled_tasks`: `nextRunAt` passed by more than one interval with no new run.",
+  }),
 });
 export type OrchestratorMcpScheduledTask = typeof OrchestratorMcpScheduledTask.Type;
 
