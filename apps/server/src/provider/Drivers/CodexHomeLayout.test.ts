@@ -707,8 +707,12 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
             );
 
           expect(yield* settles(sharedHome)).toEqual([true]);
-          // Codex reads a relative home against each session's working directory.
-          expect(yield* settles(path.relative(process.cwd(), sharedHome))).toEqual([false]);
+          // Codex reads a relative home against each session's working directory. On Windows the
+          // temp directory can sit on another drive, where no relative spelling exists.
+          const relativeHome = path.relative(process.cwd(), sharedHome);
+          if (!path.isAbsolute(relativeHome)) {
+            expect(yield* settles(relativeHome)).toEqual([false]);
+          }
 
           yield* writeTextFile(path.join(sharedHome, "notes.sqlite"), "shared");
           yield* writeTextFile(path.join(shadowHome, "notes.sqlite", "kept"), "local");
