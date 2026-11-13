@@ -144,9 +144,11 @@ it("drops a hand-edited non-string hidden tag and keeps the rest of the settings
   const settings = decodeServerSettings({
     hiddenThreadTags: ["private", 123],
     hideTaggedThreads: true,
+    acknowledgeOnlyThreadIds: ["thread:inbox", 7, ""],
   });
   expect(settings.hiddenThreadTags).toEqual(["private"]);
   expect(settings.hideTaggedThreads).toBe(true);
+  expect(settings.acknowledgeOnlyThreadIds).toEqual(["thread:inbox"]);
 });
 
 describe("ServerSettings secret providers", () => {

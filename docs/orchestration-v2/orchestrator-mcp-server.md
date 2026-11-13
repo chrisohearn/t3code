@@ -400,8 +400,16 @@ the environment by thread ID. A deleted thread returns `thread_not_found`. The
 default `messages` view returns user messages, assistant
 messages, and proposed plans. The `activity` view also returns summarized tool,
 reasoning, checkpoint, handoff, and runtime-request items. Large item text is
-bounded and reports whether it was truncated. `afterPosition` and
-`nextPosition` support incremental reads.
+bounded and reports whether it was truncated. An agent in a T3 thread that
+reads without a cursor gets the newest items, and `beforePosition=earlierPosition`
+reads older ones. Client callers (the CLI, linked environments, outside MCP
+clients) start at the oldest item instead, because the CLI and linked
+environments on older versions read that way and follow only `hasMore`.
+`afterPosition=-1` starts any read at the oldest item, and
+`afterPosition=nextPosition` reads newer items. The server stops adding items once the result reaches about 30,000 characters and
+reports the rest through `earlierPosition` or `hasMore`. Claude Code saves MCP
+results over its token limit to a file instead of showing them, so a read has
+to fit whatever `limit` an agent asks for.
 
 Thread and message results include required `createdBy` and `creationSource`
 provenance. MCP-created threads and user-role messages use `createdBy: "agent"`
@@ -428,6 +436,12 @@ List and read results report `snoozed` and `snoozedUntil`, and
 client's `effectiveSnoozed`, so agents and the sidebar agree: a snoozed thread
 wakes early only when it has a pending request or fails after snoozing. Completed
 runs, background wakes, and delegated completions keep it snoozed.
+
+They also report `blockedOnThreadWait` and `pendingBackgroundTasks`, the shell
+fields behind the sidebar's Waiting label, so an agent can see what a thread
+still waits on after its run completed. A subagent or `background_task` holds
+the thread. A command or monitor holds it only with `awaited: true`, since agents
+often leave a dev server running.
 
 ### `t3_thread_update`
 
@@ -458,6 +472,18 @@ Sends a message to any ordinary or delegated thread in the environment:
   that survives the stop still runs first. It is rejected when neither path
   applies: the provider cannot stop a turn, Stop has already reached the turn,
   or the turn or the new message is `/compact` or `/logout`.
+
+A snoozed target keeps its stored snooze unless `respectSnooze: false`. While the
+thread is snoozed as `isSnoozed` decides, the message's run is queued and held
+behind the thread's last run, marked `snoozeDeferred`. `SnoozeDeferredDelivery`
+resumes the queue once the thread wakes, using a fresh command id per attempt
+so a refused resume is retried, and a later completed run, such as a usage
+limit's resume, releases the turn too. A held run that something else releases
+stops being deferred, so a later failure hold is never released by that sweep.
+When the thread counts as awake (a pending request, a guest message, an error)
+or has never run, the message is delivered and the stored snooze stays. A snooze
+the server set until a usage limit resets ends as before, and messages from the
+app always end a snooze.
 
 The target runtime and interaction modes may not be broader than the caller's.
 Stable command and message IDs are derived from `clientRequestId` for

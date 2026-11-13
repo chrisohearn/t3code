@@ -1,5 +1,7 @@
 import * as ThreadLaunchMcp from "../../ThreadLaunchMcpService.ts";
 import * as McpClientThreads from "../../../persistence/McpClientThreads.ts";
+import * as LaunchPresets from "../../../persistence/LaunchPresets.ts";
+import * as ThreadRoles from "../../../persistence/ThreadRoles.ts";
 
 import {
   NonNegativeInt,
@@ -75,7 +77,11 @@ const ProjectCreateTool = Tool.make("t3_project_create", {
     ...ProjectCreatePayload.fields,
     workspaceRoot: Schema.optional(ProjectCreatePayload.fields.workspaceRoot),
   }),
-  success: Schema.Struct({ ...Project.fields, commitError: Schema.optional(Schema.String) }),
+  success: Schema.Struct({
+    ...Project.fields,
+    commitError: Schema.optional(Schema.String),
+    warning: Schema.optional(Schema.String),
+  }),
   dependencies: [...shared.dependencies, ManagedProjectFolders.ManagedProjectFolders],
 }).annotate(Tool.Destructive, true);
 const ProjectUpdateTool = Tool.make("t3_project_update", {
@@ -122,6 +128,8 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
   dependencies: [
     ...shared.dependencies,
     ThreadLaunchMcp.ThreadLaunchMcpService,
+    LaunchPresets.LaunchPresets,
+    ThreadRoles.ThreadRoles,
     McpClientThreads.McpClientThreads,
     ThreadLaunchService.ThreadLaunchService,
     ManagedProjectFolders.ManagedProjectFolders,

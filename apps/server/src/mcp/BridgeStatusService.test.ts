@@ -9,6 +9,7 @@ import * as Invocation from "./McpInvocationContext.ts";
 import * as Events from "./McpEvents.ts";
 import * as Metrics from "./McpBridgeMetrics.ts";
 import * as AutoReview from "../orchestration-v2/ApprovalAutoReviewStatus.ts";
+import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 
 it.effect(
   "reports fresh peer probe results and preserves bridge status when links are unavailable",
@@ -42,6 +43,20 @@ it.effect(
               deliveriesExhaustedRetries: 0,
             }),
         }),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({
+          reliability: () =>
+            Effect.succeed([
+              { taskId: "scheduled-task:quiet" },
+              {
+                taskId: "scheduled-task:late",
+                missedRun: {
+                  dueAt: "1969-12-31T00:00:00.000Z",
+                  overdueMs: 86_400_000,
+                  reason: "not_dispatched" as const,
+                },
+              },
+            ]),
+        }),
         Layer.mock(PeerForwarding.PeerForwarding)({
           links: (caller) =>
             Effect.gen(function* () {
@@ -70,6 +85,13 @@ it.effect(
         const service = yield* Bridge.BridgeStatusService;
         const status = yield* service.status();
         expect(status.autoReview).toEqual({ status: "healthy", failures: 0, lastError: null });
+        expect(status.missedScheduledRuns).toEqual([
+          {
+            scheduledTaskId: "scheduled-task:late",
+            dueAt: "1969-12-31T00:00:00.000Z",
+            overdueMs: 86_400_000,
+          },
+        ]);
         expect(status.linkedEnvironments).toMatchObject({
           checkedAt: "1970-01-01T00:00:00.000Z",
           links: [

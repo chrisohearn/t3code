@@ -2,8 +2,11 @@ import {
   EnvironmentId,
   EnvironmentConnectReachability,
   McpEventSubscriptionsResult,
+  IsoDateTime,
   McpEventWatch,
+  NonNegativeInt,
   OrchestratorMcpFailure,
+  ScheduledTaskId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
@@ -15,6 +18,7 @@ import * as Invocation from "./McpInvocationContext.ts";
 import * as McpEvents from "./McpEvents.ts";
 import * as Metrics from "./McpBridgeMetrics.ts";
 import * as AutoReview from "../orchestration-v2/ApprovalAutoReviewStatus.ts";
+import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 export const BridgeStatusResult = Schema.Struct({
   autoReview: AutoReview.Snapshot,
   serviceStartedAt: Schema.String,
@@ -39,6 +43,13 @@ export const BridgeStatusResult = Schema.Struct({
           answeredProbe: Schema.Boolean,
         }),
       ),
+    }),
+  ),
+  missedScheduledRuns: Schema.Array(
+    Schema.Struct({
+      scheduledTaskId: ScheduledTaskId,
+      dueAt: IsoDateTime,
+      overdueMs: NonNegativeInt,
     }),
   ),
   toolCalls: Schema.Array(
@@ -67,6 +78,7 @@ export const layer = Layer.effect(
     const metrics = yield* Metrics.McpBridgeMetrics;
     const forwarding = yield* PeerForwarding.PeerForwarding;
     const autoReview = yield* AutoReview.ApprovalAutoReviewStatus;
+    const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
     return BridgeStatusService.of({
       status: Effect.fn("BridgeStatusService.status")(function* () {
         const scope = yield* Invocation.McpInvocationContext;
@@ -96,10 +108,27 @@ export const layer = Layer.effect(
           ),
           Effect.orElseSucceed(() => null),
         );
+        const missedScheduledRuns = yield* scheduledTasks.reliability().pipe(
+          Effect.map((entries) =>
+            entries.flatMap(({ taskId, missedRun }) =>
+              missedRun === undefined
+                ? []
+                : [
+                    {
+                      scheduledTaskId: ScheduledTaskId.make(taskId),
+                      dueAt: missedRun.dueAt,
+                      overdueMs: missedRun.overdueMs,
+                    },
+                  ],
+            ),
+          ),
+          Effect.orElseSucceed(() => []),
+        );
         return {
           ...status,
           autoReview: yield* autoReview.read,
           linkedEnvironments,
+          missedScheduledRuns,
           toolCalls: yield* metrics.read(scope.client!.sessionId),
         };
       }),

@@ -248,7 +248,7 @@ else
   fi
   expected="$(grep " \*\{0,1\}${archive}\$" "${staging}/SHA256SUMS" | cut -d' ' -f1)"
   [ -n "$expected" ] || fail "t3 ${version} has no release archive for ${platform}-${arch}"
-  download "${base_url}/v${version}/${archive}" "${staging}/${archive}"
+  download "${base_url}/v${version}/${archive}" "${staging}/${archive}" || fail "could not download ${archive}"
 
   step "Verifying the download..."
   actual="$(checksum "${staging}/${archive}")"
@@ -329,7 +329,7 @@ case "$path_rest" in *[!A-Za-z0-9_./-]*) path_rest= ;; esac
 if [ -n "$path_rest" ]; then
   # Last on PATH, so it never shadows another t3.
   path_line="export PATH=\"\$PATH:${path_prefix}${path_rest}\""
-  shell_name="${SHELL:-}"
+  shell_name="$(printenv SHELL || true)"
   case "${shell_name##*/}" in
     zsh)
       # zsh reads .zshrc from ZDOTDIR when it is set; ~/.zshrc would never be read then.

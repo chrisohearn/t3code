@@ -31,6 +31,7 @@ import {
   projectTurnItemForDetail,
   projectDomainEventForWire,
   projectStoredEventForWire,
+  projectThreadProjectionForWire,
 } from "./WireProjection.ts";
 import { threadShellFromProjection } from "./ProjectionStore.ts";
 import { MAX_TOOL_OUTPUT_IMAGES, toolOutputImages } from "@t3tools/shared/toolOutput";
@@ -228,6 +229,45 @@ describe("orchestration V2 wire projection", () => {
       output: { content: [{ type: "image", mimeType: "image/png" }] },
     });
     expect(item.output.content[0]?.source.data).toBe(data);
+
+    const t3McpApp = {
+      attachmentId: "app-html",
+      server: "repro",
+      tool: "chart",
+      resourceUri: "ui://repro/chart",
+    };
+    const text = { type: "text", text: "Rendered chart" };
+    const appItem = {
+      ...item,
+      toolName: "repro.chart",
+      output: {
+        t3McpApp,
+        result: { content: [text, { type: "image", mimeType: "image/png", data }] },
+      },
+    };
+    expect(projectTurnItemForDetail(appItem)).toMatchObject({
+      output: { t3McpApp, result: { content: [text, { type: "image", mimeType: "image/png" }] } },
+    });
+    const largeOutput = projectTurnItemForDetail(appItem);
+    expect(
+      JSON.stringify(largeOutput.type === "dynamic_tool" ? largeOutput.output : null),
+    ).not.toContain(data);
+
+    const smallApp = {
+      t3McpApp,
+      result: { content: [text, { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" }] },
+    };
+    expect(projectTurnItemForDetail({ ...appItem, output: smallApp })).toMatchObject({
+      output: smallApp,
+    });
+
+    const forged = projectTurnItemForDetail({
+      ...appItem,
+      output: { t3McpApp: { ...t3McpApp, resourceUri: data }, result: { content: [text] } },
+    });
+    expect(
+      JSON.stringify(forged.type === "dynamic_tool" ? forged.output : null).length,
+    ).toBeLessThan(270_000);
   });
 
   it("keeps image markers when the rest of a tool output is too large to send", () => {
@@ -492,5 +532,36 @@ describe("live body deduper", () => {
   it("ships a reply whole when its message arrives after it", () => {
     const first = reply(1, "a");
     expect([first, message(2, "a")].map(makeLiveBodyDeduper())[0]).toBe(first);
+  });
+});
+
+describe("projectThreadProjectionForWire", () => {
+  it("shows run-bound items stuck on ended runs as finished and keeps background tools running", () => {
+    const item = (id: string, type: "todo_list" | "dynamic_tool", runId: string | null) =>
+      ({
+        ...base,
+        id: TurnItemId.make(id),
+        type,
+        runId,
+        status: "running",
+        ...(type === "todo_list" ? { planId: "plan-1", steps: [] } : {}),
+      }) as unknown as OrchestrationV2TurnItem;
+    const todoDone = item("todo-done", "todo_list", "run-done");
+    const todoLive = item("todo-live", "todo_list", "run-live");
+    const toolDone = item("tool-done", "dynamic_tool", "run-done");
+    const projection = {
+      runs: [
+        { id: "run-done", status: "completed" },
+        { id: "run-live", status: "running" },
+      ],
+      checkpoints: [],
+      contextHandoffs: [],
+      turnItems: [todoDone, todoLive, toolDone],
+      visibleTurnItems: [],
+    } as unknown as OrchestrationV2ThreadProjection;
+
+    const projected = projectThreadProjectionForWire(projection).turnItems;
+
+    expect(projected.map((entry) => entry.status)).toEqual(["completed", "running", "running"]);
   });
 });

@@ -5,6 +5,8 @@ import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as AgentRegistry from "../persistence/AgentRegistry.ts";
 import * as McpRequestLog from "../persistence/McpRequestLog.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
+import * as LaunchPresets from "../persistence/LaunchPresets.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -44,6 +46,7 @@ import { ProjectCloneTracker } from "../project/ProjectCloneTracker.ts";
 import { ProjectService } from "../project/ProjectService.ts";
 import { ProjectSetupScriptRunner } from "../project/ProjectSetupScriptRunner.ts";
 import { PullRequestReviewGuideService } from "../pullRequest/PullRequestReviewGuideService.ts";
+import { PullRequestService } from "../pullRequest/PullRequestService.ts";
 import { ScheduledTaskService } from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
 import { SecretRequests } from "../secrets/SecretRequests.ts";
@@ -62,6 +65,8 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(McpBridgeMetrics.McpBridgeMetrics)({}),
   Layer.mock(McpClientThreads.McpClientThreads)({}),
   Layer.mock(WorkLedger.WorkLedger)({}),
+  Layer.mock(ThreadRoles.ThreadRoles)({}),
+  Layer.mock(LaunchPresets.LaunchPresets)({}),
   Layer.mock(McpRequestLog.McpRequestLog)({}),
   Layer.mock(AgentRegistry.AgentRegistry)({}),
   Layer.mock(AssetSigner)({}),
@@ -84,6 +89,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(ProviderAdapterRegistryV2)({}),
   Layer.mock(ProviderRegistry)({}),
   Layer.mock(PullRequestReviewGuideService)({}),
+  Layer.mock(PullRequestService)({}),
   Layer.mock(RemoteDelegation)({}),
   Layer.mock(ScheduledTaskService)({}),
   Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
@@ -167,6 +173,7 @@ it.effect("only request_secret asks Claude Code to load it up front", () =>
     expect(resource.contents).toEqual([
       {
         uri: JarvisPlaybook.URI,
+        mimeType: "text/markdown",
         text: yield* JarvisPlaybook.read().pipe(Effect.provide(NodeServices.layer)),
       },
     ]);

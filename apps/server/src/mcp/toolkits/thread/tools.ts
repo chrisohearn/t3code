@@ -21,6 +21,7 @@ import {
   NonNegativeInt,
   ProjectId,
   ThreadFreeze,
+  StandingRole,
 } from "@t3tools/contracts";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Schema from "effect/Schema";
@@ -35,6 +36,7 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as PendingApproval from "../../PendingApprovalMcpService.ts";
 import { AutoReviewOverride } from "../../../orchestration-v2/ApprovalAutoReviewConfig.ts";
+import * as ThreadRoles from "../../../persistence/ThreadRoles.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
@@ -144,6 +146,7 @@ const question = Schema.Struct({
       label: Schema.String,
       description: Schema.String,
       value: Schema.optional(Schema.String),
+      preview: Schema.optional(Schema.String),
     }),
   ),
   multiSelect: Schema.optional(Schema.Boolean),
@@ -211,8 +214,15 @@ const threadConfiguration = Schema.Struct({
   }),
   threadId: ThreadId,
   modelSelection: ModelSelection,
+  scheduledModelSelection: Schema.optional(
+    Schema.Struct({ modelSelection: ModelSelection, afterRunId: RunId }),
+  ),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  // Optional: a linked environment on another build does not report it.
+  acknowledgeOnly: Schema.optional(Schema.Boolean),
+  standingRole: Schema.optional(Schema.String),
+  standingRoleSetBy: Schema.optional(Schema.String),
 });
 const ThreadConfigureTool = Tool.make("t3_thread_configure", {
   ...commandTool,
@@ -220,17 +230,34 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     ...commandTool.dependencies,
     SqlClient.SqlClient,
     ServerSettings.ServerSettingsService,
+    ThreadRoles.ThreadRoles,
   ],
   description:
-    "Read or set a thread's model and modes. Set provider, model and options with modelSelection. Omit threadId for this thread. Set runtimeMode alone to lower permissions on an idle thread; raises and active runs are refused. autoReview sets a reviewer model, null disables it, or 'inherit' uses the server default. Values from orchestrator_capabilities.",
+    "Read or set a thread's model and modes. Set provider, model and options with modelSelection. Omit threadId for this thread. Set runtimeMode alone to lower permissions on an idle thread; raises and active runs are refused. autoReview sets a reviewer model, null disables it, or 'inherit' uses the server default. Values from orchestrator_capabilities. Full access: `acknowledgeOnly` alone makes the server, not the agent, acknowledge each message. `standingRole` (alone; \"\" clears) is sent with every turn.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
     modelSelection: Schema.optional(ModelSelection),
+    applyAt: Schema.optional(
+      Schema.Literal("next_turn").annotate({
+        description: "Busy thread: apply from the next turn, queued messages included.",
+      }),
+    ),
     runtimeMode: Schema.optional(RuntimeMode),
     autoReview: Schema.optional(AutoReviewOverride),
+    acknowledgeOnly: Schema.optional(Schema.Boolean),
+    standingRole: Schema.optional(StandingRole),
   }),
-  success: Schema.Union([threadConfiguration, OrchestrationV2DispatchCommandResult]),
+  // The scheduled result goes before the plain one, which would match it and drop its fields.
+  success: Schema.Union([
+    threadConfiguration,
+    Schema.Struct({
+      status: Schema.Literal("scheduled"),
+      afterRunId: RunId,
+      sequence: OrchestrationV2DispatchCommandResult.fields.sequence,
+    }),
+    OrchestrationV2DispatchCommandResult,
+  ]),
 }).annotate(Tool.Destructive, true);
 
 const ThreadTransferTool = Tool.make("t3_thread_transfer", {
