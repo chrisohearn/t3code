@@ -14,7 +14,7 @@ if (process.env.T3_FAKE_CLAUDE_ISOLATED_REVIEW === "1") {
     "synthetic-auth"
   )
     throw new Error("reviewer changed sign-in source");
-  const sourcesIndex = argv.indexOf("--settings-sources");
+  const sourcesIndex = argv.indexOf("--setting-sources");
   if (sourcesIndex < 0 || argv[sourcesIndex + 1] !== "")
     throw new Error("reviewer loads user settings");
 }

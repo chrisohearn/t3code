@@ -8,6 +8,7 @@ import * as Bridge from "./BridgeStatusService.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as Events from "./McpEvents.ts";
 import * as Metrics from "./McpBridgeMetrics.ts";
+import * as AutoReview from "../orchestration-v2/ApprovalAutoReviewStatus.ts";
 
 it.effect(
   "reports fresh peer probe results and preserves bridge status when links are unavailable",
@@ -23,6 +24,7 @@ it.effect(
         issuedAt: 0,
       };
       const dependencies = Layer.mergeAll(
+        AutoReview.layer,
         Metrics.layer,
         Layer.mock(Events.McpEvents)({
           bridgeStatus: () =>
@@ -67,6 +69,7 @@ it.effect(
       yield* Effect.gen(function* () {
         const service = yield* Bridge.BridgeStatusService;
         const status = yield* service.status();
+        expect(status.autoReview).toEqual({ status: "healthy", failures: 0, lastError: null });
         expect(status.linkedEnvironments).toMatchObject({
           checkedAt: "1970-01-01T00:00:00.000Z",
           links: [
@@ -76,12 +79,19 @@ it.effect(
           ],
         });
         yield* Ref.set(unavailable, true);
+        const autoReview = yield* AutoReview.ApprovalAutoReviewStatus;
+        yield* autoReview.failed("Subscription overflow; resubscribing");
         expect(yield* service.status()).toMatchObject({
           linkedEnvironments: null,
           daysUntilSessionExpires: 1,
+          autoReview: {
+            status: "degraded",
+            failures: 1,
+            lastError: "Subscription overflow; resubscribing",
+          },
         });
       }).pipe(
-        Effect.provide(Bridge.layer.pipe(Layer.provide(dependencies))),
+        Effect.provide(Bridge.layer.pipe(Layer.provideMerge(dependencies))),
         Effect.provideService(Invocation.McpInvocationContext, scope),
       );
     }),

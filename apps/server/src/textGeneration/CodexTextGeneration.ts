@@ -297,6 +297,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       const binary = effectiveConfig.binaryPath || "codex";
       const env = {
         ...effectiveEnvironment,
+        HOME: effectiveEnvironment.HOME,
         ...(effectiveConfig.homePath
           ? {
               CODEX_HOME: expandHomePath(
@@ -333,6 +334,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           ),
         );
         env.CODEX_HOME = isolatedHome;
+        env.HOME = isolatedHome;
       }
       const mcpServers = yield* listEnabledMcpServers({
         binary,

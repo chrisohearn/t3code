@@ -21,13 +21,14 @@ import * as TextGenerationOperations from "@t3tools/provider-core/server/textGen
 import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Config from "./ApprovalAutoReviewConfig.ts";
+import * as Status from "./ApprovalAutoReviewStatus.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as EventSink from "./EventSink.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 
 const involvesMoney = (text: string) =>
-  /\b(buy|buying|purchas\w*|pay\w*|paid|book\w*|order\w*|checkout|charge\w*|bill\w*|invoice\w*|subscri\w*|renew\w*|spend\w*|donat\w*|transfer\w*|wire\w*|sponsor\w*|price\w*|fee\w*|refund\w*|credit.?card|stripe\w*|paypal\w*|square\w*|letsfg\w*|shopify\w*|quickbooks\w*|usd|cad|eur|gbp|aud|bitcoin|crypto)\b|[$€£¥]/iu.test(
+  /\b(buy|buying|purchas\w*|pay\w*|paid|repay\w*|prepay\w*|autopay\w*|send.?money|book\w*|rebook\w*|order\w*|checkout|cart|deposit\w*|tip\w*|charge\w*|bill\w*|invoice\w*|subscri\w*|renew\w*|spend\w*|donat\w*|transfer\w*|wire\w*|sponsor\w*|price\w*|fee\w*|refund\w*|credit.?card|stripe\w*|paypal\w*|square\w*|letsfg\w*|shopify\w*|quickbooks\w*|usd|cad|eur|gbp|aud|bitcoin|crypto)\b|[$€£¥]/iu.test(
     text
       .normalize("NFKC")
       .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
@@ -142,7 +143,7 @@ export const make = Effect.gen(function* () {
       const evidence = yield* encodeJson({ request: item, messages });
       if (/[^\x00-\x7f]/u.test((yield* encodeJson(item)).replace(/[^\p{L}]/gu, "")))
         return yield* escalate("Non-ASCII letters in the action require human review.");
-      if (involvesMoney(evidence))
+      if (involvesMoney(yield* encodeJson(item)))
         return yield* escalate("Possible spending money: fresh human approval is required.");
       if (
         evidence.length > 24000 ||
@@ -230,6 +231,54 @@ export const make = Effect.gen(function* () {
   });
 });
 
+export const runWorker = Effect.fn("ApprovalAutoReview.runWorker")(function* <R>(
+  afterSequence: number,
+  review: (threadId: ThreadId, requestId: RuntimeRequestId) => Effect.Effect<void, never, R>,
+) {
+  const events = yield* EventSink.EventSinkV2;
+  const status = yield* Status.ApprovalAutoReviewStatus;
+  let cursor = afterSequence;
+  return yield* Effect.suspend(() =>
+    events.stream({ afterSequence: cursor, bounded: true }).pipe(
+      Stream.mapEffect(
+        (stored) =>
+          Effect.gen(function* () {
+            const event = stored.event;
+            if (event.type === "runtime-request.updated" && event.payload.status === "pending") {
+              yield* review(event.threadId, event.payload.id);
+            }
+            if (
+              event.type === "turn-item.updated" &&
+              (event.payload.type === "approval_request" ||
+                event.payload.type === "user_input_request")
+            ) {
+              yield* review(event.threadId, event.payload.requestId);
+            }
+            return stored.sequence;
+          }),
+        { concurrency: 4 },
+      ),
+      Stream.runForEach((sequence) =>
+        Effect.sync(() => {
+          cursor = sequence;
+        }),
+      ),
+      Effect.andThen(Effect.fail("Approval auto-review event stream ended unexpectedly.")),
+      Effect.catchCause((cause) =>
+        Effect.gen(function* () {
+          const reason = auditText(Cause.pretty(cause));
+          yield* status.failed(reason);
+          yield* Effect.logWarning("Approval auto-review degraded; resubscribing", {
+            afterSequence: cursor,
+            cause: reason,
+          });
+          yield* Effect.sleep("1 second");
+        }),
+      ),
+    ),
+  ).pipe(Effect.forever);
+});
+
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -246,34 +295,7 @@ export const layer = Layer.effectDiscard(
           }),
         ),
       );
-    yield* forkParked(
-      events.stream({ afterSequence, bounded: true }).pipe(
-        Stream.map((stored) => stored.event),
-        Stream.mapEffect(
-          (event) => {
-            if (event.type === "runtime-request.updated" && event.payload.status === "pending") {
-              return safelyReview(event.threadId, event.payload.id);
-            }
-            if (
-              event.type === "turn-item.updated" &&
-              (event.payload.type === "approval_request" ||
-                event.payload.type === "user_input_request")
-            ) {
-              return safelyReview(event.threadId, event.payload.requestId);
-            }
-            return Effect.void;
-          },
-          { concurrency: 4 },
-        ),
-        Stream.runDrain,
-        Effect.catchCause((cause) =>
-          Effect.logWarning(
-            "Approval auto-review event stream stopped; pending requests remain human-owned",
-            { cause: auditText(Cause.pretty(cause)) },
-          ),
-        ),
-      ),
-    );
+    yield* forkParked(runWorker(afterSequence, safelyReview));
     yield* forkParked(
       Effect.gen(function* () {
         const pending = yield* sql<{
@@ -293,4 +315,4 @@ export const layer = Layer.effectDiscard(
       }),
     );
   }),
-);
+).pipe(Layer.provide(Status.layer));

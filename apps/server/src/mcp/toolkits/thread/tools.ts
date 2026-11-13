@@ -222,7 +222,7 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     ServerSettings.ServerSettingsService,
   ],
   description:
-    "Read or set a thread's model and modes. Set provider, model and options with modelSelection. Omit threadId for this thread. Set runtimeMode alone to lower permissions on an idle thread; raises and active runs are refused. autoReview alone sets a reviewer model selection, null disables it, or 'inherit' uses the server default. Values from orchestrator_capabilities.",
+    "Read or set a thread's model and modes. Set provider, model and options with modelSelection. Omit threadId for this thread. Set runtimeMode alone to lower permissions on an idle thread; raises and active runs are refused. autoReview sets a reviewer model, null disables it, or 'inherit' uses the server default. Values from orchestrator_capabilities.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),

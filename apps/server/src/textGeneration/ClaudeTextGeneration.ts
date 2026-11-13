@@ -255,7 +255,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
         [
           "-p",
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
-          ...(operation === "reviewApproval" ? ["--settings-sources", ""] : []),
+          ...(operation === "reviewApproval" ? ["--setting-sources", ""] : []),
           "--output-format",
           "json",
           "--json-schema",

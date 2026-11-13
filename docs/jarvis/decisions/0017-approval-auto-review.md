@@ -43,29 +43,33 @@ permission bypass. Failed Codex MCP discovery or a Claude managed MCP config tha
 prevents isolation escalates. Other reviewer drivers are unsupported and escalate.
 There is no fallback to another account or model without changing configuration.
 Each CLI review gets a temporary auth-only home. Codex receives a new `CODEX_HOME`
-without `AGENTS.md` or `config.toml`, with project instructions disabled; only
+and `HOME` without `AGENTS.md`, `config.toml` or user skills in `.agents/skills`,
+with project instructions disabled; only
 `auth.json` is copied for an unmanaged sign-in. Managed instances retain their
 server-owned token helper. Custom unmanaged launch settings are refused.
 Claude receives a new `CLAUDE_CONFIG_DIR` containing only a copied credentials
-file, if present, and empty `--settings-sources`. Its existing environment and
+file, if present, and empty `--setting-sources`. Its existing environment and
 keychain access remain available; instruction/settings files are not copied.
 Temporary homes are private and removed on completion, failure or interruption.
 
 ## Spending heuristic and residual risk
 
-Before calling a model, T3 normalizes the request and context with NFKC, splits
+Before calling a model, T3 normalizes only the request, not conversation context,
+with NFKC, splits
 snake-case, dotted, hyphenated and camelCase identifiers, and checks for purchase,
 payment, booking, order, checkout, charge, billing, invoice, subscription, renewal,
 spending, donation, transfer, wire, payout, sponsor, price, fee and refund language,
-credit cards, common currency codes, Bitcoin/crypto and currency symbols.
+cart/add-to-cart, sending money, repayment, prepayment, autopay, rebooking,
+deposits, tips, credit cards, common currency codes, Bitcoin/crypto and currency symbols.
 Stripe, PayPal, Square, LetsFG, Shopify and QuickBooks server prefixes escalate
 regardless of their tool's action. Non-ASCII letters anywhere in an approval
 item also escalate, including tool names and commands. A match escalates even when the
 requested decision would be decline. The model policy separately requires
 escalation for money, hidden commands and uncertainty.
 
-This deliberately overmatches: shell dollar signs, payment-related code and a
-prior discussion of subscriptions can all require human review. It cannot prove
+This deliberately overmatches: shell dollar signs and payment-related code can
+require human review. Conversation-only mentions do not trigger this heuristic.
+It cannot prove
 that arbitrary code has no financial effects, recognize every language or decode
 concealed intent. Auto-review is a delegated judgment aid, not a financial sandbox.
 Every actual money go-ahead still requires the fresh owner approval in 0015/0016.
@@ -82,8 +86,12 @@ non-answers in the same log; `t3_approval_log` distinguishes them by decision.
 Escalations retain the request kind and sanitized prompt. Stored reasons are
 credential-redacted and capped at 2,000 characters, including error causes that
 distinguish timeouts and parse failures. The event subscription uses the existing
-live-stream budget of 1,000 items and 8 MiB. Overflow stops the worker stream and
-logs a warning; pending requests remain on the human path instead of consuming
-unbounded memory.
+live-stream budget of 1,000 items and 8 MiB. Overflow or an unexpected stream end
+logs a warning and resubscribes after one second from the last fully processed
+sequence. Durable claims prevent a second model attempt; an interrupted review
+stays on the human path. `bridge_status.autoReview` latches a degraded status,
+failure count and sanitized last cause until server restart, even after recovery,
+so an enabled but interrupted worker cannot look healthy. No unbounded event
+buffer is retained.
 The short check-to-dispatch interval is not a transaction with settings changes;
 disabling review is not a rollback of an action already dispatched.
