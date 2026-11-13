@@ -212,12 +212,16 @@ pass 'a rename that fails part-way puts every live file back'
 # --- Provider canary (2026-11-13 incident) and release archive check.
 sqlite3 "$DB" "alter table orchestration_v2_projection_runs add column provider_instance_id text;" 2>/dev/null || true
 sqlite3 "$DB" "create table if not exists orchestration_v2_projection_turn_items (turn_item_id text, thread_id text, run_id text, type text, status text, updated_at text, payload_json text);" 2>/dev/null || true
+sqlite3 "$DB" "alter table orchestration_v2_projection_turn_items add column payload_json text;" 2>/dev/null || true
 sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
-run_row() { # id instance status requested started
+run_row() { # id instance status requested started [thread]
   sqlite3 "$DB" "insert into orchestration_v2_projection_runs (run_id, thread_id, status, requested_at, payload_json, provider_instance_id)
-    values ('$1','T','$3','$4','$( [[ -n "${5:-}" ]] && echo "{\"startedAt\":\"$5\"}" || echo '{}')','$2');"
+    values ('$1','${6:-T-$1}','$3','$4','$( [[ -n "${5:-}" ]] && echo "{\"startedAt\":\"$5\"}" || echo '{}')','$2');"
 }
-open_fail() { run_row "$1" "$2" failed "$3"; sqlite3 "$DB" "insert into orchestration_v2_projection_turn_items (turn_item_id, run_id, type, status, updated_at) values ('turn-item:run:$1:signal:provider-session-open-failure','$1','error','failed','$3');"; }
+open_fail() { # id instance time [thread] [message]
+  run_row "$1" "$2" failed "$3" "" "${4:-T-$1}"
+  sqlite3 "$DB" "insert into orchestration_v2_projection_turn_items (turn_item_id, run_id, type, status, updated_at, payload_json) values ('turn-item:run:$1:signal:provider-session-open-failure','$1','error','failed','$3','{\"failure\":{\"class\":\"provider_error\",\"message\":\"${5:-Cannot create Codex shadow home entry}\"}}');"
+}
 at=$(now '-3 minutes')
 run_row ok1 P completed "$(now '-2 hours')" "$(now '-2 hours')"
 [[ -z "$(broken_instances "$at")" ]] || fail 'canary flagged an instance with no failures'
@@ -227,7 +231,14 @@ run_row ok2 P completed "$(now '-90 seconds')" "$(now '-80 seconds')"
 [[ -z "$(broken_instances "$at")" ]] || fail 'instance that still starts sessions flagged'
 open_fail g1 Q "$(now '-2 minutes')"; open_fail g2 Q "$(now '-1 minute')"
 [[ -z "$(broken_instances "$at")" ]] || fail 'instance that never worked before (signed out, bad config) flagged'
-pass 'canary flags only an instance that worked before the restart and now fails every session'
+run_row ok3 R completed "$(now '-2 hours')" "$(now '-2 hours')"
+open_fail h1 R "$(now '-2 minutes')" one; open_fail h2 R "$(now '-1 minute')" one
+[[ -z "$(broken_instances "$at")" ]] || fail 'one thread failing twice flagged'
+run_row ok4 S completed "$(now '-2 hours')" "$(now '-2 hours')"
+open_fail k1 S "$(now '-2 minutes')" "" "The workspace folder no longer exists"
+open_fail k2 S "$(now '-1 minute')" "" "Please sign in again"
+[[ -z "$(broken_instances "$at")" ]] || fail 'workspace or sign-in failures flagged'
+pass 'canary flags only an instance that worked before and now fails every session on 2+ threads, not environment noise'
 service_uptime() { echo 400; }; service_version() { echo 2; }; CANARY_POLL_SECONDS=0
 sqlite3 "$DB" "delete from orchestration_v2_projection_runs where run_id = 'ok2';"
 r=$(provider_canary "$at" 2) && fail 'canary passed a broken instance'
@@ -260,6 +271,37 @@ pass 'a build that serves but fails the canary is marked bad, rolled back and re
 unset -f provider_canary
 service_version() { echo 1; }; active_version() { echo 1; }
 rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2"
+
+# A deploy onto an idle server is checked again on later ticks; a late break holds and reports.
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
+rm -f "$AUTO_HOLD"; active_version() { echo 7; }
+at=$(now '-20 minutes'); printf '7 %s\n' "$at" > "$GUARD_STATE/canary-pending"
+late_canary; [[ -e "$GUARD_STATE/canary-pending" && ! -e "$AUTO_HOLD" ]] || fail 'late canary acted with nothing broken'
+run_row ok9 P completed "$(now '-2 hours')" "$(now '-2 hours')"
+open_fail L1 P "$(now '-5 minutes')"; open_fail L2 P "$(now '-4 minutes')"
+late_canary; [[ -f "$AUTO_HOLD" && ! -e "$GUARD_STATE/canary-pending" ]] || fail 'late break not held'
+grep -q 'broke provider sessions after it went live' "$AUTO_HOLD" || fail 'late hold reason'
+rm -f "$AUTO_HOLD"; printf '7 %s\n' "$(now '-3 hours')" > "$GUARD_STATE/canary-pending"
+late_canary; [[ ! -e "$GUARD_STATE/canary-pending" && ! -e "$AUTO_HOLD" ]] || fail 'expired late canary not cleared'
+pass 'an idle deploy is re-checked on later ticks for 2 h, and a late break holds and reports'
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
+active_version() { echo 1; }
+
+# A build that served but fails the canary, when the old build cannot open the migrated DB, stays.
+latest_release() { echo 2; }; active_runs() { echo 0; }; quiet_seconds() { echo 99999; }
+svc() { echo "$*" >> "$root/svc-stay"; return 0; }; wait_inactive() { return 0; }; snapshot_db() { echo "$root/snap"; }
+binary_of() { echo /bin/true; }; installed() { return 0; }; is_trusted() { return 0; }
+cur_v=1; active_version() { echo "$cur_v"; }; write_state_for() { :; }; service_version() { echo 2; }
+can_open() { return 1; }; restore_db() { echo restored > "$root/restored"; }
+provider_canary() { echo 'P:2 broken'; return 1; }
+rm -f "$root/svc-stay" "$root/restored" "$AUTO_HOLD"
+HEALTH_WAIT_SECONDS=30 cmd_update >/dev/null 2>&1 && fail 'stay path reported success'
+[[ -f "$AUTO_HOLD" && ! -e "$root/restored" ]] || fail 'stay path restored the DB or set no hold'
+! grep -q '^stop' "$root/svc-stay" 2>/dev/null || [[ "$(grep -c '^stop' "$root/svc-stay")" == 1 ]] || fail 'stay path stopped the service for a rollback'
+pass 'a served build failing the canary stays (held) rather than restoring and discarding work'
+unset -f provider_canary restore_db can_open
+source <(sed -n '/^restore_db() {/,/^}/p' "$root/functions")
+service_version() { echo 1; }; active_version() { echo 1; }; rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2"
 
 # A checksummed archive without the binary is rejected. (Earlier tests stub release_binary_sha.)
 source <(sed -n '/^release_binary_sha() {/,/^}/p' "$root/functions")

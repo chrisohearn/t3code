@@ -317,6 +317,7 @@ release_binary_sha() {
           break
         fi
         log "release archive $archive from $repo has no usable t3 binary"
+        continue
       fi
       log "checksum mismatch for $archive from $repo"
     fi
@@ -461,6 +462,10 @@ record_healthy() {
 # Once the service has served the active version for a minute, record it as healthy.
 cmd_prove() {
   local v up i
+  # cmd_update proves (and may mark bad) the build it installs; racing it could clear a bad marker.
+  exec 8>>"$LOCK"
+  flock -n 8 || { log "prove: a service change is in progress; it does its own health check"; return 0; }
+  exec 8>&-
   for i in $(seq 1 20); do
     v=$(active_version)
     up=$(service_uptime) || up=0
@@ -695,15 +700,16 @@ recovery_summary() {
     fi
   done < <(tail -n +2 "$PRE_RESTART")
   rm -f "$PRE_RESTART"
-  (( total > 0 )) || [[ "$cancelled" != 0 ]] || return 0
   [[ -n "$unknown_req" ]] && cancelled="unknown number of"
+  (( total > 0 )) || [[ "$cancelled" != 0 ]] || return 0
   printf '%s/%s interrupted run(s) continued%s; %s pending request(s) lost' \
     "$continued" "$total" "${missing:+; not continued:$missing}" "$cancelled"
 }
 
 # Provider instances the restart at $1 broke: each started runs fine in the 6 h before it
-# (startedAt set), and since then has CANARY_FAILURES or more session-open failures and no run
-# that started. One "instance:failures" per line. This is a release regression, not an
+# (startedAt set), and since then has session-open failures on CANARY_FAILURES or more distinct
+# threads and no run that started. Failures that name a missing workspace folder or a sign-in
+# problem are the environment, not the build, and do not count. One "instance:threads" per line. This is a release regression, not an
 # ordinary provider problem (signed out, bad config, an outage), which fails before the restart
 # too or still lets some sessions start. The query reads failed runs through the partial
 # fork_runs_failed_recent_idx and seeks each run's items by run_id. $2 (optional) bounds the
@@ -713,11 +719,17 @@ broken_instances() {
   since=$(date -u -d "$at - 6 hours" +%Y-%m-%dT%H:%M:%S.000Z) || return 0
   timeout 10 sqlite3 -readonly -separator ':' "$DB" \
     "with f as (
-       select r.provider_instance_id as inst, count(*) as n
+       select r.provider_instance_id as inst, count(distinct r.thread_id) as n
          from orchestration_v2_projection_runs r
          cross join orchestration_v2_projection_turn_items i
            on i.run_id = r.run_id and i.turn_item_id like '%:signal:provider-session-open-failure'
         where r.status in ('failed', 'cancelled') and r.status = 'failed' and r.requested_at >= '$at'${until:+ and r.requested_at < '$until'}
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*workspace folder*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*sign in*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*signed out*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*log in*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*authenticat*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*unauthorized*'
         group by 1)
      select f.inst, f.n from f
       where f.n >= ${CANARY_FAILURES:-2}
@@ -740,7 +752,7 @@ provider_canary() {
   while :; do
     bad=$(broken_instances "$at" | paste -sd ' ' -)
     if [[ -n "$bad" ]]; then
-      echo "provider instance(s) that worked before the restart now fail every session (instance:failures): $bad"
+      echo "provider instance(s) that worked before the restart now fail every session (instance:threads): $bad"
       return 1
     fi
     if [[ "$(service_version)" != "$v" ]] || ! up=$(service_uptime); then
@@ -754,6 +766,25 @@ provider_canary() {
     fi
     sleep "${CANARY_POLL_SECONDS:-15}"
   done
+}
+
+# A deploy onto an idle server opens few sessions inside the canary window. For 2 h afterwards,
+# each timer tick checks again whether the deployed build broke a provider instance; if so it
+# holds automatic updates and reports (no automatic rollback this late, since work has moved on).
+late_canary() {
+  local v at bad age
+  [[ -r "$GUARD_STATE/canary-pending" ]] || return 0
+  read -r v at <"$GUARD_STATE/canary-pending" || { rm -f "$GUARD_STATE/canary-pending"; return 0; }
+  age=$(( $(date +%s) - $(date -u -d "$at" +%s 2>/dev/null || echo 0) ))
+  if [[ "$(active_version)" != "$v" ]] || (( age > 7200 )); then
+    rm -f "$GUARD_STATE/canary-pending"
+    return 0
+  fi
+  bad=$(broken_instances "$at" | paste -sd ' ' -)
+  [[ -n "$bad" ]] || return 0
+  rm -f "$GUARD_STATE/canary-pending"
+  hold_updates "$v broke provider sessions after it went live (instance:threads): $bad; check, then roll back or fix"
+  report "$v broke provider sessions after it went live (instance:threads): $bad. Automatic updates held; roll back with t3-service-update <previous version> or fix the cause, then t3-service-update resume."
 }
 
 # After a rollback restart (systemctl --no-block), give the server time to come up and queue its
@@ -850,6 +881,7 @@ cmd_update() {
   done
   # Keep a failed update from repeatedly disrupting a recovered server. Explicit manual
   # version / --now calls remain possible, but still require a responsive manager.
+  late_canary
   if [[ -z "$target$now_flag" && -f "$AUTO_HOLD" ]]; then
     echo "Automatic updates held: $(cat "$AUTO_HOLD"). Review before a manual update."
     return 0
@@ -1038,6 +1070,8 @@ cmd_update() {
       fi
       record_healthy "$latest"
       outage_end "$latest"
+      # Few sessions open on an idle server, so keep checking on later timer ticks.
+      printf '%s %s\n' "$latest" "$restart_at" >"$GUARD_STATE/canary-pending"
       local recovered
       recovered=$(recovery_summary)
       if [[ -n "$recovered" ]]; then
@@ -1051,6 +1085,16 @@ cmd_update() {
   date -Is >"$GUARD_STATE/bad/$latest"
   # Reported once the rollback has decided (below), so the report never delays a stop or restart.
   local outcome
+  # A build that served for minutes has new work in the database. If $cur cannot open the
+  # migrated database, rolling back means restoring the pre-update snapshot and losing that work,
+  # so stay on $latest, hold automatic updates and ask for a person instead.
+  if [[ -n "$canary_why" ]] && ! can_open "$cur"; then
+    hold_updates "$latest $failed_why; stayed on it because $cur cannot open the migrated database and a restore would discard work done since the update"
+    notify "T3 $latest $failed_why. Stayed on $latest (a rollback would discard work); automatic updates held."
+    local recovered; recovered=$(recovery_summary)
+    report "$latest $failed_why: stayed on $latest, automatic updates held; rolling back would discard work done since the update.${recovered:+ $recovered.}"
+    return 1
+  fi
   if ! svc stop --no-block "$UNIT" || ! wait_inactive; then
     hold_updates "failed to confirm service stopped for rollback; databases left untouched"
     manager_ready && svc start --no-block "$UNIT"
@@ -1061,12 +1105,12 @@ cmd_update() {
       notify "T3 $latest $failed_why. Restart on $cur requested; awaiting health verification."
       outcome="restart on $cur requested"
     else
-      notify "T3 $latest failed health checks and restart on $cur failed; manual recovery required."
+      notify "T3 $latest $failed_why, and restart on $cur failed; manual recovery required."
       outcome="restart on $cur failed; manual recovery required"
     fi
   elif [[ -n "$snap" ]] && restore_db "$snap"; then
     if restart_on "$cur"; then
-      notify "T3 $latest failed health checks after migration. Pre-update snapshot restored; restart on $cur requested, awaiting health verification."
+      notify "T3 $latest $failed_why after migration. Pre-update snapshot restored; restart on $cur requested, awaiting health verification."
       outcome="pre-update snapshot restored; restart on $cur requested"
     else
       notify "Pre-update snapshot restored, but restart on $cur failed; manual recovery required."
