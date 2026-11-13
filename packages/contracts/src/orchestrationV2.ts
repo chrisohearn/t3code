@@ -723,6 +723,45 @@ export const OrchestrationV2RunFailover = Schema.Struct({
 });
 export type OrchestrationV2RunFailover = typeof OrchestrationV2RunFailover.Type;
 
+/** Why a run ended cancelled or interrupted, stamped by the server on that transition. */
+export const OrchestrationV2RunStopReason = Schema.Literals([
+  "server_shutdown",
+  "server_restart",
+  "stopped",
+  "queue_cancelled",
+  "steered",
+  "replaced",
+  "superseded",
+  "thread_archived",
+  "thread_settled",
+  "thread_deleted",
+  "rolled_back",
+  "other",
+]);
+export type OrchestrationV2RunStopReason = typeof OrchestrationV2RunStopReason.Type;
+
+export const OrchestrationV2RunStopActorKind = Schema.Literals([
+  "owner_client",
+  "mcp_client",
+  "agent",
+  "server",
+]);
+export type OrchestrationV2RunStopActorKind = typeof OrchestrationV2RunStopActorKind.Type;
+
+// Stored as plain strings so an older build reading a newer build's rows (a rollback) still decodes.
+export const OrchestrationV2RunStop = Schema.Struct({
+  reason: Schema.String,
+  actor: Schema.Struct({
+    kind: Schema.String,
+    /** First eight characters of the sign-in session, never the full id. */
+    sessionId: Schema.optional(Schema.String.check(Schema.isMaxLength(8))),
+    clientLabel: Schema.optional(Schema.String),
+    threadId: Schema.optional(ThreadId),
+  }),
+  commandType: Schema.optional(Schema.String),
+});
+export type OrchestrationV2RunStop = typeof OrchestrationV2RunStop.Type;
+
 export const OrchestrationV2Run = Schema.Struct({
   clientRequestId: Schema.optional(TrimmedNonEmptyString),
   id: RunId,
@@ -747,6 +786,7 @@ export const OrchestrationV2Run = Schema.Struct({
   usageLimitContinuationOfRunId: Schema.optional(RunId),
   failover: Schema.optional(OrchestrationV2RunFailover),
   failoverOfRunId: Schema.optional(RunId),
+  stop: Schema.optional(OrchestrationV2RunStop),
   delegatedTaskId: Schema.optional(NodeId),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   restartCancelledBackgroundWork: Schema.optional(

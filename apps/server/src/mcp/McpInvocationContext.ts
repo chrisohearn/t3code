@@ -16,6 +16,8 @@ import * as Schema from "effect/Schema";
 import * as Fiber from "effect/Fiber";
 import { formatThreadLink, hostedThreadLink } from "@t3tools/shared/threadLinks";
 
+import type { CommandActor } from "../orchestration-v2/CommandActor.ts";
+
 const ALL_MCP_CAPABILITIES = [
   "preview",
   "orchestration",
@@ -167,6 +169,17 @@ export const messageSenderFor = (scope: McpInvocationScope) => {
     },
   };
 };
+
+/** The command actor for an MCP call: an agent in a thread, or an outside sign-in. */
+export const mcpCommandActor = (scope: McpInvocationScope): CommandActor["Service"] => ({
+  kind: scope.thread === undefined ? "mcp_client" : "agent",
+  caller: {
+    ...(scope.client === undefined
+      ? {}
+      : { sessionId: scope.client.sessionId.slice(0, 8), clientLabel: scope.client.label }),
+    ...(scope.thread === undefined ? {} : { threadId: scope.thread.threadId }),
+  },
+});
 
 export const assertOutsideApprovalCaller = (scope: McpInvocationScope) =>
   scope.thread === undefined &&

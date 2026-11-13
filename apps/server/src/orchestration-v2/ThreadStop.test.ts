@@ -31,6 +31,7 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { CLAUDE_PROVIDER } from "./Adapters/ClaudeAdapterV2.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import { CommandActor } from "./CommandActor.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import { OrchestrationEffectRequestV2 } from "./EffectOutbox.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -987,12 +988,25 @@ it.effect("a run Stop reached cannot delegate or start a watch, even after it en
     });
     yield* send(threadId, "queued", "queue_after_active");
     const queued = (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)!;
-    yield* orchestrator.dispatch({
-      type: "queued-run.cancel",
-      commandId: CommandId.make("cancel-queued"),
-      threadId,
-      runId: queued.id,
-    });
+    const caller = { sessionId: "ab3aa7f5", threadId: ThreadId.make("thread:other-agent") };
+    yield* orchestrator
+      .dispatch({
+        type: "queued-run.cancel",
+        commandId: CommandId.make("cancel-queued"),
+        threadId,
+        runId: queued.id,
+      })
+      .pipe(Effect.provideService(CommandActor, { kind: "agent", caller }));
+    assert.deepEqual(
+      (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+        (candidate) => candidate.id === queued.id,
+      )?.stop,
+      {
+        reason: "queue_cancelled",
+        actor: { kind: "agent", ...caller },
+        commandType: "queued-run.cancel",
+      },
+    );
     yield* projections.apply({
       id: EventId.make("event:stop-barrier:interrupt-request"),
       type: "turn-item.updated",
@@ -1730,17 +1744,29 @@ it.effect("an unanswered Stop is flagged until Force stop ends the run with its 
     );
     assert.deepEqual((yield* threadState(threadId)).runs, ["running"]);
 
-    yield* orchestrator.dispatch({
-      ...target,
-      type: "thread.background-work.settle",
-      commandId: CommandId.make("force-stop:settle"),
-      reason: "Force stopped by user",
-    });
+    yield* orchestrator
+      .dispatch({
+        ...target,
+        type: "thread.background-work.settle",
+        commandId: CommandId.make("force-stop:settle"),
+        reason: "Force stopped by user",
+      })
+      .pipe(
+        Effect.provideService(CommandActor, {
+          kind: "owner_client",
+          client: { sessionId: "session1", clientLabel: "Chris's Mac" },
+        }),
+      );
     const settled = yield* orchestrator.getThreadProjection(threadId);
     assert.deepEqual(
       settled.runs.map((candidate) => candidate.status),
       ["interrupted"],
     );
+    assert.deepEqual(settled.runs[0]?.stop, {
+      reason: "stopped",
+      actor: { kind: "owner_client", sessionId: "session1", clientLabel: "Chris's Mac" },
+      commandType: "thread.background-work.settle",
+    });
     const result = settled.turnItems.find((item) => item.type === "run_interrupt_result");
     assert.equal(
       result?.type === "run_interrupt_result" ? result.message : undefined,

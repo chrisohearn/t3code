@@ -115,6 +115,7 @@ import type {
 } from "../orchestration-v2/ProjectionStore.ts";
 import { delegatedTaskResultRun, runOutcome } from "../orchestration-v2/RestartBackgroundNote.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import { runStopDetail } from "../orchestration-v2/RunStop.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
@@ -967,10 +968,12 @@ function runExecutedModel(
 }
 
 function threadRun(
-  projection: Pick<OrchestrationV2ThreadProjection, "providerTurns">,
+  projection: Pick<OrchestrationV2ThreadProjection, "providerTurns" | "runs">,
   run: OrchestrationV2Run,
 ): OrchestratorMcpThreadRun {
+  const stop = runStopDetail(run, projection.runs);
   return {
+    ...(stop === undefined ? {} : { stop }),
     runId: run.id,
     ordinal: run.ordinal,
     status: run.status,
@@ -3205,6 +3208,13 @@ const make = Effect.gen(function* () {
           excludeSilentMaintenance: true,
         })
         .pipe(Effect.mapError(threadManagementFailure));
+      // A stopped run may have been continued as a later run; only then are the others read.
+      const continuationRuns =
+        run === undefined || !["cancelled", "interrupted", "failed"].includes(run.status)
+          ? []
+          : (yield* threadManagement
+              .getThreadRecords(input.threadId, ["runs"])
+              .pipe(Effect.mapError(threadManagementFailure))).runs;
       const maxChars = input.maxChars ?? 4000;
       const summarize = (message: OrchestrationV2ConversationMessage | undefined) => {
         if (message === undefined) return null;
@@ -3225,7 +3235,7 @@ const make = Effect.gen(function* () {
       return {
         threadId: input.threadId,
         status: shell.activityRunStatus ?? shell.status,
-        run: run === undefined ? null : threadRun({ providerTurns }, run),
+        run: run === undefined ? null : threadRun({ providerTurns, runs: continuationRuns }, run),
         lastAssistantMessage: summarize(records?.messages[0]),
         latestMessage: summarize(latest.messages[0]),
         pendingRequestIds: target.runtimeRequests

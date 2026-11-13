@@ -131,6 +131,7 @@ import {
 import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
 import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import { CommandActor } from "./CommandActor.ts";
+import { serverRunStop } from "./RunStop.ts";
 import { quoteUserInputAnswers } from "./userInputAnswerQuotes.ts";
 import {
   cancelledBeforeStart,
@@ -2259,7 +2260,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
         events,
         projection,
-        run,
+        run: { ...run, stop: serverRunStop("superseded") },
         now: yield* DateTime.now,
       });
     }
@@ -2314,7 +2315,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         isStalePullRequestWatchWake(projection, storedQueuedRun)
       ) {
         yield* writeSystemEvents(
-          queuedRunCancellationEvents(projection, storedQueuedRun, yield* DateTime.now),
+          queuedRunCancellationEvents(
+            projection,
+            { ...storedQueuedRun, stop: serverRunStop("superseded") },
+            yield* DateTime.now,
+          ),
         );
         projection = yield* readCommandProjection(threadId);
         storedQueuedRun = nextQueuedRun(projection);

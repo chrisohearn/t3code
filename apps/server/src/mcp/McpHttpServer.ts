@@ -43,6 +43,7 @@ import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as DeviceService from "../device/DeviceService.ts";
 import * as HtmlRender from "../htmlRender/HtmlRender.ts";
+import { CommandActor } from "../orchestration-v2/CommandActor.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as PullRequestWatchService from "../pullRequest/PullRequestWatchService.ts";
@@ -332,6 +333,8 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     if (HttpServerResponse.isHttpServerResponse(admitted)) return admitted;
     return yield* httpEffect.pipe(
       Effect.provideService(McpInvocationContext.McpInvocationContext, admitted),
+      // Every command an MCP call dispatches records who made it, not only thread tools'.
+      Effect.provideService(CommandActor, McpInvocationContext.mcpCommandActor(admitted)),
       Effect.map(normalizeMcpHttpResponse),
     );
   }) satisfies McpAuthMiddleware;

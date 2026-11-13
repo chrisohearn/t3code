@@ -24,6 +24,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { runStopReason } from "./RunStop.ts";
 
 it.effect("expires orphaned runtime requests before command readiness", () => {
   const threadId = ThreadId.make("thread_recovery_requests");
@@ -415,6 +416,14 @@ it.effect("cancels a stale waiting run when no checkpoint capture can finish it"
     assert.equal(summary.terminalizedRuns, 1);
     const runEvent = committedInput?.events.find((event) => event.type === "run.updated");
     assert.equal(runEvent?.type === "run.updated" ? runEvent.payload.status : null, "cancelled");
+    // The commit's command is what labels the run "cancelled by restart" in the event sink.
+    assert.equal(
+      runStopReason({
+        commandType: committedInput?.commandType,
+        commandId: committedInput?.commandId,
+      }),
+      "server_restart",
+    );
   }).pipe(Effect.provide(layer));
 });
 
