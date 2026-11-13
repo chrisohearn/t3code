@@ -214,6 +214,7 @@ function makeHarness(options: HarnessOptions = {}) {
         options.fetchWorktreeBaseCommit ??
         (() => Effect.succeed({ commitSha: "remote-main-sha", remoteRefName: "origin/main" })),
       hasCommit: options.hasCommit ?? (() => Effect.succeed(false)),
+      hasRefNamed: () => Effect.succeed(true),
       currentBranch: () => Effect.succeed(null),
       resolveWorktreeBaseRemote: () => Effect.succeed({ remoteName: "origin", branchName: "main" }),
       remoteExists: options.remoteExists ?? (() => Effect.succeed(true)),
@@ -2749,6 +2750,54 @@ it.effect.each(["origin/master", ":/initial"])(
         });
       }).pipe(Effect.provide(harness.layer));
     }),
+);
+
+it.effect.each([
+  {
+    name: "in a folder that is not a Git repository",
+    repositoryRoot: null,
+    hasCommit: false,
+    remote: true,
+    message: `Project "Project" (/repo) is not a Git repository.`,
+  },
+  {
+    name: "whose base is on no remote and not local",
+    repositoryRoot: "/repo",
+    hasCommit: false,
+    remote: false,
+    message: `Base ref "main" does not resolve to a commit in project "Project" (/repo).`,
+  },
+] as const)("a launched worktree $name fails with a clear message", (testCase) =>
+  Effect.gen(function* () {
+    const harness = makeHarness({
+      hasCommit: ({ refName }) => Effect.succeed(refName === "HEAD" || testCase.hasCommit),
+      git: {
+        repositoryRoot: () => Effect.succeed(testCase.repositoryRoot),
+        resolveWorktreeBaseRemote: () =>
+          Effect.succeed(testCase.remote ? { remoteName: "origin", branchName: "main" } : null),
+        hasRefNamed: () => Effect.succeed(false),
+      },
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: `command:launch:clear-base-${testCase.repositoryRoot === null ? "none" : "ref"}`,
+          thread: `thread:launch:clear-base-${testCase.repositoryRoot === null ? "none" : "ref"}`,
+          message: "First message",
+          workspace: { type: "worktree", baseRef: "main", startFromOrigin: true },
+        }),
+      );
+      const projection = yield* preparationSettled(launched.threadId);
+      assert.equal(projection.runs[0]?.status, "failed");
+      const failure = projection.turnItems.find((item) => item.type === "error");
+      assert.equal(
+        failure?.type === "error" ? failure.failure.message : undefined,
+        `Workspace preparation failed during provision worktree: ${testCase.message}`,
+      );
+      assert.equal(harness.createWorktree.mock.calls.length, 0);
+    }).pipe(Effect.provide(harness.layer));
+  }),
 );
 
 it.effect("leaves uncertain Git detection failures to workspace preparation", () =>

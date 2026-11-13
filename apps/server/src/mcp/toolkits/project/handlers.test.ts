@@ -424,6 +424,32 @@ it.effect("a launch with a model its provider does not advertise creates no thre
   }),
 );
 
+it.effect.each([
+  ["/tmp/review", true],
+  ["/projects/client-target", false],
+] as const)("a launch into a project rooted at %s warns: %s", ([workspaceRoot, warns]) =>
+  Effect.gen(function* () {
+    const { projectId, dependencies } = clientLaunchHarness({
+      runtimeModeCeiling: "auto",
+      launched: [],
+      workspaceRoot,
+    });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const result = yield* toolkit.handle("t3_thread_launch", { title: "Fix", projectId }).pipe(
+      Stream.unwrap,
+      Stream.runCollect,
+      Effect.map((chunk) => chunk.at(-1)?.result),
+      Effect.provide(dependencies),
+    );
+    expect(result).toMatchObject(warns ? { warning: expect.stringContaining(workspaceRoot) } : {});
+    expect(warns || (result as { warning?: string }).warning === undefined).toBe(true);
+  }),
+);
+
 it.effect("a launch retried with the same clientRequestId replays the first one", () =>
   Effect.gen(function* () {
     const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];

@@ -2198,7 +2198,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         AND NOT ${settledSubagent(sql`candidate`)}
     `;
 
-    // A todo list is never closed when its run ends, so a long thread holds an active one per
+    // Todo lists stored before runs closed them are still active, so a long thread holds one per
     // old run. Counting those as live work drags each run's nodes and subagents into every window.
     const todoListOfSettledRun = (row: Statement.Fragment) => sql`(
       ${row}.kind = 'todo_list' AND ${row}.run_id IS NOT NULL AND NOT EXISTS (
