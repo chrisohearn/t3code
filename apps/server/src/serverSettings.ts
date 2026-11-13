@@ -380,6 +380,7 @@ const PersistedServerSettings = Schema.Struct({
 // Parse first and decode second, so a managed policy can fill its defaults in between.
 const decodeSettingsFileJsonExit = Schema.decodeUnknownExit(fromLenientJson(Schema.Unknown));
 const decodePersistedServerSettingsExit = Schema.decodeUnknownExit(PersistedServerSettings);
+
 const LegacyProviderSettingsJson = fromLenientJson(
   Schema.Struct({
     providers: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
@@ -493,6 +494,25 @@ function migrateLegacyProviderSettings(
     ...settings,
     providerInstances,
   };
+}
+
+/**
+ * A settings file decoded as the server reads it, legacy `providers` blobs and a managed policy's
+ * defaults included; undefined when it does not decode. Locks and limits are the caller's to lay over.
+ */
+export function decodeSettingsFileContents(
+  raw: string,
+  withDefaults: (persisted: unknown) => unknown = (persisted) => persisted,
+): ServerSettings | undefined {
+  const parsed = decodeSettingsFileJsonExit(raw);
+  if (Exit.isFailure(parsed)) return undefined;
+  const decoded = decodePersistedServerSettingsExit(withDefaults(parsed.value));
+  const legacy = decodeLegacyProviderSettingsJsonExit(raw);
+  if (Exit.isFailure(decoded) || Exit.isFailure(legacy)) return undefined;
+  const { providers } = legacy.value;
+  return providers === undefined
+    ? decoded.value
+    : migrateLegacyProviderSettings(decoded.value, providers, []);
 }
 
 const ACP_REGISTRY_DRIVER = ProviderDriverKind.make("acpRegistry");

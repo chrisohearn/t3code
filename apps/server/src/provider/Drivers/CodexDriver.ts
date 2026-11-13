@@ -205,7 +205,9 @@ export const CodexDriver: ProviderDriver<
       accentColor,
       continuationGroupKey: continuationIdentity.continuationKey,
     });
-    yield* materializeCodexShadowHome(homeLayout).pipe(
+    yield* materializeCodexShadowHome(homeLayout, {
+      sqliteHome: processEnv.CODEX_SQLITE_HOME,
+    }).pipe(
       Effect.mapError(
         (cause) =>
           new ProviderDriverError({
