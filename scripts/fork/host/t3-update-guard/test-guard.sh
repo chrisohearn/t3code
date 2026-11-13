@@ -202,6 +202,149 @@ restore_db "$root/snap" >/dev/null 2>&1 || fail 'restore failed'
 [[ "$(cat "$T3HOME/userdata/state.sqlite")" == old && -e "$T3HOME/userdata/extra.sqlite-wal" ]] || fail 'restore incomplete'
 pass 'a database restore is staged first, so a failed copy leaves the live files untouched'
 unset -f cp
+echo live2 > "$T3HOME/userdata/state.sqlite"; echo livewal > "$T3HOME/userdata/state.sqlite-wal"
+cp() { command cp "${@/--reflink=always/--reflink=auto}"; }
+mv() { [[ "$1" == "-f" && "$2" == *state.sqlite-wal && "$3" == "$SNAPSHOTS"/replaced-* ]] && return 1; command mv "$@"; }
+restore_db "$root/snap" >/dev/null 2>&1 && fail 'restore with a failed rename reported success'
+[[ "$(cat "$T3HOME/userdata/state.sqlite")" == live2 && "$(cat "$T3HOME/userdata/state.sqlite-wal")" == livewal ]] || fail 'failed rename left an incomplete live set'
+unset -f cp mv
+pass 'a rename that fails part-way puts every live file back'
+# --- Provider canary (2026-11-13 incident) and release archive check.
+sqlite3 "$DB" "alter table orchestration_v2_projection_runs add column provider_instance_id text;" 2>/dev/null || true
+sqlite3 "$DB" "create table if not exists orchestration_v2_projection_turn_items (turn_item_id text, thread_id text, run_id text, type text, status text, updated_at text, payload_json text);" 2>/dev/null || true
+sqlite3 "$DB" "alter table orchestration_v2_projection_turn_items add column payload_json text;" 2>/dev/null || true
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
+run_row() { # id instance status requested started [thread]
+  sqlite3 "$DB" "insert into orchestration_v2_projection_runs (run_id, thread_id, status, requested_at, payload_json, provider_instance_id)
+    values ('$1','${6:-T-$1}','$3','$4','$( [[ -n "${5:-}" ]] && echo "{\"startedAt\":\"$5\"}" || echo '{}')','$2');"
+}
+open_fail() { # id instance time [thread] [message]
+  run_row "$1" "$2" failed "$3" "" "${4:-T-$1}"
+  sqlite3 "$DB" "insert into orchestration_v2_projection_turn_items (turn_item_id, run_id, type, status, updated_at, payload_json) values ('turn-item:run:$1:signal:provider-session-open-failure','$1','error','failed','$3','{\"failure\":{\"class\":\"provider_error\",\"message\":\"${5:-Cannot create Codex shadow home entry}\"}}');"
+}
+at=$(now '-3 minutes')
+run_row ok1 P completed "$(now '-2 hours')" "$(now '-2 hours')"
+[[ -z "$(broken_instances "$at")" ]] || fail 'canary flagged an instance with no failures'
+open_fail f1 P "$(now '-2 minutes')"; open_fail f2 P "$(now '-1 minute')"
+[[ "$(broken_instances "$at")" == 'P:2' ]] || fail "worked-before instance failing every session not flagged: $(broken_instances "$at")"
+run_row ok2 P completed "$(now '-90 seconds')" "$(now '-80 seconds')"
+[[ -z "$(broken_instances "$at")" ]] || fail 'instance that still starts sessions flagged'
+open_fail g1 Q "$(now '-2 minutes')"; open_fail g2 Q "$(now '-1 minute')"
+[[ -z "$(broken_instances "$at")" ]] || fail 'instance that never worked before (signed out, bad config) flagged'
+run_row ok3 R completed "$(now '-2 hours')" "$(now '-2 hours')"
+open_fail h1 R "$(now '-2 minutes')" one; open_fail h2 R "$(now '-1 minute')" one
+[[ -z "$(broken_instances "$at")" ]] || fail 'one thread failing twice flagged'
+run_row ok4 S completed "$(now '-2 hours')" "$(now '-2 hours')"
+open_fail k1 S "$(now '-2 minutes')" "" "The workspace folder no longer exists"
+open_fail k2 S "$(now '-1 minute')" "" "Please sign in again"
+[[ -z "$(broken_instances "$at")" ]] || fail 'workspace or sign-in failures flagged'
+pass 'canary flags only an instance that worked before and now fails every session on 2+ threads, not environment noise'
+service_uptime() { echo 400; }; service_version() { echo 2; }; CANARY_POLL_SECONDS=0
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs where run_id = 'ok2';"
+r=$(provider_canary "$at" 2) && fail 'canary passed a broken instance'
+[[ "$r" == *'P:2'* ]] || fail "canary reason: $r"
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
+provider_canary "$at" 2 >/dev/null || fail 'canary failed with nothing broken'
+service_version() { echo 1; }
+r=$(provider_canary "$at" 2) && fail 'canary passed after the build stopped serving'
+[[ "$r" == *'stopped serving'* ]] || fail "reason: $r"
+service_version() { echo 2; }; service_uptime() { echo 0; }; CANARY_SECONDS=1; CANARY_DEADLINE_SLACK=0
+r=$(provider_canary "$at" 2) && fail 'canary did not end at its deadline'
+[[ "$r" == *'did not stay up'* ]] || fail "deadline reason: $r"
+CANARY_SECONDS=300; unset CANARY_DEADLINE_SLACK; service_uptime() { echo 400; }
+pass 'canary fails if the build stops serving, and a wall-clock deadline bounds it'
+
+# A build that serves but fails the canary is marked bad and rolled back, with the reason reported.
+latest_release() { echo 2; }; active_runs() { echo 0; }; quiet_seconds() { echo 99999; }
+svc() { return 0; }; wait_inactive() { return 0; }; snapshot_db() { echo "$root/snap"; }
+binary_of() { echo /bin/true; }; installed() { return 0; }; is_trusted() { return 0; }
+cur_v=1; active_version() { echo "$cur_v"; }; write_state_for() { :; }
+service_version() { echo 2; }; can_open() { return 0; }
+restart_on() { echo "$1" > "$root/recovery"; }
+provider_canary() { echo 'new build breaks sessions'; return 1; }
+rm -f "$root/recovery" "$GUARD_STATE/bad/2" "$GUARD_STATE/deferred-since"
+HEALTH_WAIT_SECONDS=30 cmd_update >/dev/null 2>&1 && fail 'canary failure reported as success'
+[[ -e "$GUARD_STATE/bad/2" ]] || fail 'canary failure did not mark the release bad'
+[[ "$(cat "$root/recovery")" == 1 ]] || fail 'canary failure did not restart the old build'
+grep -q 'failed the provider canary: new build breaks sessions' "$REPORTS_DEFERRED" "$REPORTS" 2>/dev/null || fail 'canary failure not reported'
+pass 'a build that serves but fails the canary is marked bad, rolled back and reported'
+unset -f provider_canary
+service_version() { echo 1; }; active_version() { echo 1; }
+rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2"
+
+# A deploy onto an idle server is checked again on later ticks; a late break holds and reports.
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
+rm -f "$AUTO_HOLD"; active_version() { echo 7; }
+at=$(now '-20 minutes'); printf '7 %s\n' "$at" > "$GUARD_STATE/canary-pending"
+late_canary; [[ -e "$GUARD_STATE/canary-pending" && ! -e "$AUTO_HOLD" ]] || fail 'late canary acted with nothing broken'
+run_row ok9 P completed "$(now '-2 hours')" "$(now '-2 hours')"
+open_fail L1 P "$(now '-5 minutes')"; open_fail L2 P "$(now '-4 minutes')"
+exec 9>&-
+late_canary; [[ -f "$AUTO_HOLD" && ! -e "$GUARD_STATE/canary-pending" ]] || fail 'late break not held'
+grep -q 'broke provider sessions after it went live' "$AUTO_HOLD" || fail 'late hold reason'
+[[ -e "$GUARD_STATE/rejected/7" && ! -e "$GUARD_STATE/bad/7" ]] || fail 'late break not marked rejected (and must not be marked bad)'
+rm -f "$AUTO_HOLD"; printf '7 %s\n' "$(now '-3 hours')" > "$GUARD_STATE/canary-pending"
+late_canary; [[ ! -e "$GUARD_STATE/canary-pending" && ! -e "$AUTO_HOLD" ]] || fail 'expired late canary not cleared'
+( exec 9>>"$LOCK"; flock -n 9; printf '7 %s\n' "$(now '-10 minutes')" > "$GUARD_STATE/canary-pending"; rm -f "$AUTO_HOLD"
+  late_canary; [[ -e "$GUARD_STATE/canary-pending" && ! -e "$AUTO_HOLD" ]] || fail 'late canary ran while another update held the lock' ) || exit 1
+rm -f "$GUARD_STATE/canary-pending"
+pass 'an idle deploy is re-checked on later ticks for 2 h; a late break holds, reports and marks the release rejected; it skips while an update holds the lock'
+sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
+active_version() { echo 1; }
+
+# A build that served but fails the canary, when the old build cannot open the migrated DB, stays.
+latest_release() { echo 2; }; active_runs() { echo 0; }; quiet_seconds() { echo 99999; }
+svc() { echo "$*" >> "$root/svc-stay"; return 0; }; wait_inactive() { return 0; }; snapshot_db() { echo "$root/snap"; }
+binary_of() { echo /bin/true; }; installed() { return 0; }; is_trusted() { return 0; }
+cur_v=1; active_version() { echo "$cur_v"; }; write_state_for() { :; }; service_version() { echo 2; }
+can_open() { return 1; }; restore_db() { echo restored > "$root/restored"; }
+provider_canary() { echo 'P:2 broken'; return 1; }
+rm -f "$root/svc-stay" "$root/restored" "$AUTO_HOLD"
+HEALTH_WAIT_SECONDS=30 cmd_update >/dev/null 2>&1 && fail 'stay path reported success'
+[[ -f "$AUTO_HOLD" && ! -e "$root/restored" ]] || fail 'stay path restored the DB or set no hold'
+! grep -q '^stop' "$root/svc-stay" 2>/dev/null || [[ "$(grep -c '^stop' "$root/svc-stay")" == 1 ]] || fail 'stay path stopped the service for a rollback'
+pass 'a served build failing the canary stays (held) rather than restoring and discarding work'
+unset -f provider_canary restore_db can_open
+source <(sed -n '/^restore_db() {/,/^}/p' "$root/functions")
+service_version() { echo 1; }; active_version() { echo 1; }; rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2"
+
+# prove never records a build the update marked bad, and skips while an update holds the lock.
+# Earlier tests ran cmd_update in this shell, which still holds the service lock on fd 9.
+exec 9>&-
+(
+  source "$root/functions"
+  active_version() { echo 5; }; service_version() { echo 5; }; service_uptime() { echo 100; }
+  is_trusted() { return 0; }; outage_end() { :; }; log() { :; }
+  mkdir -p "$GUARD_STATE/bad" "$GUARD_STATE/healthy" "$(dirname "$STATE_FILE")"; touch "$STATE_FILE"
+  date -Is > "$GUARD_STATE/bad/5"; rm -f "$GUARD_STATE/healthy/5"*
+  cmd_prove >/dev/null 2>&1
+  [[ -e "$GUARD_STATE/bad/5" ]] || fail 'prove cleared a bad marker'
+  ! is_healthy 5 || fail 'prove recorded a bad build healthy'
+  rm -f "$GUARD_STATE/bad/5"
+  exec 9>>"$LOCK"; flock -n 9
+  cmd_prove >/dev/null 2>&1
+  ! is_healthy 5 || fail 'prove recorded health while an update held the lock'
+  exec 9>&-
+  cmd_prove >/dev/null 2>&1
+  is_healthy 5 || fail 'prove did not record a good build'
+) || exit 1
+pass 'prove skips a build marked bad, skips while an update holds the lock, and records a good build'
+
+# A checksummed archive without the binary is rejected. (Earlier tests stub release_binary_sha.)
+source <(sed -n '/^release_binary_sha() {/,/^}/p' "$root/functions")
+mkdir -p "$root/rel/t3-9.9.9-linux-x64"; echo x > "$root/rel/t3-9.9.9-linux-x64/README"
+tar czf "$root/rel/t3-9.9.9-linux-x64.tar.gz" -C "$root/rel" t3-9.9.9-linux-x64
+(cd "$root/rel" && sha256sum t3-9.9.9-linux-x64.tar.gz > SHA256SUMS)
+curl() { local out="" url=""; while (( $# )); do case "$1" in -o) out=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac; done; cp "$root/rel/${url##*/}" "$out"; }
+release_binary_sha 9.9.9 >/dev/null 2>&1 && fail 'archive without the binary accepted'
+cp -r "$root/rel/t3-9.9.9-linux-x64" "$root/rel2"; echo bin > "$root/rel2/t3"; rm -rf "$root/rel/t3-9.9.9-linux-x64"; mv "$root/rel2" "$root/rel/t3-9.9.9-linux-x64"
+tar czf "$root/rel/t3-9.9.9-linux-x64.tar.gz" -C "$root/rel" t3-9.9.9-linux-x64
+(cd "$root/rel" && sha256sum t3-9.9.9-linux-x64.tar.gz > SHA256SUMS)
+sha=$(release_binary_sha 9.9.9 2>/dev/null) || fail 'good archive rejected'
+[[ "$sha" == "$(printf 'bin\n' | sha256sum | cut -d' ' -f1)" ]] || fail "binary sha wrong: $sha"
+unset -f curl
+pass 'release verification rejects an archive without the binary and hashes the real one'
+
 timeout() { printf '%s\n' "$*" > "$root/timeout"; }
 systemctl --user is-active t3code.service
 [[ "$(cat "$root/timeout")" == '--kill-after=2 15 /usr/bin/systemctl --user is-active t3code.service' ]] || fail timeout

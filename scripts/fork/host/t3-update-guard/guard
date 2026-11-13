@@ -309,10 +309,15 @@ release_binary_sha() {
       curl -fsSL --max-time 600 -o "$tmp/$archive" "$base/$archive"; then
       sum=$(awk -v f="$archive" '$2 == f || $2 == "*" f {print $1}' "$tmp/SHA256SUMS")
       if [[ -n "$sum" ]] && [[ "$(sha256sum "$tmp/$archive" | cut -d' ' -f1)" == "$sum" ]]; then
-        tar xzOf "$tmp/$archive" "t3-$v-$PLATFORM/t3" 2>/dev/null | sha256sum | cut -d' ' -f1
-        ok=0
-        printf '%s' "$repo" >"$tmp/repo"
-        break
+        # A malformed archive, or one without the binary, must fail rather than hash an empty stream.
+        if tar xzOf "$tmp/$archive" "t3-$v-$PLATFORM/t3" >"$tmp/t3" 2>/dev/null && [[ -s "$tmp/t3" ]]; then
+          sha256sum "$tmp/t3" | cut -d' ' -f1
+          ok=0
+          printf '%s' "$repo" >"$tmp/repo"
+          break
+        fi
+        log "release archive $archive from $repo has no usable t3 binary"
+        continue
       fi
       log "checksum mismatch for $archive from $repo"
     fi
@@ -462,8 +467,15 @@ cmd_prove() {
     up=$(service_uptime) || up=0
     if (( up >= 60 )) && [[ "$(service_version)" == "$v" ]]; then
       is_trusted "$v" || trust "$v" || { log "prove: $v serves but is unverified"; return 1; }
+      # cmd_update proves, and may mark bad, the build it installs. Record only under the service
+      # lock (held briefly, so a crash-loop rollback is never locked out), and never record a
+      # build marked bad: record_healthy would clear that marker.
+      exec 8>>"$LOCK"
+      flock -n 8 || { exec 8>&-; log "prove: a service change is in progress; it does its own health check"; return 0; }
+      if is_bad "$v"; then exec 8>&-; log "prove: $v is marked bad; not recording it healthy"; return 0; fi
       is_healthy "$v" || record_healthy "$v"
       cp -f "$STATE_FILE" "$GUARD_STATE/healthy/$v.json"
+      exec 8>&-
       outage_end "$v"
       return 0
     fi
@@ -569,6 +581,11 @@ FORCE_GRACE_SECONDS="${FORCE_GRACE_SECONDS:-1200}" # extra wait for force_blocke
 # orphans left by an earlier crash; the grace window bounds the wait either way.
 TOOL_ORPHAN_SECONDS="${TOOL_ORPHAN_SECONDS:-21600}"  # 6 h
 PRE_RESTART="$GUARD_STATE/pre-restart"
+# Provider canary (2026-11-13 incident: .4 served, but every Codex Pro session failed to open).
+# After the new build serves, watch new provider sessions this long; roll back when session-open
+# failures reach CANARY_FAILURES and exceed the count in the 30 min before the restart.
+CANARY_SECONDS="${CANARY_SECONDS:-300}"
+CANARY_FAILURES="${CANARY_FAILURES:-2}"
 quiet_seconds() {
   timeout 10 sqlite3 -readonly "$DB" \
     "select cast((julianday('now') - julianday(max(max(coalesce(completed_at,'')), max(requested_at)))) * 86400 as int) from orchestration_v2_projection_runs;" 2>/dev/null
@@ -663,7 +680,7 @@ record_pre_restart() {
 # restart cancelled. A later unrelated run on the same thread does not count. Prints nothing
 # when nothing was running and nothing was cancelled.
 recovery_summary() {
-  local at kind r t n total=0 continued=0 missing="" cancelled=0 q
+  local at kind r t n total=0 continued=0 missing="" cancelled=0 q unknown_req=""
   [[ -r "$PRE_RESTART" ]] || return 0
   at=$(head -n1 "$PRE_RESTART")
   [[ "$at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$ ]] || { rm -f "$PRE_RESTART"; return 0; }
@@ -672,8 +689,7 @@ recovery_summary() {
       # A request pending at the stop that ended cancelled or expired was lost to the restart.
       q=$(timeout 10 sqlite3 -readonly "$DB" \
         "select count(*) from orchestration_v2_projection_runtime_requests where runtime_request_id = '${r//\'/\'\'}' and status in ('cancelled','expired');" 2>/dev/null)
-      [[ "$q" =~ ^[0-9]+$ ]] || q=0
-      cancelled=$((cancelled + q))
+      if [[ "$q" =~ ^[0-9]+$ ]]; then cancelled=$((cancelled + q)); else unknown_req=1; fi
       continue
     fi
     [[ "$kind" == run && -n "$r" ]] || continue
@@ -687,9 +703,111 @@ recovery_summary() {
     fi
   done < <(tail -n +2 "$PRE_RESTART")
   rm -f "$PRE_RESTART"
+  [[ -n "$unknown_req" ]] && cancelled="unknown number of"
   (( total > 0 )) || [[ "$cancelled" != 0 ]] || return 0
   printf '%s/%s interrupted run(s) continued%s; %s pending request(s) lost' \
     "$continued" "$total" "${missing:+; not continued:$missing}" "$cancelled"
+}
+
+# Provider instances the restart at $1 broke: each started runs fine in the 6 h before it
+# (startedAt set), and since then has session-open failures on CANARY_FAILURES or more distinct
+# threads and no run that started. Failures that name a missing workspace folder or a sign-in
+# problem are the environment, not the build, and do not count. One "instance:threads" per line. This is a release regression, not an
+# ordinary provider problem (signed out, bad config, an outage), which fails before the restart
+# too or still lets some sessions start. The query reads failed runs through the partial
+# fork_runs_failed_recent_idx and seeks each run's items by run_id. $2 (optional) bounds the
+# window, for replaying a past deploy.
+broken_instances() {
+  local at="$1" until="${2:-}" since
+  since=$(date -u -d "$at - 6 hours" +%Y-%m-%dT%H:%M:%S.000Z) || return 0
+  timeout 10 sqlite3 -readonly -separator ':' "$DB" \
+    "with f as (
+       select r.provider_instance_id as inst, count(distinct r.thread_id) as n
+         from orchestration_v2_projection_runs r
+         cross join orchestration_v2_projection_turn_items i
+           on i.run_id = r.run_id and i.turn_item_id like '%:signal:provider-session-open-failure'
+        where r.status in ('failed', 'cancelled') and r.status = 'failed' and r.requested_at >= '$at'${until:+ and r.requested_at < '$until'}
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*workspace folder*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*sign in*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*signed out*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*log in*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*authenticat*'
+          and lower(coalesce(json_extract(i.payload_json, '\$.failure.message'), '')) not glob '*unauthorized*'
+        group by 1)
+     select f.inst, f.n from f
+      where f.n >= ${CANARY_FAILURES:-2}
+        and exists (select 1 from orchestration_v2_projection_runs b
+                     where b.provider_instance_id = f.inst and b.requested_at >= '$since'
+                       and b.requested_at < '$at' and json_extract(b.payload_json, '$.startedAt') is not null)
+        and not exists (select 1 from orchestration_v2_projection_runs a
+                         where a.provider_instance_id = f.inst and a.requested_at >= '$at'
+                           and json_extract(a.payload_json, '$.startedAt') >= '$at'${until:+ and json_extract(a.payload_json, '\$.startedAt') < '$until'});" 2>/dev/null
+}
+
+# Watch the new build $2 after a restart at $1 (ISO UTC) until it has been up CANARY_SECONDS.
+# Fails, with the reason, when a provider instance that worked before now fails every session,
+# or when the build stops serving or never stays up long enough (a wall-clock deadline bounds
+# the wait even if the service keeps restarting). An unreadable database is not a failure: the
+# server-level health check already passed.
+provider_canary() {
+  local at="$1" v="$2" bad up deadline=$((SECONDS + CANARY_SECONDS + ${CANARY_DEADLINE_SLACK:-120}))
+  [[ "$at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$ ]] || return 0
+  while :; do
+    bad=$(broken_instances "$at" | paste -sd ' ' -)
+    if [[ -n "$bad" ]]; then
+      echo "provider instance(s) that worked before the restart now fail every session (instance:threads): $bad"
+      return 1
+    fi
+    if [[ "$(service_version)" != "$v" ]] || ! up=$(service_uptime); then
+      echo "$v stopped serving during the canary"
+      return 1
+    fi
+    (( up >= CANARY_SECONDS )) && return 0
+    if (( SECONDS >= deadline )); then
+      echo "$v did not stay up for the ${CANARY_SECONDS} s canary"
+      return 1
+    fi
+    sleep "${CANARY_POLL_SECONDS:-15}"
+  done
+}
+
+# A deploy onto an idle server opens few sessions inside the canary window. For 2 h afterwards,
+# each timer tick checks again whether the deployed build broke a provider instance; if so it
+# holds automatic updates and reports (no automatic rollback this late, since work has moved on).
+late_canary() {
+  local v at bad age
+  [[ -r "$GUARD_STATE/canary-pending" ]] || return 0
+  # Skip while another service change runs; released before cmd_update takes the lock itself.
+  exec 8>>"$LOCK"
+  flock -n 8 || { exec 8>&-; return 0; }
+  if ! read -r v at <"$GUARD_STATE/canary-pending"; then
+    rm -f "$GUARD_STATE/canary-pending"; exec 8>&-; return 0
+  fi
+  age=$(( $(date +%s) - $(date -u -d "$at" +%s 2>/dev/null || echo 0) ))
+  if [[ "$(active_version)" != "$v" ]] || (( age > 7200 )); then
+    rm -f "$GUARD_STATE/canary-pending"; exec 8>&-; return 0
+  fi
+  bad=$(broken_instances "$at" | paste -sd ' ' -)
+  [[ -n "$bad" ]] || { exec 8>&-; return 0; }
+  rm -f "$GUARD_STATE/canary-pending"
+  # Not "bad": launch skips bad builds, and this one is running on a migrated database. The
+  # rejected marker only stops the updater from deploying it again after a manual rollback.
+  mkdir -p "$GUARD_STATE/rejected" && date -Is >"$GUARD_STATE/rejected/$v"
+  hold_updates "$v broke provider sessions after it went live (instance:threads): $bad; check, then roll back or fix"
+  report "$v broke provider sessions after it went live (instance:threads): $bad. Automatic updates held; roll back with t3-service-update <previous version> or fix the cause, then t3-service-update resume."
+  exec 8>&-
+}
+
+# After a rollback restart (systemctl --no-block), give the server time to come up and queue its
+# restart continuations before the recovery summary reads them. Bounded at 2 min.
+wait_for_continuations() {
+  local deadline=$((SECONDS + 120)) up
+  while (( SECONDS < deadline )); do
+    up=$(service_uptime) || up=0
+    (( up >= 20 )) && return 0
+    sleep 5
+  done
+  return 0
 }
 
 SNAPSHOTS="$T3HOME/runtime/guard-db-snapshots"
@@ -720,11 +838,30 @@ restore_db() {
   done
   aside="$SNAPSHOTS/replaced-$(date +%Y%m%dT%H%M%S)"
   mkdir -p "$aside" || { rm -rf "$stage"; return 1; }
+  local moved=() placed=() m
+  # On any failure, put back what was moved so far: the live set stays complete and untouched.
+  undo_restore() {
+    for m in "${placed[@]}"; do mv -f "$T3HOME/userdata/$m" "$stage/" 2>/dev/null; done
+    for m in "${moved[@]}"; do mv -f "$aside/$m" "$T3HOME/userdata/" 2>/dev/null; done
+  }
   for f in "$T3HOME"/userdata/*.sqlite "$T3HOME"/userdata/*.sqlite-wal "$T3HOME"/userdata/*.sqlite-shm; do
-    [[ -e "$f" ]] && mv -f "$f" "$aside/"
+    [[ -e "$f" ]] || continue
+    # Never overwrite a live file that could not be moved aside.
+    if ! mv -f "$f" "$aside/"; then
+      undo_restore
+      log "restore: could not move $f aside; live files put back, staged snapshot kept in $stage"
+      return 1
+    fi
+    moved+=("$(basename "$f")")
   done
-  # Same filesystem: these renames do not fail part-way the way copies can.
-  for f in "$stage"/*; do mv -f "$f" "$T3HOME/userdata/"; done
+  for f in "$stage"/*; do
+    if ! mv -f "$f" "$T3HOME/userdata/"; then
+      undo_restore
+      log "restore: could not place $(basename "$f"); live files put back, staged snapshot kept in $stage"
+      return 1
+    fi
+    placed+=("$(basename "$f")")
+  done
   rmdir "$stage" 2>/dev/null
   log "restored databases from $dir; replaced files kept in $aside"
 }
@@ -755,6 +892,7 @@ cmd_update() {
   done
   # Keep a failed update from repeatedly disrupting a recovered server. Explicit manual
   # version / --now calls remain possible, but still require a responsive manager.
+  late_canary
   if [[ -z "$target$now_flag" && -f "$AUTO_HOLD" ]]; then
     echo "Automatic updates held: $(cat "$AUTO_HOLD"). Review before a manual update."
     return 0
@@ -804,6 +942,10 @@ cmd_update() {
       restart_on "$cur" && notify "Switched the T3 service back to $cur from an unverified build."
     fi
     return
+  fi
+  if [[ -z "$target" && -e "$GUARD_STATE/rejected/$latest" ]]; then
+    log "update: $latest was rejected by the late canary; skipping (run t3-service-update $latest to retry)"
+    return 0
   fi
   if is_bad "$latest" && [[ -z "$target" ]]; then
     log "update: $latest failed here before; skipping (run t3-service-update $latest to retry)"
@@ -865,7 +1007,7 @@ cmd_update() {
   is_healthy "$cur" || { is_trusted "$cur" && [[ "$(service_version)" == "$cur" ]] && record_healthy "$cur"; }
   sha=$(release_binary_sha "$latest") || { log "update: $latest is not a verified release in $TRUSTED_REPOS"; return 1; }
   printf '%s  %s\n' "$sha" "$latest" >"$GUARD_STATE/trusted/$latest.sha256"
-  rm -f "$GUARD_STATE/bad/$latest"
+  rm -f "$GUARD_STATE/bad/$latest" "$GUARD_STATE/rejected/$latest"
 
   if [[ -n "$now_flag" ]]; then
     blockers=$(force_blockers | paste -sd ';' -)
@@ -891,7 +1033,8 @@ cmd_update() {
 
   log "update: $cur -> $latest"
   if [[ -n "${T3_GUARD_DRY_RUN:-}" ]]; then echo "RUN $(binary_of "$cur") update $latest --yes"; return 0; fi
-  local snap="" t0
+  local snap="" t0 restart_at failed_why="did not serve within $HEALTH_WAIT_SECONDS s of its install" canary_why=""
+  restart_at=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
   if ! svc stop --no-block "$UNIT"; then
     hold_updates "could not confirm stop request for $UNIT; install aborted"
     manager_ready && svc start --no-block "$UNIT"
@@ -935,8 +1078,15 @@ cmd_update() {
     sleep 10
     up=$(service_uptime) || up=0
     if (( up >= 60 )) && [[ "$(service_version)" == "$latest" ]]; then
+      if ! canary_why=$(provider_canary "$restart_at" "$latest"); then
+        log "update: $latest serves but fails the provider canary: $canary_why; rolling back to $cur"
+        failed_why="served but failed the provider canary: $canary_why"
+        break
+      fi
       record_healthy "$latest"
       outage_end "$latest"
+      # Few sessions open on an idle server, so keep checking on later timer ticks.
+      printf '%s %s\n' "$latest" "$restart_at" >"$GUARD_STATE/canary-pending"
       local recovered
       recovered=$(recovery_summary)
       if [[ -n "$recovered" ]]; then
@@ -950,6 +1100,16 @@ cmd_update() {
   date -Is >"$GUARD_STATE/bad/$latest"
   # Reported once the rollback has decided (below), so the report never delays a stop or restart.
   local outcome
+  # A build that served for minutes has new work in the database. If $cur cannot open the
+  # migrated database, rolling back means restoring the pre-update snapshot and losing that work,
+  # so stay on $latest, hold automatic updates and ask for a person instead.
+  if [[ -n "$canary_why" ]] && ! can_open "$cur"; then
+    hold_updates "$latest $failed_why; stayed on it because $cur cannot open the migrated database and a restore would discard work done since the update"
+    notify "T3 $latest $failed_why. Stayed on $latest (a rollback would discard work); automatic updates held."
+    local recovered; recovered=$(recovery_summary)
+    report "$latest $failed_why: stayed on $latest, automatic updates held; rolling back would discard work done since the update.${recovered:+ $recovered.}"
+    return 1
+  fi
   if ! svc stop --no-block "$UNIT" || ! wait_inactive; then
     hold_updates "failed to confirm service stopped for rollback; databases left untouched"
     manager_ready && svc start --no-block "$UNIT"
@@ -957,15 +1117,15 @@ cmd_update() {
   fi
   if can_open "$cur"; then
     if restart_on "$cur"; then
-      notify "T3 $latest did not serve within $HEALTH_WAIT_SECONDS seconds. Restart on $cur requested; awaiting health verification."
+      notify "T3 $latest $failed_why. Restart on $cur requested; awaiting health verification."
       outcome="restart on $cur requested"
     else
-      notify "T3 $latest failed health checks and restart on $cur failed; manual recovery required."
+      notify "T3 $latest $failed_why, and restart on $cur failed; manual recovery required."
       outcome="restart on $cur failed; manual recovery required"
     fi
   elif [[ -n "$snap" ]] && restore_db "$snap"; then
     if restart_on "$cur"; then
-      notify "T3 $latest failed health checks after migration. Pre-update snapshot restored; restart on $cur requested, awaiting health verification."
+      notify "T3 $latest $failed_why after migration. Pre-update snapshot restored; restart on $cur requested, awaiting health verification."
       outcome="pre-update snapshot restored; restart on $cur requested"
     else
       notify "Pre-update snapshot restored, but restart on $cur failed; manual recovery required."
@@ -978,7 +1138,11 @@ cmd_update() {
     notify "T3 $latest did not serve within $HEALTH_WAIT_SECONDS seconds, and $cur cannot run on the migrated database (no snapshot). Left on $latest. Check: journalctl --user -u $UNIT"
     outcome="$cur cannot run on the migrated database and no snapshot exists; left on $latest"
   fi
-  report "$latest did not serve within $HEALTH_WAIT_SECONDS s of its install: $outcome. $(last_fatal)"
+  # The forced restart interrupted runs either way; say which continued.
+  local recovered
+  wait_for_continuations
+  recovered=$(recovery_summary)
+  report "$latest $failed_why: $outcome.${recovered:+ $recovered.} $(last_fatal)"
   return 1
 }
 
@@ -1009,6 +1173,8 @@ kernel_defer() {
 # Lift an automatic-updates hold after the cause is fixed. The hold file is archived, not
 # deleted, and the next timer run updates as usual.
 cmd_resume() {
+  exec 9>>"$LOCK"
+  flock -w 30 9 || { echo "A service change holds $LOCK; try again shortly." >&2; return 1; }
   [[ -f "$AUTO_HOLD" ]] || { echo "No automatic-updates hold."; return 0; }
   local kept="$AUTO_HOLD.cleared-$(date -u +%Y%m%dT%H%M%SZ)"
   mv -f "$AUTO_HOLD" "$kept" || return 1
