@@ -186,7 +186,7 @@ const make = Effect.gen(function* () {
     if (key === undefined) {
       return yield* new OrchestratorMcpFailure({
         code: "target_required",
-        message: "Pass target.projectId: this thread's project has no repository to match there.",
+        message: `Pass target.projectId: this thread's project has no repository to match in environment ${environmentId}. t3_project_list with environmentId: "${environmentId}" lists its projects.`,
       });
     }
     const matches: Array<{ readonly id: ProjectId; readonly title: string }> = [];

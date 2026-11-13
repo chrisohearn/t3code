@@ -1,6 +1,6 @@
 import * as JarvisPlaybook from "./JarvisPlaybook.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
-import { advertisedModel, requireAdvertisedModel } from "./providerModels.ts";
+import { advertisedModel, listChoices, requireAdvertisedModel } from "./providerModels.ts";
 import { hasGitEntry } from "./gitEntryProbe.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as ThreadNotifications from "./ThreadNotifications.ts";
@@ -1371,6 +1371,10 @@ const make = Effect.gen(function* () {
     const requestedInstanceId = input.target?.providerInstanceId;
     const requestedDriver = input.target?.driverKind;
     const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
+    const capableProviders = () =>
+      input.providers.filter((provider) =>
+        orchestrationCapableInstanceIds.has(provider.instanceId),
+      );
     let instanceId = requestedInstanceId;
 
     if (instanceId === undefined && requestedDriver !== undefined) {
@@ -1382,7 +1386,7 @@ const make = Effect.gen(function* () {
       if (candidates.length === 0) {
         return yield* failure(
           "provider_unavailable",
-          `No V2 provider adapter is registered for driver ${requestedDriver}.`,
+          `No V2 provider adapter is registered for target.driverKind ${requestedDriver}. Drivers here: ${listChoices(capableProviders().map((provider) => provider.driver))}.`,
         );
       }
       const healthyCandidates = candidates.filter(
@@ -1422,13 +1426,13 @@ const make = Effect.gen(function* () {
     if (provider === undefined) {
       return yield* failure(
         "provider_unavailable",
-        `Provider instance ${instanceId} is not registered.`,
+        `${requestedInstanceId === undefined ? "This thread's provider instance" : "target.providerInstanceId"} ${instanceId} is not registered. Pass target.providerInstanceId, one of: ${listChoices(capableProviders().map((provider) => provider.instanceId))}.`,
       );
     }
     if (requestedDriver !== undefined && provider.driver !== requestedDriver) {
       return yield* failure(
         "invalid_request",
-        `Provider instance ${instanceId} uses driver ${provider.driver}, not ${requestedDriver}.`,
+        `target.providerInstanceId ${instanceId} uses driver ${provider.driver}, not target.driverKind ${requestedDriver}. Pass only one of them.`,
       );
     }
     const constraints = providerConstraints(
@@ -2508,7 +2512,7 @@ const make = Effect.gen(function* () {
       ) {
         return yield* failure(
           "invalid_request",
-          "A local task runs in this thread's project. Omit target.projectId, or pass target.environmentId to run it in that environment's project.",
+          `target.projectId ${input.target.projectId} is not this thread's project (${parent.thread.projectId}), and a local task always runs here. To start work in that project, use t3_thread_launch with projectId: "${input.target.projectId}". Otherwise omit target.projectId, or add target.environmentId to run in a linked environment's project.`,
         );
       }
       const parentRun = parent.runs
@@ -2557,7 +2561,10 @@ const make = Effect.gen(function* () {
           })
           .pipe(
             Effect.mapError(() =>
-              failure("invalid_request", "Unable to resolve the parent checkout commit."),
+              failure(
+                "invalid_request",
+                `isolation "worktree" needs a commit in the parent checkout (${parent.thread.worktreePath ?? project.workspaceRoot}), and none resolved. Use isolation "shared", or commit first.`,
+              ),
             ),
           );
         // Launch preparation creates the worktree from the project root, so a

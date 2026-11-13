@@ -1985,8 +1985,22 @@ describe("OrchestratorMcpService provider resolution", () => {
           })
           .pipe(Effect.flip);
         assert.equal(byDriver.code, "provider_unavailable");
-        assert.isTrue(
-          byDriver.message.includes("No V2 provider adapter is registered for driver forkOnly."),
+        assert.include(
+          byDriver.message,
+          "No V2 provider adapter is registered for target.driverKind forkOnly. Drivers here: ",
+        );
+
+        const elsewhere = yield* service
+          .delegateTask(scope, {
+            task: "Summarize the diff.",
+            target: { projectId: ProjectId.make("project:elsewhere") },
+            mode: "async",
+          })
+          .pipe(Effect.flip);
+        assert.equal(elsewhere.code, "invalid_request");
+        assert.include(
+          elsewhere.message,
+          'use t3_thread_launch with projectId: "project:elsewhere"',
         );
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
