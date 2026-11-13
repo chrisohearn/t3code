@@ -7961,6 +7961,124 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect(
+    "a later completed run releases snooze-held messages only once the thread is awake",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threadId = ThreadId.make("runtime-layer-snooze-held-release");
+        const { send, runFor, end, releasedAfter } = yield* queueTestThread(threadId);
+        const message = (key: string, extra: object) =>
+          orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId: CommandId.make(`${threadId}:message:${key}`),
+            threadId,
+            messageId: MessageId.make(`${threadId}:message:${key}`),
+            text: key,
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            ...extra,
+          });
+        yield* send("first", "agent", true);
+        yield* end("first", "completed");
+        yield* orchestrator.dispatch({
+          type: "thread.snooze",
+          commandId: CommandId.make(`${threadId}:snooze`),
+          threadId,
+          snoozedUntil: "2099-01-01T00:00:00.000Z",
+        });
+        yield* message("held", { respectSnooze: true });
+        assert.isTrue((yield* runFor("held")).snoozeDeferred);
+
+        // A background wake runs and completes while the thread sleeps: the held turn stays held.
+        yield* message("wake", {
+          createdBy: "agent",
+          creationSource: "provider",
+          dispatchMode: { type: "queue_after_active" },
+          notification: {
+            source: { kind: "background_task" },
+            outcome: "updated",
+            summary: "Background activity updated",
+          },
+        });
+        yield* end("wake", "completed");
+        const stillHeld = yield* runFor("held");
+        assert.isTrue(stillHeld.queueHeld);
+        assert.isTrue(stillHeld.snoozeDeferred);
+
+        // Awake, the next completed run (a usage limit's resume, say) releases it like the others.
+        yield* orchestrator.dispatch({
+          type: "thread.unsnooze",
+          commandId: CommandId.make(`${threadId}:unsnooze`),
+          threadId,
+          reason: "user",
+        });
+        yield* send("resume", "agent", true);
+        yield* end("resume", "completed");
+        yield* releasedAfter("held", "resume");
+        assert.isUndefined((yield* runFor("held")).snoozeDeferred);
+      }),
+  );
+
+  it.effect("delivers to a snoozed thread that counts as awake without ending its snooze", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-layer-snooze-awake-on-error");
+      const { send, runFor, end } = yield* queueTestThread(threadId);
+      yield* send("first", "agent", true);
+      yield* end("first", "completed");
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make(`${threadId}:snooze`),
+        threadId,
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
+      yield* TestClock.adjust("1 second");
+      // A background wake fails after the snooze, which wakes the thread as the sidebar shows it.
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "provider",
+        commandId: CommandId.make(`${threadId}:message:wake`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:message:wake`),
+        text: "wake",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        notification: {
+          source: { kind: "background_task" },
+          outcome: "updated",
+          summary: "Background activity updated",
+        },
+      });
+      yield* end("wake", "failed");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "mcp",
+        commandId: CommandId.make(`${threadId}:message:respect`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:message:respect`),
+        text: "respect",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        respectSnooze: true,
+      });
+      const delivered = yield* runFor("respect");
+      assert.equal(delivered.status, "starting");
+      assert.isUndefined(delivered.snoozeDeferred);
+      const thread = (yield* orchestrator.getThreadProjection(threadId)).thread;
+      assert.equal(
+        thread.snoozedUntil === null || thread.snoozedUntil === undefined
+          ? null
+          : DateTime.formatIso(thread.snoozedUntil),
+        "2099-01-01T00:00:00.000Z",
+      );
+    }),
+  );
+
   it.effect("keeps held agent messages while the thread's worktree setup is unresolved", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -8668,7 +8786,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.isTrue(heldRun.snoozeDeferred);
       // Its own held turn does not stop the thread from being snoozed again.
       yield* snooze("2099-02-01T00:00:00.000Z");
-      assert.deepEqual(yield* SnoozeDeferredDelivery.readSnoozeDeferredThreads(), [
+      const ownDeferrals = () =>
+        SnoozeDeferredDelivery.readSnoozeDeferredThreads().pipe(
+          Effect.map((rows) => rows.filter((row) => row.threadId === threadId)),
+        );
+      assert.deepEqual(yield* ownDeferrals(), [
         { threadId, snoozedUntil: "2099-02-01T00:00:00.000Z", firstRunId: heldRun.id },
       ]);
 
@@ -8678,7 +8800,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         threadId,
         reason: "user",
       });
-      const [awake] = yield* SnoozeDeferredDelivery.readSnoozeDeferredThreads();
+      const [awake] = yield* ownDeferrals();
       assert.equal(
         SnoozeDeferredDelivery.snoozeDeferredReleases(
           [awake!],
@@ -8696,7 +8818,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(releasedRun.status, "starting");
       // Released, it is no longer the snooze's: a failure hold later must not release it again.
       assert.isUndefined(releasedRun.snoozeDeferred);
-      assert.deepEqual(yield* SnoozeDeferredDelivery.readSnoozeDeferredThreads(), []);
+      assert.deepEqual(yield* ownDeferrals(), []);
     }),
   );
 
@@ -8786,12 +8908,23 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const started2 = secondBoundary.runs.find((run) => run.id === before2!.id)!;
       assert.equal(started2.status, "starting");
       assert.deepEqual(started2.modelSelection, scheduledSelection);
-      assert.isNull(secondBoundary.thread.scheduledModelSelection ?? null);
+      // The pick still waits, so the change stays for the default turns after it.
+      assert.isNotNull(secondBoundary.thread.scheduledModelSelection ?? null);
 
       const thirdBoundary = yield* complete(before2!.id);
       const startedPick = thirdBoundary.runs.find((run) => run.id === picked!.id)!;
       assert.equal(startedPick.status, "starting");
       assert.deepEqual(startedPick.modelSelection, pickedSelection);
+      assert.deepEqual(thirdBoundary.thread.modelSelection, pickedSelection);
+      assert.isNotNull(thirdBoundary.thread.scheduledModelSelection ?? null);
+
+      // The next default turn goes back to the scheduled model, and that uses the change up.
+      const fourthBoundary = yield* complete(picked!.id);
+      const startedAfter = fourthBoundary.runs.find((run) => run.id === after!.id)!;
+      assert.equal(startedAfter.status, "starting");
+      assert.deepEqual(startedAfter.modelSelection, scheduledSelection);
+      assert.deepEqual(fourthBoundary.thread.modelSelection, scheduledSelection);
+      assert.isNull(fourthBoundary.thread.scheduledModelSelection ?? null);
     }),
   );
 
