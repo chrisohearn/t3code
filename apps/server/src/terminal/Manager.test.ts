@@ -2033,6 +2033,7 @@ it.layer(
       variable: "CODEX_HOME",
       config: { homePath: "/configured/codex" },
       expectedHome: "/configured/codex",
+      expectedSqliteHome: undefined,
     },
     {
       name: "Codex shadow home",
@@ -2040,6 +2041,7 @@ it.layer(
       variable: "CODEX_HOME",
       config: { homePath: "/configured/codex", shadowHomePath: "/configured/codex-shadow" },
       expectedHome: "/configured/codex-shadow",
+      expectedSqliteHome: "/configured/codex",
     },
     {
       name: "Claude home",
@@ -2047,8 +2049,43 @@ it.layer(
       variable: "CLAUDE_CONFIG_DIR",
       config: { homePath: "/configured/claude" },
       expectedHome: "/configured/claude",
+      expectedSqliteHome: undefined,
     },
-  ])("prefers $name over the instance environment", ({ driver, variable, config, expectedHome }) =>
+  ])(
+    "prefers $name over the instance environment",
+    ({ driver, variable, config, expectedHome, expectedSqliteHome }) =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const serverSettings = yield* ServerSettings.ServerSettingsService;
+        const environment = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
+          serverSettings,
+          path,
+          rawProviderInstanceId: "configured_home",
+          env: undefined,
+        });
+
+        expect(environment[variable]).toBe(path.resolve(expectedHome));
+        expect(environment.CODEX_SQLITE_HOME).toBe(
+          expectedSqliteHome && path.resolve(expectedSqliteHome),
+        );
+      }).pipe(
+        Effect.provide(
+          ServerSettings.layerTest({
+            providerInstances: {
+              [ProviderInstanceId.make("configured_home")]: {
+                driver: ProviderDriverKind.make(driver),
+                environment: [
+                  { name: variable, value: "~/.environment-account", sensitive: false },
+                ],
+                config,
+              },
+            },
+          }),
+        ),
+      ),
+  );
+
+  it.effect("keeps T3's own CODEX_SQLITE_HOME for a Codex shadow home terminal", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -2057,17 +2094,16 @@ it.layer(
         path,
         rawProviderInstanceId: "configured_home",
         env: undefined,
-      });
+      }).pipe(Effect.provideService(HostProcess.Environment, { CODEX_SQLITE_HOME: "t3-sqlite" }));
 
-      expect(environment[variable]).toBe(path.resolve(expectedHome));
+      expect(environment.CODEX_SQLITE_HOME).toBe("t3-sqlite");
     }).pipe(
       Effect.provide(
         ServerSettings.layerTest({
           providerInstances: {
             [ProviderInstanceId.make("configured_home")]: {
-              driver: ProviderDriverKind.make(driver),
-              environment: [{ name: variable, value: "~/.environment-account", sensitive: false }],
-              config,
+              driver: ProviderDriverKind.make("codex"),
+              config: { homePath: "/configured/codex", shadowHomePath: "/configured/codex-shadow" },
             },
           },
         }),
