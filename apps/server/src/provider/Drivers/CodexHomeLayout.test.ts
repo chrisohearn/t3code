@@ -11,6 +11,7 @@ import {
   CodexShadowHomePathConflictError,
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
+  withCodexSqliteHome,
 } from "./CodexHomeLayout.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 const decodeCodexSettingsValue = Schema.decodeSync(CodexSettings);
@@ -60,6 +61,31 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           effectiveHomePath: shadowHome,
           continuationKey: `codex:home:${sharedHome}`,
         });
+      }),
+    );
+  });
+
+  describe("withCodexSqliteHome", () => {
+    it.effect("points only auth overlay homes at the shared SQLite home", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const sharedHome = path.resolve("codex-shared");
+        const overlay = yield* resolveCodexHomeLayout(
+          decodeCodexSettings({
+            homePath: sharedHome,
+            shadowHomePath: path.resolve("codex-shadow"),
+          }),
+        );
+        const direct = yield* resolveCodexHomeLayout(decodeCodexSettings({ homePath: sharedHome }));
+
+        expect(withCodexSqliteHome(overlay, { PATH: "bin" })).toEqual({
+          PATH: "bin",
+          CODEX_SQLITE_HOME: sharedHome,
+        });
+        expect(withCodexSqliteHome(overlay, { CODEX_SQLITE_HOME: "custom" })).toEqual({
+          CODEX_SQLITE_HOME: "custom",
+        });
+        expect(withCodexSqliteHome(direct, { PATH: "bin" })).toEqual({ PATH: "bin" });
       }),
     );
   });
@@ -190,6 +216,55 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           yield* materializeCodexShadowHome(layout);
 
           expect(yield* fileSystem.readLink(shadowLock)).toBe(sharedLock);
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "links SQLite databases but settles shadow sidecars instead of linking them",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          for (const name of ["state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"]) {
+            yield* writeTextFile(path.join(sharedHome, name), "shared");
+          }
+          for (const name of ["logs_2.sqlite", "goals_1.sqlite"]) {
+            yield* writeTextFile(path.join(sharedHome, name), "shared");
+          }
+          // Windows SQLite leaves these beside the symlinked database (#79).
+          yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-wal"), "");
+          yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-shm"), "index");
+          yield* writeTextFile(path.join(shadowHome, "logs_2.sqlite-wal"), "frames");
+          yield* writeTextFile(path.join(shadowHome, "logs_2.sqlite-shm"), "index");
+          yield* fileSystem.symlink(
+            path.join(sharedHome, "goals_1.sqlite-wal"),
+            path.join(shadowHome, "goals_1.sqlite-wal"),
+          );
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          yield* materializeCodexShadowHome(layout);
+          yield* materializeCodexShadowHome(layout);
+
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "state_5.sqlite"))).toBe(
+            path.join(sharedHome, "state_5.sqlite"),
+          );
+          const shadowEntries = yield* fileSystem.readDirectory(shadowHome);
+          expect(shadowEntries.filter((name) => /-(?:wal|shm|journal)$/.test(name))).toEqual([]);
+          const staleEntries = shadowEntries.filter((name) => name.includes(".stale-")).toSorted();
+          expect(staleEntries.map((name) => name.replace(/\.stale-\d+$/, ""))).toEqual([
+            "logs_2.sqlite-shm",
+            "logs_2.sqlite-wal",
+          ]);
+          const staleWal = staleEntries.find((name) => name.startsWith("logs_2.sqlite-wal"))!;
+          expect(yield* fileSystem.readFileString(path.join(shadowHome, staleWal))).toBe("frames");
+          expect(
+            yield* fileSystem.readFileString(path.join(sharedHome, "state_5.sqlite-wal")),
+          ).toBe("shared");
         }),
     );
 
