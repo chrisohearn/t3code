@@ -3954,9 +3954,12 @@ describe("orchestration v2 provider switching", () => {
     "explicit",
     "picker",
     "scheduled",
+    "scheduled-dispatch",
     "immediate-default",
     "immediate-deferred",
     "immediate-same",
+    "immediate-fast-off",
+    "immediate-fast-omitted",
     "immediate-different",
   ] as const)("keeps queued %s routing safe while its requested account is cooling", (kind) =>
     Effect.scoped(
@@ -3965,7 +3968,7 @@ describe("orchestration v2 provider switching", () => {
         const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
         const started = yield* Deferred.make<void>();
         const immediate = kind.startsWith("immediate");
-        const startsOnClaude = kind === "scheduled" || kind === "immediate-different";
+        const startsOnClaude = kind.startsWith("scheduled") || kind === "immediate-different";
         const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
           makeTestAdapter({
             instanceId: CODEX_MODEL_SELECTION.instanceId,
@@ -3983,7 +3986,7 @@ describe("orchestration v2 provider switching", () => {
             modelSelection: CLAUDE_MODEL_SELECTION,
             responseByRunOrdinal: {},
             capturedTurns,
-            ...(kind === "scheduled" ? { holdFirstTurn: started } : {}),
+            ...(kind.startsWith("scheduled") ? { holdFirstTurn: started } : {}),
           }),
         ]);
         yield* Effect.gen(function* () {
@@ -3997,7 +4000,11 @@ describe("orchestration v2 provider switching", () => {
             threadId,
             projectId,
             title: "Cooldown queue",
-            modelSelection: startsOnClaude ? CLAUDE_MODEL_SELECTION : CODEX_MODEL_SELECTION,
+            modelSelection: startsOnClaude
+              ? CLAUDE_MODEL_SELECTION
+              : kind === "immediate-fast-omitted"
+                ? { ...CODEX_MODEL_SELECTION, options: [{ id: "fastMode", value: false }] }
+                : CODEX_MODEL_SELECTION,
             runtimeMode: "full-access",
             interactionMode: "default",
             branch: null,
@@ -4024,7 +4031,12 @@ describe("orchestration v2 provider switching", () => {
               attachments: [],
               ...(kind === "immediate-default" || kind === "immediate-deferred"
                 ? {}
-                : { modelSelection: CODEX_MODEL_SELECTION }),
+                : {
+                    modelSelection:
+                      kind === "immediate-fast-off"
+                        ? { ...CODEX_MODEL_SELECTION, options: [{ id: "fastMode", value: false }] }
+                        : CODEX_MODEL_SELECTION,
+                  }),
               dispatchMode: {
                 type: kind === "immediate-deferred" ? "defer_start" : "start_immediately",
               },
@@ -4076,13 +4088,13 @@ describe("orchestration v2 provider switching", () => {
             });
             if (position === "first") yield* Deferred.await(started);
           }
-          if (kind === "picker" || kind === "scheduled") {
+          if (kind === "picker" || kind.startsWith("scheduled")) {
             yield* orchestrator.dispatch({
               type: "thread.model-selection.set",
               commandId: CommandId.make("command:queued-cooldown:pick"),
               threadId,
               modelSelection: CODEX_MODEL_SELECTION,
-              ...(kind === "scheduled" ? { applyAt: "next_turn" as const } : {}),
+              ...(kind.startsWith("scheduled") ? { applyAt: "next_turn" as const } : {}),
             });
           }
           const queued = yield* orchestrator.getThreadProjection(threadId);
@@ -4101,6 +4113,7 @@ describe("orchestration v2 provider switching", () => {
                 occurredAt: now,
                 payload: {
                   ...pending!,
+                  ...(kind === "scheduled-dispatch" ? { queueHeld: true } : {}),
                   ...(kind === "failover" ? { failoverOfRunId: active!.id } : {}),
                   ...(kind === "restart" ? { restartContinuationOfRunId: active!.id } : {}),
                   ...(kind === "claimed"
@@ -4125,6 +4138,40 @@ describe("orchestration v2 provider switching", () => {
               },
             ],
           });
+          if (kind === "scheduled-dispatch") {
+            for (const position of ["picked", "later"] as const) {
+              yield* armCooldown;
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(`command:scheduled-cooldown:${position}`),
+                threadId,
+                messageId: MessageId.make(`message:scheduled-cooldown:${position}`),
+                text: position,
+                attachments: [],
+                dispatchMode: { type: "start_immediately" },
+                createdBy: "agent",
+                creationSource: "mcp",
+              });
+              yield* worker.drain();
+              yield* orchestrator.streamStoredEvents.pipe(
+                Stream.filter(
+                  ({ event }) =>
+                    event.type === "run.updated" &&
+                    event.payload.userMessageId ===
+                      MessageId.make(`message:scheduled-cooldown:${position}`) &&
+                    event.payload.status === "completed",
+                ),
+                Stream.runHead,
+              );
+              const after = yield* orchestrator.getThreadProjection(threadId);
+              const expected =
+                position === "picked" ? CODEX_MODEL_SELECTION : CLAUDE_MODEL_SELECTION;
+              assert.deepEqual(after.runs.at(-1)?.modelSelection, expected);
+              assert.deepEqual((yield* Ref.get(capturedTurns)).at(-1)?.modelSelection, expected);
+              assert.isNotNull(after.thread.scheduledModelSelection);
+            }
+            return;
+          }
           yield* orchestrator.resumeQueuedRuns;
           yield* worker.drain();
           yield* orchestrator.streamStoredEvents.pipe(

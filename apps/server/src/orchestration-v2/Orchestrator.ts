@@ -82,7 +82,7 @@ import {
 import * as ProviderFailover from "./ProviderFailover.ts";
 import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
-import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { draftModelPickMatchesThread, modelSelectionsEqual } from "@t3tools/shared/model";
 import { modelSwitchSince } from "./modelSwitch.ts";
 import { combinePullRequestWatchWakes, type PullRequestWatchWake } from "./pullRequestWatch.ts";
 import { recordThreadOpen } from "@t3tools/shared/paletteSearch";
@@ -2443,6 +2443,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
       const requestedSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const consumesProviderCooldownBypass =
+        queuedMessage !== undefined &&
+        ProviderFailover.resendable(queuedMessage) &&
+        projection.thread.bypassProviderCooldown === true &&
+        draftModelPickMatchesThread(requestedSelection, nextTurnModelSelection(projection.thread));
       const modelSelection =
         queuedMessage === undefined
           ? requestedSelection
@@ -2454,13 +2459,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               run: {
                 ...storedQueuedRun,
                 bypassProviderCooldown:
-                  storedQueuedRun.bypassProviderCooldown === true ||
-                  projection.thread.bypassProviderCooldown === true ||
-                  (projection.thread.scheduledModelSelection != null &&
-                    modelSelectionsEqual(
-                      requestedSelection,
-                      projection.thread.scheduledModelSelection.modelSelection,
-                    )),
+                  storedQueuedRun.bypassProviderCooldown === true || consumesProviderCooldownBypass,
               },
               message: queuedMessage,
             });
@@ -3122,7 +3121,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         [
           ...(selectionChanged ||
           threadAtStart !== projection.thread ||
-          projection.thread.bypassProviderCooldown === true
+          consumesProviderCooldownBypass
             ? [
                 {
                   type: !selectionChanged
@@ -3137,7 +3136,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     ...threadAtStart,
                     providerInstanceId: queuedRun.providerInstanceId,
                     modelSelection: queuedRun.modelSelection,
-                    bypassProviderCooldown: false,
+                    ...(consumesProviderCooldownBypass ? { bypassProviderCooldown: false } : {}),
                     updatedAt: now,
                   },
                 },
@@ -5270,6 +5269,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             return {
               ...thread,
               scheduledModelSelection: providerSwitchPlan.scheduled,
+              bypassProviderCooldown: true,
               updatedAt: now,
             };
           }
@@ -7818,15 +7818,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       modelSelection = queueTailModelSelection(projection);
     }
+    const resendablePrompt = ProviderFailover.resendable({ ...incomingMessage, role: "user" });
+    const consumesProviderCooldownBypass =
+      resendablePrompt &&
+      projection.thread.bypassProviderCooldown === true &&
+      draftModelPickMatchesThread(modelSelection, nextTurnModelSelection(projection.thread));
     const bypassProviderCooldown =
-      (command.modelSelection !== undefined &&
-        !modelSelectionsEqual(command.modelSelection, projection.thread.modelSelection)) ||
-      projection.thread.bypassProviderCooldown === true ||
-      (projection.thread.scheduledModelSelection != null &&
-        modelSelectionsEqual(
-          modelSelection,
-          projection.thread.scheduledModelSelection.modelSelection,
-        ));
+      (resendablePrompt &&
+        command.modelSelection !== undefined &&
+        !draftModelPickMatchesThread(command.modelSelection, projection.thread.modelSelection)) ||
+      consumesProviderCooldownBypass;
     if (
       command.failoverOfRunId === undefined &&
       command.restartContinuationOfRunId === undefined &&
@@ -7838,10 +7839,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         projectId: projection.thread.projectId,
         modelSelection,
         run: { bypassProviderCooldown },
-        message: { ...command, role: "user" },
+        message: { ...incomingMessage, role: "user" },
       });
     }
-    if (projection.thread.bypassProviderCooldown === true && startsOrQueuesRun) {
+    if (consumesProviderCooldownBypass && startsOrQueuesRun) {
       const now = yield* DateTime.now;
       const event = yield* emit(
         events,

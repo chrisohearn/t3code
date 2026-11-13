@@ -8451,7 +8451,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             worktreePath: process.cwd(),
           });
           // A restart continuation names the run's own model and comes from the server.
-          const send = (key: string, kind: "agent" | "server", queue: boolean) =>
+          const send = (key: string, kind: "agent" | "server" | "notification", queue: boolean) =>
             orchestrator.dispatch({
               type: "message.dispatch",
               commandId: CommandId.make(`${threadId}:${key}`),
@@ -8460,9 +8460,19 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
               text: key,
               attachments: [],
               ...(kind === "server" ? { modelSelection } : {}),
+              ...(kind === "notification"
+                ? {
+                    modelSelection: scheduledSelection,
+                    notification: {
+                      source: { kind: "monitor" as const },
+                      outcome: "updated" as const,
+                      summary: key,
+                    },
+                  }
+                : {}),
               dispatchMode: { type: queue ? "queue_after_active" : "start_immediately" },
               createdBy: "agent",
-              creationSource: kind === "server" ? "server" : "mcp",
+              creationSource: kind === "agent" ? "mcp" : "server",
             });
           const run = (key: string) =>
             orchestrator
@@ -8498,17 +8508,27 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           yield* send("active", "agent", false);
           yield* orchestrator.dispatch({
             type: "thread.model-selection.set",
+            commandId: CommandId.make(`${threadId}:pick`),
+            threadId,
+            modelSelection,
+          });
+          yield* orchestrator.dispatch({
+            type: "thread.model-selection.set",
             commandId: CommandId.make(`${threadId}:schedule`),
             threadId,
             modelSelection: scheduledSelection,
             applyAt: "next_turn",
           });
-          return { threadId, send, run, complete, scheduledNow };
+          const bypassNow = orchestrator
+            .getThreadProjection(threadId)
+            .pipe(Effect.map(({ thread }) => thread.bypassProviderCooldown === true));
+          return { threadId, send, run, complete, scheduledNow, bypassNow };
         });
 
       // Queued behind the busy run.
       const queued = yield* scenario("queued");
       yield* queued.send("continuation", "server", true);
+      assert.isTrue(yield* queued.bypassNow);
       yield* queued.send("after", "agent", true);
       assert.deepEqual((yield* queued.run("after")).modelSelection, scheduledSelection);
       yield* queued.complete("active");
@@ -8525,13 +8545,33 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       // Started at once on the idle thread, after the busy run ended.
       const immediate = yield* scenario("immediate");
       yield* immediate.complete("active");
-      yield* immediate.send("continuation", "server", false);
-      assert.deepEqual((yield* immediate.run("continuation")).modelSelection, modelSelection);
-      assert.isNotNull(yield* immediate.scheduledNow());
-      yield* immediate.complete("continuation");
+      for (const key of ["continuation", "another-continuation"]) {
+        yield* immediate.send(key, "server", false);
+        assert.deepEqual((yield* immediate.run(key)).modelSelection, modelSelection);
+        assert.isNotNull(yield* immediate.scheduledNow());
+        assert.isTrue(yield* immediate.bypassNow);
+        yield* immediate.complete(key);
+        assert.isTrue(yield* immediate.bypassNow);
+      }
       yield* immediate.send("next", "agent", false);
       assert.deepEqual((yield* immediate.run("next")).modelSelection, scheduledSelection);
       assert.isNull(yield* immediate.scheduledNow());
+      assert.isFalse(yield* immediate.bypassNow);
+
+      const notifications = yield* scenario("notifications");
+      yield* notifications.complete("active");
+      for (const key of ["wake", "another-wake"]) {
+        yield* notifications.send(key, "notification", true);
+        assert.deepEqual((yield* notifications.run(key)).modelSelection, scheduledSelection);
+        assert.isNotNull(yield* notifications.scheduledNow());
+        assert.isTrue(yield* notifications.bypassNow);
+        yield* notifications.complete(key);
+        assert.isTrue(yield* notifications.bypassNow);
+      }
+      yield* notifications.send("next", "agent", false);
+      assert.deepEqual((yield* notifications.run("next")).modelSelection, scheduledSelection);
+      assert.isNull(yield* notifications.scheduledNow());
+      assert.isFalse(yield* notifications.bypassNow);
     }),
   );
 
@@ -9165,6 +9205,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           modelSelection: newerSelection,
         });
         const waiting = yield* orchestrator.getThreadProjection(threadId);
+        assert.isTrue(waiting.thread.bypassProviderCooldown);
         yield* eventSink.write({
           events: [
             {
@@ -9192,6 +9233,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           newerSelection.instanceId,
         );
         assert.deepEqual(after.thread.modelSelection, newerSelection);
+        assert.isTrue(after.thread.bypassProviderCooldown);
       }),
   );
 
