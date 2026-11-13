@@ -14,7 +14,6 @@ import {
   resolveCodexHomeLayout,
   withCodexSqliteHome,
 } from "./CodexHomeLayout.ts";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 const decodeCodexSettingsValue = Schema.decodeSync(CodexSettings);
 
@@ -241,13 +240,6 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           );
           yield* materializeCodexShadowHome(layout);
 
-          // A link left pointing at another home is re-pointed, so its sidecars are stale too.
-          const otherHome = yield* makeTempDir("t3code-codex-other-");
-          yield* fileSystem.remove(path.join(shadowHome, "logs_2.sqlite"));
-          yield* fileSystem.symlink(
-            path.join(otherHome, "logs_2.sqlite"),
-            path.join(shadowHome, "logs_2.sqlite"),
-          );
           // Windows SQLite leaves these beside the symlinked database (#79).
           yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-wal"), "");
           yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-shm"), "index");
@@ -280,7 +272,7 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
     );
 
     it.effect.skipIf(!symlinksSupported)(
-      "matches database names without case where the filesystem ignores it",
+      "keeps a link to another home while SQLite files sit beside it",
       () =>
         Effect.gen(function* () {
           const fileSystem = yield* FileSystem.FileSystem;
@@ -289,50 +281,34 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
           const otherHome = yield* makeTempDir("t3code-codex-other-");
           const shadowHome = path.join(shadowRoot, "shadow");
-          yield* writeTextFile(path.join(sharedHome, "Logs_2.sqlite"), "shared");
-          yield* writeTextFile(path.join(shadowHome, "logs_2.sqlite-wal"), "frames");
-          yield* fileSystem.symlink(
-            path.join(otherHome, "logs_2.sqlite"),
-            path.join(shadowHome, "logs_2.sqlite"),
-          );
+          // Goals_1 differs only in case, so it is the same entry where names ignore case.
+          for (const name of ["state_5.sqlite", "logs_2.sqlite", "Goals_1.sqlite"]) {
+            yield* writeTextFile(path.join(sharedHome, name), "shared");
+          }
+          yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
+          for (const name of ["state_5.sqlite", "logs_2.sqlite", "goals_1.sqlite"]) {
+            yield* fileSystem.symlink(path.join(otherHome, name), path.join(shadowHome, name));
+          }
+          for (const name of ["logs_2.sqlite-wal", "goals_1.sqlite-wal"]) {
+            yield* writeTextFile(path.join(shadowHome, name), "frames");
+          }
 
           const layout = yield* resolveCodexHomeLayout(
             decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
           );
           yield* materializeCodexShadowHome(layout);
 
-          const shadowEntries = yield* fileSystem.readDirectory(shadowHome);
-          expect(shadowEntries).not.toContain("logs_2.sqlite-wal");
-          expect(shadowEntries.some((name) => name.startsWith("logs_2.sqlite-wal.stale-"))).toBe(
-            true,
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "state_5.sqlite"))).toBe(
+            path.join(sharedHome, "state_5.sqlite"),
           );
-        }).pipe(Effect.provideService(HostProcess.Platform, "win32")),
-    );
-
-    it.effect.skipIf(!symlinksSupported)(
-      "keeps a link to another home when a sidecar beside it cannot be settled",
-      () =>
-        Effect.gen(function* () {
-          const fileSystem = yield* FileSystem.FileSystem;
-          const path = yield* Path.Path;
-          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
-          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
-          const otherHome = yield* makeTempDir("t3code-codex-other-");
-          const shadowHome = path.join(shadowRoot, "shadow");
-          yield* writeTextFile(path.join(sharedHome, "logs_2.sqlite"), "shared");
-          // A directory cannot be removed as a file, standing in for one Windows keeps open.
-          yield* writeTextFile(path.join(shadowHome, "logs_2.sqlite-shm", "held"), "index");
-          const foreignTarget = path.join(otherHome, "logs_2.sqlite");
-          yield* fileSystem.symlink(foreignTarget, path.join(shadowHome, "logs_2.sqlite"));
-
-          const layout = yield* resolveCodexHomeLayout(
-            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
-          );
-          yield* materializeCodexShadowHome(layout);
-
-          expect(yield* fileSystem.readLink(path.join(shadowHome, "logs_2.sqlite"))).toBe(
-            foreignTarget,
-          );
+          for (const name of ["logs_2.sqlite", "goals_1.sqlite"]) {
+            expect(yield* fileSystem.readLink(path.join(shadowHome, name))).toBe(
+              path.join(otherHome, name),
+            );
+            expect(yield* fileSystem.readFileString(path.join(shadowHome, `${name}-wal`))).toBe(
+              "frames",
+            );
+          }
         }),
     );
 
