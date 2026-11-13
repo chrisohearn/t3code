@@ -369,7 +369,7 @@ const layerBase: Layer.Layer<
     // Reads inside the write transaction, so the status it compares against is the committed one.
     const stampRunStops = makeRunStopStamper((run) =>
       projectionStore.getThreadRecords(run.threadId, ["runs"], { runIds: [run.id] }).pipe(
-        Effect.map(({ runs }) => runs[0]?.status),
+        Effect.map(({ runs }) => runs[0]),
         Effect.orElseSucceed(() => undefined),
       ),
     );

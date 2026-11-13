@@ -2,6 +2,8 @@ import type {
   OrchestrationV2DomainEvent,
   OrchestrationV2Run,
   OrchestrationV2RunStop,
+  OrchestrationV2RunStopActorKind,
+  OrchestrationV2RunStopReason,
   RunId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -31,7 +33,7 @@ const REVIVED: ReadonlySet<OrchestrationV2Run["status"]> = new Set([
 const STOP_COMMANDS = new Set(["thread.stop", "run.interrupt", "subagent.stop"]);
 const SUPERSEDED_COMMAND_ID = /^(command:system:stale-question:|server:delegated-task-question)/;
 
-export function runStopReason(context: RunStopContext): OrchestrationV2RunStop["reason"] {
+export function runStopReason(context: RunStopContext): OrchestrationV2RunStopReason {
   const commandId = context.commandId ?? "";
   switch (context.commandType) {
     case "provider-runtime.reconcile":
@@ -71,7 +73,7 @@ export function runStopReason(context: RunStopContext): OrchestrationV2RunStop["
  */
 const runStopFor = Effect.fnUntraced(function* (
   context: RunStopContext,
-  reason: OrchestrationV2RunStop["reason"] = runStopReason(context),
+  reason: OrchestrationV2RunStopReason = runStopReason(context),
 ) {
   const actor = yield* Effect.serviceOption(CommandActor);
   const commandType = context.commandType === undefined ? {} : { commandType: context.commandType };
@@ -98,9 +100,7 @@ const runStopFor = Effect.fnUntraced(function* (
  * a requested stop outside any command, so the request's stop is held here until that write.
  */
 export const makeRunStopStamper = <E, R>(
-  storedStatus: (
-    run: OrchestrationV2Run,
-  ) => Effect.Effect<OrchestrationV2Run["status"] | undefined, E, R>,
+  storedRun: (run: OrchestrationV2Run) => Effect.Effect<OrchestrationV2Run | undefined, E, R>,
 ) => {
   const requested = new Map<RunId, OrchestrationV2RunStop>();
   const remember = (runId: RunId, stop: OrchestrationV2RunStop) => {
@@ -139,22 +139,30 @@ export const makeRunStopStamper = <E, R>(
         stamped.push(event);
         continue;
       }
-      const before = yield* storedStatus(run);
-      // Later rewrites of an already finished run keep whatever it had.
-      if (before !== undefined && FINISHED.has(before)) {
-        stamped.push(event);
+      const before = yield* storedRun(run);
+      // A later rewrite of an already finished run keeps the stop it had.
+      if (before !== undefined && FINISHED.has(before.status)) {
+        stamped.push(
+          before.stop === undefined ? event : { ...event, payload: { ...run, stop: before.stop } },
+        );
         continue;
       }
-      const pending = context.commandType === undefined ? requested.get(run.id) : undefined;
+      // The provider's confirmation, or the effect worker's settle after a Stop, has no actor.
+      const reason = runStopReason(context);
+      const pending =
+        (reason === "stopped" || reason === "other") &&
+        Option.isNone(yield* Effect.serviceOption(CommandActor))
+          ? requested.get(run.id)
+          : undefined;
       requested.delete(run.id);
-      const stop = pending ?? (yield* runStopFor(context));
+      const stop = pending ?? (yield* runStopFor(context, reason));
       stamped.push({ ...event, payload: { ...run, stop } });
     }
     return stamped;
   });
 };
 
-const REASON_TEXT: Record<OrchestrationV2RunStop["reason"], string> = {
+const REASON_TEXT: Record<OrchestrationV2RunStopReason, string> = {
   server_shutdown: "cancelled by restart",
   server_restart: "cancelled by restart",
   stopped: "stopped",
@@ -169,12 +177,15 @@ const REASON_TEXT: Record<OrchestrationV2RunStop["reason"], string> = {
   other: "cancelled",
 };
 
-const ACTOR_TEXT: Record<OrchestrationV2RunStop["actor"]["kind"], string> = {
+const ACTOR_TEXT: Record<OrchestrationV2RunStopActorKind, string> = {
   owner_client: "the user",
   mcp_client: "an MCP client",
   agent: "an agent",
   server: "the server",
 };
+// Rows a newer build wrote can hold reasons and actors this build does not know.
+const reasonText = new Map<string, string>(Object.entries(REASON_TEXT));
+const actorText = new Map<string, string>(Object.entries(ACTOR_TEXT));
 
 /** One line that says why a run stopped and where its work went, for thread reads. */
 export function runStopLabel(input: {
@@ -187,14 +198,14 @@ export function runStopLabel(input: {
       ? continuedAs === undefined
         ? "stopped; no reason was recorded"
         : "cut short by restart"
-      : REASON_TEXT[stop.reason];
+      : (reasonText.get(stop.reason) ?? stop.reason.replaceAll("_", " "));
   const actor =
     stop === undefined ||
     stop.reason === "server_shutdown" ||
     stop.reason === "server_restart" ||
     stop.actor.kind === "server"
       ? ""
-      : ` by ${ACTOR_TEXT[stop.actor.kind]}${stop.actor.sessionId === undefined ? "" : ` (session ${stop.actor.sessionId})`}${stop.actor.threadId === undefined ? "" : ` from thread ${stop.actor.threadId}`}`;
+      : ` by ${actorText.get(stop.actor.kind) ?? stop.actor.kind}${stop.actor.sessionId === undefined ? "" : ` (session ${stop.actor.sessionId})`}${stop.actor.threadId === undefined ? "" : ` from thread ${stop.actor.threadId}`}`;
   return continuedAs === undefined
     ? `${reason}${actor}`
     : `${reason}${actor}, continued as run ${continuedAs.ordinal}`;
@@ -212,6 +223,7 @@ export function runStopDetail(run: OrchestrationV2Run, runs: ReadonlyArray<Orche
 }
 
 /** For server writes made outside a command, which the stamper cannot attribute by type. */
-export const serverRunStop = (
-  reason: OrchestrationV2RunStop["reason"],
-): OrchestrationV2RunStop => ({ reason, actor: { kind: "server" } });
+export const serverRunStop = (reason: OrchestrationV2RunStopReason): OrchestrationV2RunStop => ({
+  reason,
+  actor: { kind: "server" },
+});

@@ -732,10 +732,19 @@ export const OrchestrationV2RunStopReason = Schema.Literals([
 ]);
 export type OrchestrationV2RunStopReason = typeof OrchestrationV2RunStopReason.Type;
 
+export const OrchestrationV2RunStopActorKind = Schema.Literals([
+  "owner_client",
+  "mcp_client",
+  "agent",
+  "server",
+]);
+export type OrchestrationV2RunStopActorKind = typeof OrchestrationV2RunStopActorKind.Type;
+
+// Stored as plain strings so an older build reading a newer build's rows (a rollback) still decodes.
 export const OrchestrationV2RunStop = Schema.Struct({
-  reason: OrchestrationV2RunStopReason,
+  reason: Schema.String,
   actor: Schema.Struct({
-    kind: Schema.Literals(["owner_client", "mcp_client", "agent", "server"]),
+    kind: Schema.String,
     /** First eight characters of the sign-in session, never the full id. */
     sessionId: Schema.optional(Schema.String.check(Schema.isMaxLength(8))),
     clientLabel: Schema.optional(Schema.String),

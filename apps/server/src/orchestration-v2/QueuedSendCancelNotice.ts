@@ -2,7 +2,7 @@ import {
   CommandId,
   MessageId,
   type OrchestrationV2DomainEvent,
-  type OrchestrationV2RunStop,
+  type OrchestrationV2RunStopReason,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -28,10 +28,10 @@ export class QueuedSendCancelNotice extends Context.Service<
 >()("t3/orchestration-v2/QueuedSendCancelNotice") {}
 
 // Delivered by another route, or a server wake that no sender is waiting on.
-const DELIVERED_OR_REPLACED: ReadonlySet<OrchestrationV2RunStop["reason"]> = new Set([
+const DELIVERED_OR_REPLACED: ReadonlySet<string> = new Set([
   "steered",
   "superseded",
-]);
+] satisfies ReadonlyArray<OrchestrationV2RunStopReason>);
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
@@ -45,6 +45,8 @@ const make = Effect.gen(function* () {
       if (
         run.status !== "cancelled" ||
         run.startedAt !== null ||
+        // A delegated task reports back to its parent through its own completion delivery.
+        run.delegatedTaskId !== undefined ||
         stop === undefined ||
         DELIVERED_OR_REPLACED.has(stop.reason)
       ) {

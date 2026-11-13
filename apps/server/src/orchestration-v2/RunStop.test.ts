@@ -110,34 +110,44 @@ it.effect(
   "stamps the transition once and keeps a requested stop for the provider's confirmation",
   () =>
     Effect.gen(function* () {
-      const stored = new Map<RunId, OrchestrationV2Run["status"]>();
+      const stored = new Map<RunId, OrchestrationV2Run>();
       const stamp = makeRunStopStamper((candidate) => Effect.succeed(stored.get(candidate.id)));
       const owner = {
         kind: "owner_client" as const,
         client: { sessionId: "session1", clientLabel: "Chris's Mac" },
       };
+      const ownerStop = {
+        reason: "stopped",
+        actor: { kind: "owner_client", sessionId: "session1", clientLabel: "Chris's Mac" },
+        commandType: "thread.stop",
+      };
 
       // Stop is requested in a command; the provider confirms later with no command.
       const stopping = run(1);
-      stored.set(stopping.id, "running");
+      stored.set(stopping.id, stopping);
       yield* stamp([interruptRequest(stopping.id)], { commandType: "thread.stop" }).pipe(
         Effect.provideService(CommandActor, owner),
       );
       const confirmed = yield* stamp([runUpdated({ ...stopping, status: "interrupted" })], {});
-      assert.deepEqual(stopOf(confirmed), [
-        {
-          reason: "stopped",
-          actor: { kind: "owner_client", sessionId: "session1", clientLabel: "Chris's Mac" },
-          commandType: "thread.stop",
-        },
-      ]);
+      assert.deepEqual(stopOf(confirmed), [ownerStop]);
 
-      // A later rewrite of a finished run keeps what it had.
-      stored.set(stopping.id, "interrupted");
+      // The effect worker's settle after a Stop runs with no actor and keeps the Stop's.
+      const settling = run(3);
+      stored.set(settling.id, settling);
+      yield* stamp([interruptRequest(settling.id)], { commandType: "run.interrupt" }).pipe(
+        Effect.provideService(CommandActor, owner),
+      );
+      const settled = yield* stamp([runUpdated({ ...settling, status: "interrupted" })], {
+        commandType: "thread.background-work.settle",
+      });
+      assert.deepEqual(stopOf(settled), [{ ...ownerStop, commandType: "run.interrupt" }]);
+
+      // A later rewrite of a finished run keeps the stop it had, even from a payload without one.
+      stored.set(stopping.id, { ...stopping, status: "interrupted", stop: ownerStop });
       const rewritten = yield* stamp([runUpdated({ ...stopping, status: "interrupted" })], {
         commandType: "thread.archive",
       });
-      assert.deepEqual(stopOf(rewritten), [undefined]);
+      assert.deepEqual(stopOf(rewritten), [ownerStop]);
 
       // A run the queue holds again is no longer stopped.
       const held = run(2, {
