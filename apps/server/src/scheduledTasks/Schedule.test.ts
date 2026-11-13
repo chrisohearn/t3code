@@ -121,6 +121,20 @@ describe("missed scheduled runs", () => {
     expect(missedScheduleRun(candidate, at("2026-11-13T05:00:00.000Z"))).toBeNull();
   });
 
+  it("measures the gap between fixed-time slots in the scheduler's zone", () => {
+    // Monday 22:00 in Los Angeles is Tuesday 06:00 UTC, so a UTC reading would see 6d16h, not 7d.
+    const weekly = {
+      enabled: true,
+      schedule: { type: "fixed_time", timeOfDay: "22:00", weekdays: [1] } as const,
+      nextRunAt: "2026-11-10T06:00:00.000Z",
+      lastRunStatus: "succeeded",
+    };
+    const inLosAngeles = (iso: string) =>
+      DateTime.setZone(at(iso), DateTime.zoneMakeNamedUnsafe("America/Los_Angeles"));
+    expect(missedScheduleRun(weekly, inLosAngeles("2026-11-17T02:00:00.000Z"))).toBeNull();
+    expect(missedScheduleRun(weekly, inLosAngeles("2026-11-17T08:00:00.000Z"))).not.toBeNull();
+  });
+
   it("uses the gap to the following slot for fixed-time tasks and 10 minutes for one-time tasks", () => {
     const daily = {
       enabled: true,
@@ -128,8 +142,9 @@ describe("missed scheduled runs", () => {
       nextRunAt: "2026-11-12T09:00:00.000Z",
       lastRunStatus: "succeeded",
     };
-    expect(missedScheduleRun(daily, at("2026-11-13T08:00:00.000Z"))).toBeNull();
-    expect(missedScheduleRun(daily, at("2026-11-13T10:00:00.000Z"))).not.toBeNull();
+    const utc = (iso: string) => DateTime.setZone(at(iso), DateTime.zoneMakeNamedUnsafe("UTC"));
+    expect(missedScheduleRun(daily, utc("2026-11-13T08:00:00.000Z"))).toBeNull();
+    expect(missedScheduleRun(daily, utc("2026-11-13T10:00:00.000Z"))).not.toBeNull();
     const once = {
       enabled: true,
       schedule: { type: "once", runAt: "2026-11-13T04:00:00.000Z" } as const,

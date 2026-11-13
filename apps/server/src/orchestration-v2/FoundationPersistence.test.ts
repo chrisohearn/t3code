@@ -2086,7 +2086,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }).pipe(Effect.provide(Layer.fresh(layerTest))),
   );
 
-  it.effect.each(["completed", "failed", "interrupted"] as const)(
+  it.effect.each(["completed", "failed", "interrupted", "rolled_back"] as const)(
     "closes run-bound items still active when a run ends %s, and leaves background tools",
     (endStatus) =>
       Effect.gen(function* () {
@@ -2192,7 +2192,8 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
         const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"]);
         const statusOf = (item: OrchestrationV2TurnItem) =>
           turnItems.find((candidate) => candidate.id === item.id)?.status;
-        const expected = endStatus === "failed" ? "cancelled" : endStatus;
+        const expected =
+          endStatus === "failed" || endStatus === "rolled_back" ? "cancelled" : endStatus;
         assert.equal(statusOf(compaction), expected);
         assert.equal(statusOf(todo), expected);
         assert.equal(statusOf(background), "running");

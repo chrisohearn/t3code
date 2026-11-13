@@ -1561,7 +1561,7 @@ it.effect(
         VALUES (${`item:${task}:${at}`}, ${threadId}, ${`run:${task}:${at}`}, 1, 'error', 'failed',
           ${at}, ${JSON.stringify({ failure: { message } })})
       `;
-      for (const id of ["task:a", "task:folded", "task:matched", "task:clean"]) {
+      for (const id of ["task:a", "task:folded", "task:matched", "task:clean", "task:hook"]) {
         yield* insertRow(sql, { id, next: null, enabled: 1, status: "succeeded" }, now);
       }
       // 10 days old, outside the window.
@@ -1572,6 +1572,13 @@ it.effect(
       yield* errorItem("task:a", "2026-11-12T05:00:00.000Z", "Workspace preparation failed");
       yield* run("task:a", "2026-11-12T06:00:00.000Z", "cancelled", 4, "manual");
       yield* run("task:a", "2026-11-12T07:00:00.000Z", "completed", 5);
+      // A webhook run's message id ends `:webhook:delivery:<uuid>`.
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_runs
+          (run_id, thread_id, ordinal, provider, status, requested_at, payload_json)
+        VALUES ('run:hook', ${threadId}, 7, 'codex', 'failed', '2026-11-12T22:00:00.000Z',
+          ${JSON.stringify({ userMessageId: "scheduled-task-message:task:hook:webhook:delivery:3f2a-91" })})
+      `;
       // A failed dispatch that never created a run leaves only the task row.
       yield* sql`UPDATE scheduled_tasks SET last_run_status = 'failed', last_run_error = 'No such folder',
       last_run_at = '2026-11-12T20:00:00.000Z' WHERE task_id = 'task:folded'`;
@@ -1599,6 +1606,13 @@ it.effect(
             lastAt: "2026-11-12T20:00:00.000Z",
             lastStatus: "failed",
             lastError: "No such folder",
+          },
+          "task:hook": {
+            failed: 1,
+            cancelled: 0,
+            lastAt: "2026-11-12T22:00:00.000Z",
+            lastStatus: "failed",
+            lastError: null,
           },
           "task:matched": {
             failed: 1,

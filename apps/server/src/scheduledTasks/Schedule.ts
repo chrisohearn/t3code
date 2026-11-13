@@ -114,7 +114,9 @@ export function missedScheduleRun(
   } else if (task.schedule.type === "once") {
     intervalMs = MISSED_FIXED_TIME_GRACE_MS;
   } else {
-    const following = nextScheduledRunAt(task.schedule, dueAt.value);
+    // Slots are wall-clock times in the scheduler's zone, so the gap to the next one is too.
+    const zone = DateTime.isZoned(now) ? now.zone : DateTime.zoneMakeLocal();
+    const following = nextScheduledRunAt(task.schedule, DateTime.setZone(dueAt.value, zone));
     intervalMs =
       following === null ? DAY_MS : Math.max(DateTime.toEpochMillis(following) - dueMs, MINUTE_MS);
   }

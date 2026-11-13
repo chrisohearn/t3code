@@ -456,11 +456,17 @@ const layerBase: Layer.Layer<
             turnItemTypes: [...RUN_BOUND_ITEM_TYPES],
             turnItemStatuses: ["pending", "running", "waiting"],
           })
-          // The thread's creation can share this batch.
+          // The thread's creation can share this batch. An old item that cannot be read must not
+          // fail the write that ends the run; its items then close on read instead.
           .pipe(
             Effect.catchTags({
               ProjectionStoreThreadNotFoundError: () => Effect.succeed({ turnItems: [] }),
             }),
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not read run items to close", { runId: run.id, cause }).pipe(
+                Effect.as({ turnItems: [] }),
+              ),
+            ),
           );
         for (const item of stored.turnItems) {
           if (!latestInBatch.has(item.id)) latestInBatch.set(item.id, item);

@@ -25,6 +25,7 @@ export function itemStatusForEndedRun(
       return "interrupted";
     case "failed":
     case "cancelled":
+    case "rolled_back":
       return "cancelled";
     default:
       return null;

@@ -34,7 +34,8 @@ function parseScheduledRunMessageId(
   const key = messageId.slice(MESSAGE_PREFIX.length);
   const timed = /^(.+):(\d+):(?:scheduled|manual)$/.exec(key);
   if (timed !== null) return { taskId: timed[1]!, startedAtMs: Number(timed[2]) };
-  const webhook = /^(.+):webhook:[^:]+$/.exec(key);
+  // Delivery ids look like `delivery:<uuid>`, so the id itself contains a colon.
+  const webhook = /^(.+):webhook:(?:delivery:)?[^:]+$/.exec(key);
   return webhook === null ? null : { taskId: webhook[1]!, startedAtMs: null };
 }
 
