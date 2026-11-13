@@ -564,17 +564,31 @@ export const OrchestratorMcpThreadResult = Schema.Struct({
 });
 export type OrchestratorMcpThreadResult = typeof OrchestratorMcpThreadResult.Type;
 
+const RespectSnooze = Schema.optional(
+  Schema.Boolean.annotate({
+    description: "Default true: keep a snooze; a send waits until it ends. false wakes the thread.",
+  }),
+);
+
+/** Set when the target is snoozed, so a sender sees the hold instead of silently ending it. */
+const SnoozeNotice = {
+  snoozedUntil: Schema.optional(IsoDateTime),
+  warning: Schema.optional(Schema.String),
+};
+
 export const OrchestratorMcpThreadPostInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+  respectSnooze: RespectSnooze,
 });
 export type OrchestratorMcpThreadPostInput = typeof OrchestratorMcpThreadPostInput.Type;
 export const OrchestratorMcpThreadPostResult = Schema.Struct({
   threadId: ThreadId,
   link: Schema.String,
   messageId: MessageId,
+  ...SnoozeNotice,
 });
 export type OrchestratorMcpThreadPostResult = typeof OrchestratorMcpThreadPostResult.Type;
 
@@ -584,6 +598,7 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
   mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
+  respectSnooze: RespectSnooze,
   freshContext: Schema.optional(
     Schema.Boolean.annotate({
       description:
@@ -620,6 +635,7 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   status: OrchestrationV2RunStatus,
   delivery: Schema.Literals(["started", "queued", "steered", "restarted"]),
   queue: Schema.optional(OrchestratorMcpQueueStanding),
+  ...SnoozeNotice,
 });
 export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendResult.Type;
 

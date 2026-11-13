@@ -142,6 +142,7 @@ import {
 import { isLiveCallerShell, threadNotFound } from "./threadAccess.ts";
 import { resolveReadableThread } from "./threadReference.ts";
 import { queuedRunMessageIds, queueStanding } from "./queueStanding.ts";
+import { snoozeNotice } from "./snoozeNotice.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
@@ -3353,10 +3354,12 @@ const make = Effect.gen(function* () {
       const key = yield* requestKey(input.clientRequestId);
       const operation = "thread-post";
       const messageId = stableOperationMessageId({ scope, requestKey: key, operation });
+      const respectSnooze = input.respectSnooze ?? true;
       yield* threadManagement
         .dispatch({
           type: "message.dispatch",
           postOnly: true,
+          ...(respectSnooze ? { respectSnooze: true } : {}),
           commandId: stableCommandId({ scope, requestKey: key, operation }),
           threadId: input.threadId,
           ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
@@ -3376,6 +3379,11 @@ const make = Effect.gen(function* () {
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,
+        ...snoozeNotice(
+          target.thread.snoozedUntil,
+          yield* Clock.currentTimeMillis,
+          respectSnooze ? "posted" : "woke",
+        ),
       };
     }),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
@@ -3473,6 +3481,7 @@ const make = Effect.gen(function* () {
           attachments: [],
           mode,
           ...(input.freshContext || input.coordinatorRollover ? { freshContext: true } : {}),
+          ...((input.respectSnooze ?? true) ? { respectSnooze: true } : {}),
           createdBy: "agent",
           creationSource: "mcp",
         })
@@ -3499,6 +3508,15 @@ const make = Effect.gen(function* () {
       return {
         ...(notify === undefined ? {} : { notify }),
         ...(queue === undefined ? {} : { queue }),
+        ...snoozeNotice(
+          target.thread.snoozedUntil,
+          yield* Clock.currentTimeMillis,
+          result.run.snoozeDeferred === true
+            ? "held"
+            : result.delivery === "steered" && (input.respectSnooze ?? true)
+              ? "steered"
+              : "woke",
+        ),
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,

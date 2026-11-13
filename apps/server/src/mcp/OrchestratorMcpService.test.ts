@@ -4141,6 +4141,65 @@ describe("OrchestratorMcpService thread lookup", () => {
       }),
   );
 
+  it.effect("keeps a target's snooze unless told to wake it, and says so", () =>
+    Effect.gen(function* () {
+      const sent = yield* Ref.make(0);
+      const snoozedUntil = DateTime.makeUnsafe("2099-01-01T00:00:00Z");
+      const snoozed = { ...launched, snoozedUntil };
+      const dispatched: Array<unknown> = [];
+      const results = yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return [
+          yield* mcp.sendToThread(client, { threadId: launched.id, message: "held" }),
+          yield* mcp.postToThread(client, { threadId: launched.id, message: "posted" }),
+          yield* mcp.sendToThread(client, {
+            threadId: launched.id,
+            message: "wake",
+            respectSnooze: false,
+          }),
+        ];
+      }).pipe(
+        Effect.provide(
+          service([snoozed], sent, {
+            getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(snoozed)),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: 1, storedEvents: [] };
+              }),
+            sendToThread: (input) =>
+              Effect.sync(() => {
+                dispatched.push(input);
+                return {
+                  delivery: "queued",
+                  run: {
+                    id: RunId.make("run:held"),
+                    status: "queued",
+                    ...(input.respectSnooze ? { snoozeDeferred: true } : {}),
+                  },
+                } as never;
+              }),
+            getThreadRecords: () =>
+              Effect.succeed(idleThreadProjection(snoozed) as OrchestrationV2ThreadProjection),
+          }),
+        ),
+      );
+      expect(dispatched).toMatchObject([
+        { respectSnooze: true },
+        { postOnly: true, respectSnooze: true },
+        { text: "wake" },
+      ]);
+      expect((dispatched[2] as { respectSnooze?: boolean }).respectSnooze).toBeUndefined();
+      const [held, posted, woke] = results;
+      for (const result of results) {
+        expect(result.snoozedUntil).toBe("2099-01-01T00:00:00.000Z");
+      }
+      expect(held!.warning).toContain("waits, held, until it wakes");
+      expect(posted!.warning).toContain("stays snoozed");
+      expect(woke!.warning).toContain("ended the snooze");
+    }),
+  );
+
   it.effect("reports where a queued send waits behind the active run", () =>
     Effect.gen(function* () {
       const sent = yield* Ref.make(0);

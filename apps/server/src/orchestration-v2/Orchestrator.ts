@@ -4581,7 +4581,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           )
           .map((message) => message.id),
       );
-      if (queuedRuns.some((run) => !automaticMessageIds.has(run.userMessageId))) {
+      if (
+        queuedRuns.some(
+          (run) => run.snoozeDeferred !== true && !automaticMessageIds.has(run.userMessageId),
+        )
+      ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
@@ -6986,7 +6990,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.notification !== undefined ||
       command.delegatedCompletion !== undefined ||
       serverNotice;
-    if (projection.thread.snoozedUntil != null && !automaticWake) {
+    // A sender that respects the snooze leaves it: a post is only recorded, and a turn waits,
+    // held behind the thread's last run, until the thread wakes. A thread with no run wakes.
+    const snoozeHeldUntil = projection.thread.snoozedUntil;
+    const respectsSnooze =
+      command.respectSnooze === true &&
+      !automaticWake &&
+      snoozeHeldUntil != null &&
+      DateTime.toEpochMillis(snoozeHeldUntil) > DateTime.toEpochMillis(yield* DateTime.now) &&
+      (command.postOnly === true || latestExecutedRun(projection.runs) != null);
+    if (projection.thread.snoozedUntil != null && !automaticWake && !respectsSnooze) {
       const now = yield* DateTime.now;
       const thread: OrchestrationV2AppThread = {
         ...projection.thread,
@@ -7480,7 +7493,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
-    const queueBehindRun = activeRun ?? worktreeMissingRun;
+    const queueBehindRun =
+      activeRun ?? worktreeMissingRun ?? (respectsSnooze ? (latestRun ?? undefined) : undefined);
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     const startsOrQueuesRun =
       dispatchMode.type === "defer_start" ||
@@ -7682,7 +7696,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         activeAttemptId: attemptId,
         status: "queued",
         ...(steerWhenReadyRunId === undefined ? {} : { steerWhenReadyRunId }),
+        ...(respectsSnooze ? { snoozeDeferred: true } : {}),
         ...(worktreeMissingRun !== undefined ||
+        respectsSnooze ||
         (heldRunsToRelease.length === 0 &&
           queueIsHeld &&
           !wakeSkipsHold &&

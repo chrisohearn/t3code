@@ -98,6 +98,7 @@ import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as SnoozeDeferredDelivery from "./SnoozeDeferredDelivery.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as DeviceHost from "../device/DeviceHost.ts";
 import * as DeviceService from "../device/DeviceService.ts";
@@ -335,7 +336,7 @@ const makeLayerTest = (settings?: Parameters<typeof ServerSettings.layerTest>[0]
   ).pipe(
     Layer.provide(McpSessionRegistryTestkit.layer),
     Layer.provide(McpProviderSessions.layer),
-    Layer.provide(SqlitePersistence.layerMemory),
+    Layer.provideMerge(SqlitePersistence.layerMemory),
     Layer.provide(layerCheckpointStoreTest),
     Layer.provide(layerServerConfig),
     Layer.provide(ServerSettings.layerTest(settings)),
@@ -8599,6 +8600,99 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(delivered.status, "starting");
       assert.deepEqual(delivered.modelSelection, pickedSelection);
       assert.deepEqual(after.thread.modelSelection, pickedSelection);
+    }),
+  );
+
+  it.effect("holds a send that respects a snooze until the thread wakes", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("runtime-layer-respect-snooze");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        createdBy: "user",
+        creationSource: "web",
+        title: "Snoozed hold",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      const message = (key: string, extra: { postOnly?: true; respectSnooze?: true } = {}) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}:${key}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:${key}`),
+          text: key,
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "agent",
+          creationSource: "mcp",
+          ...extra,
+        });
+      yield* message("first");
+      const [first] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:first-completed`),
+            type: "run.updated",
+            threadId,
+            runId: first!.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...first!, status: "completed", completedAt: yield* DateTime.now },
+          },
+        ],
+      });
+      const snooze = (until: string) =>
+        orchestrator.dispatch({
+          type: "thread.snooze",
+          commandId: CommandId.make(`${threadId}:snooze:${until}`),
+          threadId,
+          snoozedUntil: until,
+        });
+      yield* snooze("2099-01-01T00:00:00.000Z");
+
+      yield* message("post", { postOnly: true, respectSnooze: true });
+      yield* message("held", { respectSnooze: true });
+      const held = yield* orchestrator.getThreadProjection(threadId);
+      assert.isNotNull(held.thread.snoozedUntil);
+      const heldRun = held.runs.find((run) => run.userMessageId === `${threadId}:held`)!;
+      assert.equal(heldRun.status, "queued");
+      assert.isTrue(heldRun.queueHeld);
+      assert.isTrue(heldRun.snoozeDeferred);
+      // Its own held turn does not stop the thread from being snoozed again.
+      yield* snooze("2099-02-01T00:00:00.000Z");
+      assert.deepEqual(yield* SnoozeDeferredDelivery.readSnoozeDeferredThreads(), [
+        { threadId, snoozedUntil: "2099-02-01T00:00:00.000Z", firstRunId: heldRun.id },
+      ]);
+
+      yield* orchestrator.dispatch({
+        type: "thread.unsnooze",
+        commandId: CommandId.make(`${threadId}:unsnooze`),
+        threadId,
+        reason: "user",
+      });
+      const [awake] = yield* SnoozeDeferredDelivery.readSnoozeDeferredThreads();
+      assert.equal(
+        SnoozeDeferredDelivery.snoozeDeferredReleases(
+          [awake!],
+          DateTime.toEpochMillis(yield* DateTime.now),
+        ).due.length,
+        1,
+      );
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make(`snooze-deferred-release:${heldRun.id}`),
+        threadId,
+      });
+      const released = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(released.runs.find((run) => run.id === heldRun.id)?.status, "starting");
     }),
   );
 

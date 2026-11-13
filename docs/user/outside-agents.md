@@ -109,6 +109,10 @@ T3 Code.
 - When `t3_thread_send` queues behind a busy run, its `queue` result gives the
   message's position, the messages ahead of it, and how long the active run has
   been going.
+- A snoozed thread stays snoozed. `t3_thread_send` holds the message until the
+  snooze ends or someone wakes the thread, and `t3_thread_post` only records it.
+  Both return `snoozedUntil` and a warning. Pass `respectSnooze: false` to wake
+  the thread now. Messages sent from the T3 app still wake it.
 
 ## Claude Code
 
