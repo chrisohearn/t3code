@@ -30,7 +30,12 @@ export function claudeUsageLimitScope(
     return "account";
   }
   if (
-    types.some((type) => /^seven_day_(?!overage|extra)[a-z_]+$/.test(type)) ||
+    types.some(
+      (type) =>
+        type === "seven_day_overage_included" ||
+        type === "model_requires_usage_credits" ||
+        /^seven_day_(?!overage|extra)[a-z_]+$/.test(type),
+    ) ||
     /7[- ]day (?:model|fable|opus|sonnet|haiku) limit/i.test(message)
   )
     return "model";

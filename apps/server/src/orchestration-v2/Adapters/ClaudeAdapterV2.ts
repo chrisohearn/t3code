@@ -4369,6 +4369,9 @@ function isClaudeEmptyTaskNotificationSuccess(message: SDKMessage): boolean {
 
 // The CLI throttles unchanged rate_limit_event frames, but repeats this
 // undeclared payload on each blocked assistant response.
+const isClaudeModelUsageCreditsError = Schema.is(
+  Schema.Struct({ api_error: Schema.Literal("model_requires_usage_credits") }),
+);
 const isClaudeBlockedAssistantRateLimit = Schema.is(
   Schema.Struct({
     api_error_params: Schema.Struct({
@@ -10256,7 +10259,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       type: null,
                       resetAt: null,
                       scope: claudeUsageLimitScope(
-                        [],
+                        isClaudeModelUsageCreditsError(message)
+                          ? ["model_requires_usage_credits"]
+                          : [],
                         textFromClaudeContent(message.message.content),
                       ),
                     }

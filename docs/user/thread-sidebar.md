@@ -262,11 +262,15 @@ below apply.
 A model-specific limit can switch to a different fallback model on the same
 account. Account-wide limits need another instance. Administrators can optionally
 set `secondaryFallbackModelSelection` in `settings.json` (the same selection shape
-as `fallbackModelSelection`) for that case; it is unset by default. After an
+as `fallbackModelSelection`) for that case; it is server-wide, not project-specific,
+and unset by default. After an
 account limit with a known reset time, the running server routes new prompts to
-an available configured fallback until that reset or a successful turn on the
-original instance. Provider status shows the cooldown. Restarting the server
-clears learned cooldowns; it does not change the configured fallbacks.
+an available configured fallback until that reset, for at most six hours per
+failure. A successful turn or fresh usage check showing available account quota
+clears the cooldown early. Provider status shows the cooldown; **Refresh** in its
+status notice clears it manually. Explicitly selecting a model bypasses the
+cooldown for the next prompt, including a queued prompt. Restarting the server
+clears learned cooldowns; none of these actions changes the configured fallbacks.
 
 Press **Resume** in an empty composer to continue a limited or interrupted turn
 manually. Do this when the provider reports no reset time, because nothing

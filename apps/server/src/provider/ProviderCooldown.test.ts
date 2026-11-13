@@ -63,5 +63,65 @@ it.effect("cools only account limits until reset and clears on success", () =>
     });
     yield* cooldown.observe(instanceId, { status: "completed" });
     assert.deepEqual(yield* cooldown.getAll, new Map());
+    const longFailure = {
+      ...failure,
+      limitScope: "account" as const,
+      resetAt: "1970-01-08T00:00:00.000Z",
+    };
+    yield* cooldown.observe(instanceId, { status: "failed", failure: longFailure });
+    assert.equal((yield* cooldown.getAll).get(instanceId), "1970-01-01T06:01:00.000Z");
+    const healthy = {
+      ...providers[0]!,
+      checkedAt: "1970-01-01T00:01:01.000Z",
+      usageLimits: {
+        checkedAt: "1970-01-01T00:01:01.000Z",
+        windows: [
+          { id: "five_hour", kind: "session" as const, label: "Session", usedPercent: 20 },
+          { id: "seven_day", kind: "weekly" as const, label: "Weekly", usedPercent: 30 },
+        ],
+      },
+    };
+    yield* TestClock.adjust("1 second");
+    yield* cooldown.observeProvider({
+      ...healthy,
+      usageLimits: { ...healthy.usageLimits, checkedAt: "1970-01-01T00:00:00.000Z" },
+    });
+    assert.equal((yield* cooldown.getAll).size, 1);
+    yield* cooldown.observeProvider({
+      ...healthy,
+      usageLimits: {
+        ...healthy.usageLimits,
+        windows: [{ ...healthy.usageLimits.windows[0]!, usedPercent: 100 }],
+      },
+    });
+    assert.equal((yield* cooldown.getAll).size, 1);
+    yield* cooldown.observeProvider({
+      ...healthy,
+      usageLimits: { ...healthy.usageLimits, windows: [] },
+    });
+    assert.equal((yield* cooldown.getAll).size, 1);
+    yield* cooldown.observeProvider({
+      ...healthy,
+      usageLimits: { ...healthy.usageLimits, windows: [healthy.usageLimits.windows[0]!] },
+    });
+    assert.equal((yield* cooldown.getAll).size, 1);
+    yield* cooldown.observeProvider({
+      ...healthy,
+      usageLimits: { ...healthy.usageLimits, unavailable: { reason: "probeFailed" } },
+    });
+    assert.equal((yield* cooldown.getAll).size, 1);
+    yield* cooldown.observeProvider(healthy);
+    assert.deepEqual(yield* cooldown.getAll, new Map());
+    yield* cooldown.observe(instanceId, { status: "failed", failure: longFailure });
+    yield* cooldown.clear(instanceId);
+    assert.deepEqual(yield* cooldown.getAll, new Map());
+    yield* cooldown.observe(instanceId, { status: "failed", failure: longFailure });
+    yield* TestClock.adjust("5 hours");
+    yield* cooldown.observeProvider({ ...healthy, usageLimits: undefined });
+    assert.equal((yield* cooldown.getAll).size, 1);
+    yield* TestClock.adjust("1 hour");
+    assert.deepEqual(yield* cooldown.getAll, new Map());
+    yield* cooldown.observe(instanceId, { status: "failed", failure: longFailure });
+    assert.equal((yield* cooldown.getAll).get(instanceId), "1970-01-01T12:01:01.000Z");
   }).pipe(Effect.provide(ProviderCooldown.layer)),
 );

@@ -2317,6 +2317,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               settings: serverSettings,
               projectId: projection.thread.projectId,
               modelSelection: requestedSelection,
+              run: {
+                ...storedQueuedRun,
+                bypassProviderCooldown:
+                  storedQueuedRun.bypassProviderCooldown === true ||
+                  projection.thread.bypassProviderCooldown === true,
+              },
               message: queuedMessage,
             });
       const queuedRun = {
@@ -2965,7 +2971,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : "Provider or model selection changed.";
       yield* writeSystemEvents(
         [
-          ...(selectionChanged
+          ...(selectionChanged || projection.thread.bypassProviderCooldown === true
             ? [
                 {
                   type:
@@ -2979,6 +2985,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     ...projection.thread,
                     providerInstanceId: queuedRun.providerInstanceId,
                     modelSelection: queuedRun.modelSelection,
+                    bypassProviderCooldown: false,
                     updatedAt: now,
                   },
                 },
@@ -5014,6 +5021,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...thread,
             providerInstanceId: command.modelSelection.instanceId,
             modelSelection: command.modelSelection,
+            bypassProviderCooldown: true,
             updatedAt: now,
           };
       }
@@ -7107,6 +7115,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       dispatchMode = { type: "start_immediately" };
     }
     const freshContext = command.freshContext === true;
+    const bypassProviderCooldown =
+      command.modelSelection !== undefined || projection.thread.bypassProviderCooldown === true;
     if (
       command.failoverOfRunId === undefined &&
       command.restartContinuationOfRunId === undefined &&
@@ -7117,8 +7127,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         settings: serverSettings,
         projectId: projection.thread.projectId,
         modelSelection,
+        run: { bypassProviderCooldown },
         message: { ...command, role: "user" },
       });
+    }
+    if (
+      projection.thread.bypassProviderCooldown === true &&
+      (dispatchMode.type === "start_immediately" ||
+        dispatchMode.type === "queue_after_active" ||
+        dispatchMode.type === "defer_start")
+    ) {
+      const now = yield* DateTime.now;
+      const event = yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.metadata-updated",
+        threadId: command.threadId,
+        providerInstanceId: projection.thread.providerInstanceId,
+        occurredAt: now,
+        payload: { ...projection.thread, bypassProviderCooldown: false, updatedAt: now },
+      });
+      projection = applyToProjection(projection, event);
     }
     if (
       freshContext &&
@@ -7630,6 +7660,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         rootNodeId,
         activeAttemptId: attemptId,
         status: "queued",
+        ...(bypassProviderCooldown ? { bypassProviderCooldown: true } : {}),
         ...(steerWhenReadyRunId === undefined ? {} : { steerWhenReadyRunId }),
         ...(worktreeMissingRun !== undefined ||
         (heldRunsToRelease.length === 0 &&
@@ -8062,6 +8093,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         rootNodeId,
         activeAttemptId: attemptId,
         status: dispatchMode.type === "defer_start" ? "preparing" : "starting",
+        ...(bypassProviderCooldown ? { bypassProviderCooldown: true } : {}),
         queuePosition: null,
         requestedAt: now,
         startedAt: null,

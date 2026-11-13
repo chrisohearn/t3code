@@ -62,6 +62,7 @@ export function providerFailoverTarget(input: {
   readonly fallback: ModelSelection | null;
   readonly secondaryFallback?: ModelSelection | null;
   readonly limitScope?: "account" | "model";
+  readonly available?: (selection: ModelSelection) => boolean;
 }): ModelSelection | undefined {
   const { run, message, fallback } = input;
   if (
@@ -75,6 +76,7 @@ export function providerFailoverTarget(input: {
     return undefined;
   const eligible = (target: ModelSelection | null | undefined) =>
     target != null &&
+    (input.available?.(target) ?? true) &&
     (target.instanceId !== run.providerInstanceId ||
       (input.limitScope === "model" && target.model !== run.modelSelection.model));
   if (fallback !== null && eligible(fallback)) return fallback;
@@ -102,20 +104,17 @@ export const resolveProviderFailoverTarget = Effect.fn("ProviderFailover.resolve
     const cooldowns = Option.isSome(cooldownService)
       ? yield* cooldownService.value.getAll
       : new Map();
-    const available = (selection: ModelSelection | null) =>
-      selection !== null &&
+    const available = (selection: ModelSelection) =>
       resolveProjectProviderInstanceEnabled(
         settings.value,
         input.thread.projectId,
         selection.instanceId,
-      ) &&
-      !cooldowns.has(selection.instanceId)
-        ? selection
-        : null;
+      ) && !cooldowns.has(selection.instanceId);
     const targetInput = {
       ...input,
-      fallback: available(project.fallbackModelSelection),
-      secondaryFallback: available(settings.value.secondaryFallbackModelSelection),
+      fallback: project.fallbackModelSelection,
+      secondaryFallback: settings.value.secondaryFallbackModelSelection,
+      available,
     };
     return {
       account: providerFailoverTarget(targetInput),
@@ -128,6 +127,10 @@ export const resolveProviderCooldownTarget = Effect.fn("ProviderFailover.resolve
   function* (input: {
     readonly projectId: OrchestrationV2AppThread["projectId"];
     readonly modelSelection: ModelSelection;
+    readonly run: Pick<
+      OrchestrationV2Run,
+      "failover" | "failoverOfRunId" | "restartContinuationOfRunId" | "bypassProviderCooldown"
+    >;
     readonly message: Pick<
       OrchestrationV2ConversationMessage,
       "role" | "notification" | "delegatedCompletion" | "idleCompaction" | "workflowScript" | "text"
@@ -135,7 +138,14 @@ export const resolveProviderCooldownTarget = Effect.fn("ProviderFailover.resolve
     readonly cooldown: ProviderCooldown.ProviderCooldown["Service"];
     readonly settings: ServerSettings.ServerSettingsService["Service"];
   }) {
-    if (!resendable(input.message)) return input.modelSelection;
+    if (
+      input.run.bypassProviderCooldown === true ||
+      input.run.failover !== undefined ||
+      input.run.failoverOfRunId !== undefined ||
+      input.run.restartContinuationOfRunId !== undefined ||
+      !resendable(input.message)
+    )
+      return input.modelSelection;
     const cooldowns = yield* input.cooldown.getAll;
     if (!cooldowns.has(input.modelSelection.instanceId)) return input.modelSelection;
     const settingsOption = yield* input.settings.getSettings.pipe(Effect.option);

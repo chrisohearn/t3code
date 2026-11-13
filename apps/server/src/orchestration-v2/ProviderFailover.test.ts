@@ -18,6 +18,7 @@ import {
   providerFailoverClaim,
   providerFailoverTarget,
   resolveProviderCooldownTarget,
+  resolveProviderFailoverTarget,
 } from "./ProviderFailover.ts";
 import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -171,6 +172,7 @@ describe("provider failover", () => {
           modelSelection: selection,
           projectId: ProjectId.make("project:cooldown"),
           message,
+          run: {},
         };
         assert.deepEqual(yield* resolveProviderCooldownTarget(input), selection);
         const failure = {
@@ -183,6 +185,22 @@ describe("provider failover", () => {
         };
         yield* cooldown.observe(selection.instanceId, { status: "failed", failure });
         assert.deepEqual(yield* resolveProviderCooldownTarget(input), secondary);
+        const targetInput = {
+          run: { ...run, providerInstanceId: selection.instanceId, modelSelection: selection },
+          thread: { projectId: input.projectId },
+          message,
+          firstAttempt: true,
+        };
+        assert.deepEqual((yield* resolveProviderFailoverTarget(targetInput))?.account, secondary);
+        yield* settings.updateSettings({
+          providerInstances: {
+            [selection.instanceId]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              enabled: false,
+            },
+          },
+        });
+        assert.deepEqual((yield* resolveProviderFailoverTarget(targetInput))?.account, secondary);
         assert.deepEqual(
           yield* resolveProviderCooldownTarget({
             ...input,

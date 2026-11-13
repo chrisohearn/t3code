@@ -117,7 +117,7 @@ export const ProviderStatusBanner = memo(function ProviderStatusBanner({
     setIsRefreshing(true);
     await refreshProviders({
       environmentId,
-      input: { instanceId: status.instanceId, refreshModels: true },
+      input: { instanceId: status.instanceId, refreshModels: true, clearCooldown: true },
     });
     refreshingRef.current = false;
     setIsRefreshing(false);
@@ -165,6 +165,7 @@ export const ProviderStatusBanner = memo(function ProviderStatusBanner({
               ) : null}
               <Button
                 aria-label={`Refresh ${providerName} provider status`}
+                title="Refresh status and clear any account cooldown"
                 disabled={!canRefresh || isRefreshing}
                 onClick={() => void refresh()}
                 size="xs"

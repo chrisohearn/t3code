@@ -64,6 +64,7 @@ export class ProviderRegistry extends Context.Service<
     /** Unknown instance ids return the cached list without error. */
     readonly refreshInstance: (
       instanceId: ProviderInstanceId,
+      options?: { readonly clearCooldown?: boolean },
     ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
     /** Re-reads secret-backed environments first, so a fixed secret applies without a restart. */
@@ -594,6 +595,7 @@ export const layer = Layer.effect(
         readonly publish?: boolean;
       },
     ) {
+      yield* cooldown.observeProvider(provider);
       const providers = yield* upsertProviders([provider], options);
       yield* refreshCompatibility;
       return providers;
@@ -1192,8 +1194,9 @@ export const layer = Layer.effect(
           Effect.catchCause(recoverRefreshFailure),
           Effect.flatMap(withCooldowns),
         ),
-      refreshInstance: (instanceId: ProviderInstanceId) =>
-        refreshInstance(instanceId).pipe(
+      refreshInstance: (instanceId: ProviderInstanceId, options) =>
+        (options?.clearCooldown === true ? cooldown.clear(instanceId) : Effect.void).pipe(
+          Effect.andThen(refreshInstance(instanceId)),
           Effect.catchCause(recoverRefreshFailure),
           Effect.flatMap(withCooldowns),
         ),

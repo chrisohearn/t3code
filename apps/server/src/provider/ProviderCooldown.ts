@@ -16,6 +16,8 @@ export class ProviderCooldown extends Context.Service<
   {
     readonly getAll: Effect.Effect<ReadonlyMap<ProviderInstanceId, string>>;
     readonly subscribeChanges: Effect.Effect<PubSub.Subscription<void>, never, Scope.Scope>;
+    readonly clear: (instanceId: ProviderInstanceId) => Effect.Effect<void>;
+    readonly observeProvider: (provider: ServerProvider) => Effect.Effect<void>;
     readonly observe: (
       instanceId: ProviderInstanceId,
       terminal: {
@@ -28,16 +30,18 @@ export class ProviderCooldown extends Context.Service<
 
 const make = Effect.gen(function* () {
   const scope = yield* Effect.scope;
-  const entries = yield* Ref.make<ReadonlyMap<ProviderInstanceId, string>>(new Map());
+  const entries = yield* Ref.make<
+    ReadonlyMap<ProviderInstanceId, { readonly armedAt: number; readonly expiresAt: string }>
+  >(new Map());
   const changes = yield* Effect.acquireRelease(PubSub.unbounded<void>(), PubSub.shutdown);
   const clear = Effect.fn("ProviderCooldown.clear")(function* (
     instanceId: ProviderInstanceId,
-    resetAt?: string,
+    expected?: { readonly armedAt: number; readonly expiresAt: string },
   ) {
     const changed = yield* Ref.modify(entries, (current) => {
       if (
         !current.has(instanceId) ||
-        (resetAt !== undefined && current.get(instanceId) !== resetAt)
+        (expected !== undefined && current.get(instanceId) !== expected)
       )
         return [false, current];
       const next = new Map(current);
@@ -50,12 +54,41 @@ const make = Effect.gen(function* () {
     const now = yield* DateTime.now;
     const current = yield* Ref.get(entries);
     return new Map(
-      [...current].filter(([, resetAt]) => DateTime.toEpochMillis(now) < Date.parse(resetAt)),
+      [...current]
+        .filter(([, entry]) => DateTime.toEpochMillis(now) < Date.parse(entry.expiresAt))
+        .map(([instanceId, entry]) => [instanceId, entry.expiresAt]),
     );
   });
   return {
     getAll,
     subscribeChanges: PubSub.subscribe(changes),
+    clear: (instanceId) => clear(instanceId),
+    observeProvider: Effect.fn("ProviderCooldown.observeProvider")(function* (provider) {
+      const entry = (yield* Ref.get(entries)).get(provider.instanceId);
+      const limits = provider.usageLimits;
+      if (
+        entry === undefined ||
+        limits === undefined ||
+        limits.unavailable !== undefined ||
+        provider.auth.status !== "authenticated" ||
+        (provider.status !== "ready" && provider.status !== "warning") ||
+        !(Date.parse(limits.checkedAt) > entry.armedAt)
+      )
+        return;
+      const accountWindows = limits.windows.filter((window) =>
+        provider.driver === "claudeAgent"
+          ? window.id === "five_hour" || window.id === "seven_day"
+          : window.id === "primary" || window.id === "secondary" || window.id === "individual",
+      );
+      if (
+        accountWindows.length > 0 &&
+        (provider.driver !== "claudeAgent" ||
+          (accountWindows.some((window) => window.id === "five_hour") &&
+            accountWindows.some((window) => window.id === "seven_day"))) &&
+        accountWindows.every((window) => window.usedPercent < 100)
+      )
+        yield* clear(provider.instanceId, entry);
+    }),
     observe: Effect.fn("ProviderCooldown.observe")(function* (instanceId, terminal) {
       if (terminal.status === "completed") return yield* clear(instanceId);
       const failure = terminal.failure;
@@ -66,13 +99,16 @@ const make = Effect.gen(function* () {
         !failure.resetAt
       )
         return;
-      const resetAt = failure.resetAt;
-      const delay = Date.parse(resetAt) - DateTime.toEpochMillis(yield* DateTime.now);
+      const armedAt = DateTime.toEpochMillis(yield* DateTime.now);
+      const delay = Math.min(Date.parse(failure.resetAt) - armedAt, 6 * 60 * 60 * 1000);
       if (!Number.isFinite(delay) || delay <= 0) return;
-      if ((yield* Ref.get(entries)).get(instanceId) === resetAt) return;
-      yield* Ref.update(entries, (current) => new Map(current).set(instanceId, resetAt));
+      const entry = {
+        armedAt,
+        expiresAt: DateTime.formatIso(DateTime.makeUnsafe(armedAt + delay)),
+      };
+      yield* Ref.update(entries, (current) => new Map(current).set(instanceId, entry));
       yield* PubSub.publish(changes, undefined);
-      yield* clear(instanceId, resetAt).pipe(Effect.delay(delay), Effect.forkIn(scope));
+      yield* clear(instanceId, entry).pipe(Effect.delay(delay), Effect.forkIn(scope));
     }),
   } satisfies ProviderCooldown["Service"];
 });

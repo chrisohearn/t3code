@@ -10,7 +10,13 @@ const checkedAt = "2026-07-18T10:00:00.000Z";
 const noNames = { overageIncluded: undefined } as const;
 
 it("distinguishes account limits from named model limits without cooling the whole account", () => {
-  for (const types of [["seven_day_fable"], ["seven_day_opus"], ["seven_day_model"]]) {
+  for (const types of [
+    ["seven_day_fable"],
+    ["seven_day_opus"],
+    ["seven_day_model"],
+    ["seven_day_overage_included"],
+    ["model_requires_usage_credits"],
+  ]) {
     expect(claudeUsageLimitScope(types, "")).toBe("model");
   }
   expect(

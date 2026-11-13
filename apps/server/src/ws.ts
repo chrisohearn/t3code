@@ -2459,7 +2459,9 @@ export const layerWsRpc = (
               : input.reloadSecrets === true
                 ? providerRegistry.reloadSecretsAndRefresh(input.instanceId)
                 : input.instanceId !== undefined
-                  ? providerRegistry.refreshInstance(input.instanceId)
+                  ? providerRegistry.refreshInstance(input.instanceId, {
+                      clearCooldown: input.clearCooldown === true,
+                    })
                   : providerRegistry.refresh();
             if (input.refreshModels) {
               const instances = yield* providerInstances.listInstances;
