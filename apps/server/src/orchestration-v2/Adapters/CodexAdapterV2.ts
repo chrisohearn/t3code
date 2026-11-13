@@ -125,7 +125,7 @@ import {
 } from "../../provider/EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { resolveCodexLaunchArgs } from "../../provider/codexLaunchArgs.ts";
-import { isolatedCodexAppServerArgs } from "../../provider/CodexMcpIsolation.ts";
+import { makeIsolatedCodexAppServerArgs } from "../../provider/CodexMcpIsolation.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -1629,6 +1629,8 @@ export const layerAppServerClientFactory: Layer.Layer<
   | ChildProcessSpawner.ChildProcessSpawner
   | PortScanner.PortDiscovery
   | ProviderEventLoggers.ProviderEventLoggers
+  | FileSystem.FileSystem
+  | Path.Path
 > = Layer.effect(
   CodexAppServerClientFactory,
   Effect.gen(function* () {
@@ -1636,6 +1638,7 @@ export const layerAppServerClientFactory: Layer.Layer<
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
     const portDiscovery = yield* PortScanner.PortDiscovery;
+    const isolatedCodexAppServerArgs = yield* makeIsolatedCodexAppServerArgs;
 
     return CodexAppServerClientFactory.of({
       open: Effect.fn("CodexAdapterV2.open")(function* (input) {
@@ -1645,20 +1648,10 @@ export const layerAppServerClientFactory: Layer.Layer<
           ...(input.settings.homePath ? { CODEX_HOME: input.settings.homePath } : {}),
         };
         const args = yield* isolatedCodexAppServerArgs({
-          binary: input.settings.binaryPath || "codex",
+          instanceId: input.instanceId,
           env: environment,
           launchArgs: resolveCodexLaunchArgs(input.settings.launchArgs, input.environment),
-        }).pipe(
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapter.ProviderAdapterOpenSessionError({
-                driver: CODEX_PROVIDER,
-                providerSessionId: input.providerSessionId,
-                cause,
-              }),
-          ),
-        );
+        });
         const command = yield* makeCodexAppServerSpawnCommand({
           command: input.settings.binaryPath || "codex",
           args,

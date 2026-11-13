@@ -255,7 +255,8 @@ const make = Effect.gen(function* () {
       }
       const allowed = yield* authorize(binding.principal, binding.threadId).pipe(Effect.result);
       if (allowed._tag === "Failure") {
-        yield* sql`UPDATE mcp_event_relay_bindings SET closed_at = ${yield* Clock.currentTimeMillis}, last_error = ${allowed.failure.reason} WHERE id = ${binding.id}`.pipe(
+        const now = yield* Clock.currentTimeMillis;
+        yield* sql`UPDATE mcp_event_relay_bindings SET closed_at = ${now}, expires_at = ${now}, last_error = ${allowed.failure.reason} WHERE id = ${binding.id}`.pipe(
           Effect.mapError(storage),
         );
         yield* alert(binding.principal, binding.id, binding.threadId, allowed.failure.reason);
@@ -340,7 +341,8 @@ const make = Effect.gen(function* () {
           break;
         }
       }
-      yield* sql`UPDATE mcp_event_relay_bindings SET scan_cursor = ${through}, closed_at = CASE WHEN ${finished ? 1 : 0} = 1 THEN ${yield* Clock.currentTimeMillis} ELSE closed_at END WHERE id = ${binding.id}`.pipe(
+      const now = yield* Clock.currentTimeMillis;
+      yield* sql`UPDATE mcp_event_relay_bindings SET scan_cursor = ${through}, closed_at = CASE WHEN ${finished ? 1 : 0} = 1 THEN ${now} ELSE closed_at END, expires_at = CASE WHEN ${finished ? 1 : 0} = 1 THEN ${now} ELSE expires_at END WHERE id = ${binding.id}`.pipe(
         Effect.mapError(storage),
       );
       behind ||= !finished && through < latest;
@@ -407,12 +409,12 @@ const make = Effect.gen(function* () {
       (effect) => pinGate.withPermit(effect),
     ),
     missingInbox: Effect.fn("McpEventRelay.missingInbox")(function* (principal) {
-      const pins = yield* sql<{ signIn: string }>`SELECT substr(principal, 1, 8) AS "signIn"
-        FROM mcp_event_inboxes ORDER BY principal`.pipe(Effect.mapError(storage));
+      const pins = yield* sql<{ count: number }>`SELECT count(*) AS count
+        FROM mcp_event_inboxes`.pipe(Effect.mapError(storage));
       yield* sql`INSERT INTO mcp_event_relay_alerts (principal, source_key, day, reason)
         VALUES (${principal}, 'no_pinned_inbox', ${Math.floor((yield* Clock.currentTimeMillis) / 86400_000)}, 'no_pinned_inbox')
         ON CONFLICT DO NOTHING`.pipe(Effect.mapError(storage));
-      return `WARNING: Notifications are NOT bound. Caller sign-in ${principal.slice(0, 8)} has no pinned inbox. Sign-ins with pins: ${pins.map((pin) => pin.signIn).join(", ") || "none"}. Pin an inbox using the caller's own sign-in; pins are never shared across sign-ins.`;
+      return `WARNING: Notifications are NOT bound. Caller sign-in ${principal.slice(0, 8)} has no pinned inbox. Pinned sign-ins: ${pins[0]?.count ?? 0}. Pin an inbox using the caller's own sign-in; pins are never shared across sign-ins.`;
     }),
     prepare: Effect.fn("McpEventRelay.prepare")(function* (scope, input) {
       if (
@@ -449,11 +451,21 @@ const make = Effect.gen(function* () {
         firstSequence: number | null;
       }>`SELECT MIN(sequence) AS "firstSequence" FROM orchestration_events
         WHERE application_event_version = 2 AND aggregate_kind = 'thread' AND stream_id = ${threadId}
-          AND event_type = 'run.updated' AND json_extract(payload_json, '$.id') = ${runId}`.pipe(
+          AND event_type IN ('run.created', 'run.updated') AND json_extract(payload_json, '$.id') = ${runId}`.pipe(
         Effect.mapError(storage),
       );
-      if (run !== undefined && start?.firstSequence == null)
-        return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+      if (run !== undefined && start?.firstSequence == null) {
+        const [oldest] = yield* sql<{ occurredAt: string }>`SELECT occurred_at AS "occurredAt"
+          FROM orchestration_events
+          WHERE aggregate_kind = 'project'
+            OR (application_event_version = 2 AND aggregate_kind = 'thread')
+          ORDER BY sequence LIMIT 1`.pipe(Effect.mapError(storage));
+        if (
+          oldest !== undefined &&
+          DateTime.isLessThan(run.requestedAt, DateTime.makeUnsafe(oldest.occurredAt))
+        )
+          return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+      }
       const cursor = Math.min(
         prepared.cursor,
         start?.firstSequence == null ? prepared.cursor : Math.max(0, start.firstSequence - 1),

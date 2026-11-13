@@ -34,7 +34,7 @@ interface LaunchArgFilter {
 const SHARED_VALUE_FLAGS = ["--config", "-c", "--enable", "--disable"];
 const SHARED_INLINE_PREFIXES = ["--config=", "-c=", "--enable=", "--disable="];
 
-const MCP_LIST_FILTER: LaunchArgFilter = {
+const CONFIG_FILTER: LaunchArgFilter = {
   switches: new Set(),
   valueFlags: new Set([...SHARED_VALUE_FLAGS, "--profile", "-p"]),
   inlinePrefixes: [...SHARED_INLINE_PREFIXES, "--profile=", "-p="],
@@ -74,4 +74,4 @@ export const codexExecLaunchArgs = (launchArgs?: string) =>
   filterLaunchArgs(launchArgs, EXEC_FILTER);
 
 export const codexMcpListLaunchArgs = (launchArgs?: string) =>
-  filterLaunchArgs(launchArgs, MCP_LIST_FILTER);
+  filterLaunchArgs(launchArgs, CONFIG_FILTER);

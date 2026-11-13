@@ -978,22 +978,15 @@ describe("CodexAdapterV2 process exit", () => {
           ChildProcessSpawner.make((command) => {
             const args = ChildProcess.isStandardCommand(command) ? command.args : [];
             commands.push(args);
-            const listing = args.includes("mcp");
             return Effect.succeed(
               ChildProcessSpawner.makeHandle({
                 pid: ChildProcessSpawner.ProcessId(999_999_999),
-                exitCode: listing ? Effect.succeed(ChildProcessSpawner.ExitCode(0)) : Effect.never,
+                exitCode: Effect.never,
                 isRunning: Effect.succeed(true),
                 kill: () => Effect.void,
                 unref: Effect.succeed(Effect.void),
                 stdin: Sink.drain,
-                stdout: listing
-                  ? Stream.succeed(
-                      new TextEncoder().encode(
-                        '[{"name":"t3_omarchy"},{"name":"t3_macbook"},{"name":"other"}]',
-                      ),
-                    )
-                  : Stream.never,
+                stdout: Stream.never,
                 stderr: Stream.empty,
                 all: Stream.empty,
                 getInputFd: () => Sink.drain,
@@ -1005,6 +998,12 @@ describe("CodexAdapterV2 process exit", () => {
       ),
     );
     return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      yield* fs.writeFileString(
+        `${directory}/config.toml`,
+        '[mcp_servers.t3_omarchy]\ncommand="unused"\n[mcp_servers.t3_macbook]\ncommand="unused"\n',
+      );
       const factory = yield* CodexAdapterV2.CodexAppServerClientFactory;
       yield* Effect.scoped(
         factory
@@ -1013,14 +1012,13 @@ describe("CodexAdapterV2 process exit", () => {
             threadId: ThreadId.make("thread-codex-agent"),
             providerSessionId: ProviderSessionId.make("session-codex-agent"),
             runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
-            settings: DEFAULT_CODEX_SETTINGS,
+            settings: { ...DEFAULT_CODEX_SETTINGS, homePath: directory },
             environment: {},
           })
           .pipe(Effect.tap(() => Effect.sync(() => assert.equal(runningAgents, 1)))),
       );
       assert.equal(runningAgents, 0);
       assert.deepEqual(commands, [
-        ["mcp", "list", "--json"],
         [
           "app-server",
           "-c",
@@ -1031,7 +1029,10 @@ describe("CodexAdapterV2 process exit", () => {
           "mcp_servers.t3_macbook.enabled=false",
         ],
       ]);
-    }).pipe(Effect.provide(factoryLayer));
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(factoryLayer.pipe(Layer.provideMerge(NodeServices.layer))),
+    );
   });
 });
 

@@ -67,7 +67,7 @@ describe("codexExecLaunchArgs", () => {
   });
 });
 
-describe("codex exec and mcp list launch args", () => {
+describe("codex exec and config launch args", () => {
   const launchArgs =
     "--strict-config --oss --local-provider ollama --profile local -p=work --listen off --enable foo";
 
@@ -85,7 +85,7 @@ describe("codex exec and mcp list launch args", () => {
     ]);
   });
 
-  it("keeps the selected profile and drops exec-only flags for codex mcp list", () => {
+  it("keeps the selected profile and drops exec-only flags for config discovery", () => {
     NodeAssert.deepStrictEqual(codexMcpListLaunchArgs(launchArgs), [
       "--profile",
       "local",

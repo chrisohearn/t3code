@@ -26,6 +26,7 @@ import {
   ProviderInstanceId,
   ProviderDriverKind,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2Run,
   RuntimeRequestId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -302,7 +303,8 @@ it.effect("warns about the caller's missing pin without sharing another sign-in'
         reason: "no_pinned_inbox",
         warning: expect.stringContaining(f.principal.slice(0, 8)),
       });
-      expect("warning" in result && result.warning).toContain(f.other.slice(0, 8));
+      expect("warning" in result && result.warning).not.toContain(f.other.slice(0, 8));
+      expect("warning" in result && result.warning).toContain("Pinned sign-ins: 1");
       const status = yield* f.call(f.service.bridgeStatus());
       expect(status.inboxThreadId).toBeNull();
       expect(status.relayAlerts).toContainEqual(
@@ -390,6 +392,13 @@ it.effect(
           ]),
         );
         expect(status.relayBindings).toHaveLength(2);
+        yield* f.sessions.revoke({ sessionId: f.principal, revokedAt: DateTime.makeUnsafe(0) });
+        yield* f.service.drain();
+        expect(
+          yield* sql`SELECT expires_at, closed_at FROM mcp_event_relay_bindings WHERE run_id = 'unbounded'`,
+        ).toEqual([
+          { expires_at: yield* Clock.currentTimeMillis, closed_at: yield* Clock.currentTimeMillis },
+        ]);
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );
@@ -487,6 +496,9 @@ it.effect(
         expect(f.inboxSends).toHaveLength(1);
         const sql = Context.get(f.context, SqlClient.SqlClient);
         expect(yield* sql`SELECT body FROM mcp_event_relay_outbox`).toEqual([{ body: "" }]);
+        expect(yield* sql`SELECT expires_at, closed_at FROM mcp_event_relay_bindings`).toEqual([
+          { expires_at: yield* Clock.currentTimeMillis, closed_at: yield* Clock.currentTimeMillis },
+        ]);
         expect(f.sent).toHaveLength(0);
         expect((yield* f.call(rebuilt.listSubscriptions())).subscriptions).toHaveLength(0);
         expect(f.inboxSends[0]).toMatchObject({
@@ -513,6 +525,167 @@ it.effect(
           (yield* f.call(f.service.setInbox({ threadId: inbox }), f.other).pipe(Effect.flip))
             .reason,
         ).toBe("access_denied");
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["idle", "busy"] as const)(
+  "binds notify for a send to a thread that is %s before its first run update",
+  (state) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const threadId = ThreadId.make(`send-${state}`);
+        const requestedAt = DateTime.makeUnsafe(100);
+        const run: OrchestrationV2Run = {
+          id: RunId.make(`sent-${state}`),
+          threadId,
+          ordinal: state === "busy" ? 2 : 1,
+          providerInstanceId: ProviderInstanceId.make("replay"),
+          modelSelection: { instanceId: ProviderInstanceId.make("replay"), model: "fixture" },
+          providerThreadId: null,
+          userMessageId: MessageId.make(`sent-message-${state}`),
+          rootNodeId: null,
+          activeAttemptId: null,
+          status: "queued",
+          requestedAt,
+          startedAt: null,
+          completedAt: null,
+          checkpointId: null,
+          contextHandoffId: null,
+        };
+        const records = idleThreadProjection(liveThreadShell(threadId));
+        const preceding = {
+          ...run,
+          id: RunId.make("preceding"),
+          ordinal: 1,
+          status: "running" as const,
+        };
+        f.projections.set(threadId, {
+          ...records,
+          runs: state === "busy" ? [preceding, run] : [run],
+        });
+        if (state === "busy") {
+          yield* f.store.appendAgentEvents({
+            events: [
+              {
+                id: EventId.make("preceding-started"),
+                threadId,
+                occurredAt: requestedAt,
+                type: "run.updated",
+                payload: preceding,
+              },
+            ],
+          });
+        }
+        yield* f.call(f.service.setInbox({ threadId: ThreadId.make("inbox") }));
+        const notification = yield* f.call(
+          ThreadNotifications.prepare({}).pipe(
+            Effect.provideService(McpEvents.McpEvents, f.service),
+          ),
+        );
+        const [created] = yield* f.store.appendAgentEvents({
+          events: [
+            {
+              id: EventId.make("sent-created"),
+              threadId,
+              occurredAt: requestedAt,
+              type: "run.created",
+              payload: run,
+            },
+          ],
+        });
+        if (state === "busy") yield* f.outcome(threadId, preceding.id);
+        expect(
+          yield* f.call(ThreadNotifications.finish(notification, threadId, run.id)),
+        ).toMatchObject({ status: "bound" });
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        const [binding] = yield* sql<{
+          scan_cursor: number;
+        }>`SELECT scan_cursor FROM mcp_event_relay_bindings`;
+        expect(binding?.scan_cursor).toBe(created!.sequence - 1);
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(0);
+        yield* f.store.appendAgentEvents({
+          events: [
+            {
+              id: EventId.make("sent-started"),
+              threadId,
+              occurredAt: DateTime.makeUnsafe(200),
+              type: "run.updated",
+              payload: { ...run, status: "running", startedAt: DateTime.makeUnsafe(200) },
+            },
+            {
+              id: EventId.make("sent-completed"),
+              threadId,
+              occurredAt: DateTime.makeUnsafe(300),
+              type: "run.updated",
+              payload: {
+                ...run,
+                status: "completed",
+                startedAt: DateTime.makeUnsafe(200),
+                completedAt: DateTime.makeUnsafe(300),
+              },
+            },
+          ],
+        });
+        const lifecycle = yield* sql<{
+          event_type: string;
+        }>`SELECT event_type FROM orchestration_events
+          WHERE sequence > ${binding!.scan_cursor} AND json_extract(payload_json, '$.id') = ${run.id} ORDER BY sequence`;
+        expect(lifecycle.map((event) => event.event_type)).toEqual([
+          "run.created",
+          "run.updated",
+          "run.updated",
+        ]);
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(1);
+        expect(f.inboxSends[0]?.text).toContain(`"runId":"${run.id}"`);
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["empty", "newer", "same", "pruned"] as const)(
+  "requires evidence older than retained history before refusing a missing run event (%s)",
+  (history) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const threadId = ThreadId.make("missing-history");
+        const runId = RunId.make("missing-run");
+        const [stored] = yield* f.outcome(threadId, runId);
+        const records = idleThreadProjection(liveThreadShell(threadId));
+        const event = stored!.event;
+        if (event.type !== "run.updated") return yield* Effect.die("expected run update");
+        f.projections.set(threadId, {
+          ...records,
+          runs: [
+            {
+              ...event.payload,
+              requestedAt: DateTime.makeUnsafe(
+                history === "newer" ? 2000 : history === "same" ? 1234 : 1,
+              ),
+            },
+          ],
+        });
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`DELETE FROM orchestration_events`;
+        if (history !== "empty") yield* f.append([ThreadId.make("retained")]);
+        yield* f.call(f.service.setInbox({ threadId: ThreadId.make("inbox") }));
+        const notification = yield* f.call(
+          ThreadNotifications.prepare({}).pipe(
+            Effect.provideService(McpEvents.McpEvents, f.service),
+          ),
+        );
+        expect(
+          yield* f.call(ThreadNotifications.finish(notification, threadId, runId)),
+        ).toMatchObject(
+          history === "pruned"
+            ? { status: "failed", reason: "source_history_pruned" }
+            : { status: "bound" },
+        );
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
 );
