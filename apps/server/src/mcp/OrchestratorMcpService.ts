@@ -155,10 +155,14 @@ const TASK_WAKE_EVENTS = [
   { thread: "child", eventType: "runtime-request.updated" },
 ] as const;
 const SECRET_REQUEST_POLL_INTERVAL_MS = 500;
-const DEFAULT_THREAD_LIST_LIMIT = 50;
-const DEFAULT_THREAD_READ_LIMIT = 50;
+const DEFAULT_THREAD_LIST_LIMIT = 10;
+const DEFAULT_THREAD_READ_LIMIT = 10;
 const DEFAULT_THREAD_RUN_LIMIT = 10;
-const DEFAULT_THREAD_ITEM_MAX_CHARS = 20_000;
+const DEFAULT_THREAD_ITEM_MAX_CHARS = 500;
+// Claude Code saves MCP results over ~25k tokens to a file instead of showing them. Thread JSON
+// runs about 2 chars per token, so a read stops adding items here and reports the rest as more.
+const THREAD_READ_BUDGET_CHARS = 30_000;
+const encodeJsonText = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 interface ResolvedTarget {
   readonly modelSelection: ModelSelection;
@@ -642,6 +646,7 @@ function pageIncludesTerminalTaskResult(input: {
     "thread" | "runs" | "contextTransfers" | "messages" | "turnItems" | "providerTurns"
   >;
   readonly maxChars: number;
+  readonly textOffset: number;
 }): boolean {
   const transfer = taskResultTransfer(input.parentThreadId, input.target, input.task);
   if (transfer === undefined) return false;
@@ -664,7 +669,11 @@ function pageIncludesTerminalTaskResult(input: {
     if (!matchesResult) return false;
 
     const text = turnItemText(row.item);
-    return text !== null && text.length <= textPageEnd(text, 0, input.maxChars);
+    return (
+      text !== null &&
+      (input.textOffset === 0 || input.textOffset < text.length) &&
+      text.length <= textPageEnd(text, input.textOffset, input.maxChars)
+    );
   });
 }
 
@@ -807,6 +816,24 @@ function threadSnooze(
   };
 }
 
+// Provider-internal links (parentTaskId, providerInstanceId) stay out of agent results.
+function threadBackgroundWork(
+  thread: Pick<OrchestrationV2ThreadShell, "blockedOnThreadWait" | "pendingBackgroundTasks">,
+): Required<Pick<OrchestratorMcpThreadListItem, "blockedOnThreadWait" | "pendingBackgroundTasks">> {
+  return {
+    blockedOnThreadWait: thread.blockedOnThreadWait === true,
+    pendingBackgroundTasks: (thread.pendingBackgroundTasks ?? []).map((task) => ({
+      taskId: task.taskId,
+      kind: task.kind,
+      ...(task.description === undefined ? {} : { description: task.description }),
+      ...(task.awaited === undefined ? {} : { awaited: task.awaited }),
+      ...(task.kind === "subagent" && task.childThreadId !== undefined
+        ? { childThreadId: task.childThreadId }
+        : {}),
+    })),
+  };
+}
+
 function threadPullRequests(
   links: OrchestrationV2ThreadShell["pullRequests"],
   includeLinks = true,
@@ -862,6 +889,7 @@ function listItemFromShell(
     ...threadPullRequests(shell.pullRequests),
     ...threadSettlement(shell),
     ...threadSnooze(shell, nowMs),
+    ...threadBackgroundWork(shell),
     parentThreadId: shell.lineage.parentThreadId,
     relationshipToParent: shell.lineage.relationshipToParent,
     itemCount: shell.visibleItemCount,
@@ -904,6 +932,13 @@ function threadDetail(
             requestId: projection.thread.titleRegeneration.requestId,
             startedAt: DateTime.formatIso(projection.thread.titleRegeneration.startedAt),
           },
+    lastTitleRegeneration:
+      projection.thread.lastTitleRegeneration == null
+        ? null
+        : {
+            ...projection.thread.lastTitleRegeneration,
+            completedAt: DateTime.formatIso(projection.thread.lastTitleRegeneration.completedAt),
+          },
     branch: projection.thread.branch,
     worktreePath: projection.thread.worktreePath,
     parentThreadId: projection.thread.lineage.parentThreadId,
@@ -916,6 +951,7 @@ function threadDetail(
     archived: projection.thread.archivedAt !== null,
     ...threadSettlement(projection.thread),
     ...threadSnooze(shell, nowMs),
+    ...threadBackgroundWork(shell),
     createdAt: DateTime.formatIso(projection.thread.createdAt),
     updatedAt: DateTime.formatIso(projection.thread.updatedAt),
   };
@@ -3202,25 +3238,33 @@ const make = Effect.gen(function* () {
     readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, input) {
       const { parent, target, shell, revision } = yield* loadReadableThread(scope, input.threadId);
       const view = input.view ?? "messages";
-      const afterPosition = input.afterPosition ?? -1;
       const limit = input.limit ?? DEFAULT_THREAD_READ_LIMIT;
       const maxChars = input.maxCharsPerItem ?? DEFAULT_THREAD_ITEM_MAX_CHARS;
+      // Client callers (the CLI, older linked environments) page forward from a cursorless read.
+      const newestFirst =
+        input.beforePosition !== undefined ||
+        (input.afterPosition === undefined && scope.thread !== undefined);
       const timeline =
         input.sinceRevision === revision &&
         input.afterPosition === undefined &&
+        input.beforePosition === undefined &&
         input.itemId === undefined
-          ? { items: [], totalItems: shell.itemCount, hasMore: false }
+          ? { items: [], totalItems: shell.itemCount, hasMore: false, hasEarlier: false }
           : yield* threadManagement
               .getTimelinePage(input.threadId, {
-                afterPosition,
+                ...(input.afterPosition === undefined
+                  ? {}
+                  : { afterPosition: input.afterPosition }),
+                ...(newestFirst
+                  ? { beforePosition: input.beforePosition ?? Number.POSITIVE_INFINITY }
+                  : {}),
                 limit,
                 view,
                 ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
               })
               .pipe(Effect.mapError(threadManagementFailure));
-      const page = timeline.items;
       const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
-      for (const row of page) {
+      for (const row of timeline.items) {
         if (row.item.type !== "user_message" && row.item.type !== "assistant_message") continue;
         const ids = messageIdsByThread.get(row.sourceThreadId) ?? [];
         ids.push(row.item.messageId);
@@ -3236,6 +3280,39 @@ const make = Effect.gen(function* () {
         { concurrency: 1 },
       );
       const messagesByThreadId = new Map(sourceMessages);
+      const thread = threadDetail(
+        scope,
+        target,
+        timeline.totalItems,
+        shell,
+        yield* Clock.currentTimeMillis,
+        input.afterPosition === undefined &&
+          input.beforePosition === undefined &&
+          input.itemId === undefined,
+      );
+      const recentRuns = target.runs
+        .toSorted((left, right) => right.ordinal - left.ordinal)
+        .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
+        .map((run) => threadRun(target, run));
+      const allItems = timeline.items.map((row) =>
+        timelineItem({
+          row,
+          maxChars,
+          messagesByThreadId,
+          ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
+        }),
+      );
+      // Keep the end of the page the caller is reading toward, and at least one item.
+      let size = encodeJsonText({ thread, recentRuns }).length;
+      let kept = 0;
+      for (const item of newestFirst ? allItems.toReversed() : allItems) {
+        size += encodeJsonText(item).length + 1;
+        if (kept > 0 && size > THREAD_READ_BUDGET_CHARS) break;
+        kept++;
+      }
+      const start = newestFirst ? allItems.length - kept : 0;
+      const items = allItems.slice(start, start + kept);
+      const page = timeline.items.slice(start, start + kept);
       const returnedRunIds = new Set(
         page.filter((row) => row.sourceThreadId === target.thread.id).map((row) => row.item.runId),
       );
@@ -3253,12 +3330,7 @@ const make = Effect.gen(function* () {
               target,
               returnedRunIds,
             );
-      if (
-        parent !== undefined &&
-        scope.thread !== undefined &&
-        tasks.length > 0 &&
-        (input.textOffset ?? 0) === 0
-      ) {
+      if (parent !== undefined && scope.thread !== undefined && tasks.length > 0) {
         for (const task of tasks) {
           const transfer = taskResultTransfer(parent.thread.id, target, task);
           const resultRunId = transfer?.sourcePoint.runId ?? delegatedTaskRun(target, task)?.id;
@@ -3278,6 +3350,7 @@ const make = Effect.gen(function* () {
               task,
               target: { ...target, ...resultRecords },
               maxChars,
+              textOffset: input.itemId === undefined ? 0 : (input.textOffset ?? 0),
             })
           ) {
             yield* readTask(
@@ -3292,28 +3365,12 @@ const make = Effect.gen(function* () {
       }
       return {
         revision,
-        thread: threadDetail(
-          scope,
-          target,
-          timeline.totalItems,
-          shell,
-          yield* Clock.currentTimeMillis,
-          input.afterPosition === undefined && input.itemId === undefined,
-        ),
-        recentRuns: target.runs
-          .toSorted((left, right) => right.ordinal - left.ordinal)
-          .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
-          .map((run) => threadRun(target, run)),
-        items: page.map((row) =>
-          timelineItem({
-            row,
-            maxChars,
-            messagesByThreadId,
-            ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
-          }),
-        ),
-        nextPosition: page.at(-1)?.position ?? null,
-        hasMore: timeline.hasMore,
+        thread,
+        recentRuns,
+        items,
+        nextPosition: items.at(-1)?.position ?? null,
+        hasMore: timeline.hasMore || (!newestFirst && kept < allItems.length),
+        earlierPosition: timeline.hasEarlier || start > 0 ? (items[0]?.position ?? null) : null,
       } satisfies OrchestratorMcpThreadReadResult;
     }),
     postToThread: Effect.fn("OrchestratorMcpService.postToThread")(function* (scope, input) {
