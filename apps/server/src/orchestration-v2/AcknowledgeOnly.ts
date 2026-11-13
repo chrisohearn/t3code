@@ -1,4 +1,5 @@
 import type {
+  OrchestrationV2ContextHandoff,
   OrchestrationV2ConversationMessage,
   OrchestrationV2DomainEvent,
   OrchestrationV2ExecutionNode,
@@ -38,10 +39,22 @@ export const setAcknowledgeOnly = Effect.fn("AcknowledgeOnly.set")(function* (
   });
 });
 
+// Token prefixes and long opaque runs, as the update guard redacts them.
+const SECRET_PATTERNS = [
+  /(?:glpat-|gh[pousr]_|github_pat_|xox[abposr]-|sk-|AKIA|ASIA|AIza)[A-Za-z0-9_-]*/g,
+  /[A-Za-z0-9+/=_-]{32,}/g,
+];
+
+/** Sender text becomes agent-authored output, so it is redacted and kept in a code span. */
 const acknowledgementText = (message: string): string => {
-  const line = Array.from(message.replace(/\s+/g, " ").trim());
-  const excerpt = line.slice(0, EXCERPT_LENGTH).join("");
-  return `Queued for Jarvis: ${line.length > EXCERPT_LENGTH ? `${excerpt}…` : excerpt}`;
+  const line = SECRET_PATTERNS.reduce(
+    (text, pattern) => text.replace(pattern, "[redacted]"),
+    message.replace(/\s+/g, " ").trim(),
+  ).replaceAll("`", "'");
+  const characters = Array.from(line);
+  if (characters.length === 0) return "Queued.";
+  const excerpt = characters.slice(0, EXCERPT_LENGTH).join("");
+  return `Queued: \`${characters.length > EXCERPT_LENGTH ? `${excerpt}…` : excerpt}\``;
 };
 
 /**
@@ -58,6 +71,8 @@ export const settleAcknowledgeOnlyRun = Effect.fn("AcknowledgeOnly.settleRun")(f
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly message: Pick<OrchestrationV2ConversationMessage, "text">;
   readonly nextTurnItemOrdinal: number;
+  /** Handoffs addressed to this run; no provider reads them, so they are superseded. */
+  readonly handoffs: ReadonlyArray<OrchestrationV2ContextHandoff>;
 }) {
   const { run, attempt, rootNode, providerThread } = input;
   const now = yield* DateTime.now;
@@ -126,6 +141,14 @@ export const settleAcknowledgeOnlyRun = Effect.fn("AcknowledgeOnly.settleRun")(f
     { type: "node.updated", nodeId, payload: assistantNode },
     { type: "message.updated", nodeId, payload: message },
     { type: "turn-item.updated", nodeId, payload: turnItem },
+    ...input.handoffs.map(
+      (handoff) =>
+        ({
+          type: "context-handoff.updated",
+          nodeId: rootNode.id,
+          payload: { ...handoff, status: "superseded", updatedAt: now },
+        }) as const,
+    ),
     { type: "run-attempt.updated", nodeId: rootNode.id, payload: { ...attempt, ...completed } },
     { type: "run.updated", nodeId: rootNode.id, payload: { ...run, ...completed } },
     { type: "node.updated", nodeId: rootNode.id, payload: { ...rootNode, ...completed } },

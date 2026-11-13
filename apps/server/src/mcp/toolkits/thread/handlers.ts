@@ -30,6 +30,7 @@ import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { freezeThread, unfreezeThread } from "../../threadFreeze.ts";
+import type * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import { ThreadToolkit } from "./tools.ts";
 
 const isApprovalKind = Schema.is(ProviderRequestKind);
@@ -106,19 +107,34 @@ const required = <A>(value: A | undefined, name: string) =>
         }),
       )
     : Effect.succeed(value);
-const readThreadConfiguration = Effect.fn("mcp.readThreadConfiguration")(function* (
-  threadId: ThreadId | undefined,
+// Who answers a thread's messages is environment policy, so it needs full access both ways.
+const configureAcknowledgeOnly = Effect.fn("mcp.configureAcknowledgeOnly")(function* (
+  threads: ThreadManagementService.ThreadManagementService["Service"],
+  thread: Pick<
+    OrchestrationV2ThreadProjection["thread"],
+    "id" | "modelSelection" | "runtimeMode" | "interactionMode"
+  >,
+  input: {
+    readonly acknowledgeOnly?: boolean | undefined;
+    readonly modelSelection?: unknown;
+    readonly runtimeMode?: unknown;
+  },
 ) {
-  const {
-    threads,
-    projection: { thread },
-  } = yield* readThread(threadId);
+  yield* McpToolAccess.requireFullAccess("change who answers a thread");
+  if (input.modelSelection !== undefined || input.runtimeMode !== undefined) {
+    return yield* new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message: "Set acknowledgeOnly separately from modelSelection and runtimeMode.",
+    });
+  }
+  const acknowledgeOnly = yield* required(input.acknowledgeOnly, "acknowledgeOnly");
+  yield* threads.setAcknowledgeOnly(thread.id, acknowledgeOnly).pipe(Effect.mapError(unavailable));
   return {
     threadId: thread.id,
     modelSelection: thread.modelSelection,
     runtimeMode: thread.runtimeMode,
     interactionMode: thread.interactionMode,
-    acknowledgeOnly: yield* threads.acknowledgeOnly(thread.id).pipe(Effect.mapError(unavailable)),
+    acknowledgeOnly,
   };
 });
 const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A, E, R>(
@@ -243,75 +259,66 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       input.modelSelection === undefined &&
       input.runtimeMode === undefined &&
       input.acknowledgeOnly === undefined,
-    McpToolAccess.reads((input) => readThreadConfiguration(input.threadId)),
-    McpToolAccess.either(
-      (input) => input.acknowledgeOnly !== undefined,
-      // Who answers the thread's messages is environment policy, so it needs full access.
-      McpToolAccess.writesEnvironment((input) =>
-        Effect.gen(function* () {
-          const acknowledgeOnly = yield* required(input.acknowledgeOnly, "acknowledgeOnly");
-          if (input.modelSelection !== undefined || input.runtimeMode !== undefined) {
+    McpToolAccess.reads((input) =>
+      Effect.gen(function* () {
+        const {
+          threads,
+          projection: { thread },
+        } = yield* readThread(input.threadId);
+        return {
+          threadId: thread.id,
+          modelSelection: thread.modelSelection,
+          runtimeMode: thread.runtimeMode,
+          interactionMode: thread.interactionMode,
+          acknowledgeOnly: yield* threads
+            .acknowledgeOnly(thread.id)
+            .pipe(Effect.mapError(unavailable)),
+        };
+      }),
+    ),
+    writesThread((input) =>
+      Effect.gen(function* () {
+        const {
+          threads,
+          projection: { thread },
+        } = yield* readThread(input.threadId);
+        if (input.acknowledgeOnly !== undefined) {
+          return yield* configureAcknowledgeOnly(threads, thread, input);
+        }
+        if (input.runtimeMode !== undefined) {
+          if (input.modelSelection !== undefined) {
             return yield* new OrchestratorMcpFailure({
               code: "invalid_request",
-              message: "Set acknowledgeOnly separately from modelSelection and runtimeMode.",
+              message: "Set runtimeMode separately from modelSelection.",
             });
           }
-          const {
-            threads,
-            projection: { thread },
-          } = yield* readThread(input.threadId);
-          yield* threads
-            .setAcknowledgeOnly(thread.id, acknowledgeOnly)
-            .pipe(Effect.mapError(unavailable));
-          return yield* readThreadConfiguration(thread.id);
-        }),
-      ),
-      writesThread((input) =>
-        Effect.gen(function* () {
-          const {
-            threads,
-            projection: { thread },
-          } = yield* readThread(input.threadId);
-          if (input.runtimeMode !== undefined) {
-            if (input.modelSelection !== undefined) {
-              return yield* new OrchestratorMcpFailure({
-                code: "invalid_request",
-                message: "Set runtimeMode separately from modelSelection.",
-              });
-            }
-            const scope = yield* McpInvocationContext.McpInvocationContext;
-            const actor =
-              scope.thread !== undefined
-                ? `MCP thread ${scope.thread.threadId}`
-                : scope.client !== undefined
-                  ? `MCP client "${scope.client.label}" (${scope.client.sessionId.slice(0, 8)})`
-                  : "MCP caller";
-            const result = yield* threads
-              .dispatch({
-                type: "thread.runtime-mode.set",
-                threadId: thread.id,
-                commandId: yield* newCommandId(),
-                runtimeMode: input.runtimeMode,
-              })
-              .pipe(
-                Effect.provideService(RuntimeModeChangeActor, actor),
-                Effect.mapError(dispatchFailure),
-              );
-            return { sequence: result.sequence };
-          }
-          const modelSelection = yield* required(input.modelSelection, "modelSelection");
-          const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
+          const scope = yield* McpInvocationContext.McpInvocationContext;
+          const actor =
+            scope.thread !== undefined
+              ? `MCP thread ${scope.thread.threadId}`
+              : scope.client !== undefined
+                ? `MCP client "${scope.client.label}" (${scope.client.sessionId.slice(0, 8)})`
+                : "MCP caller";
           const result = yield* threads
             .dispatch({
-              type,
+              type: "thread.runtime-mode.set",
               threadId: thread.id,
               commandId: yield* newCommandId(),
-              modelSelection,
+              runtimeMode: input.runtimeMode,
             })
-            .pipe(Effect.mapError(dispatchFailure));
+            .pipe(
+              Effect.provideService(RuntimeModeChangeActor, actor),
+              Effect.mapError(dispatchFailure),
+            );
           return { sequence: result.sequence };
-        }),
-      ),
+        }
+        const modelSelection = yield* required(input.modelSelection, "modelSelection");
+        const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
+        const result = yield* threads
+          .dispatch({ type, threadId: thread.id, commandId: yield* newCommandId(), modelSelection })
+          .pipe(Effect.mapError(dispatchFailure));
+        return { sequence: result.sequence };
+      }),
     ),
   ),
   t3_pending_request: McpToolAccess.either(

@@ -1632,6 +1632,8 @@ const make = Effect.gen(function* () {
     if (failures[0] !== undefined) return yield* failures[0];
   });
 
+  // Fork: toggles read and rewrite one settings list; one at a time so none is lost.
+  const acknowledgeOnlyLock = yield* Semaphore.make(1);
   return ThreadManagementService.of({
     acknowledgeOnly: Effect.fn("ThreadManagementService.acknowledgeOnly")(function* (threadId) {
       return AcknowledgeOnly.isAcknowledgeOnlyThread(yield* serverSettings.getSettings, threadId);
@@ -1640,6 +1642,7 @@ const make = Effect.gen(function* () {
       function* (threadId, enabled) {
         yield* AcknowledgeOnly.setAcknowledgeOnly(threadId, enabled).pipe(
           Effect.provideService(ServerSettings.ServerSettingsService, serverSettings),
+          acknowledgeOnlyLock.withPermits(1),
         );
       },
     ),

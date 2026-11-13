@@ -38,7 +38,8 @@ const otherInbox = ThreadId.make("thread:another-inbox");
 
 const messages = [
   "First request for Jarvis",
-  "Second request",
+  // Sender text becomes agent output: no rendered image or link, no token.
+  "See ![chart](https://example.com/x.png) and `code`, key ghp_abcdef0123456789 here",
   `Third request\nwith a second line and ${"padding ".repeat(20)}to pass the excerpt limit`,
 ];
 
@@ -209,13 +210,17 @@ it.effect("an acknowledge-only thread answers queued messages in order without a
             .at(-1)?.text,
         }));
         assert.deepEqual(replies, [
-          { request: messages[0], reply: "Queued for Jarvis: First request for Jarvis" },
-          { request: messages[1], reply: "Queued for Jarvis: Second request" },
+          { request: messages[0], reply: "Queued: `First request for Jarvis`" },
+          {
+            request: messages[1],
+            reply:
+              "Queued: `See ![chart](https://example.com/x.png) and 'code', key [redacted] here`",
+          },
           {
             request: messages[2],
-            reply: `Queued for Jarvis: ${Array.from(messages[2]!.replace(/\s+/g, " "))
+            reply: `Queued: \`${Array.from(messages[2]!.replace(/\s+/g, " "))
               .slice(0, 120)
-              .join("")}…`,
+              .join("")}…\``,
           },
         ]);
         // Completions arrive in send order, each the event that wakes an inbox subscription.

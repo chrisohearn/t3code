@@ -467,6 +467,7 @@ export const layer: Layer.Layer<
           rootNode,
           providerThread,
           message,
+          handoffs: handoffs.filter((handoff) => handoff.targetRunId === run.id),
           nextTurnItemOrdinal:
             Math.max(
               0,
