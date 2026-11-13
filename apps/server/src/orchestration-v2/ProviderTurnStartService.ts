@@ -30,13 +30,15 @@ import {
   CLAUDE_PROVIDER,
   CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL,
 } from "./Adapters/ClaudeAdapterV2.ts";
-import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import { withTurnStartReservation, withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
+import * as AcknowledgeOnly from "./AcknowledgeOnly.ts";
 import * as ProviderFailover from "./ProviderFailover.ts";
+import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
+import { makeRestoreMissingWorktree } from "../workspace/restoreMissingWorktree.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
@@ -77,28 +79,6 @@ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStart
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
-
-class WorktreeRecreateError extends Schema.TaggedError<WorktreeRecreateError>()(
-  "WorktreeRecreateError",
-  {
-    worktreePath: Schema.String,
-    branch: Schema.String,
-    cause: Schema.Defect(),
-  },
-) {
-  override get message(): string {
-    return `Could not recreate the worktree for branch '${this.branch}' at ${this.worktreePath}.`;
-  }
-}
-
-class WorktreeRecreateNoBaseError extends Schema.TaggedError<WorktreeRecreateNoBaseError>()(
-  "WorktreeRecreateNoBaseError",
-  { worktreePath: Schema.String, branch: Schema.String },
-) {
-  override get message(): string {
-    return `Could not recreate branch '${this.branch}' at ${this.worktreePath}: the project workspace has no commit to start it from.`;
-  }
-}
 
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 const isProviderAdapterProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
@@ -179,85 +159,23 @@ export const layer: Layer.Layer<
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    const restoreMissingWorktree = yield* makeRestoreMissingWorktree;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
-    const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
+    const providerCooldown = yield* ProviderCooldown.ProviderCooldown;
     const resolveFailoverTarget = (
       input: Parameters<typeof ProviderFailover.resolveProviderFailoverTarget>[0],
     ) =>
       ProviderFailover.resolveProviderFailoverTarget(input).pipe(
         Effect.provideService(ServerSettings.ServerSettingsService, serverSettings),
+        Effect.provideService(ProviderCooldown.ProviderCooldown, providerCooldown),
       );
-
-    const resolveRecreateBase = Effect.fn("ProviderTurnStartService.resolveRecreateBase")(
-      function* (cwd: string) {
-        // Recovery can follow an external checkout, before the status cache expires.
-        yield* gitWorkflow.invalidateLocalStatus(cwd);
-        const { refName: currentBranch } = yield* gitWorkflow.localStatus({ cwd });
-        if (currentBranch !== null) {
-          const refName = `refs/heads/${currentBranch}`;
-          return { refName, baseRefName: refName };
-        }
-        if (yield* gitWorkflow.hasCommit({ cwd, refName: "refs/remotes/origin/HEAD" })) {
-          const { commitSha } = yield* gitWorkflow.resolveRemoteTrackingCommit({
-            cwd,
-            refName: "HEAD",
-            fallbackRemoteName: "origin",
-          });
-          // Start from the commit so the thread branch does not track the default branch.
-          return { refName: commitSha, baseRefName: "refs/remotes/origin/HEAD" };
-        }
-        if (yield* gitWorkflow.hasCommit({ cwd, refName: "HEAD" })) {
-          return { refName: "HEAD", baseRefName: undefined };
-        }
-        return null;
-      },
-    );
-
-    const recreateMissingWorktree = Effect.fn("ProviderTurnStartService.recreateMissingWorktree")(
-      function* (input: {
-        readonly cwd: string;
-        readonly worktreePath: string;
-        readonly branch: string;
-      }) {
-        const { cwd, worktreePath, branch } = input;
-        yield* gitWorkflow.pruneWorktrees({ cwd });
-        const localBranchNames = yield* gitWorkflow.listLocalBranchNames(cwd);
-        if (localBranchNames.includes(branch)) {
-          yield* gitWorkflow.createWorktree({ cwd, refName: branch, path: worktreePath });
-          return;
-        }
-        // Push keeps the tracking ref current, so recovery reads it without fetching.
-        const pushedRef = `refs/remotes/origin/${branch}`;
-        if (yield* gitWorkflow.hasCommit({ cwd, refName: pushedRef })) {
-          yield* gitWorkflow.createWorktree({
-            cwd,
-            refName: pushedRef,
-            newRefName: branch,
-            path: worktreePath,
-          });
-          return;
-        }
-        const base = yield* resolveRecreateBase(cwd);
-        if (base === null) {
-          return yield* new WorktreeRecreateNoBaseError({ worktreePath, branch });
-        }
-        yield* gitWorkflow.createWorktree({
-          cwd,
-          refName: base.refName,
-          newRefName: branch,
-          ...(base.baseRefName === undefined ? {} : { baseRefName: base.baseRefName }),
-          path: worktreePath,
-        });
-      },
-    );
 
     // Build draining callbacks outside startup scope so they cannot retain full thread history.
     const makeRunControls = (input: {
@@ -452,6 +370,26 @@ export const layer: Layer.Layer<
         return yield* new ProviderTurnStartError({
           runId,
           cause: `Run ${runId} is missing its execution projection state.`,
+        });
+      }
+      const settings = yield* serverSettings.getSettings.pipe(
+        Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
+      );
+      if (AcknowledgeOnly.isAcknowledgeOnlyThread(settings, projection.thread.id)) {
+        return yield* AcknowledgeOnly.settleAcknowledgeOnlyRun({
+          eventSink,
+          idAllocator,
+          run,
+          attempt,
+          rootNode,
+          providerThread,
+          message,
+          handoffs: handoffs.filter((handoff) => handoff.targetRunId === run.id),
+          nextTurnItemOrdinal:
+            Math.max(
+              0,
+              ...projection.turnItems.filter((item) => item.runId === runId).map((i) => i.ordinal),
+            ) + 1,
         });
       }
       const settleRunBeforeStart = Effect.fn("orchestrationV2.providerTurnStart.settleBeforeStart")(
@@ -658,47 +596,16 @@ export const layer: Layer.Layer<
           return;
         }
       }
-      const { worktreePath, branch } = projection.thread;
-      if (worktreePath !== null && branch !== null) {
-        const exists = yield* fileSystem
-          .exists(worktreePath)
-          .pipe(Effect.orElseSucceed(() => true));
-        if (!exists && (yield* isManagedWorktreePath(worktreePath))) {
-          const project = yield* projects.getById(projection.thread.projectId).pipe(
-            Effect.map(Option.getOrUndefined),
-            Effect.orElseSucceed(() => undefined),
-          );
-          if (project !== undefined) {
-            yield* Effect.logWarning("provider turn start recreating missing worktree", {
-              threadId: projection.thread.id,
-              worktreePath,
-              branch,
-            });
-            const recreateResult = yield* Effect.result(
-              recreateMissingWorktree({
-                cwd: project.workspaceRoot,
-                worktreePath,
-                branch,
-              }).pipe(
-                Effect.mapError((cause) =>
-                  cause._tag === "WorktreeRecreateNoBaseError"
-                    ? cause
-                    : new WorktreeRecreateError({ worktreePath, branch, cause }),
-                ),
-              ),
-            );
-            if (recreateResult._tag === "Failure") {
-              if (input.willRetry === true) return yield* recreateResult.failure;
-              yield* settleStartFailure({
-                signal: "worktree-recreate-failure",
-                title: "Couldn't recreate thread workspace",
-                error: recreateResult.failure,
-                message: recreateResult.failure.message,
-              });
-              return;
-            }
-          }
-        }
+      const recreateResult = yield* Effect.result(restoreMissingWorktree(projection.thread));
+      if (recreateResult._tag === "Failure") {
+        if (input.willRetry === true) return yield* recreateResult.failure;
+        yield* settleStartFailure({
+          signal: "worktree-recreate-failure",
+          title: "Couldn't recreate thread workspace",
+          error: recreateResult.failure,
+          message: recreateResult.failure.message,
+        });
+        return;
       }
       const selectInheritedBackgroundItems = (
         current: ProjectionStore.ProjectionRuntimeRecoveryState,
@@ -901,8 +808,7 @@ export const layer: Layer.Layer<
       const goalDriver =
         session.driver === "codex" ||
         session.driver === "claudeAgent" ||
-        (session.driver === "opencode" &&
-          session.providerSession.capabilities.turns.supportsNativeGoals === true);
+        session.providerSession.capabilities.turns.supportsNativeGoals === true;
       const goalCommand = goalDriver && parseGoalCommand(message) !== null;
       // The provider turn marks cancellation work delivered; restart continuations use their own text or resume natively.
       const noteContinuation = isRestartNoteContinuation(
@@ -1135,7 +1041,10 @@ export const layer: Layer.Layer<
           });
           const createdAt = yield* DateTime.now;
           // Runs before a fresh-context run never reach a provider again.
-          const boundary = ContextHandoffService.contextBoundaryOrdinal(projection.runs);
+          const boundary = ContextHandoffService.contextBoundaryOrdinal(
+            projection.runs,
+            projection.turnItems,
+          );
           const items = (yield* projectionStore.getTurnStartHistory(input.threadId)).filter(
             (item) =>
               item.runId === null
@@ -1149,7 +1058,10 @@ export const layer: Layer.Layer<
                       source.ordinal < run.ordinal,
                   ),
           );
-          const standingRunId = ContextHandoffService.firstConversationRunId(projection.runs);
+          const standingRunId = ContextHandoffService.firstConversationRunId(
+            projection.runs,
+            projection.turnItems,
+          );
           const standingRun =
             standingRunId === run.id || standingRunId === run.failoverOfRunId
               ? undefined
@@ -1814,12 +1726,11 @@ export const layer: Layer.Layer<
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
+          const text = goalCommand ? userText : withInlineContext(context, userText);
           yield* start({
             ...(noteContinuation ? promptedInput : turnInput),
-            message: {
-              ...turnInput.message,
-              text: goalCommand ? userText : withInlineContext(context, userText),
-            },
+            message: { ...turnInput.message, text },
+            ...(text === userText ? {} : { inlineContextLength: text.length - userText.length }),
           }).pipe(
             // Clear pending handoff markers for refused prompts so the next turn retains the native session.
             Effect.tapError((error) =>
@@ -1947,9 +1858,21 @@ export const layer: Layer.Layer<
           // Storage cleanup removes worktrees under the same lease. Only startup
           // holds it; the provider turn runs after it is released.
           const { thread } = yield* projectionStore.getThreadRecords(input.threadId, []);
-          const providerTurn = yield* thread.worktreePath === null
+          const cwd =
+            thread.worktreePath ??
+            (yield* projects
+              .getById(thread.projectId, { includeDeleted: true })
+              .pipe(Effect.map((project) => Option.getOrUndefined(project)?.workspaceRoot)));
+          const providerTurn = yield* cwd === undefined
             ? start(input)
-            : withWorkspaceLease(path.resolve(thread.worktreePath), start(input));
+            : withTurnStartReservation(
+                fileSystem,
+                path,
+                path.resolve(cwd),
+                thread.worktreePath === null
+                  ? start(input)
+                  : withWorkspaceLease(path.resolve(thread.worktreePath), start(input)),
+              );
           if (providerTurn !== undefined) yield* providerTurn;
         },
         (effect, input) =>
@@ -1963,4 +1886,4 @@ export const layer: Layer.Layer<
       ),
     });
   }),
-);
+).pipe(Layer.provide(ProviderCooldown.layer));

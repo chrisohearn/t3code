@@ -36,7 +36,7 @@ import {
 import { secretRequestPageUrl } from "./secretRequest.ts";
 import { hasOnlyPairedSurrogates } from "./threadMetadataMcp.ts";
 import { ThreadFreeze } from "./threadFreeze.ts";
-import { ThreadTitleRegeneration } from "./threadTitle.ts";
+import { LastThreadTitleRegeneration, ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2SenderClient,
   OrchestrationV2Actor,
@@ -203,8 +203,9 @@ export type OrchestratorMcpDelegateTaskInput = typeof OrchestratorMcpDelegateTas
 
 // Set only on results for still-running tasks whose completion will wake the parent.
 export const ORCHESTRATOR_MCP_RUNNING_TASK_NEXT =
-  "Completion wakes this thread, so end your turn. Do not wait on it or poll it.";
-const OrchestratorMcpRunningTaskNext = Schema.Literal(ORCHESTRATOR_MCP_RUNNING_TASK_NEXT);
+  "Completion wakes this thread. Do not wait on it or poll it. Continue other work, and end your turn when none is left.";
+// A string, not a literal: linked environments on other versions send their own wording.
+const OrchestratorMcpRunningTaskNext = Schema.String;
 
 // Optional: linked environments on older versions omit it.
 const OrchestratorMcpExecutedModel = Schema.NullOr(Schema.String).annotate({
@@ -367,6 +368,17 @@ export const OrchestratorMcpThreadPullRequest = Schema.Struct({
 });
 export type OrchestratorMcpThreadPullRequest = typeof OrchestratorMcpThreadPullRequest.Type;
 
+/** Background work still open on the thread, as its provider reported it. */
+export const OrchestratorMcpThreadBackgroundTask = Schema.Struct({
+  taskId: TrimmedNonEmptyString,
+  kind: Schema.Literals(["subagent", "command", "monitor", "background_task"]),
+  description: Schema.optional(TrimmedNonEmptyString),
+  /** The agent waits on this command or monitor. Other kinds always hold the thread. */
+  awaited: Schema.optional(Schema.Literal(true)),
+  childThreadId: Schema.optional(ThreadId),
+});
+export type OrchestratorMcpThreadBackgroundTask = typeof OrchestratorMcpThreadBackgroundTask.Type;
+
 export const OrchestratorMcpThreadListItem = Schema.Struct({
   // Optional: a linked environment on an older build omits them.
   launchedBy: Schema.optional(Schema.NullOr(Schema.String)),
@@ -384,13 +396,18 @@ export const OrchestratorMcpThreadListItem = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   linkedPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
-  /** Linked pull requests not yet merged or closed; list_thread_pull_requests has all of them. */
+  /** Up to 5 open linked pull requests, watched first; list_thread_pull_requests pages all of them. */
   pullRequests: Schema.optional(Schema.Array(OrchestratorMcpThreadPullRequest)),
   pullRequestCount: Schema.optional(NonNegativeInt),
+  openPullRequestCount: Schema.optional(NonNegativeInt),
   settled: Schema.Boolean,
   settledAt: Schema.NullOr(IsoDateTime),
   snoozed: Schema.Boolean,
   snoozedUntil: Schema.NullOr(IsoDateTime),
+  /** Absent from linked environments that predate it. */
+  blockedOnThreadWait: Schema.optional(Schema.Boolean),
+  /** Absent from linked environments that predate it. */
+  pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestratorMcpThreadBackgroundTask)),
   parentThreadId: Schema.NullOr(ThreadId),
   relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
   itemCount: NonNegativeInt,
@@ -430,15 +447,12 @@ export const OrchestratorMcpThreadReadInput = Schema.Struct({
   itemId: Schema.optional(TurnItemId),
   textOffset: Schema.optional(NonNegativeInt),
   view: Schema.optional(Schema.Literals(["messages", "activity"])),
-  afterPosition: Schema.optional(NonNegativeInt),
-  limit: Schema.optional(clampedPositiveInt(100)).annotate({
-    description: "Max items, 1 to 100.",
-  }),
-  runLimit: Schema.optional(clampedPositiveInt(50)).annotate({
-    description: "Max recent runs, 1 to 50.",
-  }),
-  maxCharsPerItem: Schema.optional(clampedPositiveInt(50_000)).annotate({
-    description: "Max chars per item, 1 to 50000.",
+  afterPosition: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1))),
+  beforePosition: Schema.optional(NonNegativeInt),
+  limit: Schema.optional(clampedPositiveInt(100)).annotate({ description: "Max 100." }),
+  runLimit: Schema.optional(clampedPositiveInt(50)).annotate({ description: "Max 50." }),
+  maxCharsPerItem: Schema.optional(clampedPositiveInt(20_000)).annotate({
+    description: "Max 20000.",
   }),
 });
 export type OrchestratorMcpThreadReadInput = typeof OrchestratorMcpThreadReadInput.Type;
@@ -458,10 +472,12 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   linkedPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
-  /** Open linked pull requests, on the first page only; list_thread_pull_requests has all of them. */
+  /** Up to 5 open linked pull requests, watched first, on the first page only; list_thread_pull_requests pages all of them. */
   pullRequests: Schema.optional(Schema.Array(OrchestratorMcpThreadPullRequest)),
   pullRequestCount: Schema.optional(NonNegativeInt),
+  openPullRequestCount: Schema.optional(NonNegativeInt),
   titleRegeneration: Schema.NullOr(ThreadTitleRegeneration),
+  lastTitleRegeneration: Schema.optional(Schema.NullOr(LastThreadTitleRegeneration)),
   branch: Schema.NullOr(Schema.String),
   worktreePath: Schema.NullOr(Schema.String),
   parentThreadId: Schema.NullOr(ThreadId),
@@ -474,6 +490,10 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   settledAt: Schema.NullOr(IsoDateTime),
   snoozed: Schema.Boolean,
   snoozedUntil: Schema.NullOr(IsoDateTime),
+  /** Absent from linked environments that predate it. */
+  blockedOnThreadWait: Schema.optional(Schema.Boolean),
+  /** Absent from linked environments that predate it. */
+  pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestratorMcpThreadBackgroundTask)),
   /** Set while the thread is frozen. Omitted by an environment on an older build. */
   frozen: Schema.optional(Schema.NullOr(ThreadFreeze)),
   createdAt: IsoDateTime,
@@ -535,6 +555,8 @@ export const OrchestratorMcpThreadReadResult = Schema.Struct({
   items: Schema.Array(OrchestratorMcpThreadTimelineItem),
   nextPosition: Schema.NullOr(NonNegativeInt),
   hasMore: Schema.Boolean,
+  /** null when nothing is older than the page. Missing from peers that only read forward. */
+  earlierPosition: Schema.optional(Schema.NullOr(NonNegativeInt)),
 });
 export type OrchestratorMcpThreadReadResult = typeof OrchestratorMcpThreadReadResult.Type;
 
@@ -567,17 +589,31 @@ export const OrchestratorMcpThreadResult = Schema.Struct({
 });
 export type OrchestratorMcpThreadResult = typeof OrchestratorMcpThreadResult.Type;
 
+const RespectSnooze = Schema.optional(
+  Schema.Boolean.annotate({
+    description: "Default true: a snoozed thread waits. false wakes it.",
+  }),
+);
+
+/** Set when the target is snoozed, so a sender sees the hold instead of silently ending it. */
+const SnoozeNotice = {
+  snoozedUntil: Schema.optional(IsoDateTime),
+  warning: Schema.optional(Schema.String),
+};
+
 export const OrchestratorMcpThreadPostInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+  respectSnooze: Schema.optional(Schema.Boolean),
 });
 export type OrchestratorMcpThreadPostInput = typeof OrchestratorMcpThreadPostInput.Type;
 export const OrchestratorMcpThreadPostResult = Schema.Struct({
   threadId: ThreadId,
   link: Schema.String,
   messageId: MessageId,
+  ...SnoozeNotice,
 });
 export type OrchestratorMcpThreadPostResult = typeof OrchestratorMcpThreadPostResult.Type;
 
@@ -587,6 +623,7 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
   mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
+  respectSnooze: RespectSnooze,
   freshContext: Schema.optional(
     Schema.Boolean.annotate({
       description:
@@ -603,6 +640,16 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
 });
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;
 
+/** Set when a send queues: `position` 1 starts next. `held` waits for a resume. */
+export const OrchestratorMcpQueueStanding = Schema.Struct({
+  position: PositiveInt,
+  messagesAhead: NonNegativeInt,
+  activeRunId: Schema.NullOr(RunId),
+  activeRunAgeSeconds: Schema.NullOr(NonNegativeInt),
+  held: Schema.optional(Schema.Boolean),
+});
+export type OrchestratorMcpQueueStanding = typeof OrchestratorMcpQueueStanding.Type;
+
 export const OrchestratorMcpThreadSendResult = Schema.Struct({
   notify: Schema.optional(McpThreadNotifyResult),
   threadId: ThreadId,
@@ -616,6 +663,8 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   held: Schema.optional(Schema.Literal(true)),
   /** Set when a freeze holds the send. */
   frozen: Schema.optional(Schema.Literal(true)),
+  queue: Schema.optional(OrchestratorMcpQueueStanding),
+  ...SnoozeNotice,
 });
 export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendResult.Type;
 
@@ -820,6 +869,22 @@ export const OrchestratorMcpScheduledTask = Schema.Struct({
   blockedByPolicy: Schema.optional(Schema.String).annotate({
     description: "Present when an administrator's policy stops this task from running.",
   }),
+  recentFailures: Schema.optional(
+    Schema.Struct({
+      failed: NonNegativeInt,
+      cancelled: NonNegativeInt,
+      lastAt: IsoDateTime,
+      lastStatus: Schema.Literals(["failed", "cancelled"]),
+      lastError: Schema.NullOr(Schema.String),
+    }),
+  ),
+  missedRun: Schema.optional(
+    Schema.Struct({
+      dueAt: IsoDateTime,
+      overdueMs: NonNegativeInt,
+      reason: Schema.Literals(["not_dispatched", "run_in_progress"]),
+    }),
+  ),
 });
 export type OrchestratorMcpScheduledTask = typeof OrchestratorMcpScheduledTask.Type;
 

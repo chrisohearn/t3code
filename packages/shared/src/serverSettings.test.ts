@@ -59,24 +59,25 @@ describe("fallbackTextGenerationModelSelection", () => {
     ).toEqual({ instanceId: "opencode", model: "opencode/big-pickle" });
   });
 
-  it("replaces and clears the fallback without carrying model options", () => {
-    const fallbackModelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "new" };
-    const settings = applyServerSettingsPatch(
-      {
-        ...DEFAULT_SERVER_SETTINGS,
-        fallbackModelSelection: {
-          ...fallbackModelSelection,
-          model: "old",
-          options: [{ id: "effort", value: "high" }],
+  it.each(["fallbackModelSelection", "secondaryFallbackModelSelection"] as const)(
+    "replaces and clears %s without carrying model options",
+    (key) => {
+      const fallbackModelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "new" };
+      const settings = applyServerSettingsPatch(
+        {
+          ...DEFAULT_SERVER_SETTINGS,
+          [key]: {
+            ...fallbackModelSelection,
+            model: "old",
+            options: [{ id: "effort", value: "high" }],
+          },
         },
-      },
-      { fallbackModelSelection },
-    );
-    expect(settings.fallbackModelSelection).toEqual(fallbackModelSelection);
-    expect(
-      applyServerSettingsPatch(settings, { fallbackModelSelection: null }).fallbackModelSelection,
-    ).toBeNull();
-  });
+        { [key]: fallbackModelSelection },
+      );
+      expect(settings[key]).toEqual(fallbackModelSelection);
+      expect(applyServerSettingsPatch(settings, { [key]: null })[key]).toBeNull();
+    },
+  );
   it("falls back to a configured non-default instance", () => {
     const configured = ProviderInstanceId.make("codex_work");
     const providerInstances = {
@@ -375,6 +376,23 @@ describe("serverSettings helpers", () => {
       settings.textGenerationModelSelection,
     );
     expect(settings.sourceControlWriterModelSelection).toBe(sourceControlWriterModelSelection);
+  });
+
+  it("falls back from a removed instance whose id matches an inherited object key", () => {
+    for (const id of ["constructor", "toString", "valueOf"]) {
+      const speechPostProcessingModelSelection = createModelSelection(
+        ProviderInstanceId.make(id),
+        "gpt-5.4-mini",
+      );
+      const settings = { ...DEFAULT_SERVER_SETTINGS, speechPostProcessingModelSelection };
+
+      expect(isModelSelectionProviderEnabled(settings, speechPostProcessingModelSelection)).toBe(
+        false,
+      );
+      expect(resolveSpeechPostProcessingModelSelection(settings)).toBe(
+        settings.textGenerationModelSelection,
+      );
+    }
   });
 
   it("falls back from a writer provider that cannot generate application text", () => {

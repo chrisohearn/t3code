@@ -1,9 +1,14 @@
 import { assert, describe, it } from "@effect/vitest";
+import {
+  DATABASE_MIGRATIONS_STARTED_MESSAGE,
+  isRunningDatabaseMigrations,
+} from "@t3tools/shared/databaseMigrationLog";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -87,18 +92,41 @@ describe("fork migrations", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("record in their own table on a new database", () =>
-    Effect.gen(function* () {
-      yield* runMigrations({ toMigrationInclusive: migrationManifest.at(-1)![0] });
-      assert.isTrue(yield* hasPendingMigrations());
-      yield* runMigrations();
-      assert.isFalse(yield* hasPendingMigrations());
-      assert.deepStrictEqual(yield* upstreamHistory, migrationManifest);
-      assert.deepStrictEqual(
-        (yield* forkHistory).map(([id, name]) => [id, name] as const),
-        forkMigrationManifest,
-      );
-    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  it.effect.each(["pending migrations", "legacy history repair"] as const)(
+    "record in their own table and finish %s",
+    (pendingWork) => {
+      const messages: unknown[] = [];
+      const logger = Logger.make(({ message }) => messages.push(message));
+
+      return Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const latestUpstreamId = migrationManifest.at(-1)![0];
+        yield* runMigrations({ toMigrationInclusive: latestUpstreamId });
+        if (pendingWork === "legacy history repair") {
+          yield* runMigrations();
+          yield* sql`
+            INSERT INTO effect_sql_migrations (migration_id, name)
+            VALUES (${latestUpstreamId + 1}, ${forkMigrationManifest[0]![1]})
+          `;
+        }
+        assert.isTrue(yield* hasPendingMigrations());
+        assert.deepStrictEqual(
+          yield* runMigrations().pipe(
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          ),
+          [],
+        );
+        const output = messages.map(String).join("\n");
+        assert.include(output, DATABASE_MIGRATIONS_STARTED_MESSAGE);
+        assert.isFalse(isRunningDatabaseMigrations(output), output);
+        assert.isFalse(yield* hasPendingMigrations());
+        assert.deepStrictEqual(yield* upstreamHistory, migrationManifest);
+        assert.deepStrictEqual(
+          (yield* forkHistory).map(([id, name]) => [id, name] as const),
+          forkMigrationManifest,
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" })));
+    },
   );
 
   it.effect("move off upstream ids so upstream's migrations there run, once", () =>

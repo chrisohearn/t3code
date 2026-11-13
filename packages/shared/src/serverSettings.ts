@@ -51,7 +51,9 @@ export function isModelSelectionProviderEnabled(
 ): boolean {
   const generator = textGeneratorForSelection(settings, selection.instanceId);
   if (generator !== undefined) return generator.enabled;
-  const instanceConfig = settings.providerInstances[selection.instanceId];
+  const instanceConfig = Object.hasOwn(settings.providerInstances, selection.instanceId)
+    ? settings.providerInstances[selection.instanceId]
+    : undefined;
   if (instanceConfig !== undefined) {
     return resolveProviderInstanceEnabled(instanceConfig);
   }
@@ -603,6 +605,9 @@ export function applyServerSettingsPatch(
       : {}),
     ...(patch.fallbackModelSelection !== undefined
       ? { fallbackModelSelection: patch.fallbackModelSelection }
+      : {}),
+    ...(patch.secondaryFallbackModelSelection !== undefined
+      ? { secondaryFallbackModelSelection: patch.secondaryFallbackModelSelection }
       : {}),
     ...(patch.speechPostProcessingModelSelection !== undefined
       ? { speechPostProcessingModelSelection: patch.speechPostProcessingModelSelection }

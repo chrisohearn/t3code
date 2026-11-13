@@ -15,12 +15,14 @@ import {
   dedupeSubagentBodies,
   dedupeTurnItemBodies,
 } from "@t3tools/shared/orchestrationV2DedupedBodies";
+import { MCP_APP_OUTPUT_KEY, readMcpAppReference } from "@t3tools/shared/mcpApp";
 import {
   compactDynamicToolOutput,
   omitToolOutputImageData,
   toolOutputImages,
   toolOutputIndicatesFailure,
 } from "@t3tools/shared/toolOutput";
+import { settleItemForEndedRun } from "./RunItemSettlement.ts";
 
 // A checkpoint over vendored or generated trees can list 15k+ files; the card needs a prefix.
 const MAX_WIRE_CHECKPOINT_FILES = 200;
@@ -228,7 +230,7 @@ function boundDynamicValue(value: unknown): unknown {
 }
 
 /** Preserve ordered image markers in truncated output so clients can load images by index. */
-function boundToolOutput(output: unknown): unknown {
+function boundToolResult(output: unknown): unknown {
   const omitted = omitToolOutputImageData(output);
   const bounded = boundDynamicValue(omitted);
   if (typeof bounded !== "string" || typeof omitted === "string") return bounded;
@@ -239,6 +241,21 @@ function boundToolOutput(output: unknown): unknown {
         { type: "text", text: bounded },
         ...images.map((image) => ({ type: "image", mimeType: image.mimeType })),
       ];
+}
+
+function boundToolOutput(output: unknown): unknown {
+  if (typeof output !== "object" || output === null || !("result" in output)) {
+    return boundToolResult(output);
+  }
+  const app =
+    MCP_APP_OUTPUT_KEY in output ? readMcpAppReference(output[MCP_APP_OUTPUT_KEY]) : undefined;
+  if (app === undefined) return boundToolResult(output);
+  // The app receives this result, so its image data stays unless it is too large to send.
+  const fits = boundDynamicValue(output.result) === output.result;
+  return {
+    [MCP_APP_OUTPUT_KEY]: app,
+    result: fits ? output.result : boundToolResult(output.result),
+  };
 }
 
 export function projectTurnItemForDetail(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
@@ -294,11 +311,16 @@ export function projectThreadProjectionForWire(
   projection: OrchestrationV2ThreadProjection,
 ): OrchestrationV2ThreadProjection {
   const projectedById = new Map<string, OrchestrationV2TurnItem>();
+  const runStatuses = new Map(projection.runs.map((run) => [run.id, run.status]));
   const project = (item: OrchestrationV2TurnItem) => {
     const key = `${item.threadId}:${item.id}`;
     const existing = projectedById.get(key);
     if (existing !== undefined) return existing;
-    const projected = projectTurnItemForWire(item);
+    const runStatus = item.runId === null ? undefined : runStatuses.get(item.runId);
+    // Items stored before runs settled their own items still read as running.
+    const projected = projectTurnItemForWire(
+      runStatus === undefined ? item : settleItemForEndedRun(item, runStatus),
+    );
     projectedById.set(key, projected);
     return projected;
   };

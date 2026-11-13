@@ -23,6 +23,7 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as AcknowledgeOnly from "./AcknowledgeOnly.ts";
 import { restartContinuationRun } from "./RestartContinuation.ts";
 import { isBufferedProviderNotification } from "./NotificationMailbox.ts";
 import { queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
@@ -421,12 +422,19 @@ export const make = Effect.gen(function* () {
         ...retryableRuns,
         ...queuedRunsInDeliveryOrder({ runs: queuedRuns, messages: queuedMessages }),
       ];
+      // Fork: acknowledge-only runs have no provider work to protect, so their queue keeps moving.
+      const holdQueue = !AcknowledgeOnly.isAcknowledgeOnlyThread(
+        yield* settings.getSettings.pipe(
+          Effect.orElseSucceed(() => ({ acknowledgeOnlyThreadIds: [] })),
+        ),
+        projection.thread.id,
+      );
       for (const [index, run] of heldRuns.entries()) {
         if (bufferedMessageIds.has(run.userMessageId)) {
           runs.push(run);
           continue;
         }
-        if (run.queueHeld === true && retryableRuns.length === 0) continue;
+        if (run.queueHeld === true && holdQueue && retryableRuns.length === 0) continue;
         events.push({
           id: yield* allocateEventId(),
           type: "run.updated",
@@ -437,7 +445,7 @@ export const make = Effect.gen(function* () {
           payload: {
             ...run,
             status: "queued",
-            queueHeld: true,
+            queueHeld: holdQueue,
             ...(retryableRuns.length === 0 ? {} : { queuePosition: index + 1 }),
           },
         });

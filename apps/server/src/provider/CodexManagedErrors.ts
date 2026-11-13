@@ -122,13 +122,13 @@ export function classifyCodexManagedError(value: unknown) {
       return {
         ...failure,
         message:
-          "Codex sent a tool namespace that ChatGPT sharing does not support. Use another provider for this request.",
+          "ChatGPT sharing does not support tool namespaces. Remove namespaced tools from this thread or use another provider.",
       };
     if (text.includes("additional_tools"))
       return {
         ...failure,
         message:
-          "Codex sent an input item that ChatGPT sharing does not support. Use another provider for this request.",
+          "ChatGPT sharing does not support the additional_tools input item. Remove additional tools from this thread or use another provider.",
       };
   }
   return failure;
