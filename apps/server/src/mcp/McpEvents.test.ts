@@ -1106,7 +1106,10 @@ it("says why a cancelled run stopped, so a restart cancel does not read as a fai
     contextHandoffId: null,
   };
   const observe = (
-    payload: typeof run & { readonly stop?: { reason: string; actor: { kind: string } } },
+    payload: Omit<typeof run, "status"> & {
+      readonly status: "cancelled" | "rolled_back";
+      readonly stop?: { reason: string; actor: { kind: string } };
+    },
   ) =>
     McpEvents.observeEvent(
       {
@@ -1128,6 +1131,13 @@ it("says why a cancelled run stopped, so a restart cancel does not read as a fai
     observe({ ...run, stop: { reason: "server_shutdown", actor: { kind: "server" } } }),
   ).toMatchObject({ state: "cancelled", stopReason: "server_shutdown" });
   expect(observe(run)).not.toHaveProperty("stopReason");
+  expect(
+    observe({
+      ...run,
+      status: "rolled_back",
+      stop: { reason: "server_shutdown", actor: { kind: "server" } },
+    }),
+  ).not.toHaveProperty("stopReason");
 });
 
 it.effect(

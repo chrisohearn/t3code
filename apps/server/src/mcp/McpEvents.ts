@@ -96,7 +96,10 @@ export const observeEvent = (
         return;
       name = state === "failed" ? "thread.blocker" : "thread.run.result";
       resourceId = event.payload.id;
-      if (event.type === "run.updated") stopReason = event.payload.stop?.reason;
+      // A rolled-back run can still carry an earlier cancel's stop.
+      if (event.type === "run.updated" && (state === "cancelled" || state === "interrupted")) {
+        stopReason = event.payload.stop?.reason;
+      }
       break;
     case "runtime-request.updated":
       if (event.payload.status !== "pending") return;

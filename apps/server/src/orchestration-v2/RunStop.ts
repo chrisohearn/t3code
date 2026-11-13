@@ -30,7 +30,6 @@ const REVIVED: ReadonlySet<OrchestrationV2Run["status"]> = new Set([
   "preparing",
   "starting",
 ]);
-const STOP_COMMANDS = new Set(["thread.stop", "run.interrupt", "subagent.stop"]);
 const SUPERSEDED_COMMAND_ID = /^(command:system:stale-question:|server:delegated-task-question)/;
 
 export function runStopReason(context: RunStopContext): OrchestrationV2RunStopReason {
@@ -114,7 +113,8 @@ export const makeRunStopStamper = <E, R>(
     events: ReadonlyArray<OrchestrationV2DomainEvent>,
     context: RunStopContext,
   ) {
-    if (STOP_COMMANDS.has(context.commandType ?? "")) {
+    // Any command can ask for an interrupt: a Stop, or a message or steer that replaces the turn.
+    if (context.commandType !== undefined) {
       for (const event of events) {
         if (event.type === "turn-item.updated" && event.payload.type === "run_interrupt_request") {
           if (event.payload.runId !== null) {
@@ -199,6 +199,10 @@ export function runStopLabel(input: {
   readonly continuedAs: Pick<OrchestrationV2Run, "id" | "ordinal"> | undefined;
 }): string {
   const { stop, continuedAs } = input;
+  // A continuation that failed before its prompt was taken is retried as another run.
+  if (input.status === "failed" && continuedAs !== undefined) {
+    return `failed to start; retried as run ${continuedAs.ordinal}`;
+  }
   // A finished or waiting run a restart continued lost only background work it left running.
   const reason =
     input.status !== undefined && !STOPPED.has(input.status)
@@ -221,13 +225,21 @@ export function runStopLabel(input: {
 }
 
 /**
- * Runs a restart can continue: cancelled ones, and finished ones whose background work it cut.
- * Reads look for a continuation only for these, so every read reports the same thing.
+ * Runs a restart can continue: cancelled ones, finished ones whose background work it cut, and a
+ * continuation that failed before its prompt was taken (retried). Reads look for a continuation
+ * only for these, so every read reports the same thing.
  */
 export function mayHaveRestartContinuation(
-  run: Pick<OrchestrationV2Run, "status" | "restartCancelledBackgroundWork">,
+  run: Pick<
+    OrchestrationV2Run,
+    "status" | "restartCancelledBackgroundWork" | "restartContinuationOfRunId"
+  >,
 ): boolean {
-  return run.status === "cancelled" || (run.restartCancelledBackgroundWork?.length ?? 0) > 0;
+  return (
+    run.status === "cancelled" ||
+    (run.status === "failed" && run.restartContinuationOfRunId !== undefined) ||
+    (run.restartCancelledBackgroundWork?.length ?? 0) > 0
+  );
 }
 
 /** Shown on a cancelled or interrupted run, or one a restart continued. */

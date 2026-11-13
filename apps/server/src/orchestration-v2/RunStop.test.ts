@@ -149,6 +149,17 @@ it.effect(
       });
       assert.deepEqual(stopOf(rewritten), [ownerStop]);
 
+      // A message that replaces the running turn asks for the interrupt; its reason is held too.
+      const replaced = run(5);
+      stored.set(replaced.id, replaced);
+      yield* stamp([interruptRequest(replaced.id)], { commandType: "message.dispatch" }).pipe(
+        Effect.provideService(CommandActor, owner),
+      );
+      assert.deepEqual(
+        stopOf(yield* stamp([runUpdated({ ...replaced, status: "interrupted" })], {})),
+        [{ ...ownerStop, reason: "replaced", commandType: "message.dispatch" }],
+      );
+
       // An interrupt no Stop asked for, written outside any command, is the provider's.
       const dropped = run(4);
       stored.set(dropped.id, dropped);
@@ -213,4 +224,12 @@ it("labels a restart cancel with the run that continued it", () => {
   );
   const { restartCancelledBackgroundWork: _work, ...plain } = finished;
   assert.isUndefined(runStopDetail(plain, [plain, resumed]));
+
+  // A continuation that failed before its prompt was taken reads as retried.
+  const failedStart = run(82, { status: "failed", restartContinuationOfRunId: finished.id });
+  const retry = run(83, { restartContinuationOfRunId: failedStart.id });
+  assert.equal(
+    runStopDetail(failedStart, [failedStart, retry])?.label,
+    "failed to start; retried as run 83",
+  );
 });
