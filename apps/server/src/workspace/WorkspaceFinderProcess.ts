@@ -14,6 +14,7 @@ type FinderMethod =
   | "isScanning"
   | "mixedSearch"
   | "scanFiles"
+  | "scanFilesAsync"
   | "waitForIndexReady";
 
 export interface ProcessFinder {

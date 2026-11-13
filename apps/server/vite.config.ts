@@ -99,10 +99,6 @@ export default mergeConfig(
       },
     },
     pack: {
-      // SEA cannot load file-backed ESM imports; retain Undici as a runtime CJS external.
-      ...(packExecutable
-        ? { alias: { undici: NodeURL.fileURLToPath(import.meta.resolve("./src/seaUndici.cjs")) } }
-        : {}),
       // SEA embeds one entry; expose the history worker as a hidden subcommand.
       entry: packBootstrap
         ? ["src/bin.ts"]
@@ -130,6 +126,13 @@ export default mergeConfig(
             },
           }
         : {}),
+      // jsonc-parser's UMD main requires its own files at runtime, which the bundle cannot follow.
+      alias: {
+        "jsonc-parser": "jsonc-parser/lib/esm/main.js",
+        ...(packExecutable
+          ? { undici: NodeURL.fileURLToPath(import.meta.resolve("./src/seaUndici.cjs")) }
+          : {}),
+      },
       deps: {
         // alwaysBundle=false has no opinion; neverBundle must retain transitive native acceleration.
         alwaysBundle: (id: string) =>
