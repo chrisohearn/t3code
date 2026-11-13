@@ -2455,7 +2455,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 ...storedQueuedRun,
                 bypassProviderCooldown:
                   storedQueuedRun.bypassProviderCooldown === true ||
-                  projection.thread.bypassProviderCooldown === true,
+                  projection.thread.bypassProviderCooldown === true ||
+                  (projection.thread.scheduledModelSelection != null &&
+                    modelSelectionsEqual(
+                      requestedSelection,
+                      projection.thread.scheduledModelSelection.modelSelection,
+                    )),
               },
               message: queuedMessage,
             });
@@ -7468,41 +7473,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: projection.thread,
       });
     }
-    const bypassProviderCooldown =
-      command.modelSelection !== undefined || projection.thread.bypassProviderCooldown === true;
-    if (
-      command.failoverOfRunId === undefined &&
-      command.restartContinuationOfRunId === undefined &&
-      (dispatchMode.type === "start_immediately" || dispatchMode.type === "queue_after_active")
-    ) {
-      modelSelection = yield* ProviderFailover.resolveProviderCooldownTarget({
-        cooldown: providerCooldown,
-        settings: serverSettings,
-        projectId: projection.thread.projectId,
-        modelSelection,
-        run: { bypassProviderCooldown },
-        message: { ...command, role: "user" },
-      });
-    }
-    if (
-      projection.thread.bypassProviderCooldown === true &&
-      (dispatchMode.type === "start_immediately" ||
-        dispatchMode.type === "queue_after_active" ||
-        dispatchMode.type === "defer_start")
-    ) {
-      const now = yield* DateTime.now;
-      const event = yield* emit(
-        events,
-        command,
-      )({
-        type: "thread.metadata-updated",
-        threadId: command.threadId,
-        providerInstanceId: projection.thread.providerInstanceId,
-        occurredAt: now,
-        payload: { ...projection.thread, bypassProviderCooldown: false, updatedAt: now },
-      });
-      projection = applyToProjection(projection, event);
-    }
     if (
       freshContext &&
       (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active")
@@ -7847,6 +7817,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       !isBufferedProviderNotification(incomingMessage)
     ) {
       modelSelection = queueTailModelSelection(projection);
+    }
+    const bypassProviderCooldown =
+      (command.modelSelection !== undefined &&
+        !modelSelectionsEqual(command.modelSelection, projection.thread.modelSelection)) ||
+      projection.thread.bypassProviderCooldown === true ||
+      (projection.thread.scheduledModelSelection != null &&
+        modelSelectionsEqual(
+          modelSelection,
+          projection.thread.scheduledModelSelection.modelSelection,
+        ));
+    if (
+      command.failoverOfRunId === undefined &&
+      command.restartContinuationOfRunId === undefined &&
+      startsOrQueuesRun
+    ) {
+      modelSelection = yield* ProviderFailover.resolveProviderCooldownTarget({
+        cooldown: providerCooldown,
+        settings: serverSettings,
+        projectId: projection.thread.projectId,
+        modelSelection,
+        run: { bypassProviderCooldown },
+        message: { ...command, role: "user" },
+      });
+    }
+    if (projection.thread.bypassProviderCooldown === true && startsOrQueuesRun) {
+      const now = yield* DateTime.now;
+      const event = yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.metadata-updated",
+        threadId: command.threadId,
+        providerInstanceId: projection.thread.providerInstanceId,
+        occurredAt: now,
+        payload: { ...projection.thread, bypassProviderCooldown: false, updatedAt: now },
+      });
+      projection = applyToProjection(projection, event);
     }
     yield* ensureGoalCommandSupported(command, command, modelSelection.instanceId);
     // Client messages resume held queues; server continuations and scheduled tasks do not.
