@@ -16,6 +16,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
+  PlanId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -2133,11 +2134,11 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           type: "compaction",
           driver: null,
         };
-        const reasoning: OrchestrationV2TurnItem = {
-          ...itemBase("reasoning", 2),
-          type: "reasoning",
-          text: "thinking",
-          streaming: true,
+        const todo: OrchestrationV2TurnItem = {
+          ...itemBase("todo", 2),
+          type: "todo_list",
+          planId: PlanId.make(`plan:run-end-items:${endStatus}`),
+          steps: [],
         };
         const background: OrchestrationV2TurnItem = {
           ...itemBase("background", 3),
@@ -2173,10 +2174,10 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             itemEvent(background),
           ],
         });
-        // The reasoning item arrives in the same batch that ends the run.
+        // The todo list arrives in the same batch that ends the run.
         yield* eventSink.write({
           events: [
-            itemEvent(reasoning),
+            itemEvent(todo),
             {
               id: EventId.make(`event:run-end-items:${endStatus}:ended`),
               type: "run.updated",
@@ -2193,7 +2194,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           turnItems.find((candidate) => candidate.id === item.id)?.status;
         const expected = endStatus === "failed" ? "cancelled" : endStatus;
         assert.equal(statusOf(compaction), expected);
-        assert.equal(statusOf(reasoning), expected);
+        assert.equal(statusOf(todo), expected);
         assert.equal(statusOf(background), "running");
       }).pipe(Effect.provide(Layer.fresh(layerTest))),
   );

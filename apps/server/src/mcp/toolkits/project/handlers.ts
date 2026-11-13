@@ -11,6 +11,7 @@ import { mutateProjectWithClone } from "../../../project/ProjectMutation.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as Repositories from "../../../sourceControl/SourceControlRepositoryService.ts";
 
+import { temporaryFolderWarning } from "../../../project/temporaryFolder.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { newCommandId, readCaller, unavailable } from "../../threadAccess.ts";
 import { ProjectToolkit } from "./tools.ts";
@@ -104,9 +105,11 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           };
         }
         const commandId = yield* newCommandId();
-        return yield* projects
+        const created = yield* projects
           .create({ ...input, workspaceRoot, commandId, projectId: ProjectId.make(commandId) })
           .pipe(Effect.mapError(projectFailure));
+        const warning = temporaryFolderWarning(workspaceRoot);
+        return warning === undefined ? created : { ...created, warning };
       }),
     // Linked work may bring the repository it works in; an existing
     // registered workspace is still refused.

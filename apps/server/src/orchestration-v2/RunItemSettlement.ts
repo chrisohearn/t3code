@@ -4,7 +4,7 @@ import type { OrchestrationV2Run, OrchestrationV2TurnItem } from "@t3tools/contr
  * Items that cannot outlive their run. Shell, tool and subagent items can be background work,
  * so a run ending does not close them.
  */
-export const RUN_BOUND_ITEM_TYPES = ["todo_list", "compaction", "reasoning"] as const;
+export const RUN_BOUND_ITEM_TYPES = ["todo_list", "compaction"] as const;
 
 const ACTIVE_ITEM_STATUSES: ReadonlySet<string> = new Set(["pending", "running", "waiting"]);
 
@@ -37,6 +37,5 @@ export function settleItemForEndedRun(
 ): OrchestrationV2TurnItem {
   const status = itemStatusForEndedRun(runStatus);
   if (status === null || !isActiveRunBoundItem(item)) return item;
-  const settled = { ...item, status, completedAt: item.completedAt ?? item.updatedAt };
-  return settled.type === "reasoning" ? { ...settled, streaming: false } : settled;
+  return { ...item, status, completedAt: item.completedAt ?? item.updatedAt };
 }

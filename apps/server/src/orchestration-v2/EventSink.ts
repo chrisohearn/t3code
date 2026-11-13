@@ -433,7 +433,7 @@ const layerBase: Layer.Layer<
       );
     };
 
-    // A todo list, compaction or reasoning item never outlives its run, but providers rarely close
+    // A todo list or compaction item never outlives its run, but providers rarely close
     // them. Close what is still active here, in the transaction that ends the run.
     // The enclosing write span already traces this per-batch step.
     const closeEndedRunItems = Effect.fnUntraced(function* (
