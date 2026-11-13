@@ -1,4 +1,5 @@
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { CLOUD_CLI_DESIRED_LINK_SECRET } from "../cloud/CliState.ts";
 import { CLOUD_LINK_REVOKED, CLOUD_LINKED_USER_ID, RELAY_URL_SECRET } from "../cloud/config.ts";
 import * as ConnectReachability from "../cloud/ConnectReachability.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
@@ -212,20 +213,24 @@ const make = Effect.gen(function* () {
   const reachability = yield* ConnectReachability.ConnectReachability;
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const serviceStartedAt = yield* Clock.currentTimeMillis;
-  // A restart stores the tunnel config only after the relay provisions the tunnel again,
-  // seconds after startup. Until then a check reads not_linked although the server is
-  // linked, so not_linked releases the hold only when no cloud link is stored either.
-  const cloudLinked = Effect.all(
+  // A CLI managed link stores its tunnel config again seconds after a restart, so a
+  // not_linked check holds only for that link; other links never lose the config.
+  const managedTunnelPending = Effect.all(
     [
       secrets.get(CLOUD_LINKED_USER_ID),
       secrets.get(RELAY_URL_SECRET),
       secrets.get(CLOUD_LINK_REVOKED),
+      secrets.get(CLOUD_CLI_DESIRED_LINK_SECRET),
     ],
     { concurrency: "unbounded" },
   ).pipe(
     Effect.map(
-      ([user, relay, revoked]) =>
-        Option.isSome(user) && Option.isSome(relay) && Option.isNone(revoked),
+      ([user, relay, revoked, desired]) =>
+        Option.isSome(user) &&
+        Option.isSome(relay) &&
+        Option.isNone(revoked) &&
+        Option.isSome(desired) &&
+        new TextDecoder().decode(desired.value) !== "publish_only",
     ),
     Effect.orElseSucceed(() => false),
   );
@@ -240,7 +245,7 @@ const make = Effect.gen(function* () {
         if (status?.status === "reachable") return true;
         const checked = yield* reachability.check;
         if (checked.status === "reachable") return true;
-        return checked.cause === "not_linked" && !(yield* cloudLinked);
+        return checked.cause === "not_linked" && !(yield* managedTunnelPending);
       }).pipe(
         Effect.repeat({ schedule: Schedule.spaced("5 seconds"), until: (ready) => ready }),
         Effect.timeoutOption(remaining),
