@@ -558,6 +558,7 @@ it("readThread keeps an activity page within an MCP client's output limit and pa
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadEventSequence: () => Effect.succeed(1),
           getTimelinePage: (_threadId, options) => {
             const after =
               options.itemId === undefined
