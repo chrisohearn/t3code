@@ -21,6 +21,7 @@ import {
   toolOutputImages,
   toolOutputIndicatesFailure,
 } from "@t3tools/shared/toolOutput";
+import { settleItemForEndedRun } from "./RunItemSettlement.ts";
 
 // A checkpoint over vendored or generated trees can list 15k+ files; the card needs a prefix.
 const MAX_WIRE_CHECKPOINT_FILES = 200;
@@ -294,11 +295,16 @@ export function projectThreadProjectionForWire(
   projection: OrchestrationV2ThreadProjection,
 ): OrchestrationV2ThreadProjection {
   const projectedById = new Map<string, OrchestrationV2TurnItem>();
+  const runStatuses = new Map(projection.runs.map((run) => [run.id, run.status]));
   const project = (item: OrchestrationV2TurnItem) => {
     const key = `${item.threadId}:${item.id}`;
     const existing = projectedById.get(key);
     if (existing !== undefined) return existing;
-    const projected = projectTurnItemForWire(item);
+    const runStatus = item.runId === null ? undefined : runStatuses.get(item.runId);
+    // Items stored before runs settled their own items still read as running.
+    const projected = projectTurnItemForWire(
+      runStatus === undefined ? item : settleItemForEndedRun(item, runStatus),
+    );
     projectedById.set(key, projected);
     return projected;
   };

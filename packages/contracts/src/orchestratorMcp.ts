@@ -35,6 +35,7 @@ import {
 } from "./threadPullRequest.ts";
 import { secretRequestPageUrl } from "./secretRequest.ts";
 import { hasOnlyPairedSurrogates } from "./threadMetadataMcp.ts";
+import { ThreadFreeze } from "./threadFreeze.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2SenderClient,
@@ -473,6 +474,8 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   settledAt: Schema.NullOr(IsoDateTime),
   snoozed: Schema.Boolean,
   snoozedUntil: Schema.NullOr(IsoDateTime),
+  /** Set while the thread is frozen. Omitted by an environment on an older build. */
+  frozen: Schema.optional(Schema.NullOr(ThreadFreeze)),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -610,6 +613,10 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   taskId: Schema.optional(NodeId),
   status: OrchestrationV2RunStatus,
   delivery: Schema.Literals(["started", "queued", "steered", "restarted"]),
+  /** Set when the queued message is held: it starts only after the thread is unfrozen or resumed. */
+  held: Schema.optional(Schema.Literal(true)),
+  /** Set when a freeze holds the send. */
+  frozen: Schema.optional(Schema.Literal(true)),
 });
 export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendResult.Type;
 
@@ -814,6 +821,22 @@ export const OrchestratorMcpScheduledTask = Schema.Struct({
   blockedByPolicy: Schema.optional(Schema.String).annotate({
     description: "Present when an administrator's policy stops this task from running.",
   }),
+  recentFailures: Schema.optional(
+    Schema.Struct({
+      failed: NonNegativeInt,
+      cancelled: NonNegativeInt,
+      lastAt: IsoDateTime,
+      lastStatus: Schema.Literals(["failed", "cancelled"]),
+      lastError: Schema.NullOr(Schema.String),
+    }),
+  ),
+  missedRun: Schema.optional(
+    Schema.Struct({
+      dueAt: IsoDateTime,
+      overdueMs: NonNegativeInt,
+      reason: Schema.Literals(["not_dispatched", "run_in_progress"]),
+    }),
+  ),
 });
 export type OrchestratorMcpScheduledTask = typeof OrchestratorMcpScheduledTask.Type;
 

@@ -12,7 +12,7 @@ import McpEvents from "./ForkMigrations/001_McpEvents.ts";
 import McpBridgeStatus from "./ForkMigrations/004_McpBridgeStatus.ts";
 import McpSubscriptionRenewal from "./ForkMigrations/006_McpSubscriptionRenewal.ts";
 import McpInboxRelay from "./ForkMigrations/009_McpInboxRelay.ts";
-import McpRelayDiagnostics from "./ForkMigrations/014_McpRelayDiagnostics.ts";
+import McpRelayDiagnostics from "./ForkMigrations/016_McpRelayDiagnostics.ts";
 import { hasPendingMigrations, migrationManifest, runMigrations } from "./Migrations.ts";
 
 // The last upstream id before fork builds started taking upstream's ids for fork migrations.

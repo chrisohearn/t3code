@@ -69,6 +69,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import type { ScheduledTaskReliability } from "../scheduledTasks/ScheduledTaskReliability.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
@@ -2846,6 +2847,7 @@ describe("OrchestratorMcpService provider resolution", () => {
       tasks: ReadonlyArray<ScheduledTask>,
       boundThread: OrchestrationV2ThreadShell | null,
       upserted: Ref.Ref<number>,
+      reliability: ReadonlyArray<ScheduledTaskReliability> = [],
     ) =>
       layerOrchestratorService.pipe(
         Layer.provide(
@@ -2866,6 +2868,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             Layer.mock(RemoteDelegation.RemoteDelegation)({}),
             Layer.mock(ScheduledTaskService.ScheduledTaskService)({
               list: () => Effect.succeed({ tasks }),
+              reliability: () => Effect.succeed(reliability),
               upsert: () =>
                 Ref.update(upserted, (count) => count + 1).pipe(Effect.as({ task: tasks[0]! })),
             }),
@@ -2892,6 +2895,41 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.deepEqual(
           listed.tasks.map((summary) => summary.webhookUrl),
           [undefined, "https://t3.example/hooks/secret"],
+        );
+      }),
+    );
+
+    it.effect("adds recent failures and missed runs to the listed task they belong to", () =>
+      Effect.gen(function* () {
+        const upserted = yield* Ref.make(0);
+        const failing = task({ id: ScheduledTaskId.make("scheduled-task:failing") });
+        const quiet = task({ id: ScheduledTaskId.make("scheduled-task:quiet") });
+        const recentFailures = {
+          failed: 3,
+          cancelled: 6,
+          lastAt: "2026-11-12T07:11:28.827Z",
+          lastStatus: "failed" as const,
+          lastError: "Workspace preparation failed",
+        };
+        const missedRun = {
+          dueAt: "2026-11-12T01:00:00.000Z",
+          overdueMs: 7_200_000,
+          reason: "not_dispatched" as const,
+        };
+        const listed = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.flatMap((mcp) => mcp.listScheduledTasks(supervisedClient, { projectId })),
+          Effect.provide(
+            service([failing, quiet], null, upserted, [
+              { taskId: failing.id, recentFailures, missedRun },
+            ]),
+          ),
+        );
+        assert.deepEqual(
+          listed.tasks.map((summary) => [summary.recentFailures, summary.missedRun]),
+          [
+            [recentFailures, missedRun],
+            [undefined, undefined],
+          ],
         );
       }),
     );
@@ -2938,6 +2976,7 @@ describe("OrchestratorMcpService provider resolution", () => {
                   Layer.mock(RemoteDelegation.RemoteDelegation)({}),
                   Layer.mock(ScheduledTaskService.ScheduledTaskService)({
                     list: () => Effect.succeed({ tasks: [task({})] }),
+                    reliability: () => Effect.succeed([]),
                   }),
                 ),
               ),

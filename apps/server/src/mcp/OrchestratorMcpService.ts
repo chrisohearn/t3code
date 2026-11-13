@@ -917,6 +917,7 @@ function threadDetail(
     archived: projection.thread.archivedAt !== null,
     ...threadSettlement(projection.thread),
     ...threadSnooze(shell, nowMs),
+    frozen: projection.thread.frozen ?? null,
     createdAt: DateTime.formatIso(projection.thread.createdAt),
     updatedAt: DateTime.formatIso(projection.thread.updatedAt),
   };
@@ -2131,10 +2132,26 @@ const make = Effect.gen(function* () {
               failure("orchestration_error", `Could not list scheduled tasks: ${error.message}`),
             ),
           );
+        // History is extra: a failed read must not hide the tasks themselves.
+        const reliability = new Map(
+          (yield* scheduledTasks.reliability().pipe(Effect.orElseSucceed(() => []))).map(
+            (entry) => [entry.taskId, entry] as const,
+          ),
+        );
         return {
           tasks: yield* Effect.forEach(
             tasks.filter((task) => projectId === undefined || task.projectId === projectId),
-            (task) => summarizeScheduledTask(scope, { parent, limits }, task),
+            (task) =>
+              summarizeScheduledTask(scope, { parent, limits }, task).pipe(
+                Effect.map((summary) => {
+                  const { recentFailures, missedRun } = reliability.get(task.id) ?? {};
+                  return {
+                    ...summary,
+                    ...(recentFailures === undefined ? {} : { recentFailures }),
+                    ...(missedRun === undefined ? {} : { missedRun }),
+                  };
+                }),
+              ),
           ),
         };
       },
@@ -3485,6 +3502,8 @@ const make = Effect.gen(function* () {
         ...(result.run.delegatedTaskId === undefined ? {} : { taskId: result.run.delegatedTaskId }),
         status: result.run.status,
         delivery: result.delivery,
+        ...(result.run.queueHeld === true ? { held: true as const } : {}),
+        ...(target.thread.frozen == null ? {} : { frozen: true as const }),
       } satisfies OrchestratorMcpThreadSendResult;
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {

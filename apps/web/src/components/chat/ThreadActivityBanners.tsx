@@ -3,9 +3,11 @@ import type {
   OrchestrationV2PendingBackgroundTask,
   OrchestrationV2ProviderGoal,
   OrchestrationV2ProviderSession,
+  ThreadFreeze,
   ThreadId,
 } from "@t3tools/contracts";
 import type { EnvironmentThreadShell, ThreadStructure } from "@t3tools/client-runtime/state/shell";
+import { describeThreadFreeze } from "@t3tools/client-runtime/state/thread-workflows";
 import {
   presentPendingBackgroundWork,
   presentProviderGoal,
@@ -32,6 +34,16 @@ import { Button, InlineButton } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import type { ComposerBannerStackItem } from "./ComposerBannerStack";
 import type { ThreadNowItem } from "./ThreadNow";
+
+export function frozenBannerItem(freeze: ThreadFreeze): ComposerBannerStackItem {
+  return {
+    id: "thread-frozen",
+    variant: "warning",
+    icon: <CircleStopIcon />,
+    title: <output>{describeThreadFreeze(freeze)}</output>,
+    description: "Nothing runs until it is unfrozen. Sending a message here lifts the freeze.",
+  };
+}
 
 export function extensionStatusBannerItem(
   statuses: NonNullable<OrchestrationV2ProviderSession["extensionStatuses"]>,

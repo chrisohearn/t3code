@@ -5145,6 +5145,8 @@ it.effect.each(["missing", "file"] as const)(
         assert.instanceOf(error, ProviderWorkspaceMissingError);
         assert.include(error.message, cwd);
         assert.include(error.message, "Restore the folder at this path before retrying.");
+        // The fixture lives in the system temp folder, which a reboot clears.
+        assert.include(error.message, "under a temporary folder");
         assert.equal((yield* Ref.get(state)).openCount, 0);
         assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));
         assert.deepEqual(
