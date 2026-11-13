@@ -30,12 +30,13 @@ import {
   CLAUDE_PROVIDER,
   CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL,
 } from "./Adapters/ClaudeAdapterV2.ts";
-import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import { withTurnStartReservation, withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as AcknowledgeOnly from "./AcknowledgeOnly.ts";
 import * as ProviderFailover from "./ProviderFailover.ts";
+import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeRestoreMissingWorktree } from "../workspace/restoreMissingWorktree.ts";
 import * as EventSink from "./EventSink.ts";
@@ -165,7 +166,9 @@ export const layer: Layer.Layer<
     const turnAnalytics = yield* ProviderUsageAnalytics.ProviderTurnAnalytics;
     const contextHandoffService = yield* ContextHandoffService.ContextHandoffServiceV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
+    const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
@@ -175,11 +178,13 @@ export const layer: Layer.Layer<
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const threadRoles = yield* ThreadRoles.ThreadRoles;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
+    const providerCooldown = yield* ProviderCooldown.ProviderCooldown;
     const resolveFailoverTarget = (
       input: Parameters<typeof ProviderFailover.resolveProviderFailoverTarget>[0],
     ) =>
       ProviderFailover.resolveProviderFailoverTarget(input).pipe(
         Effect.provideService(ServerSettings.ServerSettingsService, serverSettings),
+        Effect.provideService(ProviderCooldown.ProviderCooldown, providerCooldown),
       );
 
     // Build draining callbacks outside startup scope so they cannot retain full thread history.
@@ -1057,7 +1062,10 @@ export const layer: Layer.Layer<
           });
           const createdAt = yield* DateTime.now;
           // Runs before a fresh-context run never reach a provider again.
-          const boundary = ContextHandoffService.contextBoundaryOrdinal(projection.runs);
+          const boundary = ContextHandoffService.contextBoundaryOrdinal(
+            projection.runs,
+            projection.turnItems,
+          );
           const items = (yield* projectionStore.getTurnStartHistory(input.threadId)).filter(
             (item) =>
               item.runId === null
@@ -1071,7 +1079,10 @@ export const layer: Layer.Layer<
                       source.ordinal < run.ordinal,
                   ),
           );
-          const standingRunId = ContextHandoffService.firstConversationRunId(projection.runs);
+          const standingRunId = ContextHandoffService.firstConversationRunId(
+            projection.runs,
+            projection.turnItems,
+          );
           const standingRun =
             standingRunId === run.id || standingRunId === run.failoverOfRunId
               ? undefined
@@ -1755,12 +1766,11 @@ export const layer: Layer.Layer<
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
+          const text = goalCommand ? userText : withInlineContext(context, userText);
           yield* start({
             ...(noteContinuation ? promptedInput : turnInput),
-            message: {
-              ...turnInput.message,
-              text: goalCommand ? userText : withInlineContext(context, userText),
-            },
+            message: { ...turnInput.message, text },
+            ...(text === userText ? {} : { inlineContextLength: text.length - userText.length }),
           }).pipe(
             // Clear pending handoff markers for refused prompts so the next turn retains the native session.
             Effect.tapError((error) =>
@@ -1901,9 +1911,21 @@ export const layer: Layer.Layer<
           // Storage cleanup removes worktrees under the same lease. Only startup
           // holds it; the provider turn runs after it is released.
           const { thread } = yield* projectionStore.getThreadRecords(input.threadId, []);
-          const providerTurn = yield* thread.worktreePath === null
+          const cwd =
+            thread.worktreePath ??
+            (yield* projects
+              .getById(thread.projectId, { includeDeleted: true })
+              .pipe(Effect.map((project) => Option.getOrUndefined(project)?.workspaceRoot)));
+          const providerTurn = yield* cwd === undefined
             ? start(input)
-            : withWorkspaceLease(path.resolve(thread.worktreePath), start(input));
+            : withTurnStartReservation(
+                fileSystem,
+                path,
+                path.resolve(cwd),
+                thread.worktreePath === null
+                  ? start(input)
+                  : withWorkspaceLease(path.resolve(thread.worktreePath), start(input)),
+              );
           if (providerTurn !== undefined) yield* providerTurn;
         },
         (effect, input) =>
@@ -1917,4 +1939,4 @@ export const layer: Layer.Layer<
       ),
     });
   }),
-);
+).pipe(Layer.provide(ProviderCooldown.layer));

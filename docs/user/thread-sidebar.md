@@ -13,10 +13,11 @@ Its branch and workspace mode come from your configured defaults. To continue in
 an existing worktree, use **New thread in this worktree** from the branch toolbar.
 
 On mobile, **New thread** starts in the current thread's project, or else in the
-last project you opened or chose on that device. If neither is available, the
-project picker opens. Turn off **Settings → General → Use last project** to
-choose a project every time. When you pick a project that is on more than one
-machine, the thread starts on a connected one if any is connected.
+project the thread list is filtered to, or else in the last project you opened
+or chose on that device. If none is available, the project picker opens. Turn
+off **Settings → General → Use last project** to choose a project every time.
+When you pick a project that is on more than one machine, the thread starts on
+a connected one if any is connected.
 
 When you change a new thread's project, T3 Code stays in the current environment
 if that project exists there. Otherwise it selects an environment that has it.
@@ -258,6 +259,20 @@ pick another model in the composer to switch back. It never happens after the
 agent replied, used a tool or changed a file, after you steered the turn or
 pressed Stop, or a second time for the same message. Otherwise the limit choices
 below apply.
+
+A model-specific limit can switch to a different fallback model on the same
+account. Account-wide limits need another instance. Administrators can optionally
+set `secondaryFallbackModelSelection` in `settings.json` (the same selection shape
+as `fallbackModelSelection`) for that case; it is server-wide, not project-specific,
+and unset by default. After an
+account limit with a known reset time, the running server routes new prompts to
+an available configured fallback until that reset, for at most six hours per
+failure. A successful turn or fresh usage check showing available account quota
+clears the cooldown early. Provider status shows the cooldown; **Refresh** in its
+status notice clears it manually. Explicitly selecting a model bypasses the
+cooldown for the next prompt, including a queued prompt. Restarting the server
+clears learned cooldowns; none of these actions changes the configured fallbacks.
+
 Press **Resume** in an empty composer to continue a limited or interrupted turn
 manually. Do this when the provider reports no reset time, because nothing
 continues the turn on its own.

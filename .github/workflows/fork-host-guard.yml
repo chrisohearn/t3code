@@ -1,0 +1,27 @@
+name: Fork host update guard
+
+# Runs the host update guard's tests (scripts/fork/host/t3-update-guard) when they change.
+on:
+  pull_request:
+    paths:
+      - "scripts/fork/host/t3-update-guard/**"
+      - ".github/workflows/fork-host-guard.yml"
+  push:
+    branches: [integration/mcp-events-20261109]
+    paths:
+      - "scripts/fork/host/t3-update-guard/**"
+
+permissions:
+  contents: read
+
+jobs:
+  guard-tests:
+    name: Update guard tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install sqlite3
+        run: command -v sqlite3 >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q sqlite3; }
+      - name: Run test-guard.sh
+        run: bash scripts/fork/host/t3-update-guard/test-guard.sh
