@@ -86,12 +86,10 @@ export const isTemporaryFolder = Effect.fn("isTemporaryFolder")(function* (
   const lexical = lexicalPath(path);
   if (PERSISTENT_MOUNTS.test(lexical)) return false;
   const byName = underTemporaryName(lexical);
-  const inspected = yield* Effect.tryPromise({
-    try: () => probe.inspect(lexical),
-    catch: (cause) => cause,
-  }).pipe(
+  // A probe that fails answers like one that times out: by name.
+  const inspected = yield* Effect.promise(() => probe.inspect(lexical).catch(() => undefined)).pipe(
     Effect.timeoutOption(PROBE_TIMEOUT),
-    Effect.orElseSucceed(() => Option.none()),
+    Effect.map(Option.flatMapNullishOr((value) => value)),
   );
   if (Option.isNone(inspected)) return byName;
   const { resolved, tmpfs } = inspected.value;
