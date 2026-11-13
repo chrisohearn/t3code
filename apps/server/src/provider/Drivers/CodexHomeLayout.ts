@@ -1,6 +1,8 @@
 import { ProviderDriverKind, type CodexSettings } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as PlatformError from "effect/PlatformError";
@@ -39,6 +41,19 @@ const REPLACEABLE_SHARED_RUNTIME_ENTRIES = new Set([
   "thread-writer-locks",
   ".sqlite-maintenance.lock",
 ]);
+
+// Windows SQLite names -wal/-shm beside a symlinked database rather than its target,
+// which gave each shadow home a private WAL for a shared database (#79).
+const SQLITE_SIDECAR_PATTERN = /^(.+\.sqlite)-(?:wal|shm|journal)$/;
+
+/** Points an auth overlay's SQLite databases at the shared home so they keep one WAL. */
+export function withCodexSqliteHome(
+  layout: CodexHomeLayout,
+  environment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  if (layout.mode !== "authOverlay" || environment.CODEX_SQLITE_HOME?.trim()) return environment;
+  return { ...environment, CODEX_SQLITE_HOME: layout.sharedHomePath };
+}
 
 function resolveHomePath(path: Path.Path, home: string, value: string | undefined): string {
   const expanded =
@@ -322,6 +337,97 @@ const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (inpu
   }
 });
 
+// Codex now opens its databases in the shared home, so sidecars of a shared database are
+// leftovers. Empty ones go; any holding WAL or journal data is moved aside, never deleted.
+const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqliteSidecars")(
+  function* (input: {
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly sharedHomePath: string;
+    readonly effectiveHomePath: string;
+  }): Effect.fn.Return<void, CodexShadowHomeError, Path.Path> {
+    const path = yield* Path.Path;
+    // A Codex process from before this fix may still hold the file open on Windows.
+    const warnUnsettled = (sidecarPath: string) => (cause: PlatformError.PlatformError) =>
+      Effect.logWarning("Could not settle a leftover SQLite file in a Codex shadow home.", {
+        path: sidecarPath,
+        cause,
+      });
+    const shadowEntryNames = yield* input.fileSystem.readDirectory(input.effectiveHomePath).pipe(
+      Effect.catchTags({
+        PlatformError: (cause) =>
+          new CodexShadowHomeFileSystemError({
+            sharedHomePath: input.sharedHomePath,
+            effectiveHomePath: input.effectiveHomePath,
+            operation: "readDirectory",
+            path: input.effectiveHomePath,
+            cause,
+          }),
+      }),
+    );
+    const sidecarsByDatabase = new Map<string, Array<string>>();
+    for (const entryName of shadowEntryNames) {
+      const database = SQLITE_SIDECAR_PATTERN.exec(entryName)?.[1];
+      if (database === undefined) continue;
+      sidecarsByDatabase.set(database, [...(sidecarsByDatabase.get(database) ?? []), entryName]);
+    }
+
+    for (const [database, sidecarNames] of sidecarsByDatabase) {
+      // A shadow's own database (say, from an older Codex) may be open; its sidecars are live.
+      const databasePath = path.join(input.effectiveHomePath, database);
+      const databaseState = yield* readLinkState({
+        ...input,
+        entryName: database,
+        linkPath: databasePath,
+      });
+      const sharesDatabase =
+        databaseState._tag === "Missing" ||
+        (databaseState._tag === "Symlink" &&
+          path.resolve(input.effectiveHomePath, databaseState.target) ===
+            path.join(input.sharedHomePath, database));
+      if (!sharesDatabase) {
+        yield* Effect.logWarning(
+          "Left SQLite files alone in a Codex shadow home because its database is not the shared one.",
+          { path: databasePath },
+        );
+        continue;
+      }
+      const regularSidecars: Array<{ readonly name: string; readonly size: bigint }> = [];
+      for (const entryName of sidecarNames) {
+        const sidecarPath = path.join(input.effectiveHomePath, entryName);
+        const state = yield* readLinkState({ ...input, entryName, linkPath: sidecarPath });
+        if (state._tag === "Symlink") {
+          yield* input.fileSystem
+            .remove(sidecarPath)
+            .pipe(Effect.catchTags({ PlatformError: warnUnsettled(sidecarPath) }));
+        } else if (state._tag === "NotSymlink") {
+          const info = yield* input.fileSystem.stat(sidecarPath).pipe(Effect.option);
+          if (Option.isSome(info)) regularSidecars.push({ name: entryName, size: info.value.size });
+        }
+      }
+      if (regularSidecars.length === 0) continue;
+
+      // -shm only indexes the WAL, so the group holds data only through -wal or -journal.
+      const holdsData = regularSidecars.some(
+        (sidecar) => !sidecar.name.endsWith("-shm") && sidecar.size > 0n,
+      );
+      const suffix = `.stale-${yield* Clock.currentTimeMillis}`;
+      for (const sidecar of regularSidecars) {
+        const sidecarPath = path.join(input.effectiveHomePath, sidecar.name);
+        const settle = holdsData
+          ? input.fileSystem.rename(sidecarPath, `${sidecarPath}${suffix}`)
+          : input.fileSystem.remove(sidecarPath);
+        yield* settle.pipe(Effect.catchTags({ PlatformError: warnUnsettled(sidecarPath) }));
+      }
+      if (holdsData) {
+        yield* Effect.logWarning(
+          "Moved SQLite WAL data left in a Codex shadow home aside; it was not applied to the shared database.",
+          { files: regularSidecars.map((sidecar) => `${sidecar.name}${suffix}`) },
+        );
+      }
+    }
+  },
+);
+
 const ensureShadowAuthIsPrivate = Effect.fn("CodexHomeLayout.ensureShadowAuthIsPrivate")(
   function* (input: {
     readonly fileSystem: FileSystem.FileSystem;
@@ -402,7 +508,11 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
   );
   const entries = new Set<string>(KNOWN_SHARED_DIRECTORIES);
   for (const entryName of sharedEntryNames) {
-    if (!PRIVATE_ENTRY_NAMES.has(entryName) && !SHADOW_LOCAL_ENTRY_NAMES.has(entryName)) {
+    if (
+      !PRIVATE_ENTRY_NAMES.has(entryName) &&
+      !SHADOW_LOCAL_ENTRY_NAMES.has(entryName) &&
+      !SQLITE_SIDECAR_PATTERN.test(entryName)
+    ) {
       entries.add(entryName);
     }
   }
@@ -420,6 +530,12 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
           }),
     { discard: true },
   );
+
+  yield* settleShadowSqliteSidecars({
+    fileSystem,
+    sharedHomePath: layout.sharedHomePath,
+    effectiveHomePath,
+  });
 
   yield* Effect.forEach(
     entries,
