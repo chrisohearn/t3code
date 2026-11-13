@@ -4,6 +4,7 @@ import * as Ledger from "../../../persistence/WorkLedger.ts";
 import * as Access from "../../McpToolAccess.ts";
 import { readCaller } from "../../threadAccess.ts";
 import { LedgerToolkit } from "./tools.ts";
+import { messageSenderFor } from "../../McpInvocationContext.ts";
 export const layer = Access.toLayer(LedgerToolkit, {
   ledger_upsert: Access.writes((input) =>
     Effect.gen(function* () {
@@ -14,7 +15,11 @@ export const layer = Access.toLayer(LedgerToolkit, {
           code: "capability_denied",
           message: "A caller identity is required.",
         });
-      return yield* (yield* Ledger.WorkLedger).upsert(input, updatedBy);
+      return yield* (yield* Ledger.WorkLedger).upsert(
+        input,
+        updatedBy,
+        messageSenderFor(scope).senderClient,
+      );
     }),
   ),
   ledger_history: Access.reads((input) =>

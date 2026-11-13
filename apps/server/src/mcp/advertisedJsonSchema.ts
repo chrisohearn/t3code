@@ -1,4 +1,5 @@
 import * as Predicate from "effect/Predicate";
+import type * as SchemaAST from "effect/SchemaAST";
 import { Tool } from "effect/ai";
 
 type Json = unknown;
@@ -67,7 +68,22 @@ const mergeTaggedObjects = (branches: ReadonlyArray<Json>): JsonObject | undefin
   return { type: "object", properties, required: [tag, ...requiredByAll] };
 };
 
-const compact = (schema: Json, optional: boolean): Json => {
+const sourceProperty = (
+  source: SchemaAST.AST | undefined,
+  name: string,
+): SchemaAST.AST | undefined => {
+  if (source?._tag === "Objects")
+    return source.propertySignatures.find((property) => property.name === name)?.type;
+  if (source?._tag === "Union")
+    return source.types
+      .map((type) => sourceProperty(type, name))
+      .find((type) => type !== undefined);
+  return undefined;
+};
+const explicitlyNullable = (source: SchemaAST.AST | undefined): boolean =>
+  source?._tag === "Null" || (source?._tag === "Union" && source.types.some(explicitlyNullable));
+
+const compact = (schema: Json, optional: boolean, source?: SchemaAST.AST): Json => {
   if (Array.isArray(schema)) return schema.map((item) => compact(item, false));
   if (!Predicate.isObject(schema)) return schema;
   const required = new Set(Array.isArray(schema.required) ? schema.required : []);
@@ -80,7 +96,7 @@ const compact = (schema: Json, optional: boolean): Json => {
         ? Object.fromEntries(
             Object.entries(value).map(([name, property]) => [
               name,
-              compact(property, !required.has(name)),
+              compact(property, !required.has(name), sourceProperty(source, name)),
             ]),
           )
         : compact(value, false);
@@ -88,19 +104,29 @@ const compact = (schema: Json, optional: boolean): Json => {
   if (Array.isArray(result.anyOf)) {
     const branches = result.anyOf
       .flatMap((branch) => (isBareAnyOf(branch) ? branch.anyOf : [branch]))
-      .filter((branch) => !(optional && isNullSchema(branch)) && !isJsonStringSchema(branch));
+      .filter(
+        (branch) =>
+          !(optional && isNullSchema(branch) && !explicitlyNullable(source)) &&
+          !isJsonStringSchema(branch),
+      );
+    const nonNull = branches.filter((branch) => !isNullSchema(branch));
+    const merged = mergeTaggedObjects(nonNull);
+    const distinct = [
+      ...(merged === undefined ? nonNull : [merged]),
+      ...(branches.some(isNullSchema) ? [{ type: "null" }] : []),
+    ];
     const { anyOf: _anyOf, ...rest } = result;
-    const only = branches.length === 1 ? branches[0] : mergeTaggedObjects(branches);
-    result = Predicate.isObject(only) ? { ...only, ...rest } : { ...rest, anyOf: branches };
+    const only = distinct.length === 1 ? distinct[0] : undefined;
+    result = Predicate.isObject(only) ? { ...only, ...rest } : { ...rest, anyOf: distinct };
   }
   return result;
 };
 
 /**
- * The input schema T3 advertises for a tool. Drops JSON noise that every thread pays for:
- * `additionalProperties: true`, safe-integer bounds, nested `anyOf`, JSON-string fallbacks, and
- * the `null` branch of optional properties. A tagged union of objects becomes one object.
- * Decoding still uses the full schema, so each tag's own required fields still apply.
+ * Compact advertised schemas keep explicit null clears, but omit synthesized optional nulls.
+ * Tagged object unions merge for display; decoding still enforces each tag's required fields.
  */
 export const advertisedJsonSchema = (tool: Tool.Any) =>
-  compact(Tool.getJsonSchema(tool), false) as ReturnType<typeof Tool.getJsonSchema>;
+  compact(Tool.getJsonSchema(tool), false, tool.parametersSchema.ast) as ReturnType<
+    typeof Tool.getJsonSchema
+  >;

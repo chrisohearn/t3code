@@ -14,6 +14,7 @@ import {
   type WorkLedgerQueryInput,
   type WorkLedgerQueryResult,
   OrchestratorMcpFailure,
+  OrchestrationV2SenderClient,
 } from "@t3tools/contracts";
 import { parseThreadLinkHref, formatThreadLink } from "@t3tools/shared/threadLinks";
 import * as Context from "effect/Context";
@@ -36,6 +37,7 @@ export class WorkLedger extends Context.Service<
     readonly upsert: (
       input: WorkLedgerUpsertInput,
       updatedBy: string,
+      updatedByClient?: OrchestrationV2SenderClient,
     ) => Effect.Effect<WorkLedgerUpsertResult, OrchestratorMcpFailure>;
     readonly history: (
       input: WorkLedgerHistoryInput,
@@ -56,11 +58,14 @@ const decode = Schema.decodeUnknownEffect(
       Struct.assign({
         links: Schema.fromJsonString(WorkLedgerItem.fields.links),
         approval: Schema.NullOr(approvalJson),
+        handoffArgs: Schema.NullOr(Schema.fromJsonString(Schema.Json)),
       }),
     ),
   ),
 );
 const encodeApproval = Schema.encodeEffect(approvalJson);
+const encodeEditor = Schema.encodeEffect(Schema.fromJsonString(OrchestrationV2SenderClient));
+const encodeHandoffArgs = Schema.encodeEffect(Schema.fromJsonString(Schema.Json));
 const decodeTurnItem = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2TurnItemJson),
 );
@@ -131,6 +136,7 @@ const ledgerRowHash = (row: WorkLedgerItem) =>
         row.blocker,
         row.approvalNote,
         row.links,
+        ...(row.handoffArgs == null ? [] : [row.handoffArgs]),
       ]),
     )
     .digest("hex");
@@ -139,6 +145,7 @@ const decodeHistory = Schema.decodeUnknownEffect(
     WorkLedgerHistoryEntry.mapFields(
       Struct.assign({
         changes: Schema.fromJsonString(WorkLedgerHistoryEntry.fields.changes),
+        changedByClient: Schema.NullOr(Schema.fromJsonString(OrchestrationV2SenderClient)),
       }),
     ),
   ),
@@ -156,7 +163,7 @@ const storage = () =>
   });
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const select = sql`SELECT work_key AS key, title, owner_kind AS "ownerKind", owner_name AS "ownerName", owner_thread_id AS "ownerThreadId", status, wait_reason AS "waitReason", next_check_at AS "nextCheckAt", last_run_id AS "lastRunId", last_run_status AS "lastRunStatus", last_run_at AS "lastRunAt", blocker, next_action AS "nextAction", approval_note AS "approvalNote", approval_json AS approval, links_json AS links, created_at AS "createdAt", updated_at AS "updatedAt", updated_by AS "updatedBy" FROM work_ledger`;
+  const select = sql`SELECT work_key AS key, title, owner_kind AS "ownerKind", owner_name AS "ownerName", owner_thread_id AS "ownerThreadId", status, wait_reason AS "waitReason", next_check_at AS "nextCheckAt", last_run_id AS "lastRunId", last_run_status AS "lastRunStatus", last_run_at AS "lastRunAt", blocker, next_action AS "nextAction", approval_note AS "approvalNote", approval_json AS approval, handoff_args_json AS "handoffArgs", links_json AS links, created_at AS "createdAt", updated_at AS "updatedAt", updated_by AS "updatedBy" FROM work_ledger`;
   const read = (key: string) =>
     sql`${select} WHERE work_key = ${key}`.pipe(
       Effect.flatMap(decode),
@@ -321,13 +328,13 @@ const make = Effect.gen(function* () {
         Effect.mapError(storage),
       ),
     ),
-    upsert: Effect.fn("WorkLedger.upsert")((input, updatedBy) =>
+    upsert: Effect.fn("WorkLedger.upsert")((input, updatedBy, updatedByClient) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
             const current = yield* read(input.key);
             const now = DateTime.formatIso(yield* DateTime.now);
-            const { approval: approvalInput, ...fieldsInput } = input;
+            const { approval: approvalInput, addLinks, removeLinks, ...fieldsInput } = input;
             const patch = Object.fromEntries(
               Object.entries(fieldsInput).filter(([, value]) => value !== undefined),
             );
@@ -343,6 +350,7 @@ const make = Effect.gen(function* () {
               nextAction: null,
               approvalNote: null,
               links: [],
+              handoffArgs: null,
               ...current,
               ...patch,
               approval: null,
@@ -360,6 +368,18 @@ const make = Effect.gen(function* () {
               candidate.nextCheckAt = DateTime.formatIso(parsed.value);
             }
             const warnings: string[] = [];
+            if (candidate.status === "blocked" && candidate.waitReason === null) {
+              candidate.waitReason = "decision";
+              warnings.push("Blocked work has no waitReason; defaulted to decision.");
+            }
+            if (
+              /^(BLOCKED_TECH|WAIT_DECISION)\b/i.test(candidate.blocker ?? "") &&
+              (candidate.waitReason === "external" || candidate.waitReason === "natural")
+            ) {
+              warnings.push(
+                `Blocker contradicts waitReason ${candidate.waitReason}; review the waiting reason.`,
+              );
+            }
             const threadIds = new Set<string>();
             if (candidate.ownerThreadId !== null) {
               const ref = parseThreadLinkHref(candidate.ownerThreadId);
@@ -372,14 +392,22 @@ const make = Effect.gen(function* () {
               if (ref !== null) candidate.ownerThreadId = ref.threadId;
               threadIds.add(candidate.ownerThreadId);
             }
-            candidate.links = candidate.links.map((link) => {
+            const normalizeLink = (link: string) => {
               const href = (link.match(/^\[[^\]]*\]\((.*)\)$/)?.[1] ?? link).replace(/^<|>$/g, "");
               const ref = parseThreadLinkHref(href);
               if (ref === null) return link;
+              return formatThreadLink(ref).slice(1, -1);
+            };
+            const removedLinks = new Set((removeLinks ?? []).map(normalizeLink));
+            candidate.links = [
+              ...new Set([...candidate.links, ...(addLinks ?? [])].map(normalizeLink)),
+            ].filter((link) => !removedLinks.has(link));
+            for (const link of candidate.links) {
+              const ref = parseThreadLinkHref(link);
+              if (ref === null) continue;
               if (ref.environmentId === null) threadIds.add(ref.threadId);
               else warnings.push(`Scoped thread ${ref.threadId} was not checked locally.`);
-              return formatThreadLink(ref).slice(1, -1);
-            });
+            }
             for (const threadId of threadIds) {
               const exists =
                 yield* sql`SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ${threadId} AND deleted_at IS NULL`;
@@ -420,7 +448,7 @@ const make = Effect.gen(function* () {
             else if (approval !== null && approval.rowHash !== ledgerRowHash(item))
               yield* retire(
                 approval,
-                "the row's title, next action, owner, blocker, links or approval note changed. Ask Chris again.",
+                "the row's title, next action, owner, blocker, links, handoff arguments or approval note changed. Ask Chris again.",
               );
             if (approvalInput !== undefined && approvalInput !== null) {
               if (finished)
@@ -443,6 +471,21 @@ const make = Effect.gen(function* () {
               approval === null
                 ? null
                 : yield* encodeApproval(approval).pipe(Effect.mapError(storage));
+            const changes = Object.fromEntries(
+              Object.entries({ ...item, approval })
+                .filter(
+                  ([field, value]) =>
+                    !["createdAt", "updatedAt", "updatedBy"].includes(field) &&
+                    JSON.stringify(current?.[field as keyof WorkLedgerItem] ?? null) !==
+                      JSON.stringify(value),
+                )
+                .map(([field, value]) => [
+                  field,
+                  { before: current?.[field as keyof WorkLedgerItem] ?? null, after: value },
+                ]),
+            );
+            if (current !== undefined && Object.keys(changes).length === 0)
+              return { ...current, warnings };
             const row = {
               work_key: item.key,
               title: item.title,
@@ -457,6 +500,8 @@ const make = Effect.gen(function* () {
               approval_note: item.approvalNote,
               approval_json: approvalJsonText,
               links_json: linksJson,
+              handoff_args_json:
+                item.handoffArgs == null ? null : yield* encodeHandoffArgs(item.handoffArgs),
               created_at: item.createdAt,
               updated_at: item.updatedAt,
               updated_by: item.updatedBy,
@@ -467,23 +512,13 @@ const make = Effect.gen(function* () {
               wait_reason=excluded.wait_reason, next_check_at=excluded.next_check_at,
               next_action=excluded.next_action, approval_note=excluded.approval_note,
               approval_json=excluded.approval_json, links_json=excluded.links_json,
+              handoff_args_json=excluded.handoff_args_json,
               updated_at=excluded.updated_at, updated_by=excluded.updated_by`;
-            const changes = Object.fromEntries(
-              Object.entries({ ...item, approval })
-                .filter(
-                  ([field, value]) =>
-                    !["createdAt", "updatedAt", "updatedBy"].includes(field) &&
-                    JSON.stringify(current?.[field as keyof WorkLedgerItem] ?? null) !==
-                      JSON.stringify(value),
-                )
-                .map(([field, value]) => [
-                  field,
-                  { before: current?.[field as keyof WorkLedgerItem] ?? null, after: value },
-                ]),
-            );
             const changesJson = yield* encodeChanges(changes);
-            yield* sql`INSERT INTO work_ledger_history (work_key, changed_at, changed_by, changes_json)
-              VALUES (${item.key}, ${now}, ${updatedBy}, ${changesJson})`;
+            const changedByClientJson =
+              updatedByClient === undefined ? null : yield* encodeEditor(updatedByClient);
+            yield* sql`INSERT INTO work_ledger_history (work_key, changed_at, changed_by, changes_json, changed_by_client_json)
+              VALUES (${item.key}, ${now}, ${updatedBy}, ${changesJson}, ${changedByClientJson})`;
             return { ...item, approval, warnings };
           }),
         )
@@ -493,7 +528,7 @@ const make = Effect.gen(function* () {
     history: Effect.fn("WorkLedger.history")(function* (input) {
       const limit = input.limit ?? 25;
       const rows =
-        yield* sql`SELECT id, work_key AS key, changed_at AS "changedAt", changed_by AS "changedBy", changes_json AS changes
+        yield* sql`SELECT id, work_key AS key, changed_at AS "changedAt", changed_by AS "changedBy", changes_json AS changes, changed_by_client_json AS "changedByClient"
         FROM work_ledger_history WHERE work_key = ${input.key} AND id > ${input.cursor ?? 0}
         ORDER BY id LIMIT ${limit + 1}`;
       const decoded = yield* decodeHistory(rows);
@@ -508,12 +543,28 @@ const make = Effect.gen(function* () {
         Effect.flatMap(decode),
         Effect.mapError(storage),
       );
-      const now = DateTime.toEpochMillis(yield* DateTime.now);
+      const nowDate = yield* DateTime.now;
+      const now = DateTime.toEpochMillis(nowDate);
+      const cutoff = DateTime.formatIso(DateTime.subtract(nowDate, { hours: 24 }));
+      const upperBound = DateTime.formatIso(nowDate);
       const items = yield* Effect.forEach(ledgerRows.slice(0, limit), (item) =>
         Effect.gen(function* () {
+          const [flips] = yield* sql<{
+            count: number;
+          }>`SELECT COUNT(*) AS count FROM work_ledger_history
+            WHERE work_key = ${item.key} AND changed_at >= ${cutoff}
+              AND changed_at <= ${upperBound}
+              AND json_extract(changes_json, '$.status.before') IN ('open', 'blocked')
+              AND json_extract(changes_json, '$.status.after') IN ('open', 'blocked')
+              AND json_extract(changes_json, '$.status.before') != json_extract(changes_json, '$.status.after')`;
+          const flap = {
+            openBlockedFlips24h: flips?.count ?? 0,
+            flapping: (flips?.count ?? 0) > 3,
+          };
           if (item.ownerThreadId === null)
             return {
               item,
+              ...flap,
               latestRunId: null,
               latestRunStatus: null,
               pendingRequestCount: 0,
@@ -538,6 +589,7 @@ const make = Effect.gen(function* () {
           ORDER BY created_at DESC, message_id DESC LIMIT 1`;
           return {
             item,
+            ...flap,
             latestRunId: run === undefined ? null : RunId.make(run.run_id),
             latestRunStatus: run?.status ?? null,
             pendingRequestCount: pending?.count ?? 0,

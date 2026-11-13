@@ -8,6 +8,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import LedgerMigration from "./ForkMigrations/010_WorkLedgerPortfolio.ts";
 import BaseLedgerMigration from "./ForkMigrations/002_WorkLedger.ts";
+import HygieneMigration from "./ForkMigrations/013_WorkLedgerHygiene.ts";
 import * as TestClock from "effect/testing/TestClock";
 import * as Sqlite from "./Sqlite.ts";
 import * as WorkLedger from "./WorkLedger.ts";
@@ -88,7 +89,9 @@ it.effect(
       ).toContain("a");
       // Thread ids from create_threads can be longer than a display name.
       const longCaller = `thread:${"x".repeat(300)}`;
-      expect((yield* ledger.upsert({ key: "a" }, longCaller)).updatedBy).toBe(longCaller);
+      expect((yield* ledger.upsert({ key: "a", nextAction: "Review" }, longCaller)).updatedBy).toBe(
+        longCaller,
+      );
     }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
 
@@ -128,7 +131,12 @@ it.effect(
       expect((yield* ledger.query({ due: false })).items).toEqual([]);
       const change = { key: "wait", waitReason: null, nextCheckAt: null } as const;
       yield* ledger.upsert(change, "caller-b");
-      yield* ledger.upsert({ key: "wait" }, "caller-b");
+      const unchanged = (yield* ledger.query({})).items[0]!;
+      yield* TestClock.setTime(2000);
+      expect(yield* ledger.upsert({ key: "wait" }, "caller-c")).toEqual({
+        ...unchanged,
+        warnings: expect.any(Array),
+      });
       const page = yield* ledger.history({ key: "wait", limit: 1 });
       expect(page.items[0]).toMatchObject({
         changedBy: "caller-a",
@@ -144,7 +152,7 @@ it.effect(
           nextCheckAt: { before: "1970-01-01T00:00:00.000Z", after: null },
         },
       });
-      expect(rest.items[1]!.changes).toEqual({});
+      expect(rest.items).toHaveLength(1);
       expect((yield* ledger.query({ waitReason: null })).items).toHaveLength(1);
       expect((yield* ledger.query({ due: true })).items).toEqual([]);
       const before = yield* ledger.history({ key: "wait" });
@@ -161,6 +169,69 @@ it.effect(
       ).toBe("invalid_request");
       yield* ledger.upsert({ key: "wait", nextCheckAt: "invalid" }, "caller-c").pipe(Effect.flip);
       expect(yield* ledger.history({ key: "wait" })).toEqual(before);
+      const sender = {
+        sessionId: "12345678",
+        clientLabel: "Coordinator",
+        kind: "outside-client",
+        access: "full-access",
+      } as const;
+      const args = {
+        tool: "t3_thread_send",
+        arguments: { threadId: "worker", message: "Exact payload", mode: "queue" },
+      };
+      const links = yield* ledger.upsert(
+        {
+          key: "wait",
+          addLinks: ["https://example.com/pr/1", "t3-thread://v1/angle-missing"],
+          removeLinks: ["[remote](<t3-thread://v2/remote/thread>)"],
+          handoffArgs: args,
+        },
+        "12345678-full-session",
+        sender,
+      );
+      expect(links.links).toEqual([
+        "t3-thread://v2/env-1/also-missing",
+        "t3-thread://v1/angle-missing",
+        "https://example.com/pr/1",
+      ]);
+      expect((yield* ledger.query({})).items[0]!.handoffArgs).toEqual(args);
+      const history = yield* ledger.history({ key: "wait" });
+      expect(history.items.at(-1)).toMatchObject({
+        changedBy: "12345678-full-session",
+        changedByClient: sender,
+        changes: { handoffArgs: { before: null, after: args } },
+      });
+      const cleared = yield* ledger.upsert(
+        decodeUpsert({ key: "wait", handoffArgs: null }),
+        "caller-c",
+      );
+      expect(cleared.handoffArgs).toBeNull();
+      expect((yield* ledger.history({ key: "wait" })).items.at(-1)!.changes.handoffArgs).toEqual({
+        before: args,
+        after: null,
+      });
+      expect(
+        decodeUpsert({ key: "wait", handoffArgs: { payload: "x".repeat(4082) } }).handoffArgs,
+      ).toEqual({ payload: "x".repeat(4082) });
+      for (const handoffArgs of [
+        { payload: "x".repeat(4083) },
+        { payload: "🎉".repeat(1021) },
+        { bad: undefined },
+        { bad: NaN },
+      ]) {
+        expect(() => decodeUpsert({ key: "wait", handoffArgs })).toThrow();
+      }
+      expect(yield* ledger.upsert({ key: "wait", status: "blocked" }, "caller-c")).toMatchObject({
+        waitReason: "decision",
+        warnings: expect.arrayContaining([expect.stringContaining("defaulted")]),
+      });
+      for (const blocker of ["BLOCKED_TECH: tool offline", "WAIT_DECISION: choose route"]) {
+        for (const waitReason of ["external", "natural"] as const) {
+          expect(
+            (yield* ledger.upsert({ key: "wait", blocker, waitReason }, "caller-c")).warnings,
+          ).toContainEqual(expect.stringContaining("contradicts"));
+        }
+      }
     }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
 
@@ -229,7 +300,7 @@ it.effect(
       yield* sql`UPDATE orchestration_v2_projection_runs SET completed_at = '1970-01-01T00:00:02.000Z' WHERE run_id = 'run-1'`;
       expect(
         (yield* ledger.query({})).items.find((item) => item.key === "run-key")!.updatedAt,
-      ).toBe("1970-01-02T01:00:00.000Z");
+      ).toBe("1970-01-01T00:00:02.000Z");
       expect(page.nextCursor).toBe("run-key");
       expect((yield* ledger.portfolio({ cursor: page.nextCursor! })).items[0]).toMatchObject({
         item: { key: "z" },
@@ -239,6 +310,24 @@ it.effect(
       expect(
         (yield* ledger.query({})).items.find((item) => item.key === "run-key")!.lastRunStatus,
       ).toBe("completed");
+      for (const status of ["blocked", "open", "blocked"] as const) {
+        yield* ledger.upsert({ key: "z", status }, "caller");
+      }
+      expect((yield* ledger.portfolio({ cursor: "run-key" })).items[0]).toMatchObject({
+        openBlockedFlips24h: 3,
+        flapping: false,
+      });
+      yield* ledger.upsert({ key: "z", status: "open" }, "caller");
+      yield* ledger.upsert({ key: "z", nextAction: "No status change" }, "caller");
+      expect((yield* ledger.portfolio({ cursor: "run-key" })).items[0]).toMatchObject({
+        openBlockedFlips24h: 4,
+        flapping: true,
+      });
+      yield* TestClock.adjust(24 * 60 * 60 * 1000 + 1);
+      expect((yield* ledger.portfolio({ cursor: "run-key" })).items[0]).toMatchObject({
+        openBlockedFlips24h: 0,
+        flapping: false,
+      });
     }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
 
@@ -616,6 +705,13 @@ it.effect("records Chris's dialog answer only for the row it names, and withdraw
     expect((yield* approve("typed-row", {}, "r3/typed")).approval?.quotedAnswer).toBe(
       "Yes, for R&D, if a < b.",
     );
+    expect(
+      (yield* ledger.upsert({ key: "r3/typed", handoffArgs: { target: "changed" } }, "agent"))
+        .approval,
+    ).toBeNull();
+    expect(yield* approve("typed-row", {}, "r3/typed").pipe(Effect.flip)).toMatchObject({
+      message: expect.stringContaining("already used or withdrawn"),
+    });
 
     // An answer older than a day no longer approves anything.
     yield* TestClock.setTime(25 * 60 * 60 * 1000);
@@ -665,5 +761,25 @@ it.effect("backfills recognized blockers and preserves legacy thread link destin
       { wait_reason: null },
     ]);
     expect(yield* sql`SELECT * FROM work_ledger_history`).toEqual([]);
+    yield* sql`INSERT INTO work_ledger_history (work_key, changed_at, changed_by, changes_json)
+      VALUES ('a', '1970-01-01', 'legacy-editor', '{"status":{"before":"open","after":"blocked"}}')`;
+    const ledgerBefore = yield* sql`SELECT * FROM work_ledger ORDER BY work_key`;
+    const historyBefore = yield* sql`SELECT * FROM work_ledger_history`;
+    yield* HygieneMigration;
+    expect(yield* sql`SELECT * FROM work_ledger ORDER BY work_key`).toEqual(
+      ledgerBefore.map((row) => ({ ...row, handoff_args_json: null })),
+    );
+    expect(yield* sql`SELECT * FROM work_ledger_history`).toEqual(
+      historyBefore.map((row) => ({ ...row, changed_by_client_json: null })),
+    );
+    const boundary = `"${"x".repeat(4094)}"`;
+    yield* sql`UPDATE work_ledger SET handoff_args_json = ${boundary} WHERE work_key = 'a'`;
+    for (const invalid of ['{"broken":', `"${"x".repeat(4095)}"`, `"${"🎉".repeat(1024)}"`]) {
+      expect(
+        yield* sql`UPDATE work_ledger SET handoff_args_json = ${invalid} WHERE work_key = 'a'`.pipe(
+          Effect.isFailure,
+        ),
+      ).toBe(true);
+    }
   }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );
