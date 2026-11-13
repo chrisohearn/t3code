@@ -600,6 +600,16 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
 });
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;
 
+/** Set when a send queues: `position` 1 starts next. `held` waits for a resume. */
+export const OrchestratorMcpQueueStanding = Schema.Struct({
+  position: PositiveInt,
+  messagesAhead: NonNegativeInt,
+  activeRunId: Schema.NullOr(RunId),
+  activeRunAgeSeconds: Schema.NullOr(NonNegativeInt),
+  held: Schema.optional(Schema.Boolean),
+});
+export type OrchestratorMcpQueueStanding = typeof OrchestratorMcpQueueStanding.Type;
+
 export const OrchestratorMcpThreadSendResult = Schema.Struct({
   notify: Schema.optional(McpThreadNotifyResult),
   threadId: ThreadId,
@@ -609,6 +619,7 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   taskId: Schema.optional(NodeId),
   status: OrchestrationV2RunStatus,
   delivery: Schema.Literals(["started", "queued", "steered", "restarted"]),
+  queue: Schema.optional(OrchestratorMcpQueueStanding),
 });
 export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendResult.Type;
 

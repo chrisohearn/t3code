@@ -141,6 +141,7 @@ import {
 } from "./delegatedTaskModes.ts";
 import { isLiveCallerShell, threadNotFound } from "./threadAccess.ts";
 import { resolveReadableThread } from "./threadReference.ts";
+import { queuedRunMessageIds, queueStanding } from "./queueStanding.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
@@ -1309,6 +1310,20 @@ const make = Effect.gen(function* () {
   });
 
   const loadProviders = providerRegistry.getProviders;
+
+  // Best effort: the message is already queued, so a failed read only omits the standing.
+  const readQueueStanding = Effect.fn("OrchestratorMcpService.readQueueStanding")(
+    function* (threadId: ThreadId, runId: RunId) {
+      const { runs } = yield* threadManagement.getThreadRecords(threadId, ["runs"], {
+        runStatuses: [...ThreadManagementService.ACTIVE_RUN_STATUSES, "queued"],
+      });
+      const { messages } = yield* threadManagement.getThreadRecords(threadId, ["messages"], {
+        messageIds: queuedRunMessageIds(runs),
+      });
+      return queueStanding({ runs, messages }, runId, yield* Clock.currentTimeMillis);
+    },
+    Effect.orElseSucceed(() => undefined),
+  );
 
   const loadOrchestrationCapableInstanceIds = () =>
     providerAdapters.list().pipe(Effect.map((instanceIds) => new Set(instanceIds)));
@@ -3470,8 +3485,13 @@ const make = Effect.gen(function* () {
         result.run.id,
         input.clientRequestId,
       ).pipe(Effect.provideService(Invocation.McpInvocationContext, scope));
+      const queue =
+        result.delivery === "queued"
+          ? yield* readQueueStanding(input.threadId, result.run.id)
+          : undefined;
       return {
         ...(notify === undefined ? {} : { notify }),
+        ...(queue === undefined ? {} : { queue }),
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,
