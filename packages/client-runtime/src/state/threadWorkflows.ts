@@ -3,6 +3,7 @@ import {
   isCompactionCommandMessage,
   type OrchestrationV2ProjectedTurnItem,
   type OrchestrationV2ProviderCapabilities,
+  type ThreadFreeze,
 } from "@t3tools/contracts";
 import { copySorted } from "@t3tools/shared/Array";
 
@@ -31,10 +32,19 @@ export interface QueuedThreadRun {
   readonly message?: Message;
 }
 
+/** One line for the frozen indicator, shared by web and mobile. */
+export function describeThreadFreeze(freeze: ThreadFreeze): string {
+  return `Frozen by ${freeze.by.label}${
+    freeze.by.sessionId === undefined ? "" : ` (${freeze.by.sessionId})`
+  }: ${freeze.reason}`;
+}
+
 export interface ThreadQueueWorkflowState {
   readonly activeRun: Run | null;
   readonly queuedRuns: ReadonlyArray<QueuedThreadRun>;
   readonly isHeld: boolean;
+  /** Set while the thread is frozen: nothing starts until it is unfrozen or the owner resumes. */
+  readonly frozen: ThreadFreeze | null;
   readonly canPromoteToSteer: boolean;
   /** The active run is a compaction, so promoting a queued message stops it instead of steering. */
   readonly promoteSkipsCompaction: boolean;
@@ -173,6 +183,7 @@ export function deriveThreadQueueWorkflowState(projection: Projection): ThreadQu
     activeRun,
     queuedRuns,
     isHeld: projection.runs.some((run) => run.status === "queued" && run.queueHeld === true),
+    frozen: projection.thread.frozen ?? null,
     canSendNow:
       activeRun === null &&
       projection.thread.archivedAt == null &&

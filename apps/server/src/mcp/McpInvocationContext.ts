@@ -153,6 +153,8 @@ export interface McpInvocationScope {
   readonly client: McpClientCaller | undefined;
   /** False while the Linked environments beta is off here; `/mcp` reads it per request. */
   readonly linkedEnvironments?: boolean;
+  /** Short digest of the request's `Mcp-Session-Id`: one agent's connection, kept for the request log. */
+  readonly connection?: string;
 }
 
 export const messageSenderFor = (scope: McpInvocationScope) => {

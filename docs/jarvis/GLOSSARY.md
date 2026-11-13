@@ -48,3 +48,9 @@ The one set of questions an agent asks Chris before a task starts. His answers a
 
 **completion supervisor**:
 The scheduled task that re-drives idle ledger work every 30 minutes and posts a digest to Jarvis's inbox.
+
+**frozen thread**:
+A thread an operator has stopped and held: its run is interrupted, its queue and delegates are held, and it starts nothing until it is unfrozen or its owner acts.
+
+**shared, unattributable**:
+A sign-in that several threads use, so its calls cannot be tied to one agent.

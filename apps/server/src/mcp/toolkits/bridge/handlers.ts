@@ -2,6 +2,7 @@ import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import * as McpEvents from "../../McpEvents.ts";
 import * as Effect from "effect/Effect";
 import * as Invocation from "../../McpInvocationContext.ts";
+import * as AgentRegistry from "../../../persistence/AgentRegistry.ts";
 import * as RequestLog from "../../../persistence/McpRequestLog.ts";
 import * as Access from "../../McpToolAccess.ts";
 import * as Bridge from "../../BridgeStatusService.ts";
@@ -11,6 +12,17 @@ export const layer = Access.toLayer(BridgeToolkit, {
     Effect.gen(function* () {
       const scope = yield* Invocation.McpInvocationContext;
       return yield* (yield* RequestLog.McpRequestLog).usage(input, scope.client?.sessionId);
+    }),
+  ),
+  agent_registry: Access.reads((input) =>
+    Effect.gen(function* () {
+      const scope = yield* Invocation.McpInvocationContext;
+      const client = scope.client;
+      return yield* (yield* AgentRegistry.AgentRegistry).list(input, {
+        sessionId: client?.sessionId,
+        seesAll:
+          client === undefined || (client.access === "full-access" && client.linked !== true),
+      });
     }),
   ),
   event_subscriptions: Access.reads(() =>

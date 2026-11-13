@@ -1,6 +1,7 @@
 import { RuntimeModeChangeActor } from "../../orchestration-v2/DispatchModeLimit.ts";
 import { CommandActor } from "../../orchestration-v2/CommandActor.ts";
 import * as McpEvents from "../McpEvents.ts";
+import * as AgentRegistry from "../../persistence/AgentRegistry.ts";
 import * as McpRequestLog from "../../persistence/McpRequestLog.ts";
 import * as BridgeStatusService from "../BridgeStatusService.ts";
 import { BridgeToolkit } from "./bridge/tools.ts";
@@ -220,6 +221,7 @@ it.effect(
         ).pipe(
           Layer.provide(Layer.mock(BridgeStatusService.BridgeStatusService)({})),
           Layer.provide(Layer.mock(McpEvents.McpEvents)({})),
+          Layer.provide(Layer.mock(AgentRegistry.AgentRegistry)({})),
           Layer.provideMerge(McpRequestLog.layer.pipe(Layer.provide(Sqlite.layerMemory))),
           Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
           Layer.provideMerge(McpBridgeMetrics.layer),
