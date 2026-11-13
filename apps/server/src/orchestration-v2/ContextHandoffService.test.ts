@@ -301,3 +301,69 @@ it.effect("inherited history stops at a missing fork ancestor", () =>
     assert.deepEqual(items, []);
   }),
 );
+
+const standingNow = DateTime.makeUnsafe("2026-11-12T17:10:00Z");
+const standingRun = {
+  id: RunId.make("run:opening"),
+  userMessageId: MessageId.make("message:opening"),
+};
+const standingThread = {
+  createdBy: "agent",
+  creationSource: "mcp",
+  lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: ThreadId.make("t") },
+} as const;
+const standingMessage = {
+  id: standingRun.userMessageId,
+  threadId: ThreadId.make("t"),
+  runId: standingRun.id,
+  nodeId: null,
+  role: "user",
+  text: "You are the inbox.",
+  attachments: [],
+  streaming: false,
+  createdBy: "agent",
+  creationSource: "mcp",
+  createdAt: standingNow,
+  updatedAt: standingNow,
+} as const;
+const standingItem: OrchestrationV2TurnItem = {
+  ...importedItem({ role: "user", id: "opening", text: "You are the inbox.", ordinal: 1 }),
+  runId: standingRun.id,
+};
+
+it.each([
+  ["the launcher", {}, true],
+  ["the user", { createdBy: "user", creationSource: "web" }, true],
+  ["another thread", { senderThreadId: ThreadId.make("other") }, false],
+  [
+    "a linked agent",
+    {
+      senderClient: {
+        sessionId: "linked01",
+        clientLabel: "Elsewhere",
+        kind: "linked-agent",
+        access: "full-access",
+      },
+    },
+    false,
+  ],
+  ["a post", { postOnly: true }, false],
+  [
+    "a wake",
+    { notification: { source: { kind: "system" }, outcome: "updated", summary: "Woke" } },
+    false,
+  ],
+] as const)(
+  "names the opening message as standing instructions only from %s",
+  (_, change, named) => {
+    assert.equal(
+      ContextHandoffService.standingInstructionsItemId({
+        thread: standingThread,
+        run: standingRun,
+        message: { ...standingMessage, ...change },
+        items: [standingItem],
+      }),
+      named ? standingItem.id : undefined,
+    );
+  },
+);

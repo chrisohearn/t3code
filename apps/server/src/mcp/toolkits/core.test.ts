@@ -1,4 +1,5 @@
 import { RuntimeModeChangeActor } from "../../orchestration-v2/DispatchModeLimit.ts";
+import { CommandActor } from "../../orchestration-v2/CommandActor.ts";
 import * as McpEvents from "../McpEvents.ts";
 import * as McpRequestLog from "../../persistence/McpRequestLog.ts";
 import * as BridgeStatusService from "../BridgeStatusService.ts";
@@ -591,6 +592,101 @@ it.effect("an answered question reports already answered instead of not found", 
     ),
   );
 });
+
+it.effect(
+  "stamps an MCP question answer as an agent's or outside client's, never the owner's",
+  () => {
+    const shell = McpToolAccessTestkit.liveThreadShell(threadId);
+    const requestId = RuntimeRequestId.make("pending-question");
+    const projection = McpToolAccessTestkit.idleThreadProjection(shell);
+    const answeredBy: Array<unknown> = [];
+    const outside: McpInvocationContext.McpInvocationScope = {
+      ...scope,
+      thread: undefined,
+      client: {
+        sessionId: "outside",
+        label: "Outside client",
+        access: "full-access",
+        linked: false,
+      },
+    };
+    return Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      for (const invocation of [scope, outside]) {
+        const result = yield* server
+          .callTool({
+            name: "t3_pending_request",
+            arguments: { action: "respond", threadId, requestId, answers: { size: "large" } },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+        expect(result.isError).not.toBe(true);
+      }
+      expect(answeredBy).toEqual(["agent", "mcp_client"]);
+    }).pipe(
+      Effect.provide(
+        layerThreadToolkit.pipe(
+          Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: () => Effect.succeed(shell),
+              getProjectThreadRecords: () =>
+                Effect.succeed({
+                  ...projection,
+                  runtimeRequests: [
+                    {
+                      id: requestId,
+                      nodeId: NodeId.make("root"),
+                      providerTurnId: null,
+                      nativeRequestRef: null,
+                      kind: "user_input",
+                      status: "pending",
+                      responseCapability: { type: "message" },
+                      createdAt: shell.createdAt,
+                      resolvedAt: null,
+                    },
+                  ],
+                  turnItems: [
+                    {
+                      id: TurnItemId.make("pending-question-item"),
+                      threadId,
+                      runId: null,
+                      nodeId: null,
+                      providerThreadId: null,
+                      providerTurnId: null,
+                      nativeItemRef: null,
+                      parentItemId: null,
+                      ordinal: 0,
+                      status: "running",
+                      title: null,
+                      startedAt: shell.createdAt,
+                      completedAt: null,
+                      updatedAt: shell.updatedAt,
+                      type: "user_input_request",
+                      requestId,
+                      questions: [],
+                    },
+                  ],
+                }),
+              dispatch: () =>
+                Effect.gen(function* () {
+                  answeredBy.push(
+                    Option.getOrUndefined(
+                      Option.map(yield* Effect.serviceOption(CommandActor), (actor) => actor.kind),
+                    ),
+                  );
+                  return { sequence: 1, storedEvents: [] };
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+  },
+);
 
 it("bounds public command rejections and redacts internal dispatch causes", () => {
   const command = { commandId: CommandId.make("mcp-core-command"), commandType: "thread.settle" };

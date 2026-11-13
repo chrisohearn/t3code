@@ -7396,6 +7396,51 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       if (terminal.status !== "failed") return;
       assert.equal(terminal.failure.class, "usage_limit");
       assert.equal(terminal.failure.resetAt, "2026-10-12T12:20:00.000Z");
+      assert.equal(terminal.accountFailure, "usage_limit");
+      assert.equal(terminal.noWorkObserved, true);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  it.effect("does not prove no work once Claude answered before a 429", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-limit-after-output"),
+          text: "Continue.",
+          attachments: [],
+        }),
+      );
+      yield* Queue.offerAll(harness.sdkMessages, [
+        makeAssistantTextFrame({
+          uuid: "00000000-0000-4000-8000-000000000686",
+          text: "I started on the change.",
+        }),
+        makeResultFrame({
+          uuid: "00000000-0000-4000-8000-000000000687",
+          result: "API Error: 429 Rate limited.",
+          isError: true,
+          apiErrorStatus: 429,
+          terminalReason: "api_error",
+        }),
+      ]);
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      assert.equal(terminal.accountFailure, "usage_limit");
+      assert.isUndefined(terminal.noWorkObserved);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -7536,6 +7581,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         terminal.failure.class,
         apiErrorStatus === 429 ? "usage_limit" : "provider_error",
       );
+      // Exhausted 429 retries are an account cause; other API errors stay with the thread.
+      assert.equal(terminal.accountFailure, apiErrorStatus === 429 ? "usage_limit" : undefined);
+      assert.equal(terminal.noWorkObserved, true);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -7591,6 +7639,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.include(terminal.failure.message, configDir);
       assert.include(terminal.failure.message, JSON.stringify(cwd));
       assert.notInclude(terminal.failure.message, "repeated API errors");
+      assert.equal(terminal.accountFailure, "auth");
+      assert.equal(terminal.noWorkObserved, true);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(

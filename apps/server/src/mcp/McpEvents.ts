@@ -1,3 +1,6 @@
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { CLOUD_CLI_DESIRED_LINK_SECRET } from "../cloud/CliState.ts";
+import { CLOUD_LINK_REVOKED, CLOUD_LINKED_USER_ID, RELAY_URL_SECRET } from "../cloud/config.ts";
 import * as ConnectReachability from "../cloud/ConnectReachability.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import {
@@ -82,6 +85,13 @@ export const observeEvent = (
     case "subagent.updated":
       state = event.payload.status;
       if (!["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(state))
+        return;
+      // A run failing over is not a blocker: its failover run reports the outcome. A skip is.
+      if (
+        event.type === "run.updated" &&
+        event.payload.failover !== undefined &&
+        event.payload.failover.state !== "skipped"
+      )
         return;
       name = state === "failed" ? "thread.blocker" : "thread.run.result";
       resourceId = event.payload.id;
@@ -201,7 +211,29 @@ export class McpEvents extends Context.Service<
 
 const make = Effect.gen(function* () {
   const reachability = yield* ConnectReachability.ConnectReachability;
+  const secrets = yield* ServerSecretStore.ServerSecretStore;
   const serviceStartedAt = yield* Clock.currentTimeMillis;
+  // A CLI managed link stores its tunnel config again seconds after a restart, so a
+  // not_linked check holds only for that link; other links never lose the config.
+  const managedTunnelPending = Effect.all(
+    [
+      secrets.get(CLOUD_LINKED_USER_ID),
+      secrets.get(RELAY_URL_SECRET),
+      secrets.get(CLOUD_LINK_REVOKED),
+      secrets.get(CLOUD_CLI_DESIRED_LINK_SECRET),
+    ],
+    { concurrency: "unbounded" },
+  ).pipe(
+    Effect.map(
+      ([user, relay, revoked, desired]) =>
+        Option.isSome(user) &&
+        Option.isSome(relay) &&
+        Option.isNone(revoked) &&
+        Option.isSome(desired) &&
+        new TextDecoder().decode(desired.value) !== "publish_only",
+    ),
+    Effect.orElseSucceed(() => false),
+  );
   let startupHoldReleased = false;
   const awaitStartupTunnel = Effect.fn("McpEvents.awaitStartupTunnel")(function* () {
     if (startupHoldReleased) return;
@@ -212,7 +244,8 @@ const make = Effect.gen(function* () {
         const status = Option.getOrNull(latest);
         if (status?.status === "reachable") return true;
         const checked = yield* reachability.check;
-        return checked.status === "reachable" || checked.cause === "not_linked";
+        if (checked.status === "reachable") return true;
+        return checked.cause === "not_linked" && !(yield* managedTunnelPending);
       }).pipe(
         Effect.repeat({ schedule: Schedule.spaced("5 seconds"), until: (ready) => ready }),
         Effect.timeoutOption(remaining),

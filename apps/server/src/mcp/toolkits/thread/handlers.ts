@@ -1,4 +1,5 @@
 import { RuntimeModeChangeActor } from "../../../orchestration-v2/DispatchModeLimit.ts";
+import { CommandActor } from "../../../orchestration-v2/CommandActor.ts";
 import {
   ProviderRequestKind,
   type CommandId,
@@ -7,6 +8,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type RunId,
   OrchestratorMcpFailure,
+  orchestratorMcpScheduledTaskRunStatus,
   type OrchestrationV2Command,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -46,6 +48,14 @@ function queueEntry(
     truncated: characters.length > limit,
   };
 }
+const withMcpCommandActor = Effect.fn("mcp.withCommandActor")(function* <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) {
+  const scope = yield* McpInvocationContext.McpInvocationContext;
+  return yield* Effect.provideService(effect, CommandActor, {
+    kind: scope.thread === undefined ? "mcp_client" : "agent",
+  });
+});
 const dispatch = Effect.fn("mcp.dispatchThreadCommand")(function* (
   threadId: ThreadId | undefined,
   command: (common: { commandId: CommandId; threadId: ThreadId }) => OrchestrationV2Command,
@@ -53,7 +63,7 @@ const dispatch = Effect.fn("mcp.dispatchThreadCommand")(function* (
   const { threads, projection } = yield* readThread(threadId);
   const result = yield* threads
     .dispatch(command({ commandId: yield* newCommandId(), threadId: projection.thread.id }))
-    .pipe(Effect.mapError(dispatchFailure));
+    .pipe(withMcpCommandActor, Effect.mapError(dispatchFailure));
   return { sequence: result.sequence };
 });
 
@@ -130,7 +140,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           : {
               link: McpInvocationContext.threadLinkFor(scope, threadId),
             }),
-        lastRunStatus: task.lastRunStatus,
+        lastRunStatus: orchestratorMcpScheduledTaskRunStatus(task),
         runCount: task.runCount,
         nextRunAt: task.nextRunAt,
       };
@@ -342,7 +352,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               requestId,
               answers,
             })
-            .pipe(Effect.mapError(dispatchFailure));
+            .pipe(withMcpCommandActor, Effect.mapError(dispatchFailure));
           return { sequence: result.sequence };
         }),
       ),

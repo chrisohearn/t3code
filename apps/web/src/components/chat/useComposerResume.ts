@@ -39,7 +39,6 @@ interface ComposerResumeInput {
     threadId: EnvironmentThreadShell["id"];
     createdAt: string;
     branch?: string;
-    runtimeMode: RuntimeMode;
     interactionMode: ProviderInteractionMode;
   }) => Promise<AtomCommandResult<void, unknown>>;
   readonly clearUsageLimitsFor: ReturnType<typeof useUsageLimitsPanel>["clearFor"];
@@ -115,7 +114,6 @@ export function useComposerResume(input: ComposerResumeInput) {
         ...(localCheckoutBranchMismatch
           ? { branch: localCheckoutBranchMismatch.currentBranch }
           : {}),
-        runtimeMode,
         interactionMode: DEFAULT_INTERACTION_MODE,
       });
       if (settingsResult._tag === "Failure") return settingsResult;

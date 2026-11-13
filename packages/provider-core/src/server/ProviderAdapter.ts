@@ -12,6 +12,7 @@ import {
   OrchestrationV2PlanArtifact,
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderFailure,
+  OrchestrationV2ProviderFailoverReason,
   OrchestrationV2ProviderRetry,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderTurn,
@@ -184,6 +185,8 @@ export const ProviderAdapterV2Event = Schema.Union([
     failure: Schema.Null,
     reason: Schema.optional(Schema.String),
     threadDisposition: Schema.Literals(["reusable", "broken"]),
+    /** Positive evidence only: the adapter saw no output, tool call or file change in this turn. */
+    noWorkObserved: Schema.optional(Schema.Literal(true)),
   }),
   Schema.Struct({
     type: Schema.Literal("turn.terminal"),
@@ -199,6 +202,10 @@ export const ProviderAdapterV2Event = Schema.Union([
     threadDisposition: Schema.Literals(["reusable", "broken"]),
     /** Child turns outlive root failure and report their own terminals; otherwise open children settle. */
     childTurnsContinue: Schema.optional(Schema.Literal(true)),
+    /** Positive evidence only: the adapter saw no output, tool call or file change in this turn. */
+    noWorkObserved: Schema.optional(Schema.Literal(true)),
+    /** Set only when the adapter recognized an account-side cause, never inferred from the class. */
+    accountFailure: Schema.optional(OrchestrationV2ProviderFailoverReason),
   }),
 ]);
 export type ProviderAdapterV2Event = typeof ProviderAdapterV2Event.Type;

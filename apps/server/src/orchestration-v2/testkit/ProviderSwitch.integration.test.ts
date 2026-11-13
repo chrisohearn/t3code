@@ -28,6 +28,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
@@ -114,6 +115,11 @@ function makeTestAdapter(input: {
   >;
   readonly failure?: ReturnType<typeof makeProviderFailure>;
   readonly failedRunOrdinals?: ReadonlySet<number>;
+  /** What the adapter proved about a failed turn. */
+  readonly failedTerminalEvidence?: {
+    readonly noWorkObserved?: true;
+    readonly accountFailure?: "usage_limit" | "auth" | "billing";
+  };
   readonly interruptedRunOrdinals?: ReadonlySet<number>;
   readonly cancelledRunOrdinals?: ReadonlySet<number>;
   readonly holdRunOrdinal?: number;
@@ -369,6 +375,7 @@ function makeTestAdapter(input: {
                             code: "simulated_failure",
                             class: "provider_error",
                           }),
+                        ...input.failedTerminalEvidence,
                       }
                     : { status: terminalStatus, failure: null }),
                   threadDisposition: "reusable",
@@ -3632,6 +3639,120 @@ describe("orchestration v2 provider switching", () => {
           );
         }),
       ),
+  );
+
+  // The 2026-11-12 incident: the shared ChatGPT account hit its limit before the turn did any
+  // work. The failed run claims a failover and the worker re-sends its message on Claude.
+  it.live("re-sends a message on the fallback model when its account fails before any work", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("account-failover");
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const threadId = ThreadId.make("thread:account-failover");
+        const role = "You are the inbox. Reply only 'Queued for Jarvis: <summary>'.";
+        const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+          makeTestAdapter({
+            instanceId: CODEX_MODEL_SELECTION.instanceId,
+            driver: CODEX_DRIVER,
+            capabilities: CodexProviderCapabilitiesV2,
+            modelSelection: CODEX_MODEL_SELECTION,
+            responseByRunOrdinal: { 1: "Queued for Jarvis: ready" },
+            capturedTurns,
+            failedRunOrdinals: new Set([2]),
+            failure: makeProviderFailure({
+              message: "You've hit your usage limit.",
+              code: "subscription_sharing_usage_limit_exceeded",
+              class: "usage_limit",
+            }),
+            failedTerminalEvidence: { noWorkObserved: true, accountFailure: "usage_limit" },
+          }),
+          makeTestAdapter({
+            instanceId: CLAUDE_MODEL_SELECTION.instanceId,
+            driver: CLAUDE_DRIVER,
+            capabilities: ClaudeProviderCapabilitiesV2,
+            modelSelection: CLAUDE_MODEL_SELECTION,
+            responseByRunOrdinal: {},
+            capturedTurns,
+          }),
+        ]);
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const send = (key: string, text: string) =>
+            orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`command:account-failover:${key}`),
+              threadId,
+              messageId: MessageId.make(`message:account-failover:${key}`),
+              text,
+              attachments: [],
+              dispatchMode: { type: "start_immediately" },
+              createdBy: "agent",
+              creationSource: "mcp",
+            });
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("command:account-failover:create"),
+            threadId,
+            projectId: ProjectId.make("project:account-failover"),
+            title: "Inbox",
+            modelSelection: CODEX_MODEL_SELECTION,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "agent",
+            creationSource: "mcp",
+          });
+          yield* send("role", role);
+          yield* worker.drain();
+          yield* waitForIdle(threadId);
+          yield* send("source", "Queue: the audit finished.");
+          yield* worker.drain();
+          const failed = yield* orchestrator.streamStoredEvents.pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "run.updated" &&
+                event.payload.status === "failed" &&
+                event.payload.failover?.state === "pending",
+            ),
+            Stream.runHead,
+          );
+          assert.isTrue(Option.isSome(failed));
+          yield* worker.drain();
+          const after = yield* waitForIdle(threadId);
+          yield* worker.drain();
+
+          const source = after.runs.find(
+            (run) => run.userMessageId === MessageId.make("message:account-failover:source"),
+          );
+          const failover = after.runs.find((run) => run.failoverOfRunId === source?.id);
+          assert.equal(source?.failover?.state, "dispatched");
+          assert.equal(failover?.status, "completed");
+          assert.deepEqual(failover?.modelSelection, CLAUDE_MODEL_SELECTION);
+          assert.deepEqual(after.thread.modelSelection, CLAUDE_MODEL_SELECTION);
+          assert.isTrue(after.turnItems.some((item) => item.id === `failover:${source?.id}`));
+          const turns = yield* Ref.get(capturedTurns);
+          assert.deepEqual(
+            turns.map((turn) => turn.driver),
+            [CODEX_DRIVER, CODEX_DRIVER, CLAUDE_DRIVER],
+          );
+          // Claude gets the prompt once, with the thread's role named as standing instructions.
+          const delivered = turns.at(-1)!.text;
+          assert.include(delivered, role);
+          assert.include(delivered, "is this thread's first message");
+          assert.equal(delivered.split("Queue: the audit finished.").length - 1, 1);
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              { name: "account-failover", runtimePolicyOverride: { cwd } },
+              layerRegistry,
+              { settings: { fallbackModelSelection: CLAUDE_MODEL_SELECTION } },
+            ),
+          ),
+        );
+      }),
+    ),
   );
 
   it.live("fails an unsupported queued handoff and advances to the next queued provider", () =>

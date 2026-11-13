@@ -2,10 +2,12 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as NodeUtil from "node:util";
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, vi } from "@effect/vitest";
 import {
   ProjectId,
   ProviderInstanceId,
+  type ScheduledTask,
   ScheduledTaskError,
   ScheduledTaskId,
   type ScheduledTaskUpsertInput,
@@ -15,14 +17,17 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
@@ -419,63 +424,152 @@ it.effect("thread cleanup notifies subscribers and a finishing run cannot recrea
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
+const PREPARATION_FAILURE =
+  "Workspace preparation failed during provision worktree: Git command failed in GitWorkflowService.resolveWorktreeBaseRemote (/home/user/app): Failed to resolve the VCS driver for this Git command.";
+const THREAD_DELETED = "The run's thread was deleted before the run finished.";
+
+const followerLayer = (
+  threadManagement: Layer.Layer<ThreadManagementService.ThreadManagementService>,
+  threadLaunch: Layer.Layer<ThreadLaunchService.ThreadLaunchService> = Layer.mock(
+    ThreadLaunchService.ThreadLaunchService,
+  )({}),
+) =>
+  ScheduledTaskService.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        ManagedPolicy.layerTest(),
+        threadLaunch,
+        threadManagement,
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+          namedProjectsRoot: "/projects",
+          isScratchProject: () => Effect.succeed(false),
+        }),
+        NodeCrypto.layer,
+        Scheduler.layer,
+      ),
+    ),
+  );
+
 it.effect.each([
-  { status: "failed", error: "Weekly usage limit reached" },
-  { status: "interrupted", error: "The run was stopped." },
-  { status: "cancelled", error: "The run was cancelled." },
-] as const)("a run that ends $status after its message was accepted records it", (outcome) =>
+  { name: "ends failed", run: "failed", status: "failed", error: "Weekly usage limit reached" },
+  { name: "ends interrupted", run: "interrupted", status: "failed", error: "The run was stopped." },
+  { name: "ends cancelled", run: "cancelled", status: "failed", error: "The run was cancelled." },
+  { name: "completes", run: "completed", status: "succeeded", error: null },
+  // The Jarvis inbox heartbeat failed this way on its first launch and still read as succeeded.
+  {
+    name: "fails workspace preparation on its first launch",
+    run: "failed",
+    status: "failed",
+    error: PREPARATION_FAILURE,
+    unbound: true,
+  },
+  {
+    name: "is steered into the active run, which completes",
+    run: "cancelled",
+    status: "succeeded",
+    error: null,
+    joins: true,
+  },
+  {
+    name: "loses its soft-deleted thread",
+    run: "completed",
+    status: "failed",
+    error: THREAD_DELETED,
+    softDeleted: true,
+  },
+  {
+    name: "loses its thread while it runs",
+    run: "completed",
+    status: "failed",
+    error: THREAD_DELETED,
+    waitFails: "thread",
+  },
+  {
+    name: "is removed while it runs",
+    run: "completed",
+    status: "failed",
+    error: "The run was removed before it finished.",
+    waitFails: "run",
+  },
+] as const)("a run that $name after its message was accepted records its outcome", (outcome) =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("project:test");
+    const threadId = ThreadId.make("thread:quota");
+    const unbound = "unbound" in outcome;
+    const joins = "joins" in outcome;
     const ended = yield* Deferred.make<void>();
     const sent = yield* Ref.make("");
-    const run = { id: "run:2", status: outcome.status, rootNodeId: "node:root" };
-    const layer = ScheduledTaskService.layer.pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          ManagedPolicy.layerTest(),
-          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
-          Layer.mock(ThreadManagementService.ThreadManagementService)({
-            sendToThread: (input) => Ref.set(sent, input.messageId).pipe(Effect.as({} as never)),
-            getThreadShell: () => Effect.succeed(threadShell(projectId)),
-            getProjectThreadRecords: () =>
-              Effect.map(
-                Ref.get(sent),
-                (userMessageId) =>
-                  ({
-                    runs: [
-                      { id: "run:1", status: "completed", userMessageId: "message:earlier" },
-                      { ...run, userMessageId },
-                    ],
-                    messages: [{ id: userMessageId, runId: "run:2" }],
-                    turnItems: [
-                      {
-                        type: "error",
-                        status: "failed",
-                        runId: "run:2",
-                        nodeId: "node:root",
-                        failure: { message: "Weekly usage limit reached" },
-                      },
-                    ],
-                  }) as never,
-              ),
-            waitForThread: (input) =>
-              Deferred.await(ended).pipe(
-                Effect.as({
-                  threadId: input.threadId,
-                  run: { ...run, id: input.runId, userMessageId: "" },
-                  timedOut: false,
-                } as never),
-              ),
+    const run = { id: "run:2", status: outcome.run, rootNodeId: "node:root" };
+    const layer = followerLayer(
+      Layer.mock(ThreadManagementService.ThreadManagementService)({
+        sendToThread: (input) => Ref.set(sent, input.messageId).pipe(Effect.as({} as never)),
+        // Deleted once its message was sent, so saving and dispatching still see the thread.
+        getThreadShell: () =>
+          Effect.map(Ref.get(sent), (messageId) =>
+            threadShell(
+              projectId,
+              "softDeleted" in outcome && messageId !== ""
+                ? { deletedAt: "2026-11-12T18:00:00.000Z" }
+                : {},
+            ),
+          ),
+        getProjectThreadRecords: () =>
+          Effect.map(
+            Ref.get(sent),
+            (userMessageId) =>
+              ({
+                runs: [
+                  { id: "run:1", status: "completed", userMessageId: "message:earlier" },
+                  { ...run, userMessageId },
+                ],
+                messages: [{ id: userMessageId, runId: joins ? "run:3" : "run:2" }],
+                turnItems: [
+                  {
+                    type: "error",
+                    status: "failed",
+                    runId: "run:2",
+                    nodeId: "node:root",
+                    failure: {
+                      message: unbound ? PREPARATION_FAILURE : "Weekly usage limit reached",
+                    },
+                  },
+                ],
+              }) as never,
+          ),
+        waitForThread: (input) =>
+          Effect.gen(function* () {
+            yield* Deferred.await(ended);
+            if ("waitFails" in outcome && outcome.waitFails === "run") {
+              return yield* new ThreadManagementService.ThreadManagementRunNotFoundError({
+                threadId: input.threadId,
+                runId: input.runId!,
+              });
+            }
+            if ("waitFails" in outcome) {
+              return yield* new ThreadManagementService.ThreadManagementThreadNotFoundError({
+                projectId,
+                threadId: input.threadId,
+              });
+            }
+            return {
+              threadId: input.threadId,
+              run: {
+                ...run,
+                id: input.runId,
+                status: joins && input.runId === "run:3" ? "completed" : run.status,
+                userMessageId: "",
+              },
+              timedOut: false,
+            } as never;
           }),
-          Layer.mock(SecretRequests.SecretRequests)({}),
-          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
-            namedProjectsRoot: "/projects",
-            isScratchProject: () => Effect.succeed(false),
-          }),
-          NodeCrypto.layer,
-          Scheduler.layer,
-        ),
-      ),
+      }),
+      Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+        launch: (input) =>
+          Ref.set(sent, input.initialMessage?.messageId ?? "").pipe(
+            Effect.as({ threadId } as never),
+          ),
+      }),
     );
     yield* Effect.gen(function* () {
       const service = yield* ScheduledTaskService.ScheduledTaskService;
@@ -486,25 +580,319 @@ it.effect.each([
         enabled: true,
         schedule: { type: "interval", everyMs: 60_000 },
         projectId,
-        threadId: ThreadId.make("thread:quota"),
+        threadId: unbound ? null : threadId,
+        workspaceStrategy: { type: "root" },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      });
+      const dispatched = yield* service.runNow({ id: task.id });
+      // Pending: the stored status stays the one before this run, a status every client knows.
+      assert.equal(dispatched.task.lastRunStatus, "never");
+      assert.equal(dispatched.task.runInProgressSince, dispatched.task.lastRunAt);
+      const settled = yield* service.subscribeList().pipe(
+        Stream.map(({ tasks }) => tasks.find((candidate) => candidate.id === task.id)),
+        Stream.filter((current) => current?.runInProgressSince === undefined),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* Deferred.succeed(ended, undefined);
+      const recorded = Option.getOrUndefined(yield* Fiber.join(settled));
+      assert.deepEqual(
+        { status: recorded?.lastRunStatus, error: recorded?.lastRunError },
+        { status: outcome.status, error: outcome.error },
+      );
+      assert.equal(recorded?.runCount, 1);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect("a run still going when the next one starts cannot overwrite the newer run", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:test");
+    const sent = yield* Ref.make<ReadonlyArray<string>>([]);
+    const endFirst = yield* Deferred.make<void>();
+    const endSecond = yield* Deferred.make<void>();
+    const layer = followerLayer(
+      Layer.mock(ThreadManagementService.ThreadManagementService)({
+        sendToThread: (input) =>
+          Ref.update(sent, (all) => [...all, input.messageId]).pipe(Effect.as({} as never)),
+        getThreadShell: () => Effect.succeed(threadShell(projectId)),
+        getProjectThreadRecords: () =>
+          Effect.map(
+            Ref.get(sent),
+            (messages) =>
+              ({
+                runs: messages.map((userMessageId, index) => ({
+                  id: `run:${index}`,
+                  status: "running",
+                  rootNodeId: "node:root",
+                  userMessageId,
+                })),
+                messages: messages.map((id, index) => ({ id, runId: `run:${index}` })),
+                turnItems: [],
+              }) as never,
+          ),
+        waitForThread: (input) =>
+          Deferred.await(input.runId === "run:0" ? endFirst : endSecond).pipe(
+            Effect.as({
+              threadId: input.threadId,
+              run: {
+                id: input.runId,
+                status: input.runId === "run:0" ? "failed" : "completed",
+                rootNodeId: "node:root",
+              },
+              timedOut: false,
+            } as never),
+          ),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const { task } = yield* service.upsert({
+        id: ScheduledTaskId.make("task:overlap"),
+        title: "Hourly sync",
+        prompt: "Sync upstream",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60 * 60_000 },
+        projectId,
+        threadId: ThreadId.make("thread:overlap"),
         workspaceStrategy: { type: "root" },
         modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
         runtimeMode: "full-access",
         interactionMode: "default",
       });
       yield* service.runNow({ id: task.id });
-      const failed = yield* service.subscribeList().pipe(
-        Stream.map(({ tasks }) => tasks.find((candidate) => candidate.id === task.id)),
-        Stream.filter((current) => current?.lastRunStatus === "failed"),
+      yield* TestClock.adjust("1 minute");
+      const second = yield* service.runNow({ id: task.id });
+      const states = yield* Queue.unbounded<ScheduledTask | undefined>();
+      yield* service.subscribeList().pipe(
+        Stream.runForEach(({ tasks }) =>
+          Queue.offer(
+            states,
+            tasks.find((candidate) => candidate.id === task.id),
+          ),
+        ),
+        Effect.forkChild,
+      );
+      yield* Queue.take(states);
+      yield* Deferred.succeed(endFirst, undefined);
+      // The first run's follower notifies when it ends; the second run is still the pending one.
+      const afterFirst = yield* Queue.take(states);
+      assert.deepEqual(
+        { status: afterFirst?.lastRunStatus, since: afterFirst?.runInProgressSince },
+        { status: "never", since: second.task.lastRunAt },
+      );
+      yield* Deferred.succeed(endSecond, undefined);
+      const afterSecond = yield* Queue.take(states);
+      assert.deepEqual(
+        {
+          status: afterSecond?.lastRunStatus,
+          error: afterSecond?.lastRunError,
+          since: afterSecond?.runInProgressSince,
+        },
+        { status: "succeeded", error: null, since: undefined },
+      );
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect("a restart finds each trigger's run again and records how it ended", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const startedAt = "2026-11-12T17:44:47.869Z";
+    const startedMs = Date.parse(startedAt);
+    const threadId = ThreadId.make("thread:resumed");
+    const release = yield* Deferred.make<void>();
+    const followed = {
+      "task:scheduled": `scheduled-task-message:task:scheduled:${startedMs}:scheduled`,
+      "task:manual": `scheduled-task-message:task:manual:${startedMs}:manual`,
+      "task:webhook": "scheduled-task-message:task:webhook:webhook:delivery-1",
+    };
+    const matched = `scheduled-task-message:task:matched:${startedMs}:scheduled`;
+    for (const id of [...Object.keys(followed), "task:matched", "task:lost"]) {
+      yield* insertRow(sql, { id, next: null, enabled: 1, status: "succeeded" }, startedAt);
+      yield* sql`
+        UPDATE scheduled_tasks
+        SET last_run_at = ${startedAt},
+            last_run_webhook_delivery_id = ${id === "task:webhook" ? "delivery-1" : null}
+        WHERE task_id = ${id}
+      `;
+    }
+    for (const messageId of [...Object.values(followed), matched]) {
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_messages
+          (message_id, thread_id, run_id, role, streaming, created_at, updated_at, payload_json)
+        VALUES (${messageId}, ${threadId}, ${`run:${messageId}`}, 'user', 0, ${startedAt}, ${startedAt}, '{}')
+      `;
+    }
+    // Already recorded as the clean success it was, so there is nothing to follow.
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_runs
+        (run_id, thread_id, ordinal, provider, status, requested_at, payload_json)
+      VALUES (${`run:${matched}`}, ${threadId}, 1, 'codex', 'completed', ${startedAt}, '{}')
+    `;
+    const layer = followerLayer(
+      Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: () => Effect.succeed(threadShell(ProjectId.make("project:test"))),
+        getProjectThreadRecords: () =>
+          Effect.succeed({
+            runs: Object.values(followed).map((userMessageId) => ({
+              id: `run:${userMessageId}`,
+              status: "failed",
+              rootNodeId: "node:root",
+              userMessageId,
+            })),
+            messages: Object.values(followed).map((id) => ({ id, runId: `run:${id}` })),
+            turnItems: Object.values(followed).map((id) => ({
+              type: "error",
+              status: "failed",
+              runId: `run:${id}`,
+              nodeId: "node:root",
+              failure: { message: PREPARATION_FAILURE },
+            })),
+          } as never),
+        waitForThread: (input) =>
+          Deferred.await(release).pipe(
+            Effect.as({
+              threadId: input.threadId,
+              run: { id: input.runId, status: "failed", rootNodeId: "node:root" },
+              timedOut: false,
+            } as never),
+          ),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const pending = (yield* service.list()).tasks
+        .filter((task) => task.runInProgressSince !== undefined)
+        .map((task) => task.id)
+        .toSorted();
+      assert.deepEqual(pending, ["task:manual", "task:scheduled", "task:webhook"]);
+      const settled = yield* service.subscribeList().pipe(
+        Stream.map(({ tasks }) => tasks),
+        Stream.filter((tasks) => tasks.every((task) => task.runInProgressSince === undefined)),
         Stream.runHead,
         Effect.forkChild,
       );
-      yield* Deferred.succeed(ended, undefined);
-      const recorded = Option.getOrUndefined(yield* Fiber.join(failed));
-      assert.equal(recorded?.lastRunError, outcome.error);
-      assert.equal(recorded?.runCount, 1);
+      yield* Deferred.succeed(release, undefined);
+      const recorded = Object.fromEntries(
+        Option.getOrThrow(yield* Fiber.join(settled)).map((task) => [
+          task.id,
+          [task.lastRunStatus, task.lastRunError],
+        ]),
+      );
+      assert.deepEqual(recorded, {
+        "task:scheduled": ["failed", PREPARATION_FAILURE],
+        "task:manual": ["failed", PREPARATION_FAILURE],
+        "task:webhook": ["failed", PREPARATION_FAILURE],
+        "task:matched": ["succeeded", null],
+        // No message to follow: left as it was.
+        "task:lost": ["succeeded", null],
+      });
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+// #69: a task MCP saved to run in its folder because the folder was not a repository.
+it.effect.each([
+  { name: "refuses an unbound MCP task", git: "folder", dispatch: "refused" },
+  {
+    name: "refuses an MCP task whose parent folder became a repository",
+    git: "parent",
+    dispatch: "refused",
+  },
+  {
+    name: "refuses an MCP task later edited in Settings",
+    git: "folder",
+    editedInSettings: true,
+    dispatch: "refused",
+  },
+  { name: "runs a bound task", git: "folder", bound: true, dispatch: "sent" },
+  { name: "runs a task whose folder was chosen in Settings", git: "folder", source: "web" },
+  { name: "runs a task in a scratch project", git: "folder", scratch: true },
+  { name: "runs a task whose folder is still not a repository", git: "none" },
+] as const)("a saved project-folder workspace in a folder that became a repository $name", (row) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const sql = yield* SqlClient.SqlClient;
+    const parent = yield* fileSystem.makeTempDirectoryScoped({ prefix: "scheduled-root-" });
+    const root = path.join(parent, "project");
+    yield* fileSystem.makeDirectory(root);
+    if (row.git !== "none") {
+      yield* fileSystem.makeDirectory(path.join(row.git === "parent" ? parent : root, ".git"));
+    }
+    const projectId = ProjectId.make("project:repo");
+    yield* sql`
+      INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+      VALUES (${projectId}, 'Repo', ${root}, '[]', '', '')
+    `;
+    const dispatched = yield* Ref.make<"launched" | "sent" | "refused">("refused");
+    const layer = ScheduledTaskService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ManagedPolicy.layerTest(),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+            launch: () =>
+              Ref.set(dispatched, "launched").pipe(
+                Effect.as({ threadId: ThreadId.make("thread:launched") } as never),
+              ),
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            sendToThread: () => Ref.set(dispatched, "sent").pipe(Effect.as({} as never)),
+            getThreadShell: () => Effect.succeed(threadShell(projectId)),
+            getProjectThreadRecords: () =>
+              Effect.succeed({ runs: [], messages: [], turnItems: [] } as never),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: "/projects",
+            isScratchProject: () => Effect.succeed("scratch" in row),
+          }),
+          NodeCrypto.layer,
+          Scheduler.layer,
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const input: ScheduledTaskUpsertInput = {
+        id: ScheduledTaskId.make("task:repo"),
+        title: "Nightly notes",
+        prompt: "Update the notes",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60_000 },
+        projectId,
+        threadId: "bound" in row ? ThreadId.make("thread:bound") : null,
+        workspaceStrategy: { type: "root" },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "source" in row ? row.source : "mcp",
+      };
+      const { task } = yield* service.upsert(input);
+      if ("editedInSettings" in row) {
+        const edited = yield* service.upsert({ ...input, title: "Renamed", creationSource: "web" });
+        assert.equal(edited.task.creationSource, "mcp");
+      }
+      const result = yield* service.runNow({ id: task.id });
+      assert.equal(yield* Ref.get(dispatched), "dispatch" in row ? row.dispatch : "launched");
+      if ("dispatch" in row && row.dispatch === "refused") {
+        assert.equal(result.task.lastRunStatus, "failed");
+        assert.equal(result.task.runCount, 1);
+        assert.include(
+          result.task.lastRunError,
+          row.git === "parent"
+            ? `inside the Git repository at ${parent} (${path.join(parent, ".git")})`
+            : `${root} is now a Git repository (${path.join(root, ".git")})`,
+        );
+      } else {
+        assert.equal(result.task.runInProgressSince, result.task.lastRunAt);
+      }
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(Layer.merge(SqlitePersistence.layerMemory, NodeServices.layer))),
 );
 
 it.effect("a bound run follows its thread when promotion moves it mid-send", () =>

@@ -2255,6 +2255,7 @@ it.effect("ProviderSessionManagerV2 fails a turn whose provider retry never resu
         status: "interrupted",
         failure: null,
         threadDisposition: "reusable",
+        noWorkObserved: true,
       });
       yield* Queue.offer(adapterQueue!, {
         type: "provider_session.updated",
@@ -2282,6 +2283,9 @@ it.effect("ProviderSessionManagerV2 fails a turn whose provider retry never resu
         retry,
         retryStartedAt: now,
         threadDisposition: "reusable",
+        // The adapter's no-work evidence survives the rewrite, so a stalled limit can fail over.
+        noWorkObserved: true,
+        accountFailure: "usage_limit",
       });
     });
 

@@ -2476,6 +2476,15 @@ export const layerWithOptions = (
               retry: stalled.retry,
               ...(stalled.startedAt === null ? {} : { retryStartedAt: stalled.startedAt }),
               threadDisposition: event.threadDisposition,
+              // Only adapters with work evidence set the flag, and their retry items class only 429s as usage_limit.
+              ...(event.noWorkObserved === true
+                ? {
+                    noWorkObserved: true as const,
+                    ...(stalled.failure.class === "usage_limit"
+                      ? { accountFailure: "usage_limit" as const }
+                      : {}),
+                  }
+                : {}),
             },
           };
         };

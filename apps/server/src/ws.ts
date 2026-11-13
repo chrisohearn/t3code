@@ -122,6 +122,7 @@ import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
+import { CommandActor, ownerClientActor } from "./orchestration-v2/CommandActor.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
@@ -1422,6 +1423,7 @@ export const layerWsRpc = (
   Layer.effectContext(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
+      const commandActor = ownerClientActor(currentSession);
       const sql = yield* SqlClient.SqlClient;
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
       const intakeContext = yield* Effect.context<
@@ -1972,7 +1974,13 @@ export const layerWsRpc = (
                             "creationSource" in command ? command.creationSource : "web",
                         }),
                       )
-                  ).pipe(Effect.provide(intakeContext)),
+                  ).pipe(
+                    (dispatch) =>
+                      commandActor === undefined
+                        ? dispatch
+                        : Effect.provideService(dispatch, CommandActor, commandActor),
+                    Effect.provide(intakeContext),
+                  ),
                 )
                 .pipe(
                   Effect.tap((result) =>

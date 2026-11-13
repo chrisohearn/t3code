@@ -7,6 +7,7 @@ import {
   AuthOrchestrationOperateScope,
   type EnvironmentId,
   type ScheduledTask,
+  scheduledTaskRunDisplayStatus,
   type ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -170,7 +171,7 @@ export function ThreadAutomationsPanel(props: {
               <span
                 className={cn(
                   "absolute -right-1 -top-1 size-1.5 rounded-full",
-                  STATUS_DOT_CLASS[task.lastRunStatus],
+                  STATUS_DOT_CLASS[scheduledTaskRunDisplayStatus(task)],
                 )}
                 aria-hidden
               />
@@ -223,7 +224,9 @@ export function ThreadAutomationsPanel(props: {
                       part="icon"
                       aria-label={`Run ${task.title} now`}
                       disabled={
-                        !canOperate || busyTaskId !== null || task.lastRunStatus === "running"
+                        !canOperate ||
+                        busyTaskId !== null ||
+                        scheduledTaskRunDisplayStatus(task) === "running"
                       }
                       onClick={() => void runNow(task)}
                     >

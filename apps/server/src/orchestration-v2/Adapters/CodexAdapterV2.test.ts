@@ -6608,6 +6608,35 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       willRetry: true,
       expectedClass: "transport_error",
     },
+    // The 2026-11-12 Jarvis inbox incident: the sharing cap before any output, then no reset.
+    {
+      name: "sharing-limit-before-work",
+      code: "other",
+      details: "subscription_sharing_usage_limit_exceeded",
+      notification: true,
+      expectedClass: "usage_limit",
+      expectedCode: "subscription_sharing_usage_limit_exceeded",
+      expectedMessage: "Usage settings",
+    },
+    {
+      name: "sharing-limit-after-file-change",
+      code: "other",
+      details: "subscription_sharing_usage_limit_exceeded",
+      notification: true,
+      workBefore: true,
+      expectedClass: "usage_limit",
+      expectedCode: "subscription_sharing_usage_limit_exceeded",
+      expectedMessage: "Usage settings",
+    },
+    {
+      name: "sharing-sign-in",
+      code: "other",
+      details: "subscription_sharing_v2_invalid_user",
+      notification: true,
+      expectedClass: "provider_error",
+      expectedCode: "subscription_sharing_v2_invalid_user",
+      expectedMessage: "could not validate",
+    },
   ] as const)("classifies Codex terminal failures from $name evidence", (scenario) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -6685,6 +6714,29 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 ]
               : []),
             ...(readsReset ? [premium] : []),
+            // A file change that starts never reaches the projection when the turn then fails.
+            ...("workBefore" in scenario
+              ? [
+                  {
+                    type: "emit_inbound" as const,
+                    label: "item/started/fileChange",
+                    frame: {
+                      method: "item/started",
+                      params: {
+                        threadId: nativeThreadId,
+                        turnId: nativeTurnId,
+                        startedAtMs: 1,
+                        item: {
+                          type: "fileChange",
+                          id: "limit-file-change",
+                          status: "inProgress",
+                          changes: [],
+                        },
+                      },
+                    },
+                  },
+                ]
+              : []),
             ...(scenario.name === "deferred-reset" ? [snapshot] : []),
             ...(scenario.name === "deferred-reset"
               ? [
@@ -6872,6 +6924,19 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         if (terminal?.status !== "failed") return;
         assert.equal(terminal.failure.class, scenario.expectedClass);
         assert.equal(terminal.threadDisposition, "reusable");
+        assert.equal(
+          terminal.accountFailure,
+          scenario.expectedClass === "usage_limit"
+            ? "usage_limit"
+            : scenario.name === "sharing-sign-in"
+              ? "auth"
+              : undefined,
+        );
+        // A child started or a file change began: the turn did work, so it never fails over.
+        assert.equal(
+          terminal.noWorkObserved,
+          "workBefore" in scenario || scenario.name === "deferred-reset" ? undefined : true,
+        );
         if (scenario.name === "deferred-reset" || scenario.name === "first-request-reset")
           assert.equal(terminal.failure.resetAt, resetAt);
         if (scenario.name === "newer-reset-during-read")

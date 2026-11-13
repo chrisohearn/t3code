@@ -87,8 +87,40 @@ export const UserInputAttachments = Schema.Record(
 );
 export type UserInputAttachments = typeof UserInputAttachments.Type;
 
+/**
+ * Who answered a question dialog, stamped by the server from the dispatch path: an owner's
+ * paired client, an outside MCP sign-in, or an agent. Answers recorded before it existed have none.
+ */
+export const UserInputAnsweredBy = Schema.Literals(["owner_client", "mcp_client", "agent"]);
+export type UserInputAnsweredBy = typeof UserInputAnsweredBy.Type;
+
+/** The server's record of the paired session an owner answered from. */
+export const UserInputAnsweringClient = Schema.Struct({
+  sessionId: TrimmedNonEmptyString.check(Schema.isMaxLength(8)),
+  clientLabel: Schema.String,
+});
+export type UserInputAnsweringClient = typeof UserInputAnsweringClient.Type;
+
+/**
+ * One answer value as the dialog read when it was answered: the single option it chose, text
+ * typed (or left as the agent prefilled it), or a value no single option or typed answer explains.
+ */
+export const UserInputAnswerQuote = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("option"),
+    label: Schema.String,
+    description: Schema.String,
+  }),
+  Schema.Struct({ kind: Schema.Literal("text"), text: Schema.String, prefilled: Schema.Boolean }),
+  Schema.Struct({ kind: Schema.Literal("unmatched") }),
+]);
+export type UserInputAnswerQuote = typeof UserInputAnswerQuote.Type;
+
 export const UserInputAttachmentAnswerPayload = Schema.Struct({
   requestId: TrimmedNonEmptyString,
+  answeredBy: Schema.optional(UserInputAnsweredBy),
+  answeringClient: Schema.optional(UserInputAnsweringClient),
+  quotesById: Schema.optional(Schema.Record(Schema.String, Schema.Array(UserInputAnswerQuote))),
   questionTextById: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   answers: ProviderUserInputAnswers,
   attachmentsByQuestionId: UserInputAttachments,

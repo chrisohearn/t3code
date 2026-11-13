@@ -63,6 +63,11 @@ function LedgerList({ environmentId }: { readonly environmentId: EnvironmentId }
                 <p className="whitespace-pre-wrap break-words text-sm">
                   {item.nextAction || "No next action recorded."}
                 </p>
+                {item.approval && (
+                  <p className="line-clamp-3 whitespace-pre-wrap break-words text-sm text-muted-foreground">
+                    Your approval: “{item.approval.quotedAnswer}”
+                  </p>
+                )}
                 {item.ownerThreadId && (
                   <Link
                     to="/$environmentId/$threadId"

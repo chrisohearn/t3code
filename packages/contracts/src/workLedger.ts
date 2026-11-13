@@ -6,7 +6,9 @@ import {
   ThreadId,
   RunId,
   TrimmedNonEmptyString,
+  TurnItemId,
 } from "./baseSchemas.ts";
+import { UserInputAnsweringClient } from "./providerPolicy.ts";
 
 const text = Schema.String.check(Schema.isMaxLength(8000));
 const name = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
@@ -37,9 +39,35 @@ const fields = {
   approvalNote: Schema.NullOr(text),
   links: Schema.Array(Schema.String.check(Schema.isMaxLength(4096))).check(Schema.isMaxLength(100)),
 };
+/** Chris's answer to a question dialog whose question names the row as `Ledger key: <key>`. */
+export const WorkLedgerApprovalSource = Schema.Struct({
+  threadId: ThreadId,
+  itemId: TurnItemId,
+  /** Which question of the dialog; needed when the dialog asked more than one. */
+  questionId: Schema.optional(TrimmedNonEmptyString),
+});
+export type WorkLedgerApprovalSource = typeof WorkLedgerApprovalSource.Type;
+/** Written only by the server after it verifies the source; the quotes come from the dialog. */
+export const WorkLedgerApproval = Schema.Struct({
+  approvedBy: Schema.Literal("user"),
+  sourceThreadId: ThreadId,
+  sourceItemId: TurnItemId,
+  sourceRunId: RunId,
+  questionId: TrimmedNonEmptyString,
+  quotedQuestion: text,
+  quotedAnswer: text,
+  answeringClient: UserInputAnsweringClient,
+  /** Hash of the row's key, title, nextAction, ownerKind and ownerName when verified. */
+  rowHash: TrimmedNonEmptyString,
+  verifiedAt: IsoDateTime,
+  recordedBy: TrimmedNonEmptyString,
+});
+export type WorkLedgerApproval = typeof WorkLedgerApproval.Type;
 export const WorkLedgerItem = Schema.Struct({
   key: name,
   ...fields,
+  // Optional: an environment on an older build omits it.
+  approval: Schema.optional(Schema.NullOr(WorkLedgerApproval)),
   lastRunId: Schema.NullOr(RunId),
   lastRunStatus: Schema.NullOr(Schema.String),
   lastRunAt: Schema.NullOr(IsoDateTime),
@@ -52,6 +80,8 @@ export type WorkLedgerItem = typeof WorkLedgerItem.Type;
 export const WorkLedgerUpsertInput = Schema.Struct({
   key: name,
   ...Schema.Struct(fields).mapFields(Struct.map(Schema.optional)).fields,
+  /** A source to verify as Chris's approval, or null to revoke the recorded one. */
+  approval: Schema.optional(Schema.NullOr(Schema.Struct({ source: WorkLedgerApprovalSource }))),
 });
 export type WorkLedgerUpsertInput = typeof WorkLedgerUpsertInput.Type;
 export const WorkLedgerQueryInput = Schema.Struct({
@@ -61,6 +91,7 @@ export const WorkLedgerQueryInput = Schema.Struct({
   updatedSince: Schema.optional(IsoDateTime),
   waitReason: Schema.optional(WorkLedgerWaitReason),
   due: Schema.optional(Schema.Boolean),
+  approved: Schema.optional(Schema.Boolean),
   cursor: Schema.optional(name),
   limit: pageLimit,
 });

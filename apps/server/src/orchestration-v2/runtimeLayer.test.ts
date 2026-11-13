@@ -24,6 +24,7 @@ import {
   TurnItemId,
   type ModelSelection,
   type OrchestrationV2Run,
+  type OrchestrationV2SenderClient,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2RuntimeRequest,
   ProjectId,
@@ -72,6 +73,7 @@ import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import { CommandActor } from "./CommandActor.ts";
 import { ROLLBACK_FAILED_MESSAGE } from "./CheckpointRollbackService.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -89,6 +91,8 @@ import * as RuntimeLayer from "./runtimeLayer.ts";
 import { shellStreamItemFromThreadShell } from "./ShellStream.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ProviderFailover from "./ProviderFailover.ts";
+import * as ProviderFailoverDispatch from "./ProviderFailoverDispatch.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -319,26 +323,28 @@ const layerProjectionReplayTest = ProjectionReplay.layer.pipe(
   ),
 );
 
-const layerTest = Layer.mergeAll(
-  RuntimeLayer.layer,
-  layerProjectionReplayTest,
-  RuntimeLayer.layerEventSink,
-  ProjectStore.layer,
-  ProjectionStore.layer,
-  EffectOutbox.layer,
-  ThreadCommandExecutor.layer,
-).pipe(
-  Layer.provide(McpSessionRegistryTestkit.layer),
-  Layer.provide(McpProviderSessions.layer),
-  Layer.provide(SqlitePersistence.layerMemory),
-  Layer.provide(layerCheckpointStoreTest),
-  Layer.provide(layerServerConfig),
-  Layer.provide(ServerSettings.layerTest()),
-  Layer.provide(layerTestProviderInstanceRegistry),
-  Layer.provide(layerGitWorkflowTest),
-  Layer.provide(layerProjectServiceTest),
-  Layer.provide(layerPlatformTest),
-);
+const makeLayerTest = (settings?: Parameters<typeof ServerSettings.layerTest>[0]) =>
+  Layer.mergeAll(
+    RuntimeLayer.layer,
+    layerProjectionReplayTest,
+    RuntimeLayer.layerEventSink,
+    ProjectStore.layer,
+    ProjectionStore.layer,
+    EffectOutbox.layer,
+    ThreadCommandExecutor.layer,
+  ).pipe(
+    Layer.provide(McpSessionRegistryTestkit.layer),
+    Layer.provide(McpProviderSessions.layer),
+    Layer.provide(SqlitePersistence.layerMemory),
+    Layer.provide(layerCheckpointStoreTest),
+    Layer.provide(layerServerConfig),
+    Layer.provide(ServerSettings.layerTest(settings)),
+    Layer.provide(layerTestProviderInstanceRegistry),
+    Layer.provide(layerGitWorkflowTest),
+    Layer.provide(layerProjectServiceTest),
+    Layer.provide(layerPlatformTest),
+  );
+const layerTest = makeLayerTest();
 
 const layerLegacyImportTest = Layer.merge(RuntimeLayer.layer, layerProjectionReplayTest).pipe(
   Layer.provide(McpSessionRegistryTestkit.layer),
@@ -2161,7 +2167,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         requestId,
         answers: { color: "  Blue  ", sizes: ["Small", "Large"], note: "" },
       };
-      const accepted = yield* orchestrator.dispatch(command);
+      const accepted = yield* orchestrator.dispatch(command).pipe(
+        Effect.provideService(CommandActor, {
+          kind: "owner_client",
+          client: { sessionId: "session1", clientLabel: "Chris's Mac" },
+        }),
+      );
       const repeated = yield* orchestrator.dispatch(command);
       assert.equal(repeated.sequence, accepted.sequence);
       const answered = yield* orchestrator.getThreadProjection(threadId);
@@ -2174,6 +2185,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       if (answeredItem?.type === "user_input_request") {
         assert.deepEqual(answeredItem.questionAnswer, {
           requestId,
+          answeredBy: "owner_client",
+          answeringClient: { sessionId: "session1", clientLabel: "Chris's Mac" },
+          quotesById: {
+            color: [{ kind: "text", text: "Blue", prefilled: false }],
+            sizes: [
+              { kind: "text", text: "Small", prefilled: false },
+              { kind: "text", text: "Large", prefilled: false },
+            ],
+            note: [{ kind: "text", text: "", prefilled: false }],
+          },
           answers: command.answers,
           attachmentsByQuestionId: {},
           questionTextById: {
@@ -3082,6 +3103,123 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         cleaned,
         inherited.attachmentId,
         "deleted a page its live fork still shows",
+      );
+    }),
+  );
+
+  // A thread whose session, like Claude's, must end to take a new mode.
+  const seedOwnerModeThread = (name: string) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make(`${name}-thread`);
+      yield* seedProject({
+        projectId: ProjectId.make(`${name}-project`),
+        title: "Owner mode project",
+        workspaceRoot: "/workspace/project",
+        defaultModelSelection: null,
+        createdAt: "2026-09-07T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${name}-create`),
+        threadId,
+        projectId: ProjectId.make(`${name}-project`),
+        title: "Owner mode test",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${name}-session`),
+            type: "provider-session.attached",
+            threadId,
+            driver,
+            occurredAt: now,
+            payload: {
+              id: ProviderSessionId.make(`${name}-session`),
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              status: "running",
+              cwd: "/workspace/project",
+              model: modelSelection.model,
+              capabilities: {
+                ...CodexProviderCapabilitiesV2,
+                sessions: {
+                  ...CodexProviderCapabilitiesV2.sessions,
+                  supportsRuntimeModeSwitchInSession: false,
+                },
+              },
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+          },
+        ],
+      });
+      return threadId;
+    });
+
+  it.effect("commits nothing when an owner sets the thread's current mode", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = yield* seedOwnerModeThread("owner-mode-same");
+      const sequence = yield* orchestrator.getThreadEventSequence(threadId);
+      yield* orchestrator.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("owner-mode-same-set"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
+    }),
+  );
+
+  it.effect("refuses an owner's mode change that would end a running session, until it ends", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = yield* seedOwnerModeThread("owner-mode-running");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("owner-mode-running-send"),
+        threadId,
+        messageId: MessageId.make("owner-mode-running-message"),
+        text: "Start work",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      });
+      const setMode = {
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("owner-mode-running-set"),
+        threadId,
+        runtimeMode: "approval-required",
+      } as const;
+      const failure = yield* orchestrator.dispatch(setMode).pipe(Effect.flip);
+      assert.instanceOf(failure, Orchestrator.OrchestratorDispatchError);
+      assert.equal(failure.cause, Orchestrator.RUNTIME_MODE_CHANGE_DURING_RUN_REFUSAL);
+      const refused = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(refused.thread.runtimeMode, "full-access");
+      assert.isTrue(refused.providerSessions.every((session) => session.status === "running"));
+
+      // No rejection is recorded, so a client retrying the same command succeeds after the run.
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("owner-mode-running-stop"),
+        threadId,
+      });
+      yield* orchestrator.dispatch(setMode);
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(threadId)).thread.runtimeMode,
+        "approval-required",
       );
     }),
   );
@@ -11477,6 +11615,384 @@ it.layer(layerSharedApplicationDataPlaneTest)("shared application data plane", (
           (SELECT COUNT(*) FROM orchestration_v2_command_receipts) AS count
       `;
       assert.equal(retiredWrites[0]?.count, 0);
+    }),
+  );
+});
+
+it.layer(
+  makeLayerTest({
+    providerInstances: { [claudeInstanceId]: { driver: claudeDriver, enabled: true } },
+  }),
+)("provider failover", (it) => {
+  const fallback = { instanceId: claudeInstanceId, model: "claude-opus-5-5" } as const;
+  const role = "You are the inbox. Reply only 'Queued for Jarvis: <summary>' and never use tools.";
+  const sourceAttachment = {
+    type: "image",
+    id: "failover-attachment",
+    name: "screenshot.png",
+    mimeType: "image/png",
+    sizeBytes: 128,
+  } as const;
+
+  // The incident shape: a standing role, then a run that failed on the account limit
+  // before any work, with the claim its failure wrote and a message queued behind it.
+  const failedRunWithClaim = (
+    key: string,
+    options?: {
+      readonly freshContext?: boolean;
+      readonly fallbackInstanceId?: ProviderInstanceId;
+      /** The failed message opens the thread; there is no earlier role. */
+      readonly sourceFirst?: boolean;
+      /** The claim's effect already settled without resolving it. */
+      readonly withoutEffect?: boolean;
+      readonly senderClient?: OrchestrationV2SenderClient;
+    },
+  ) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make(`failover:${key}`);
+      const projectId = ProjectId.make(`failover:project:${key}`);
+      const now = yield* DateTime.now;
+      yield* seedProject({
+        projectId,
+        title: "Failover project",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        createdAt: DateTime.formatIso(now),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`failover:create:${key}`),
+        threadId,
+        projectId,
+        title: "Inbox",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      const send = (suffix: string, text: string, mode: "defer_start" | "queue_after_active") =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`failover:${suffix}:${key}`),
+          threadId,
+          messageId: MessageId.make(`failover:${suffix}:${key}`),
+          text,
+          attachments: suffix === "source" ? [sourceAttachment] : [],
+          dispatchMode: { type: mode },
+          ...(suffix === "fresh" ? { freshContext: true } : {}),
+          ...(suffix === "source" && options?.senderClient !== undefined
+            ? { senderClient: options.senderClient }
+            : {}),
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+      const finish = (run: OrchestrationV2Run, payload: Partial<OrchestrationV2Run>) =>
+        events.writeWithEffects({
+          // The claim's effect stays unrun here so the test drives it; its future start keeps it pending.
+          effects:
+            payload.failover === undefined || options?.withoutEffect === true
+              ? []
+              : [
+                  {
+                    ...ProviderFailover.providerFailoverEffect(threadId, run.id),
+                    availableAt: DateTime.add(now, { days: 1 }),
+                  },
+                ],
+          events: [
+            {
+              id: EventId.make(`failover:${run.id}:${payload.status}`),
+              type: "run.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: { ...run, completedAt: now, ...payload },
+            },
+          ],
+        });
+      const latest = Effect.map(orchestrator.getThreadProjection(threadId), (projection) =>
+        projection.runs.at(-1)!,
+      );
+      if (options?.sourceFirst !== true) {
+        yield* send("role", role, "defer_start");
+        yield* finish(yield* latest, { status: "completed", startedAt: now });
+      }
+      if (options?.freshContext === true) {
+        yield* send("fresh", "Start over from here.", "defer_start");
+        yield* finish(yield* latest, { status: "completed", startedAt: now });
+      }
+      yield* send("source", "Queue: the audit finished.", "defer_start");
+      const source = yield* latest;
+      yield* send("queued", "Queue: a later note.", "queue_after_active");
+      const queued = yield* latest;
+      yield* finish(source, {
+        status: "failed",
+        startedAt: now,
+        delegatedTaskId: NodeId.make(`failover:task:${key}`),
+        failover: {
+          state: "pending",
+          reason: "usage_limit",
+          modelSelection: {
+            ...fallback,
+            instanceId: options?.fallbackInstanceId ?? fallback.instanceId,
+          },
+        },
+      });
+      return { threadId, source, queued };
+    });
+
+  const runFailover = (threadId: ThreadId, sourceRunId: RunId, attempt = 1) =>
+    ProviderFailoverDispatch.dispatchProviderFailover({
+      threadId,
+      sourceRunId,
+      attempt,
+      willRetry: false,
+      providers: Effect.succeed([]),
+    });
+
+  it.effect.each([false, true])(
+    "re-sends the failed message once on the fallback with its conversation's first message (fresh context: %s)",
+    (freshContext) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const { threadId, source, queued } = yield* failedRunWithClaim(`dispatch:${freshContext}`, {
+          freshContext,
+        });
+        // Startup queue recovery and the parent wait both treat the claim as unfinished work.
+        yield* orchestrator.resumeQueuedRuns;
+        const pending = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(pending.runs.find((run) => run.id === queued.id)?.status, "queued");
+        assert.isTrue(
+          yield* orchestrator.restartContinuationPending(
+            pending.runs.find((run) => run.id === source.id)!,
+          ),
+        );
+
+        // A second delivery of the effect, as after a restart, changes nothing.
+        yield* runFailover(threadId, source.id, 1);
+        yield* runFailover(threadId, source.id, 2);
+
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        const failedOver = after.runs.filter((run) => run.failoverOfRunId === source.id);
+        assert.lengthOf(failedOver, 1);
+        const run = failedOver[0]!;
+        assert.deepEqual(run.modelSelection, fallback);
+        assert.notEqual(run.status, "queued");
+        // The failover run answers the delegated task the failed run owned.
+        assert.equal(run.delegatedTaskId, `failover:task:dispatch:${freshContext}`);
+        const resent = after.messages.find((message) => message.id === run.userMessageId);
+        assert.equal(resent?.text, "Queue: the audit finished.");
+        assert.deepEqual(resent?.attachments, [sourceAttachment]);
+        const resolved = after.runs.find((candidate) => candidate.id === source.id)!;
+        assert.deepEqual(resolved.failover, {
+          state: "dispatched",
+          reason: "usage_limit",
+          modelSelection: fallback,
+          runId: run.id,
+        });
+        assert.isFalse(yield* orchestrator.restartContinuationPending(resolved));
+        assert.equal(after.runs.find((candidate) => candidate.id === queued.id)?.status, "queued");
+        assert.equal(after.thread.modelSelection.instanceId, fallback.instanceId);
+        assert.isTrue(
+          after.turnItems.some(
+            (item) => item.type === "system_notice" && item.id === `failover:${source.id}`,
+          ),
+        );
+        // The fallback starts a new conversation; its handoff names the role as standing.
+        const handoff = after.contextHandoffs.find((candidate) => candidate.targetRunId === run.id);
+        const standing = handoff?.history?.messages.find(
+          (message) => message.itemId === handoff.history?.standingItemId,
+        );
+        // A fresh-context run starts a new conversation; history before it never reaches a provider.
+        assert.equal(standing?.text, freshContext ? "Start over from here." : role);
+        assert.isFalse(
+          freshContext &&
+            (handoff?.history?.messages.some((message) => message.text === role) ?? false),
+        );
+        // The re-sent prompt is the new turn, never also history.
+        assert.isFalse(
+          handoff?.history?.messages.some((message) => message.text === resent?.text) ?? false,
+        );
+
+        // The message queued behind the failed run follows the thread to the fallback.
+        const events = yield* EventSink.EventSinkV2;
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`failover:${run.id}:completed`),
+              type: "run.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: yield* DateTime.now,
+              payload: { ...run, status: "completed", completedAt: yield* DateTime.now },
+            },
+          ],
+        });
+        yield* orchestrator.resumeQueuedRuns;
+        const started = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+          (candidate) => candidate.id === queued.id,
+        );
+        assert.notEqual(started?.status, "queued");
+        assert.equal(started?.providerInstanceId, fallback.instanceId);
+      }),
+  );
+
+  it.effect("re-sends a thread's opening message without repeating it as history", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, source } = yield* failedRunWithClaim("source-first", {
+        sourceFirst: true,
+      });
+      yield* runFailover(threadId, source.id);
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      const run = after.runs.find((candidate) => candidate.failoverOfRunId === source.id);
+      assert.isDefined(run);
+      const handoff = after.contextHandoffs.find((candidate) => candidate.targetRunId === run!.id);
+      assert.isFalse(
+        handoff?.history?.messages.some(
+          (message) => message.text === "Queue: the audit finished.",
+        ) ?? false,
+      );
+      assert.isUndefined(handoff?.history?.standingItemId);
+    }),
+  );
+
+  it.effect.each([
+    "stop",
+    "stop-before-failure",
+    "archive",
+    "disabled-fallback",
+    "steer",
+    "forged-text",
+    "client-mode-limit",
+    "settled-effect",
+  ] as const)("skips the failover after %s and releases what it held", (scenario) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const { threadId, source, queued } = yield* failedRunWithClaim(
+        scenario,
+        scenario === "disabled-fallback"
+          ? { fallbackInstanceId: alternateInstanceId }
+          : scenario === "settled-effect"
+            ? { withoutEffect: true }
+            : scenario === "client-mode-limit"
+              ? {
+                  senderClient: {
+                    sessionId: "jarvis01",
+                    clientLabel: "Jarvis",
+                    kind: "outside-client",
+                    access: "approval-required",
+                  },
+                }
+              : {},
+      );
+      const now = yield* DateTime.now;
+      if (scenario === "steer") {
+        // The user steered the run during its retries; re-sending its first message would drop that.
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`failover:steer`),
+              type: "message.updated",
+              threadId,
+              runId: source.id,
+              occurredAt: now,
+              payload: {
+                id: MessageId.make(`failover:steer`),
+                threadId,
+                runId: source.id,
+                nodeId: source.rootNodeId,
+                role: "user",
+                text: "Also check the release notes.",
+                attachments: [],
+                streaming: false,
+                createdBy: "user",
+                creationSource: "web",
+                createdAt: now,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+      }
+      if (scenario === "forged-text") {
+        // Only the source's own text and sender may be re-sent.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`failover:forged`),
+          threadId,
+          messageId: MessageId.make(`failover:forged`),
+          text: "Something the source never said.",
+          attachments: [],
+          modelSelection: fallback,
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "agent",
+          creationSource: "mcp",
+          failoverOfRunId: source.id,
+        });
+      }
+      if (scenario === "settled-effect") {
+        // Startup recovery resolves a claim whose effect is gone, which releases the queue.
+        yield* orchestrator.recoverDelegatedTasks;
+        yield* orchestrator.resumeQueuedRuns;
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(after.runs.find((run) => run.id === source.id)?.failover?.state, "skipped");
+        assert.notEqual(after.runs.find((run) => run.id === queued.id)?.status, "queued");
+        return;
+      }
+      if (scenario === "stop" || scenario === "archive") {
+        yield* orchestrator.dispatch(
+          scenario === "stop"
+            ? { type: "thread.stop", commandId: CommandId.make(`failover:stop`), threadId }
+            : {
+                type: "thread.archive",
+                commandId: CommandId.make(`failover:archive`),
+                threadId,
+              },
+        );
+      }
+      if (scenario === "stop-before-failure") {
+        // Stop reached the run while it ran; its failure and claim landed afterwards.
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`failover:interrupt-request`),
+              type: "turn-item.updated",
+              threadId,
+              runId: source.id,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make(`failover:interrupt-request`),
+                type: "run_interrupt_request",
+                threadId,
+                runId: source.id,
+                nodeId: source.rootNodeId,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 3,
+                status: "completed",
+                title: null,
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                message: "Stop requested.",
+              },
+            },
+          ],
+        });
+      }
+      yield* runFailover(threadId, source.id);
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.isFalse(after.runs.some((run) => run.failoverOfRunId === source.id));
+      assert.equal(after.runs.find((run) => run.id === source.id)?.failover?.state, "skipped");
+      assert.deepEqual(after.thread.modelSelection, modelSelection);
     }),
   );
 });

@@ -19,6 +19,7 @@ import {
 import { usePullRequestDraftThread } from "./chat/usePullRequestDraftThread";
 import { usePullRequestLinking } from "../hooks/usePullRequestLinking";
 import { useComposerSelection } from "./chat/useComposerSelection";
+import { useRuntimeModePickStore } from "./chat/runtimeModePickStore";
 import { useProjectCloneBanner } from "./chat/useProjectCloneBanner";
 import { useAttachmentPreviewHandoff } from "./chat/useAttachmentPreviewHandoff";
 import {
@@ -75,7 +76,6 @@ import {
   type ThreadId,
   ProviderInteractionMode,
   resolveIdleCompaction,
-  RuntimeMode,
 } from "@t3tools/contracts";
 import {
   deriveProviderSubagentStatus,
@@ -450,9 +450,6 @@ export default function ChatView(props: ChatViewProps) {
     reportFailure: false,
   });
   const canWriteSourceControl = useEnvironmentScope(environmentId, AuthSourceControlWriteScope);
-  const setThreadRuntimeMode = useOrchestrationCommand(threadEnvironment.setRuntimeMode, {
-    reportFailure: false,
-  });
   const setThreadInteractionMode = useOrchestrationCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
@@ -956,10 +953,17 @@ export default function ChatView(props: ChatViewProps) {
     localServerError === null && visibleThreadError === serverRuntime?.lastError;
   const defaultRuntimeMode = resolveProjectSettings(settings, activeThread?.projectId ?? null)
     .settings.defaultRuntimeMode;
+  const runtimeModePick = useRuntimeModePickStore((store) =>
+    isServerThread && activeThread
+      ? (store.picks[scopedThreadKey(scopeThreadRef(activeThread.environmentId, activeThread.id))]
+          ?.mode ?? null)
+      : null,
+  );
+  // A server thread shows its own mode; a saved draft's mode only seeds a new thread.
   const runtimeMode =
-    composerRuntimeMode ??
-    (isServerThread ? activeThread?.runtimeMode : undefined) ??
-    defaultRuntimeMode;
+    isServerThread && activeThread
+      ? (runtimeModePick ?? activeThread.runtimeMode)
+      : (composerRuntimeMode ?? defaultRuntimeMode);
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = canWriteSourceControl && isLocalDraftThread;
   const activeThreadId = activeThread?.id ?? null;
@@ -2046,7 +2050,6 @@ export default function ChatView(props: ChatViewProps) {
     threadId: ThreadId;
     createdAt: string;
     branch?: string;
-    runtimeMode: RuntimeMode;
     interactionMode: ProviderInteractionMode;
   }): Promise<AtomCommandResult<void, unknown>> => {
     if (!serverThread) {
@@ -2066,23 +2069,6 @@ export default function ChatView(props: ChatViewProps) {
           input: {
             threadId: input.threadId,
             ...metadataUpdate,
-          },
-        }),
-        () => undefined,
-      );
-      if (result._tag === "Failure") {
-        return result;
-      }
-    }
-
-    if (input.runtimeMode !== serverThread.runtimeMode) {
-      result = mapAtomCommandResult(
-        await setThreadRuntimeMode({
-          environmentId,
-          input: {
-            threadId: input.threadId,
-            runtimeMode: input.runtimeMode,
-            createdAt: input.createdAt,
           },
         }),
         () => undefined,
@@ -2870,6 +2856,7 @@ export default function ChatView(props: ChatViewProps) {
     multipleModelSelections,
     runtimeMode,
     isLocalDraftThread,
+    isWorking,
     canOverrideServerThreadEnvMode,
     setPendingServerThreadEnvModeEntry,
     setPendingServerThreadStartFromOriginByThreadId,

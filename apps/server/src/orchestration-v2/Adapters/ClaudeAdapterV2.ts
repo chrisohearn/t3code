@@ -62,6 +62,7 @@ import {
   type SDKAPIRetryMessage,
   type SDKMessage,
   type SDKRateLimitInfo,
+  type SDKAssistantMessageError,
   type SDKResultMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -4496,6 +4497,90 @@ function providerFailureFromResult(
   });
 }
 
+// Errors that reject the request; max_output_tokens instead ends output Claude produced.
+const CLAUDE_API_FAILURE_ERRORS = new Set<SDKAssistantMessageError>([
+  "authentication_failed",
+  "oauth_org_not_allowed",
+  "account_on_hold",
+  "verification_required",
+  "billing_error",
+  "rate_limit",
+  "overloaded",
+  "invalid_request",
+  "model_not_found",
+  "server_error",
+  "unknown",
+  "cloud_credential_error",
+]);
+
+const CLAUDE_NON_WORK_SYSTEM_SUBTYPES = new Set([
+  "init",
+  "api_retry",
+  "status",
+  "compact_boundary",
+  "hook_started",
+  "hook_progress",
+  "hook_response",
+]);
+
+/**
+ * Whether a frame routed to the turn shows Claude did something. API-error assistant frames
+ * carry `error` (and come from "<synthetic>"); prompt echoes, retries, hooks and status are bookkeeping.
+ */
+function claudeFrameShowsWork(message: SDKMessage): boolean {
+  switch (message.type) {
+    case "result":
+    case "rate_limit_event":
+    case "user":
+    case "auth_status":
+      return false;
+    case "system":
+      return !CLAUDE_NON_WORK_SYSTEM_SUBTYPES.has(message.subtype);
+    case "assistant":
+      return (
+        message.message.model !== "<synthetic>" &&
+        (message.error === undefined || !CLAUDE_API_FAILURE_ERRORS.has(message.error))
+      );
+    case "stream_event":
+      return (
+        message.event.type !== "message_start" &&
+        message.event.type !== "message_delta" &&
+        message.event.type !== "message_stop"
+      );
+    default:
+      return true;
+  }
+}
+
+function claudeAccountErrorFrame(
+  error: SDKAssistantMessageError | undefined,
+): "auth" | "billing" | undefined {
+  switch (error) {
+    case "authentication_failed":
+    case "oauth_org_not_allowed":
+    case "account_on_hold":
+    case "verification_required":
+      return "auth";
+    case "billing_error":
+      return "billing";
+    default:
+      return undefined;
+  }
+}
+
+/** The account-side cause of a failed result; a limit needs rejection evidence or a plain 429. */
+function claudeResultAccountFailure(input: {
+  readonly message: SDKResultMessage;
+  readonly usageLimited: boolean;
+  readonly frame: "auth" | "billing" | undefined;
+}): "usage_limit" | "auth" | "billing" | undefined {
+  const status = input.message.subtype === "success" ? input.message.api_error_status : null;
+  if (status === 401) return "auth";
+  if (status === 402) return "billing";
+  if (input.frame !== undefined) return input.frame;
+  return input.usageLimited || status === 429 ? "usage_limit" : undefined;
+}
+
 function providerFailureFromApiRetry(message: SDKAPIRetryMessage): OrchestrationV2ProviderFailure {
   const errorName = message.error.replaceAll("_", " ");
   return makeProviderFailure({
@@ -4650,6 +4735,10 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
 }
 
 interface ActiveClaudeTurnContext {
+  /** Set by any frame or permission request that shows work; never cleared, so absence proves none. */
+  workObserved?: true;
+  /** An account-side cause a root API-error frame named. */
+  accountErrorFrame?: "auth" | "billing";
   readonly queryPolicy: ClaudeRuntimeQueryPolicy;
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly autoCompactWindow: string;
@@ -8608,6 +8697,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly failure?: OrchestrationV2ProviderFailure;
           readonly threadDisposition?: "reusable" | "broken";
           readonly result?: SDKResultMessage;
+          readonly accountFailure?: "usage_limit" | "auth" | "billing";
         }) {
           input.context.steersClosed = true;
           yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
@@ -8828,6 +8918,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                         retryStartedAt: providerRetry.startedAt,
                       }),
                   threadDisposition,
+                  ...(input.context.workObserved === true ? {} : { noWorkObserved: true as const }),
+                  ...(input.accountFailure === undefined
+                    ? {}
+                    : { accountFailure: input.accountFailure }),
                 }
               : {
                   type: "turn.terminal",
@@ -8838,6 +8932,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   status: input.status,
                   failure: null,
                   threadDisposition,
+                  ...(input.status !== "completed" && input.context.workObserved !== true
+                    ? { noWorkObserved: true as const }
+                    : {}),
                 };
           yield* Effect.all(
             [
@@ -9924,6 +10021,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             }
             return;
           }
+          if (claudeFrameShowsWork(message) && context === (yield* Ref.get(activeTurn))) {
+            context.workObserved = true;
+          }
           const focusedPlugin = claudeFocusRequestedPanePlugin(message);
           if (focusedPlugin !== null && context === (yield* Ref.get(activeTurn))) {
             yield* Effect.logWarning("orchestration-v2.claude-mod-pane-focus-unsupported", {
@@ -10164,6 +10264,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   };
                 }
               }
+              const accountError = claudeAccountErrorFrame(message.error);
+              if (accountError !== undefined) context.accountErrorFrame = accountError;
               if (message.error === "authentication_failed") {
                 context.authenticationFailureMessage = claudeSignedOutMessage({
                   configDir: adapterOptions.environment.CLAUDE_CONFIG_DIR,
@@ -11158,6 +11260,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               resultFailure?.class === "usage_limit"
                 ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
                 : resultFailure;
+            const accountFailure =
+              terminalFailure === null
+                ? undefined
+                : claudeResultAccountFailure({
+                    message,
+                    usageLimited,
+                    frame: context.accountErrorFrame,
+                  });
             yield* finalizeActiveTurn({
               context,
               status: interrupted
@@ -11168,6 +11278,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               completedAt,
               result: message,
               ...(terminalFailure === null ? {} : { failure: terminalFailure }),
+              ...(accountFailure === undefined ? {} : { accountFailure }),
             });
           }
         });
@@ -11401,6 +11512,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               toolUseID: callbackOptions.toolUseID,
             } satisfies PermissionResult;
           }
+          context.workObserved = true;
 
           const nativeRequestId = callbackOptions.toolUseID;
           const nativeToolInput = claudeNativeToolInputFromRecord(toolInput);
