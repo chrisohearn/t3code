@@ -564,7 +564,10 @@ IDLE_QUIET_SECONDS="${IDLE_QUIET_SECONDS:-900}"
 # (force_blockers). Was 3 h.
 MAX_DEFER_SECONDS="${MAX_DEFER_SECONDS:-1800}"     # 30 min; see cmd_update
 FORCE_GRACE_SECONDS="${FORCE_GRACE_SECONDS:-1200}" # extra wait for force_blockers past the cap
-TOOL_QUIET_SECONDS="${TOOL_QUIET_SECONDS:-120}"    # a tool call updated this recently is in flight
+# A running tool call's updated_at is not a heartbeat (it changes only on persisted item
+# updates), so any running tool item counts. Only items untouched for this long are treated as
+# orphans left by an earlier crash; the grace window bounds the wait either way.
+TOOL_ORPHAN_SECONDS="${TOOL_ORPHAN_SECONDS:-21600}"  # 6 h
 PRE_RESTART="$GUARD_STATE/pre-restart"
 quiet_seconds() {
   timeout 10 sqlite3 -readonly "$DB" \
@@ -581,72 +584,93 @@ force_blockers() {
     "select count(*) from orchestration_v2_projection_runtime_requests where status = 'pending';" 2>/dev/null)
   [[ "$n" =~ ^[0-9]+$ ]] || n="unknown number of"
   [[ "$n" == 0 ]] || echo "$n pending approval(s) or question(s)"
+  # Runs first (cross join keeps that order), then the partial active-item index; scanning the
+  # turn items instead takes over 10 s on a large database.
   n=$(timeout 10 sqlite3 -readonly "$DB" \
-    "select count(*) from orchestration_v2_projection_turn_items i
-       join orchestration_v2_projection_runs r on r.run_id = i.run_id
-      where r.status in ('running','starting','waiting') and i.status in ('running','pending')
+    "select count(*) from orchestration_v2_projection_runs r
+       cross join orchestration_v2_projection_turn_items i
+         on i.thread_id = r.thread_id and i.run_id = r.run_id
+      where r.status in ('running','starting','waiting') and i.status in ('pending','running','waiting')
         and i.type in ('command_execution','dynamic_tool','file_change')
-        and i.updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-$TOOL_QUIET_SECONDS seconds');" 2>/dev/null)
+        and i.updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-$TOOL_ORPHAN_SECONDS seconds');" 2>/dev/null)
   [[ "$n" =~ ^[0-9]+$ ]] || n="unknown number of"
-  [[ "$n" == 0 ]] || echo "$n tool call(s) active in the last $TOOL_QUIET_SECONDS s"
+  [[ "$n" == 0 ]] || echo "$n tool call(s) still running"
   return 0
 }
 
-# T3 processes stuck while exiting: uninterruptible sleep with PF_EXITING (0x4) set. Plain D
-# state is ordinary disk I/O (a test run waiting on pages) and must not block updates. One pid
-# per line, sorted.
-t3_exit_hang_pids() {
-  local pid rest
-  for pid in $(ps -eo pid=,stat=,cgroup= 2>/dev/null | awk '$2 ~ /^D/ && $3 ~ /t3code/ {print $1}'); do
-    rest=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null) || continue
-    read -r -a f <<<"$rest"
-    [[ "${f[0]:-}" == D && "${f[6]:-0}" =~ ^[0-9]+$ ]] && (( f[6] & 4 )) && echo "$pid"
+# True when a /proc/<pid>/task/<tid>/stat line is a task in uninterruptible sleep with
+# PF_EXITING (0x4) set. comm may contain spaces and parentheses, so fields start after the last ")".
+stat_is_exiting_d() {
+  local rest f
+  rest=${1##*) }
+  read -r -a f <<<"$rest"
+  [[ "${f[0]:-}" == D && "${f[6]:-}" =~ ^[0-9]+$ ]] && (( f[6] & 4 ))
+}
+
+# T3 tasks (threads included: the stuck one is whichever thread exits last) that are stuck while
+# exiting. Plain D state is ordinary disk I/O and must not block updates. One pid:tid per line.
+t3_exit_hang_tasks() {
+  local pid st line t
+  for pid in $(ps -eo pid=,cgroup= 2>/dev/null | awk '$2 ~ /t3code/ {print $1}'); do
+    for st in /proc/"$pid"/task/*/stat; do
+      line=$(cat "$st" 2>/dev/null) || continue
+      stat_is_exiting_d "$line" && { t=${st%/stat}; echo "$pid:${t##*/}"; }
+    done
   done | sort
 }
 
-# Signs of the kernel 7.2.15 hang seen on 2026-11-12: an exiting process sticks in
+# Signs of the kernel 7.2.15 hang seen on 2026-11-12: an exiting task sticks in
 # exit_mmap -> __vma_start_write and never releases its cgroup, so stopping the service hangs
-# and only a reboot recovers. Prints the reason and succeeds when a stop is unsafe now. The
-# journal check covers this boot only, so a reboot clears it. T3_GUARD_IGNORE_KERNEL=1 skips it.
+# and only a reboot recovers. Prints the reason and succeeds when a stop is unsafe now.
+# - The journal check matches that stack (or the bad-page error seen with it) in this boot only,
+#   so unrelated hung tasks (a stalled mount) do not block updates, and a reboot clears it.
+# - The task check catches a hang before the kernel's 120 s hung-task report.
+# T3_GUARD_IGNORE_KERNEL=1 skips both (see README).
+kernel_log() { timeout 10 journalctl -k -b 0 -q --no-pager 2>/dev/null; }
 kernel_hang_signs() {
-  local n first again
+  local klog n first again
   [[ -n "${T3_GUARD_IGNORE_KERNEL:-}" ]] && return 1
-  n=$(timeout 10 journalctl -k -b 0 -q --no-pager 2>/dev/null |
-    grep -c -E 'blocked for more than [0-9]+ seconds|Bad page state')
-  if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then
-    echo "kernel logged $n hung-task or bad-page message(s) this boot"
-    return 0
+  if klog=$(kernel_log) && [[ -n "$klog" ]]; then
+    n=$(grep -c -E '__vma_start_(write|exclude_readers)|Bad page state' <<<"$klog")
+    if (( n > 0 )); then
+      echo "kernel logged $n exit-hang or bad-page line(s) this boot"
+      return 0
+    fi
+  else
+    log "kernel log unreadable; checking T3 tasks only"
   fi
-  first=$(t3_exit_hang_pids)
+  first=$(t3_exit_hang_tasks)
   [[ -n "$first" ]] || return 1
   sleep 5
-  again=$(comm -12 <(printf '%s\n' "$first") <(t3_exit_hang_pids))
+  again=$(comm -12 <(printf '%s\n' "$first") <(t3_exit_hang_tasks))
   [[ -n "$again" ]] || return 1
-  echo "T3 process(es) $(printf '%s ' $again)stuck while exiting"
+  echo "T3 task(s) $(printf '%s ' $again)stuck while exiting"
   return 0
 }
 
-# Threads running at the restart, so the guard can check afterwards that each one continued.
+# Runs active at the restart (run id and thread id per line), so the guard can check afterwards
+# that each one got its own restart continuation.
 record_pre_restart() {
   { date -u +%Y-%m-%dT%H:%M:%S.000Z
-    timeout 10 sqlite3 -readonly "$DB" \
-      "select distinct thread_id from orchestration_v2_projection_runs where status in ('running','starting','waiting');"
+    timeout 10 sqlite3 -readonly -separator ' ' "$DB" \
+      "select run_id, thread_id from orchestration_v2_projection_runs where status in ('running','starting','waiting');"
   } >"$PRE_RESTART" 2>/dev/null || rm -f "$PRE_RESTART"
 }
 
-# After a restart: how many interrupted threads have a run requested since (restart recovery
-# queues one per thread), which do not, and how many requests the restart cancelled. Prints
-# nothing when nothing was running and nothing was cancelled.
+# After a restart: how many interrupted runs got a continuation (a run whose
+# restartContinuationOfRunId names them), which threads did not, and how many requests the
+# restart cancelled. A later unrelated run on the same thread does not count. Prints nothing
+# when nothing was running and nothing was cancelled.
 recovery_summary() {
-  local at t n total=0 continued=0 missing="" cancelled
+  local at r t n total=0 continued=0 missing="" cancelled
   [[ -r "$PRE_RESTART" ]] || return 0
   at=$(head -n1 "$PRE_RESTART")
   [[ "$at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$ ]] || { rm -f "$PRE_RESTART"; return 0; }
-  while IFS= read -r t; do
-    [[ -n "$t" ]] || continue
+  while read -r r t; do
+    [[ -n "$r" ]] || continue
     total=$((total + 1))
     n=$(timeout 10 sqlite3 -readonly "$DB" \
-      "select count(*) from orchestration_v2_projection_runs where thread_id = '${t//\'/\'\'}' and requested_at >= '$at';" 2>/dev/null)
+      "select count(*) from orchestration_v2_projection_runs where json_extract(payload_json, '\$.restartContinuationOfRunId') = '${r//\'/\'\'}';" 2>/dev/null)
     if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then
       continued=$((continued + 1))
     else
@@ -654,11 +678,11 @@ recovery_summary() {
     fi
   done < <(tail -n +2 "$PRE_RESTART")
   cancelled=$(timeout 10 sqlite3 -readonly "$DB" \
-    "select count(*) from orchestration_v2_projection_runtime_requests where status = 'cancelled' and resolved_at >= '$at';" 2>/dev/null)
+    "select count(*) from orchestration_v2_projection_runtime_requests where status in ('cancelled','expired') and resolved_at >= '$at';" 2>/dev/null)
   [[ "$cancelled" =~ ^[0-9]+$ ]] || cancelled="unknown"
   rm -f "$PRE_RESTART"
   (( total > 0 )) || [[ "$cancelled" != 0 ]] || return 0
-  printf '%s/%s interrupted thread(s) continued%s; %s request(s) cancelled' \
+  printf '%s/%s interrupted run(s) continued%s; %s request(s) cancelled or expired' \
     "$continued" "$total" "${missing:+; not continued:$missing}" "$cancelled"
 }
 
@@ -708,7 +732,7 @@ wait_inactive() {
 
 # Install the newest trusted release (or $1), verify it serves, roll back if not.
 cmd_update() {
-  local now_flag="" target="" cur latest runs sha blockers="" forced="" hang
+  local now_flag="" target="" cur latest runs sha blockers="" forced="" hang deferred_epoch=""
   while (( $# )); do
     case "$1" in
       --now) now_flag=1 ;;
@@ -741,8 +765,9 @@ cmd_update() {
   if [[ -z "$target" && "$cur" == "$(active_version)" ]] &&
     [[ "$(printf '%s\n%s\n' "$cur" "$latest" | sort -V | tail -n1)" == "$cur" ]]; then
     rm -f "$GUARD_STATE/deferred" "$GUARD_STATE/deferred-since"
-    if [[ "$(service_version)" != "$cur" ]]; then
-      hold_updates "selected newest build $cur is not serving; recovery required"
+    # The port can answer from another process; the managed unit itself must be up.
+    if [[ "$(service_version)" != "$cur" ]] || ! service_uptime >/dev/null; then
+      hold_updates "selected newest build $cur is not serving from $UNIT; recovery required"
       log "update: refusing to report success for an unhealthy selected build"
       return 1
     fi
@@ -805,6 +830,7 @@ cmd_update() {
       echo "Deferred: $why. Use --now to restart anyway."
       return 0
     fi
+    deferred_epoch=$(stat -c %Y "$GUARD_STATE/deferred-since" 2>/dev/null)
     rm -f "$GUARD_STATE/deferred" "$GUARD_STATE/deferred-since"
   fi
 
@@ -825,12 +851,29 @@ cmd_update() {
       report "update to $latest deferred: $hang. Stopping T3 now could hang until a reboot; it proceeds after one."
       cat /proc/sys/kernel/random/boot_id >"$GUARD_STATE/kernel-deferred" 2>/dev/null
     fi
+    # Keep the original deferral clock, so after the reboot a busy server does not wait the
+    # whole cap again.
+    [[ "$deferred_epoch" =~ ^[0-9]+$ ]] && touch -d "@$deferred_epoch" "$GUARD_STATE/deferred-since"
     echo "Deferred: $hang. Reboot, then the update proceeds."
+    # A person running it by hand gets a failure, since nothing was installed; the timer does not.
+    [[ -n "$target$now_flag" ]] && return 3
     return 0
   fi
   if [[ -n "$now_flag" ]]; then
     blockers=$(force_blockers | paste -sd ';' -)
     forced="requested with --now"
+  elif [[ -n "$forced" ]]; then
+    # The first sample was taken before the release download, which can take minutes. Sample
+    # again just before the stop; a blocker that appeared meanwhile still gets the grace window,
+    # measured from the original deferral.
+    blockers=$(force_blockers | paste -sd ';' -)
+    if [[ -n "$blockers" && "$deferred_epoch" =~ ^[0-9]+$ ]] &&
+      (( $(date +%s) < deferred_epoch + MAX_DEFER_SECONDS + FORCE_GRACE_SECONDS )); then
+      touch -d "@$deferred_epoch" "$GUARD_STATE/deferred-since"
+      echo "$latest" >"$GUARD_STATE/deferred"
+      echo "Deferred: waiting for ${blockers//;/, } before stopping. Use --now to restart anyway."
+      return 0
+    fi
   fi
   record_pre_restart
 
@@ -846,8 +889,9 @@ cmd_update() {
     outage_begin "update $cur -> $latest"
     t0=$(date +%s)
     if ! snap=$(snapshot_db "before-$latest"); then
-      log "update: database snapshot failed; aborting update and restarting $cur"
-      restart_on "$cur"
+      hold_updates "database snapshot before $latest failed after the service stopped; update aborted, restarting $cur"
+      restart_on "$cur" ||
+        report "restart on $cur failed after a failed snapshot before $latest; manual recovery required"
       return 1
     fi
     log "snapshot $snap ($(( $(date +%s) - t0 )) s)"

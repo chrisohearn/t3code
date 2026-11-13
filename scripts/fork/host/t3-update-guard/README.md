@@ -19,3 +19,11 @@ These are the files that keep the T3 background service on Chris's Omarchy machi
 4. Check the install with `t3-service-update status`.
 
 Installing the guard does not restart the T3 service.
+
+## When updates happen
+
+- **Idle server:** the guard updates once no thread has run for 15 min.
+- **Busy server:** threads nearly always run, so after 30 min of waiting (`MAX_DEFER_SECONDS`) the update is forced.
+- **Before a forced restart:** the guard waits up to 20 more minutes (`FORCE_GRACE_SECONDS`) while an approval or question is pending, or a tool call is still running. A restart cancels pending approvals, and a tool call cut off part-way can be repeated by its continuation. It checks again just before stopping.
+- **Kernel exit hang:** the guard never stops the service while the kernel shows the 7.2.15 exit hang. That means the `__vma_start_write` stack or a bad-page error in this boot's kernel log, or a T3 task stuck while exiting. It defers instead and reports once per boot, and a reboot clears it. For a manual `--now` it exits with status 3. To skip this check, run `T3_GUARD_IGNORE_KERNEL=1 t3-service-update --now`. Only do that when you know the stop will not hang.
+- **After a restart:** the guard reports to Jarvis how many interrupted runs got a continuation, which threads did not, and how many requests were cancelled or expired. Check those threads before repeating any outside action.
