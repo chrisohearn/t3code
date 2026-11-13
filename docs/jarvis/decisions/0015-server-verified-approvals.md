@@ -16,7 +16,7 @@ Act in the same wake, report, and mark the row done. Marking it done or cancelle
 
 ### Getting an approval
 
-Ask Chris in a question dialog. The question must say the action, its object and amount in plain words, with `Ledger key: <key>` alone on its own line. Keep it under 600 characters. Do not use links with titles, reference definitions, images, HTML, character references, or invisible or control characters.
+Ask Chris in a question dialog. The question must say the action, its object and amount in plain text (write amounts as `5000 USD`), with `Ledger key: <key>` alone on its own line. Keep it to 12 lines and 600 characters. The question and the option labels and descriptions may not contain `[`, `]`, `\`, `<`, `&` or `$`, tabs, or invisible, blank-rendering or control characters; the server refuses them rather than parse markdown that could hide text. Chris's typed answers only need to be visible.
 
 Then record his answer with `ledger_upsert` and `approval: { source: { threadId, itemId, questionId? } }`, using the dialog's `itemId` and `sourceThreadId` from `t3_thread_read`. Chris's chat messages are not sources.
 

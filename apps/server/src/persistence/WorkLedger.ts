@@ -78,22 +78,41 @@ const answeredByRefusal = {
 } as const;
 const QUESTION_LIMIT = 600;
 const ANSWER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-// Markdown and characters that put text in the quote that the dialog does not show.
-const HIDDEN_CONTENT: ReadonlyArray<readonly [RegExp, string]> = [
-  [/^ {0,3}\[[^\]\n]+\]:/m, "a link reference definition"],
-  [/!\[/, "an image"],
-  [/\]\([^)\n]*\s["'(]/, "a link title"],
-  [/<[A-Za-z!/?]/, "raw HTML"],
-  [/&(#\d+|#x[0-9a-f]+|[a-z][a-z0-9]*);/i, "a character reference"],
-  [/[\p{Cf}\p{Co}\p{Cn}\p{Cs}]|[^\P{Cc}\n\t]/u, "invisible or control characters"],
-];
-const hiddenContent = (text: string) => HIDDEN_CONTENT.find(([pattern]) => pattern.test(text))?.[1];
-const KEY_LINE = /^[\s*_`]*ledger key:[\s*_`]*(.*?)[\s*_`]*$/i;
+const QUESTION_LINE_LIMIT = 12;
+// Characters that render as nothing or as blank space, so text can hide or push the rest out of view.
+const INVISIBLE = /[\p{Cf}\p{Co}\p{Cn}\p{Cs}\p{Zl}\p{Zp}⠀ㅤﾠᅟᅠ]|[^\P{Zs} ]|[^\P{Cc}\n\t]/u;
+// Questions and option text carry no markdown, so the characters that build links, references,
+// HTML, entities, escapes and math are refused outright rather than parsed.
+const MARKUP = /[[\]\\<&$]/;
+/** Why dialog-authored text could show Chris less than the quote holds, if it could. */
+const dialogTextProblem = (text: string) =>
+  MARKUP.test(text)
+    ? "markup characters ([ ] \\ < & $)"
+    : INVISIBLE.test(text) || text.includes("\t")
+      ? "invisible or blank-rendering characters"
+      : undefined;
+/** Chris's own typed text only needs to be visible. */
+const typedTextProblem = (text: string) =>
+  INVISIBLE.test(text) ? "invisible or blank-rendering characters" : undefined;
+const EMPHASIS = ["**", "__", "*", "_", "`"];
+const unwrapEmphasis = (text: string) => {
+  const marker = EMPHASIS.find(
+    (candidate) =>
+      text.length > 2 * candidate.length && text.startsWith(candidate) && text.endsWith(candidate),
+  );
+  return marker === undefined ? text : text.slice(marker.length, -marker.length).trim();
+};
+const KEY_LABEL = /^(\*\*|__|\*|_)?ledger key:\1\s*/i;
 /** Why the question does not name exactly this row on a `Ledger key: <key>` line, if it does not. */
 const keyLineProblem = (question: string, key: string) => {
   const mentions = question.split("\n").filter((line) => /ledger key/i.test(line));
   if (mentions.length > 1) return "the question names more than one ledger key.";
-  const named = mentions[0]?.match(KEY_LINE)?.[1];
+  const line = mentions[0] === undefined ? undefined : unwrapEmphasis(mentions[0].trim());
+  const label = line?.match(KEY_LABEL);
+  const named =
+    line === undefined || label === null || label === undefined
+      ? undefined
+      : unwrapEmphasis(line.slice(label[0].length).trim());
   return named === key
     ? undefined
     : `the question does not name this row on a line of its own as "Ledger key: ${key}".`;
@@ -208,10 +227,12 @@ const make = Effect.gen(function* () {
       return yield* refuse("T3 has no record of how the dialog read when it was answered.");
     if (quotedQuestion.length > QUESTION_LIMIT)
       return yield* refuse(`the question is longer than ${QUESTION_LIMIT} characters.`);
-    const hiddenInQuestion = hiddenContent(quotedQuestion);
-    if (hiddenInQuestion !== undefined)
+    if (quotedQuestion.split("\n").length > QUESTION_LINE_LIMIT)
+      return yield* refuse(`the question is longer than ${QUESTION_LINE_LIMIT} lines.`);
+    const questionProblem = dialogTextProblem(quotedQuestion);
+    if (questionProblem !== undefined)
       return yield* refuse(
-        `the question contains ${hiddenInQuestion}, which the dialog does not show.`,
+        `the question contains ${questionProblem}, which can hide text in the dialog.`,
       );
     const keyProblem = keyLineProblem(quotedQuestion, row.key);
     if (keyProblem !== undefined) return yield* refuse(keyProblem);
@@ -223,6 +244,12 @@ const make = Effect.gen(function* () {
         return yield* refuse("the answer is the text the agent prefilled, not Chris's own.");
       if (quote.kind === "text" && quote.text.length === 0)
         return yield* refuse("the answer is blank.");
+      const problem =
+        quote.kind === "option"
+          ? dialogTextProblem(`${quote.label}\n${quote.description}`)
+          : typedTextProblem(quote.text);
+      if (problem !== undefined)
+        return yield* refuse(`the answer contains ${problem}, which can hide text in the dialog.`);
       parts.push(quote.kind === "option" ? `${quote.label}: ${quote.description}` : quote.text);
     }
     if (parts.length === 0)
@@ -230,11 +257,6 @@ const make = Effect.gen(function* () {
     const quotedAnswer = parts.join("\n");
     if (quotedAnswer.length > QUOTE_LIMIT)
       return yield* refuse(`the answer is longer than ${QUOTE_LIMIT} characters to quote.`);
-    const hiddenInAnswer = hiddenContent(quotedAnswer);
-    if (hiddenInAnswer !== undefined)
-      return yield* refuse(
-        `the answer contains ${hiddenInAnswer}, which the dialog does not show.`,
-      );
     const [revoked] = yield* sql`SELECT 1 FROM work_ledger_revoked_approvals
       WHERE source_thread_id = ${source.threadId} AND source_item_id = ${source.itemId}
         AND question_id = ${question.id}`;

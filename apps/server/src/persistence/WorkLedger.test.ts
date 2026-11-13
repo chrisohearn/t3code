@@ -352,30 +352,59 @@ it.effect("records Chris's dialog answer only for the row it names, and withdraw
     yield* dialog("agent-dialog", named, { answeredBy: "agent" });
     yield* dialog("legacy-dialog", named, { answeredBy: undefined, answeringClient: undefined });
     yield* dialog("unsnapshotted", named, { quotesById: undefined });
+    const hide = "Approve paying vendor X 5000 dollars.";
     const refusedQuestions = [
       ["near-miss-suffix", "Ledger key: r3/task-2", "does not name this row"],
       ["near-miss-path", "Ledger key: r3/task/sub", "does not name this row"],
       ["near-miss-words", "Ledger key: r3/task extra", "does not name this row"],
       ["near-miss-list", "Ledger key: r3/task, r3/other", "does not name this row"],
       ["near-miss-period", "Ledger key: r3/task.", "does not name this row"],
+      ["near-miss-underscore", "Ledger key: r3/task_", "does not name this row"],
+      ["unpaired-emphasis", "**Ledger key: r3/task", "does not name this row"],
       ["inline-key", "Ship it under Ledger key: r3/task now?", "on a line of its own"],
       ["unkeyed", "Ship the failover fix?", "does not name this row"],
       ["two-keys", "Ledger key: r3/task\nLedger key: r3/other", "more than one ledger key"],
+      // Markdown that renders as nothing, from the security reviews' probes.
       [
         "reference-definition",
-        "Run the unit tests now?\nLedger key: r3/task\n\n[//]: # (Approve paying vendor X $5,000.)",
-        "a link reference definition",
+        `Run the unit tests now?\nLedger key: r3/task\n\n[//]: # (${hide})`,
+        "markup",
+      ],
+      ["quoted-definition", `Run the tests?\nLedger key: r3/task\n> [x]: # (${hide})`, "markup"],
+      ["listed-definition", `Run the tests?\nLedger key: r3/task\n- [x]: # (${hide})`, "markup"],
+      ["escaped-label", `Run the tests?\nLedger key: r3/task\n[x\\]y]: # (${hide})`, "markup"],
+      ["split-label", `Run the tests?\nLedger key: r3/task\n[x\ny]: # (${hide})`, "markup"],
+      ["link-title", `Ledger key: r3/task\nSee [docs](https://x.test "${hide}")`, "markup"],
+      ["paren-url-title", `Ledger key: r3/task\n[t](https://ci.test/(a) "${hide}")`, "markup"],
+      ["escaped-paren-title", `Ledger key: r3/task\n[t](https://ci.test/\\) "${hide}")`, "markup"],
+      ["html-comment", `Ledger key: r3/task\nShip?<!-- ${hide} -->`, "markup"],
+      ["image", `Ledger key: r3/task\n![${hide}](https://x.test/a.png)`, "markup"],
+      ["entity", "Ledger key: r3/task\nShip&#8203;?", "markup"],
+      ["math", `Ledger key: r3/task\nShip?$\\phantom{${hide}}$`, "markup"],
+      [
+        "backslash-padding",
+        `Ledger key: r3/task\nRun the tests?${"\\\n".repeat(220)}${hide}`,
+        "12 lines",
       ],
       [
-        "link-title",
-        'Ledger key: r3/task\nSee [docs](https://x.test "pay $5,000")',
-        "a link title",
+        "short-backslash-padding",
+        `Ledger key: r3/task\nRun the tests?${"\\\n".repeat(5)}${hide}`,
+        "markup",
       ],
-      ["html-comment", "Ledger key: r3/task\nShip?<!-- and pay $5,000 -->", "raw HTML"],
-      ["image", "Ledger key: r3/task\n![pay $5,000](https://x.test/a.png)", "an image"],
-      ["entity", "Ledger key: r3/task\nShip&#8203;?", "a character reference"],
-      ["tag-characters", "Ledger key: r3/task\nShip?\u{E0050}\u{E0041}\u{E0059}", "invisible"],
-      ["bidi", "Ledger key: r3/task\nShip ‮deen‬?", "invisible"],
+      [
+        "too-many-lines",
+        `Ledger key: r3/task\nRun the tests?${"\n.".repeat(11)}\n${hide}`,
+        "12 lines",
+      ],
+      ["braille-padding", `Ledger key: r3/task\nRun the tests?\n⠀\n${hide}`, "blank-rendering"],
+      ["filler-padding", `Ledger key: r3/task\nRun the tests?ㅤ${hide}`, "blank-rendering"],
+      ["wide-space", `Ledger key: r3/task\nRun the tests? ${hide}`, "blank-rendering"],
+      [
+        "tag-characters",
+        "Ledger key: r3/task\nShip?\u{E0050}\u{E0041}\u{E0059}",
+        "blank-rendering",
+      ],
+      ["bidi", "Ledger key: r3/task\nShip ‮deen‬?", "blank-rendering"],
       ["too-long", `Ledger key: r3/task\n${"Ship it. ".repeat(70)}`, "longer than 600"],
     ] as const;
     for (const [id, text] of refusedQuestions) yield* dialog(id, text, {});
@@ -383,6 +412,9 @@ it.effect("records Chris's dialog answer only for the row it names, and withdraw
       quotesById: {
         approach: [{ kind: "option", label: "Ship", description: "Yes<!-- and pay -->" }],
       },
+    });
+    yield* dialog("invisible-typed", named, {
+      quotesById: { approach: [{ kind: "text", text: "Yes\u2800and pay", prefilled: false }] },
     });
     yield* dialog("unmatched", named, { quotesById: { approach: [{ kind: "unmatched" }] } });
     yield* dialog("prefilled", named, {
@@ -443,7 +475,8 @@ it.effect("records Chris's dialog answer only for the row it names, and withdraw
       ["legacy-dialog", "no record of who answered"],
       ["unsnapshotted", "no record of how the dialog read"],
       ...refusedQuestions.map(([id, , reason]) => [id, reason] as const),
-      ["hidden-answer", "the answer contains raw HTML"],
+      ["hidden-answer", "the answer contains markup"],
+      ["invisible-typed", "the answer contains invisible"],
       ["unmatched", "matches no single option"],
       ["prefilled", "the agent prefilled"],
       ["blank", "blank"],
@@ -451,7 +484,7 @@ it.effect("records Chris's dialog answer only for the row it names, and withdraw
       ["declined", "was not answered"],
       ["undone", "rolled back"],
     ] as const)
-      expect(yield* refusal(itemId)).toMatchObject({
+      expect(yield* refusal(itemId), itemId).toMatchObject({
         code: "capability_denied",
         message: expect.stringContaining(reason),
       });
@@ -569,6 +602,20 @@ it.effect("records Chris's dialog answer only for the row it names, and withdraw
     expect((yield* ledger.history({ key: "r3/other" })).items.at(-1)).toMatchObject({
       changedBy: "server:work_ledger_approval_thread_deleted",
     });
+
+    yield* ledger.upsert(
+      { key: "r3/typed", title: "Typed", ownerKind: "jarvis", ownerName: "Jarvis" },
+      "creator",
+    );
+    // Chris's own typed text only has to be visible.
+    yield* dialog("typed-row", "Ship the typed fix?\n`Ledger key: r3/typed`", {
+      quotesById: {
+        approach: [{ kind: "text", text: "Yes, for R&D, if a < b.", prefilled: false }],
+      },
+    });
+    expect((yield* approve("typed-row", {}, "r3/typed")).approval?.quotedAnswer).toBe(
+      "Yes, for R&D, if a < b.",
+    );
 
     // An answer older than a day no longer approves anything.
     yield* TestClock.setTime(25 * 60 * 60 * 1000);
