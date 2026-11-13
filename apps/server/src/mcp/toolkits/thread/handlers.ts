@@ -52,9 +52,11 @@ const withMcpCommandActor = Effect.fn("mcp.withCommandActor")(function* <A, E, R
   effect: Effect.Effect<A, E, R>,
 ) {
   const scope = yield* McpInvocationContext.McpInvocationContext;
-  return yield* Effect.provideService(effect, CommandActor, {
-    kind: scope.thread === undefined ? "mcp_client" : "agent",
-  });
+  return yield* Effect.provideService(
+    effect,
+    CommandActor,
+    McpInvocationContext.mcpCommandActor(scope),
+  );
 });
 const dispatch = Effect.fn("mcp.dispatchThreadCommand")(function* (
   threadId: ThreadId | undefined,

@@ -30,6 +30,7 @@ import { replayAndBufferProjectedLiveEvents } from "./LiveStreamBudget.ts";
 import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventStore.ts";
 import { projectStoredEventForWire } from "./WireProjection.ts";
 import { makeRunOutcomeRecorder, type RunOutcome } from "./RunMetrics.ts";
+import { makeRunStopStamper, type RunStopContext } from "./RunStop.ts";
 
 import * as ScheduledTaskChanges from "../scheduledTasks/ScheduledTaskChanges.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
@@ -365,7 +366,21 @@ const layerBase: Layer.Layer<
         });
       });
 
-    const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+    // Reads inside the write transaction, so the status it compares against is the committed one.
+    const stampRunStops = makeRunStopStamper((run) =>
+      projectionStore.getThreadRecords(run.threadId, ["runs"], { runIds: [run.id] }).pipe(
+        Effect.map(({ runs }) => runs[0]?.status),
+        Effect.orElseSucceed(() => undefined),
+      ),
+    );
+
+    const normalizeEvents = (
+      unstamped: ReadonlyArray<OrchestrationV2DomainEvent>,
+      context: RunStopContext = {},
+    ) =>
+      Effect.flatMap(stampRunStops(unstamped, context), (events) => normalizeStampedEvents(events));
+
+    const normalizeStampedEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
       const runOrdinals = new Map(
         events.flatMap((event) =>
           event.type === "run.created" || event.type === "run.updated"
@@ -498,6 +513,7 @@ const layerBase: Layer.Layer<
             input.guardPendingUserInputCancellations === true
               ? yield* guardUserInputCancellations(events)
               : events,
+            { commandId: input.commandId },
           );
           const committed = yield* eventStore.append({
             ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
@@ -575,6 +591,7 @@ const layerBase: Layer.Layer<
               input.guardPendingUserInputCancellations === true
                 ? yield* guardUserInputCancellations(input.events)
                 : input.events,
+              { commandId: input.commandId },
             );
             const storedEvents = yield* eventStore.append({
               ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
@@ -640,6 +657,7 @@ const layerBase: Layer.Layer<
             input.guardPendingUserInputCancellations === true
               ? yield* guardUserInputCancellations(input.events)
               : input.events,
+            { commandId: input.commandId },
           );
           const storedEvents = yield* eventStore.append({
             ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
@@ -736,6 +754,7 @@ const layerBase: Layer.Layer<
             runId === undefined
               ? input.events
               : yield* updateDelegatedCompletionOnly(input.events, (id) => id === runId),
+            { commandType: input.commandType, commandId: input.commandId },
           );
           const storedEvents = yield* eventStore.append({
             commandId: input.commandId,

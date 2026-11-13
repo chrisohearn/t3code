@@ -1,5 +1,6 @@
 import type {
   ServerAuthSessionMethod,
+  ThreadId,
   UserInputAnsweredBy,
   UserInputAnsweringClient,
 } from "@t3tools/contracts";
@@ -11,7 +12,16 @@ import * as Context from "effect/Context";
  */
 export class CommandActor extends Context.Service<
   CommandActor,
-  { readonly kind: UserInputAnsweredBy; readonly client?: UserInputAnsweringClient }
+  {
+    readonly kind: UserInputAnsweredBy;
+    readonly client?: UserInputAnsweringClient;
+    /** An MCP caller's sign-in and thread, for attribution only; approvals read `client`. */
+    readonly caller?: {
+      readonly sessionId?: string;
+      readonly clientLabel?: string;
+      readonly threadId?: ThreadId;
+    };
+  }
 >()("t3/orchestration-v2/CommandActor") {}
 
 /**
