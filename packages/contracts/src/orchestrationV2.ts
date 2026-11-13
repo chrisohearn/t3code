@@ -3344,6 +3344,15 @@ export const OrchestrationV2Command = Schema.Union([
     worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     expectedWorktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
     expectedBranch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+    /** A message queued in the same commit, so a workspace change cannot settle the thread first. */
+    continuation: Schema.optional(
+      Schema.Struct({
+        messageId: MessageId,
+        text: Schema.String,
+        senderThreadId: Schema.optional(ThreadId),
+        senderClient: Schema.optional(OrchestrationV2SenderClient),
+      }),
+    ),
     /** Reject unless no message or run has landed on this thread. */
     expectedEmpty: Schema.optional(Schema.Boolean),
     limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
