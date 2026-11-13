@@ -5,7 +5,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir "$tmp/bin"
-printf '#!/bin/sh\ncat "$GH_FIXTURE"\n' >"$tmp/bin/gh"
+# The stub only answers a paginated, slurped request (the fixture is a list of pages).
+printf '#!/bin/sh\ncase "$*" in *--paginate*--slurp*) cat "$GH_FIXTURE" ;; *) echo "gh stub: unpaginated request" >&2; exit 1 ;; esac\n' >"$tmp/bin/gh"
 chmod +x "$tmp/bin/gh"
 export PATH="$tmp/bin:$PATH" GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # shellcheck source=upstream-stable-tag.sh
@@ -17,18 +18,26 @@ check() { [[ "$2" == "$3" ]] && echo "ok   $1" || { echo "FAIL $1: got '$2', wan
 # Tag selection: skips drafts, prereleases and odd names; newest by version, not by date.
 export GH_FIXTURE=$tmp/releases.json
 cat >"$GH_FIXTURE" <<'JSON'
-[{"tag_name":"v0.2.0-nightly.20261113.1","draft":false,"prerelease":true},
+[[{"tag_name":"v0.2.0-nightly.20261113.1","draft":false,"prerelease":true},
  {"tag_name":"v0.1.10","draft":false,"prerelease":false},
  {"tag_name":"v0.1.9","draft":false,"prerelease":false},
  {"tag_name":"v0.3.0","draft":true,"prerelease":false},
  {"tag_name":"v0.2.0-rc.1","draft":false,"prerelease":false},
- {"tag_name":"v0.2.0","draft":false,"prerelease":true}]
+ {"tag_name":"v0.2.0","draft":false,"prerelease":true}]]
 JSON
 check "newest stable by version" "$(upstream_stable_tag)" v0.1.10
-echo '[{"tag_name":"v0.2.0","draft":false,"prerelease":true}]' >"$GH_FIXTURE"
+echo '[[{"tag_name":"v0.2.0","draft":false,"prerelease":true}]]' >"$GH_FIXTURE"
 check "no stable tag prints nothing" "$(upstream_stable_tag)" ""
-echo '[]' >"$GH_FIXTURE"
+echo '[[]]' >"$GH_FIXTURE"
 check "no releases prints nothing" "$(upstream_stable_tag)" ""
+# More than 100 prereleases (two full pages) before the stable tag: it must still be found.
+python3 -I - >"$GH_FIXTURE" <<'PY'
+import json
+pre = lambda i: {"tag_name": f"v0.2.0-nightly.20261113.{i}", "draft": False, "prerelease": True}
+print(json.dumps([[pre(i) for i in range(100)], [pre(i) for i in range(100, 200)],
+                  [{"tag_name": "v0.1.9", "draft": False, "prerelease": False}]]))
+PY
+check "stable tag found past 200 prereleases" "$(upstream_stable_tag)" v0.1.9
 
 # Decisions. main: A-B-C-D-E; the fork merged C. Tags are commits on main or on a side branch.
 r=$tmp/repo

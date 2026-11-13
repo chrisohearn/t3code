@@ -5,9 +5,10 @@
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then set -euo pipefail; fi
 
 upstream_stable_tag() {
-  gh api "repos/${T3_UPSTREAM_REPO:-pingdotgg/t3code}/releases?per_page=100" | python3 -I -c '
+  # Every page: upstream publishes many nightly prereleases, so the newest stable can be pages deep.
+  gh api --paginate --slurp "repos/${T3_UPSTREAM_REPO:-pingdotgg/t3code}/releases?per_page=100" | python3 -I -c '
 import json, re, sys
-tags = [r["tag_name"] for r in json.load(sys.stdin)
+tags = [r["tag_name"] for page in json.load(sys.stdin) for r in page
         if not r["draft"] and not r["prerelease"] and re.fullmatch(r"v\d+\.\d+\.\d+", r["tag_name"])]
 if tags:
     print(max(tags, key=lambda t: tuple(map(int, t[1:].split(".")))))'
