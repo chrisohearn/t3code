@@ -37,7 +37,7 @@ export interface ProviderFailoverTargets {
  * Only a prompt someone sent is re-sent. Wakes, delegated results, compaction and slash
  * commands are provider-specific or have their own recovery.
  */
-function resendable(
+export function resendable(
   message: Pick<
     OrchestrationV2ConversationMessage,
     "role" | "notification" | "delegatedCompletion" | "idleCompaction" | "workflowScript" | "text"

@@ -82,7 +82,7 @@ import {
 import * as ProviderFailover from "./ProviderFailover.ts";
 import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
-import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { draftModelPickMatchesThread, modelSelectionsEqual } from "@t3tools/shared/model";
 import { modelSwitchSince } from "./modelSwitch.ts";
 import { combinePullRequestWatchWakes, type PullRequestWatchWake } from "./pullRequestWatch.ts";
 import { recordThreadOpen } from "@t3tools/shared/paletteSearch";
@@ -800,6 +800,32 @@ function cancelledAppOwnedTask(
   };
 }
 
+// A workspace change detaches the session, which can settle the calling run at once. Queuing its
+// follow-up in a later command would let a delegated task report its result before that exists.
+function metadataUpdateContinuation(
+  command: Extract<OrchestrationV2Command, { readonly type: "thread.metadata.update" }>,
+): Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }> | undefined {
+  return command.continuation === undefined
+    ? undefined
+    : {
+        type: "message.dispatch",
+        commandId: command.commandId,
+        threadId: command.threadId,
+        messageId: command.continuation.messageId,
+        text: command.continuation.text,
+        ...(command.continuation.senderThreadId === undefined
+          ? {}
+          : { senderThreadId: command.continuation.senderThreadId }),
+        ...(command.continuation.senderClient === undefined
+          ? {}
+          : { senderClient: command.continuation.senderClient }),
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "mcp",
+      };
+}
+
 // Provider wakes can start follow-up work; monitor updates only report progress.
 // Dispatch takes the parent's lock for follow-ups because intake writes the parent.
 function mayStartSubagentFollowup(
@@ -811,7 +837,10 @@ function mayStartSubagentFollowup(
     command.restartContinuationOfRunId !== undefined
   )
     return false;
-  if (command.notification !== undefined) return command.notification.source.kind !== "monitor";
+  if (command.notification !== undefined)
+    return (
+      command.notification.source.kind !== "monitor" || command.notification.outcome !== "updated"
+    );
   return (
     command.createdBy === "user" ||
     command.creationSource === "mcp" ||
@@ -1050,7 +1079,11 @@ function threadAtRunStart(
 ): OrchestrationV2ThreadProjection["thread"] {
   const scheduled = projection.thread.scheduledModelSelection;
   if (scheduled == null || starting.model === "server") return projection.thread;
-  const cleared = { ...projection.thread, scheduledModelSelection: null };
+  const cleared = {
+    ...projection.thread,
+    scheduledModelSelection: null,
+    bypassProviderCooldown: false,
+  };
   if (starting.model === "named") {
     return starting.ordinal !== null && starting.ordinal <= scheduled.queuedThroughOrdinal
       ? projection.thread
@@ -2529,6 +2562,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
       const requestedSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const recoveryRun =
+        storedQueuedRun.failoverOfRunId !== undefined ||
+        storedQueuedRun.restartContinuationOfRunId !== undefined;
+      const consumesProviderCooldownBypass =
+        !recoveryRun &&
+        (storedQueuedRun.explicitModelSelection !== true ||
+          projection.thread.scheduledModelSelection == null ||
+          storedQueuedRun.ordinal >
+            projection.thread.scheduledModelSelection.queuedThroughOrdinal) &&
+        queuedMessage !== undefined &&
+        ProviderFailover.resendable(queuedMessage) &&
+        projection.thread.bypassProviderCooldown === true &&
+        draftModelPickMatchesThread(requestedSelection, nextTurnModelSelection(projection.thread));
       const modelSelection =
         queuedMessage === undefined
           ? requestedSelection
@@ -2540,13 +2586,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               run: {
                 ...storedQueuedRun,
                 bypassProviderCooldown:
-                  storedQueuedRun.bypassProviderCooldown === true ||
-                  projection.thread.bypassProviderCooldown === true ||
-                  (projection.thread.scheduledModelSelection != null &&
-                    modelSelectionsEqual(
-                      requestedSelection,
-                      projection.thread.scheduledModelSelection.modelSelection,
-                    )),
+                  storedQueuedRun.bypassProviderCooldown === true || consumesProviderCooldownBypass,
               },
               message: queuedMessage,
             });
@@ -2739,8 +2779,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const threadAtStart = threadAtRunStart(projection, {
         runId: queuedRun.id,
         ordinal: queuedRun.ordinal,
-        model:
-          queuedRun.explicitModelSelection !== true
+        model: recoveryRun
+          ? "server"
+          : queuedRun.explicitModelSelection !== true
             ? "default"
             : queuedMessage?.creationSource === "server"
               ? "server"
@@ -3216,7 +3257,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         [
           ...(selectionChanged ||
           threadAtStart !== projection.thread ||
-          projection.thread.bypassProviderCooldown === true
+          consumesProviderCooldownBypass
             ? [
                 {
                   type: !selectionChanged
@@ -3231,7 +3272,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     ...threadAtStart,
                     providerInstanceId: queuedRun.providerInstanceId,
                     modelSelection: queuedRun.modelSelection,
-                    bypassProviderCooldown: false,
+                    ...(consumesProviderCooldownBypass ? { bypassProviderCooldown: false } : {}),
                     updatedAt: now,
                   },
                 },
@@ -5377,6 +5418,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             return {
               ...thread,
               scheduledModelSelection: providerSwitchPlan.scheduled,
+              bypassProviderCooldown: true,
               updatedAt: now,
             };
           }
@@ -7043,6 +7085,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ]);
   });
 
+  // Providers own native subagent conversations; messages cannot target them, and adapters ask questions on the parent.
+  const refuseNativeSubagentMessage = Effect.fnUntraced(function* (
+    command: Pick<OrchestrationV2Command, "commandId"> & { readonly threadId: ThreadId },
+  ) {
+    const thread = yield* projectionStore
+      .getThread(command.threadId)
+      .pipe(
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+        ),
+      );
+    if (isProviderNativeSubagentThread(thread)) {
+      return yield* new OrchestratorSubagentThreadReadOnlyError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+      });
+    }
+    return thread;
+  });
+
   const dispatchMessage = Effect.fn("Orchestrator.dispatchMessage")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -7929,30 +7991,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       modelSelection = queueTailModelSelection(projection);
     }
+    const recoveryRun =
+      command.failoverOfRunId !== undefined || command.restartContinuationOfRunId !== undefined;
+    const resendablePrompt = ProviderFailover.resendable({ ...incomingMessage, role: "user" });
+    const consumesProviderCooldownBypass =
+      !recoveryRun &&
+      resendablePrompt &&
+      projection.thread.bypassProviderCooldown === true &&
+      draftModelPickMatchesThread(modelSelection, nextTurnModelSelection(projection.thread));
     const bypassProviderCooldown =
-      (command.modelSelection !== undefined &&
-        !modelSelectionsEqual(command.modelSelection, projection.thread.modelSelection)) ||
-      projection.thread.bypassProviderCooldown === true ||
-      (projection.thread.scheduledModelSelection != null &&
-        modelSelectionsEqual(
-          modelSelection,
-          projection.thread.scheduledModelSelection.modelSelection,
-        ));
-    if (
-      command.failoverOfRunId === undefined &&
-      command.restartContinuationOfRunId === undefined &&
-      startsOrQueuesRun
-    ) {
+      (resendablePrompt &&
+        command.modelSelection !== undefined &&
+        !draftModelPickMatchesThread(
+          command.modelSelection,
+          nextTurnModelSelection(projection.thread),
+        )) ||
+      consumesProviderCooldownBypass;
+    if (!recoveryRun && startsOrQueuesRun) {
       modelSelection = yield* ProviderFailover.resolveProviderCooldownTarget({
         cooldown: providerCooldown,
         settings: serverSettings,
         projectId: projection.thread.projectId,
         modelSelection,
         run: { bypassProviderCooldown },
-        message: { ...command, role: "user" },
+        message: { ...incomingMessage, role: "user" },
       });
     }
-    if (projection.thread.bypassProviderCooldown === true && startsOrQueuesRun) {
+    if (consumesProviderCooldownBypass && startsOrQueuesRun) {
       const now = yield* DateTime.now;
       const event = yield* emit(
         events,
@@ -8383,8 +8448,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const threadAtStart = threadAtRunStart(projection, {
       runId: null,
       ordinal: null,
-      model:
-        command.modelSelection === undefined
+      model: recoveryRun
+        ? "server"
+        : command.modelSelection === undefined
           ? "default"
           : command.creationSource === "server"
             ? "server"
@@ -15777,7 +15843,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.active.reorder":
       case "thread.tag.set":
       case "thread.mark-unread":
-      case "thread.metadata.update":
       case "thread.pull-request.link":
       case "thread.pull-request.unlink":
       case "thread.pull-request-link.sync":
@@ -15790,6 +15855,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "provider.switch":
         yield* dispatchThreadMutation(command, events, effects);
         break;
+      case "thread.metadata.update": {
+        const continuation = metadataUpdateContinuation(command);
+        if (continuation !== undefined) yield* refuseNativeSubagentMessage(command);
+        yield* dispatchThreadMutation(command, events, effects);
+        if (continuation !== undefined) {
+          cancelUnsettledEffects = yield* dispatchMessage(continuation, events, effects);
+          yield* recordSubagentFollowup(continuation, events).pipe(mapDispatchError(command));
+        }
+        break;
+      }
       case "thread.pull-request-watch.checks-reopen":
         yield* dispatchThreadMutation(command, events, effects);
         break;
@@ -15813,20 +15888,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* dispatchThreadProjectAdoptFolder(command, events);
         break;
       case "message.dispatch": {
-        // Providers own native subagent conversations; messages cannot target them, and adapters ask questions on the parent.
-        const thread = yield* projectionStore
-          .getThread(command.threadId)
-          .pipe(
-            Effect.mapError(
-              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
-            ),
-          );
-        if (isProviderNativeSubagentThread(thread)) {
-          return yield* new OrchestratorSubagentThreadReadOnlyError({
-            commandId: command.commandId,
-            threadId: command.threadId,
-          });
-        }
+        const thread = yield* refuseNativeSubagentMessage(command);
         const guestSend =
           command.guestMessageId === undefined
             ? undefined
@@ -16465,11 +16527,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     // Taken before the lineage read, so a message whose read yields keeps its
     // place ahead of later messages to the same thread.
-    if (command.type === "message.dispatch")
+    const message =
+      command.type === "thread.metadata.update" ? metadataUpdateContinuation(command) : command;
+    if (message?.type === "message.dispatch")
       return yield* messageIntake.withLock(
-        command.threadId,
-        mayStartSubagentFollowup(command)
-          ? withSubagentParentLock(command.threadId, dispatch)
+        message.threadId,
+        mayStartSubagentFollowup(message)
+          ? withSubagentParentLock(message.threadId, dispatch)
           : dispatch,
       );
     // Answering a message-mode question can also start a follow-up.
