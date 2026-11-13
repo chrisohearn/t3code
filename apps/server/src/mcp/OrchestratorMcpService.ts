@@ -1312,6 +1312,21 @@ const make = Effect.gen(function* () {
 
   const loadProviders = providerRegistry.getProviders;
 
+  // Read after the dispatch: the orchestrator decides whether a snooze stays, and a usage-limit
+  // snooze always ends.
+  const snoozeOutcome = Effect.fn("OrchestratorMcpService.snoozeOutcome")(function* (
+    threadId: ThreadId,
+    snoozedUntil: DateTime.Utc | null | undefined,
+    kept: "held" | "posted" | "steered",
+  ) {
+    const nowMs = yield* Clock.currentTimeMillis;
+    if (snoozedUntil == null || DateTime.toEpochMillis(snoozedUntil) <= nowMs) return {};
+    const after = yield* threadManagement
+      .getThreadShell(threadId)
+      .pipe(Effect.orElseSucceed(() => null));
+    return snoozeNotice(snoozedUntil, nowMs, after?.snoozedUntil == null ? "woke" : kept);
+  });
+
   // Best effort: the message is already queued, so a failed read only omits the standing.
   const readQueueStanding = Effect.fn("OrchestratorMcpService.readQueueStanding")(
     function* (threadId: ThreadId, runId: RunId) {
@@ -3379,11 +3394,7 @@ const make = Effect.gen(function* () {
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,
-        ...snoozeNotice(
-          target.thread.snoozedUntil,
-          yield* Clock.currentTimeMillis,
-          respectSnooze ? "posted" : "woke",
-        ),
+        ...(yield* snoozeOutcome(input.threadId, target.thread.snoozedUntil, "posted")),
       };
     }),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
@@ -3508,15 +3519,11 @@ const make = Effect.gen(function* () {
       return {
         ...(notify === undefined ? {} : { notify }),
         ...(queue === undefined ? {} : { queue }),
-        ...snoozeNotice(
+        ...(yield* snoozeOutcome(
+          input.threadId,
           target.thread.snoozedUntil,
-          yield* Clock.currentTimeMillis,
-          result.run.snoozeDeferred === true
-            ? "held"
-            : result.delivery === "steered" && (input.respectSnooze ?? true)
-              ? "steered"
-              : "woke",
-        ),
+          result.run.snoozeDeferred === true ? "held" : "steered",
+        )),
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,

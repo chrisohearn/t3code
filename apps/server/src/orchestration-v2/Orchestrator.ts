@@ -910,6 +910,12 @@ function worktreeSetupPending(
   );
 }
 
+/** A released turn is no longer a snooze's: a later failure hold must not re-release it. */
+function withoutSnoozeDeferral(run: OrchestrationV2Run): OrchestrationV2Run {
+  const { snoozeDeferred: _snoozeDeferred, ...released } = run;
+  return released;
+}
+
 function nextQueuedRun(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
 ): OrchestrationV2Run | undefined {
@@ -3226,7 +3232,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .map((message) => message.id),
     );
     const now = yield* DateTime.now;
-    const released = held.filter((run) => unattended.has(run.userMessageId));
+    // A snooze's held turn waits for the thread to wake, not for later runs.
+    const released = held.filter(
+      (run) => unattended.has(run.userMessageId) && run.snoozeDeferred !== true,
+    );
     if (released.length === 0) return;
     yield* writeSystemEvents(
       released.map((run) => ({
@@ -6991,13 +7000,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.delegatedCompletion !== undefined ||
       serverNotice;
     // A sender that respects the snooze leaves it: a post is only recorded, and a turn waits,
-    // held behind the thread's last run, until the thread wakes. A thread with no run wakes.
+    // held behind the thread's last run, until the thread wakes. A thread with no run wakes,
+    // and so does one the server snoozed until its usage limit resets: that is no one's hold.
     const snoozeHeldUntil = projection.thread.snoozedUntil;
+    const limitRecovery = projection.thread.limitRecovery;
     const respectsSnooze =
       command.respectSnooze === true &&
       !automaticWake &&
       snoozeHeldUntil != null &&
       DateTime.toEpochMillis(snoozeHeldUntil) > DateTime.toEpochMillis(yield* DateTime.now) &&
+      !(
+        limitRecovery?.snooze === true &&
+        DateTime.toEpochMillis(snoozeHeldUntil) === Date.parse(limitRecovery.resetAt)
+      ) &&
       (command.postOnly === true || latestExecutedRun(projection.runs) != null);
     if (projection.thread.snoozedUntil != null && !automaticWake && !respectsSnooze) {
       const now = yield* DateTime.now;
@@ -7539,7 +7554,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         runId: held.id,
         providerInstanceId: held.providerInstanceId,
         occurredAt: releasedAt,
-        payload: { ...held, queueHeld: false },
+        payload: { ...withoutSnoozeDeferral(held), queueHeld: false },
       });
     }
     if (shouldQueue) {
@@ -12380,7 +12395,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // from a later run (a stop, say) is not this failure's to release.
     const failureOwnsQueue = latestExecutedRun(projection.runs)?.id === state.run.id;
     for (const run of projection.runs) {
-      if (!failureOwnsQueue || run.status !== "queued" || run.queueHeld !== true) continue;
+      if (
+        !failureOwnsQueue ||
+        run.status !== "queued" ||
+        run.queueHeld !== true ||
+        run.snoozeDeferred === true
+      )
+        continue;
       yield* emitEvent({
         type: "run.updated",
         threadId: command.threadId,
@@ -15440,7 +15461,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             runId: run.id,
             providerInstanceId: run.providerInstanceId,
             occurredAt: now,
-            payload: { ...run, queueHeld: false },
+            payload: { ...withoutSnoozeDeferral(run), queueHeld: false },
           });
         }
         if (queued.length === 0) {

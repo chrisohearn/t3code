@@ -1,4 +1,5 @@
 import { CommandId, ThreadId } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -61,11 +62,29 @@ export const readSnoozeDeferredThreads = Effect.fn("SnoozeDeferredDelivery.read"
   }));
 });
 
+export class SnoozeDeferredStore extends Context.Service<
+  SnoozeDeferredStore,
+  { readonly read: Effect.Effect<ReadonlyArray<SnoozeDeferredThread>> }
+>()("t3/orchestration-v2/SnoozeDeferredStore") {}
+
+const layerStore = Layer.effect(
+  SnoozeDeferredStore,
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    return SnoozeDeferredStore.of({
+      read: readSnoozeDeferredThreads().pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.orElseSucceed(() => []),
+      ),
+    });
+  }),
+);
+
 const affectsDeferral = (event: OrchestrationV2DomainEvent) =>
   event.type.startsWith("thread.") || event.type === "run.created" || event.type === "run.updated";
 
 const makeSweep = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
+  const store = yield* SnoozeDeferredStore;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const due = DueHint.make();
@@ -78,13 +97,7 @@ const makeSweep = Effect.gen(function* () {
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     if (yield* due.isIdle(nowMs)) return;
     const readVersion = yield* due.version;
-    const { due: releases, wakeAtMs } = snoozeDeferredReleases(
-      yield* readSnoozeDeferredThreads().pipe(
-        Effect.provideService(SqlClient.SqlClient, sql),
-        Effect.orElseSucceed(() => []),
-      ),
-      nowMs,
-    );
+    const { due: releases, wakeAtMs } = snoozeDeferredReleases(yield* store.read, nowMs);
     for (const thread of releases) {
       yield* threads
         .dispatch({
@@ -111,10 +124,12 @@ const makeSweep = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effectDiscard(
+export const layerWorker = Layer.effectDiscard(
   Effect.gen(function* () {
     const sweep = yield* makeSweep;
     const scheduler = yield* Scheduler.Scheduler;
     yield* scheduler.register("snooze-deferred-delivery", sweep());
   }),
 );
+
+export const layer = layerWorker.pipe(Layer.provide(layerStore));

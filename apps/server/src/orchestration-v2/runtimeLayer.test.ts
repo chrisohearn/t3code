@@ -8692,7 +8692,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         threadId,
       });
       const released = yield* orchestrator.getThreadProjection(threadId);
-      assert.equal(released.runs.find((run) => run.id === heldRun.id)?.status, "starting");
+      const releasedRun = released.runs.find((run) => run.id === heldRun.id)!;
+      assert.equal(releasedRun.status, "starting");
+      // Released, it is no longer the snooze's: a failure hold later must not release it again.
+      assert.isUndefined(releasedRun.snoozeDeferred);
+      assert.deepEqual(yield* SnoozeDeferredDelivery.readSnoozeDeferredThreads(), []);
     }),
   );
 

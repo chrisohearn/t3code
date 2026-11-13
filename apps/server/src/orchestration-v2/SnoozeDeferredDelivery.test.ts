@@ -1,25 +1,87 @@
-import { describe, expect, it } from "vite-plus/test";
+import { assert, describe, it } from "@effect/vitest";
+import type { OrchestrationV2Command, OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
-import { snoozeDeferredReleases } from "./SnoozeDeferredDelivery.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as Orchestrator from "./Orchestrator.ts";
+import * as SnoozeDeferredDelivery from "./SnoozeDeferredDelivery.ts";
+import * as ThreadManagement from "./ThreadManagementService.ts";
+
+const startMs = Date.parse("2026-11-13T03:00:00.000Z");
+const deferred = (threadId: string, snoozedUntil: string | null) => ({
+  threadId,
+  snoozedUntil,
+  firstRunId: `run:${threadId}`,
+});
 
 describe("snoozeDeferredReleases", () => {
   it("releases awake threads and wakes at the earliest snooze still holding a turn", () => {
-    const now = Date.parse("2026-11-13T03:00:00Z");
-    const thread = (threadId: string, snoozedUntil: string | null) => ({
-      threadId,
-      snoozedUntil,
-      firstRunId: `run:${threadId}`,
-    });
-    const { due, wakeAtMs } = snoozeDeferredReleases(
+    const { due, wakeAtMs } = SnoozeDeferredDelivery.snoozeDeferredReleases(
       [
-        thread("unsnoozed", null),
-        thread("expired", "2026-11-13T02:59:59.000Z"),
-        thread("later", "2026-11-24T00:00:00.000Z"),
-        thread("sooner", "2026-11-18T00:00:00.000Z"),
+        deferred("unsnoozed", null),
+        deferred("expired", "2026-11-13T02:59:59.000Z"),
+        deferred("later", "2026-11-24T00:00:00.000Z"),
+        deferred("sooner", "2026-11-18T00:00:00.000Z"),
       ],
-      now,
+      startMs,
     );
-    expect(due.map((entry) => entry.threadId)).toEqual(["unsnoozed", "expired"]);
-    expect(wakeAtMs).toBe(Date.parse("2026-11-18T00:00:00.000Z"));
+    assert.deepEqual(
+      due.map((entry) => entry.threadId),
+      ["unsnoozed", "expired"],
+    );
+    assert.equal(wakeAtMs, Date.parse("2026-11-18T00:00:00.000Z"));
   });
 });
+
+it.effect("resumes a held turn when its snooze ends or the thread is woken, once", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(startMs);
+    const rows = yield* Ref.make([deferred("snoozed", "2026-11-13T03:01:00.000Z")]);
+    const released = yield* Queue.unbounded<OrchestrationV2Command>();
+    const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
+    const layer = SnoozeDeferredDelivery.layerWorker.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Scheduler.layer,
+          Layer.succeed(SnoozeDeferredDelivery.SnoozeDeferredStore, {
+            read: Ref.get(rows),
+          }),
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            // A release clears the turn's deferral, so the store stops listing it.
+            dispatch: (command) =>
+              Ref.update(rows, (current) =>
+                current.filter((row) => row.threadId !== command.threadId),
+              ).pipe(
+                Effect.andThen(Queue.offer(released, command)),
+                Effect.as({ sequence: 1, storedEvents: [] }),
+              ),
+          }),
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            streamDomainEvents: Stream.fromQueue(events),
+          }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      yield* TestClock.adjust("60 seconds");
+      assert.deepEqual(yield* Queue.take(released), {
+        type: "queue.resume",
+        commandId: "snooze-deferred-release:run:snoozed",
+        threadId: "snoozed",
+      } as never);
+
+      yield* Ref.set(rows, [deferred("woken", null)]);
+      yield* Queue.offer(events, { type: "thread.unsnoozed" } as never);
+      yield* TestClock.adjust("5 seconds");
+      assert.equal((yield* Queue.take(released)).threadId, "woken");
+
+      yield* TestClock.adjust("10 minutes");
+      assert.equal(yield* Queue.size(released), 0);
+    }).pipe(Effect.provide(layer));
+  }),
+);

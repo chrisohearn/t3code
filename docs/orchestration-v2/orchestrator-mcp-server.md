@@ -459,6 +459,14 @@ Sends a message to any ordinary or delegated thread in the environment:
   applies: the provider cannot stop a turn, Stop has already reached the turn,
   or the turn or the new message is `/compact` or `/logout`.
 
+A snoozed target stays snoozed unless `respectSnooze: false`. The message's run
+is queued and held behind the thread's last run, marked `snoozeDeferred`, and
+`SnoozeDeferredDelivery` resumes the queue once the snooze ends or the thread is
+woken. A held run that something else releases stops being deferred, so a later
+failure hold is never released by that sweep. A thread that has never run, and a
+snooze the server set until a usage limit resets, wake as before. Messages from
+the app always wake the thread.
+
 The target runtime and interaction modes may not be broader than the caller's.
 Stable command and message IDs are derived from `clientRequestId` for
 idempotent retries.

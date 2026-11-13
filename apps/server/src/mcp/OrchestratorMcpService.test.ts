@@ -4161,6 +4161,14 @@ describe("OrchestratorMcpService thread lookup", () => {
       }).pipe(
         Effect.provide(
           service([snoozed], sent, {
+            // The orchestrator keeps the snooze only for a sender that respects it.
+            getThreadShell: () =>
+              Effect.succeed(
+                dispatched.length === 0 ||
+                  (dispatched.at(-1) as { respectSnooze?: boolean }).respectSnooze === true
+                  ? snoozed
+                  : launched,
+              ),
             getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(snoozed)),
             dispatch: (command) =>
               Effect.sync(() => {
