@@ -92,7 +92,7 @@ pass 'past the cap, open approvals and tool calls get a bounded extra wait'
 touch -d '-51 minutes' "$GUARD_STATE/deferred-since"
 out=$(cmd_update 2>/dev/null)
 [[ "$out" == RUN* ]] || fail "cap plus grace did not force: $out"
-[[ "$(sed -n 2p "$PRE_RESTART")" == 'r1 A' ]] || fail 'running run not recorded before restart'
+grep -qx 'run r1 A' "$PRE_RESTART" && grep -qx 'req q1' "$PRE_RESTART" || fail 'running run or pending request not recorded before restart'
 pass 'past the cap plus grace the update is forced and running runs are recorded'
 sqlite3 "$DB" "delete from orchestration_v2_projection_runtime_requests; delete from orchestration_v2_projection_turn_items;"
 touch -d '-31 minutes' "$GUARD_STATE/deferred-since"
@@ -118,10 +118,15 @@ set +e; out=$(cmd_update --now 2>/dev/null); rc=$?; set -e
 [[ "$out" == Deferred:*exit-hang* && $rc == 3 ]] || fail "kernel signs did not defer --now with rc 3: rc=$rc $out"
 [[ ! -e "$root/svc-kernel" ]] || fail 'service touched while the kernel showed the hang'
 [[ ! -e "$AUTO_HOLD" ]] || fail 'kernel deferral set a hold that needs a human'
-touch -d '-40 minutes' "$GUARD_STATE/deferred-since"; since=$(stat -c %Y "$GUARD_STATE/deferred-since")
+[[ -e "$GUARD_STATE/deferred-since" ]] || fail 'manual kernel deferral erased the timer clock'
+touch -d '-10 minutes' "$GUARD_STATE/deferred-since"; since=$(stat -c %Y "$GUARD_STATE/deferred-since")
 out=$(cmd_update 2>/dev/null)
-[[ "$(stat -c %Y "$GUARD_STATE/deferred-since")" == "$since" ]] || fail 'kernel deferral reset the deferral clock'
-pass 'kernel hang signs defer even --now (rc 3), without touching the service, a hold, or the clock'
+[[ "$(stat -c %Y "$GUARD_STATE/deferred-since")" == "$since" ]] || fail 'kernel deferral reset a recent deferral clock'
+touch -d '-5 hours' "$GUARD_STATE/deferred-since"
+out=$(cmd_update 2>/dev/null)
+age=$(( $(date +%s) - $(stat -c %Y "$GUARD_STATE/deferred-since") ))
+(( age >= MAX_DEFER_SECONDS - 5 && age <= MAX_DEFER_SECONDS + 5 )) || fail "old clock not clamped to the cap: age $age"
+pass 'kernel hang signs defer even --now (rc 3) with no service touch or hold; the clock is kept but never older than the cap'
 kernel_hang_signs() { return 1; }
 unset T3_GUARD_DRY_RUN
 
@@ -137,15 +142,17 @@ stat_is_exiting_d '123 (node) D 1 1 1 0 -1 4194368 0 0' && fail 'plain D state c
 stat_is_exiting_d '123 (node) S 1 1 1 0 -1 4194372 0 0' && fail 'sleeping task counted'
 pass '/proc stat parsing finds D state with PF_EXITING, whatever the comm'
 
-printf '%s\nr1 A\nr9 B\n' "$(now '-2 minutes')" > "$PRE_RESTART"
+printf '%s\nrun r1 A\nrun r9 B\nreq q2\nreq q3\nreq q4\n' "$(now '-2 minutes')" > "$PRE_RESTART"
 sqlite3 "$DB" "insert into orchestration_v2_projection_runs values ('r2','A','running','$(now '-1 minute')',null,'{\"restartContinuationOfRunId\":\"r1\"}');
   insert into orchestration_v2_projection_runs values ('r10','B','running','$(now '-1 minute')',null,'{}');
   insert into orchestration_v2_projection_runtime_requests values ('q2','cancelled','$(now '-1 minute')');
-  insert into orchestration_v2_projection_runtime_requests values ('q3','expired','$(now '-1 minute')');"
+  insert into orchestration_v2_projection_runtime_requests values ('q3','expired','$(now '-1 minute')');
+  insert into orchestration_v2_projection_runtime_requests values ('q4','resolved','$(now '-1 minute')');
+  insert into orchestration_v2_projection_runtime_requests values ('q5','cancelled','$(now '-1 minute')');"
 s=$(recovery_summary)
-[[ "$s" == '1/2 interrupted run(s) continued; not continued: B; 2 request(s) cancelled or expired' ]] || fail "summary: $s"
+[[ "$s" == '1/2 interrupted run(s) continued; not continued: B; 2 pending request(s) lost' ]] || fail "summary: $s"
 [[ ! -e "$PRE_RESTART" ]] || fail 'pre-restart record kept after summary'
-pass 'recovery summary matches each continuation to its run and counts cancelled and expired requests'
+pass 'recovery summary matches continuations to their runs and counts only requests pending at the stop'
 printf '%s\n' "$(now)" > "$PRE_RESTART"
 sqlite3 "$DB" "delete from orchestration_v2_projection_runtime_requests;"
 [[ -z "$(recovery_summary)" ]] || fail 'empty restart produced a summary'
@@ -156,6 +163,15 @@ service_uptime() { return 1; }
 cmd_update >/dev/null 2>&1 && fail 'no-op reported with the managed unit down'
 [[ -f "$AUTO_HOLD" ]] || fail 'unit down did not trip the health breaker'
 pass 'a no-op needs the managed unit up, not just an answer on the port'
+rm -f "$AUTO_HOLD"
+cmd_update 1 >/dev/null 2>&1 && fail 'explicit current version reported with the unit down'
+[[ -f "$AUTO_HOLD" ]] || fail 'explicit current version with unit down did not hold'
+pass 'an explicit current version also needs the managed unit up'
+out=$(cmd_resume)
+[[ ! -e "$AUTO_HOLD" && "$out" == 'Automatic updates resumed.'* ]] || fail "resume: $out"
+ls "$AUTO_HOLD".cleared-* >/dev/null 2>&1 || fail 'resume deleted the hold instead of archiving it'
+[[ "$(cmd_resume)" == 'No automatic-updates hold.' ]] || fail 'resume without a hold'
+pass 'resume lifts a hold and keeps it as an archive'
 rm -f "$AUTO_HOLD"; service_uptime() { echo 100; }
 
 latest_release() { echo 2; }; active_runs() { echo 0; }; quiet_seconds() { echo 99999; }
@@ -166,6 +182,19 @@ cmd_update >/dev/null 2>&1 && fail 'failed snapshot accepted'
 [[ "$(cat "$root/recovery")" == 1 ]] || fail 'failed snapshot did not restart the old build'
 pass 'a failed snapshot after the stop holds automatic updates and restarts the old build'
 rm -f "$AUTO_HOLD"
+
+mkdir -p "$T3HOME/userdata" "$root/snap"
+echo live > "$T3HOME/userdata/state.sqlite"; echo old > "$root/snap/state.sqlite"; echo old > "$root/snap/extra.sqlite-wal"
+# tmpfs cannot reflink; the host (btrfs) can.
+cp() { [[ "$*" == *extra.sqlite-wal* ]] && return 1; command cp "${@/--reflink=always/--reflink=auto}"; }
+restore_db "$root/snap" 2>/dev/null && fail 'partial restore reported success'
+[[ "$(cat "$T3HOME/userdata/state.sqlite")" == live ]] || fail 'failed restore changed the live database'
+ls -d "$T3HOME"/userdata/.restore-* >/dev/null 2>&1 && fail 'failed restore left its staging dir'
+cp() { command cp "${@/--reflink=always/--reflink=auto}"; }
+restore_db "$root/snap" >/dev/null 2>&1 || fail 'restore failed'
+[[ "$(cat "$T3HOME/userdata/state.sqlite")" == old && -e "$T3HOME/userdata/extra.sqlite-wal" ]] || fail 'restore incomplete'
+pass 'a database restore is staged first, so a failed copy leaves the live files untouched'
+unset -f cp
 timeout() { printf '%s\n' "$*" > "$root/timeout"; }
 systemctl --user is-active t3code.service
 [[ "$(cat "$root/timeout")" == '--kill-after=2 15 /usr/bin/systemctl --user is-active t3code.service' ]] || fail timeout
