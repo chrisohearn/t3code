@@ -94,7 +94,8 @@ behind=0
 # An open sync PR (one a failed run opened, or an agent's conflict fix) is re-checked and, when
 # it passes, merged and released. Otherwise start a new sync branch from the integration branch.
 open_pr=""
-if [[ "$release_only" == 0 ]]; then
+# With no stable tag (upstream_sha empty) an open sync PR is still looked up, to be refused below.
+if [[ "$release_only" == 0 || -z "$upstream_sha" ]]; then
   open_pr=$(gh pr list -R "$FORK" --base "$BRANCH" --state open --json number,headRefName \
     --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] // empty | "\(.number) \(.headRefName)"')
 fi
@@ -104,6 +105,18 @@ if [[ -n "$open_pr" ]]; then
   read -r pr_number sync_branch <<<"$open_pr"
   git -C "$SOURCE" fetch -q origin "$sync_branch"
   git -C "$SOURCE" worktree add -q -B "$sync_branch" "$wt" "origin/$sync_branch"
+  # open-pr-guard begin (stable mode never publishes upstream beyond the selected tag; tested)
+  if [[ "$UPSTREAM_TRACK" == stable ]]; then
+    pr_upstream=$(git -C "$wt" merge-base HEAD upstream/main)
+    if [[ -z "$stable_tag" ]] || ! git -C "$wt" merge-base --is-ancestor "$pr_upstream" "$upstream_sha"; then
+      refusal="open sync PR #$pr_number carries upstream beyond ${stable_tag:-any stable tag}; close it or rerun with UPSTREAM_TRACK=nightly"
+      log "$refusal"
+      [[ -n "$dry_run" ]] || gh pr comment "$pr_number" -R "$FORK" --body "$refusal" >/dev/null
+      git -C "$SOURCE" worktree remove --force "$wt" 2>/dev/null || true
+      exit 4
+    fi
+  fi
+  # open-pr-guard end
   # Finish this candidate before incorporating newer upstream commits and resetting its CI.
   target_sha=$upstream_sha
   upstream_sha=$(git -C "$wt" merge-base HEAD "$target_sha")

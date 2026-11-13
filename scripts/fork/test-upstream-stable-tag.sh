@@ -88,4 +88,28 @@ for sha in "" "$S" "$B"; do
   check "release-only, upstream_sha='${sha:0:7}': no git merge attempted" "$(run_merge_step 1 "$sha")" ""
 done
 check "merge mode does try git (control)" "$(run_merge_step 0 "$B" | head -1)" "merge-base --is-ancestor $B HEAD"
+
+# Stable mode refuses an open sync PR that carries upstream beyond the selected tag (exit 4, no merge).
+gblock=$(sed -n '/open-pr-guard begin/,/open-pr-guard end/p' "$here/upstream-sync.sh")
+[[ -n "$gblock" ]] || { echo "FAIL open-pr-guard block not found"; exit 1; }
+git -C "$r" update-ref refs/remotes/upstream/main main
+run_guard() { # <pr-head> <tag-sha> <stable_tag> [dry_run]; prints "rc=N comments=N worktree=kept|removed"
+  local wt=$tmp/guard-wt
+  git -C "$r" worktree add -q --detach "$wt" "$1"
+  : >"$tmp/gh-calls"
+  set +e
+  ( gh() { echo "$*" >>"$tmp/gh-calls"; }
+    log() { :; }
+    UPSTREAM_TRACK=stable SOURCE=$r wt=$wt pr_number=7 FORK=f upstream_sha=$2 stable_tag=$3 dry_run=${4:-}
+    eval "$gblock"; exit 0 ) >/dev/null 2>&1
+  local rc=$?
+  set -e
+  local kept=removed; [[ -d "$wt" ]] && kept=kept
+  echo "rc=$rc comments=$(wc -l <"$tmp/gh-calls" | tr -d ' ') worktree=$kept"
+  git -C "$r" worktree remove --force "$wt" 2>/dev/null || true
+}
+check "open PR within the tag continues" "$(run_guard "$D" "$E" v1)" "rc=0 comments=0 worktree=kept"
+check "open PR beyond the tag: exit 4, comment, worktree removed" "$(run_guard "$E" "$D" v1)" "rc=4 comments=1 worktree=removed"
+check "open PR beyond the tag, dry run: no comment" "$(run_guard "$E" "$D" v1 1)" "rc=4 comments=0 worktree=removed"
+check "open PR with no stable tag is refused" "$(run_guard "$D" "" "")" "rc=4 comments=1 worktree=removed"
 exit $fail
