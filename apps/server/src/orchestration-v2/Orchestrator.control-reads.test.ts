@@ -1,4 +1,6 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
   EnvironmentId,
@@ -16,6 +18,8 @@ import {
   RunAttemptId,
   RunId,
   RuntimeRequestId,
+  ScheduledTaskId,
+  type ScheduledTaskUpsertInput,
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
@@ -52,6 +56,12 @@ import * as ApprovalAutoReviewConfig from "./ApprovalAutoReviewConfig.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as TextGenerators from "../textGeneration/TextGenerators.ts";
+import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import { decodeJsonReply } from "@t3tools/provider-core/server/textGenerationOperations";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
@@ -2361,6 +2371,7 @@ it.effect(
           "printf café",
         ].map((prompt) => ["command", "accept", false, "money", prompt] as const),
         ["command", "accept", false, "agent-context"],
+        ["command", "accept", false, "scheduled-context"],
         ["command", "accept", false, "disabled"],
         ["command", "accept", false, "inherit"],
         ["command", "accept", false, "opt-out"],
@@ -2383,7 +2394,7 @@ it.effect(
           projectId: ProjectId.make("project:snoozed-live"),
           title: "Deferred question",
           modelSelection,
-          runtimeMode: "full-access",
+          runtimeMode: autoReview === "scheduled-context" ? "approval-required" : "full-access",
           interactionMode: "default",
           branch: null,
           worktreePath: null,
@@ -2470,18 +2481,94 @@ it.effect(
             },
           });
         if (autoReview !== undefined) {
-          yield* orchestrator.dispatch({
-            type: "message.dispatch",
-            threadId,
-            commandId: CommandId.make(`context:${suffix}`),
-            messageId: MessageId.make(`context:${suffix}`),
-            text: "Run the project tests. Keep the order of feedback, payload and wire checks.",
-            attachments: [],
-            postOnly: true,
-            dispatchMode: { type: "defer_start" },
-            createdBy: autoReview === "agent-context" ? "agent" : "user",
-            creationSource: autoReview === "agent-context" ? "mcp" : "web",
-          });
+          if (autoReview === "scheduled-context") {
+            const scheduleLayer = ScheduledTaskService.layer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  ManagedPolicy.layerTest(),
+                  Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+                  Layer.mock(ThreadManagement.ThreadManagementService)({
+                    getThreadShell: (id) => projections.getThreadShell(id).pipe(Effect.orDie),
+                    getThreadRecords: orchestrator.getThreadRecords,
+                    getProjectThreadRecords: () =>
+                      Effect.succeed({ runs: [], messages: [], turnItems: [] } as never),
+                    sendToThread: (input) =>
+                      orchestrator
+                        .dispatch({
+                          type: "message.dispatch",
+                          threadId: input.threadId,
+                          commandId: CommandId.make(input.commandId ?? `scheduled:${suffix}`),
+                          messageId: MessageId.make(input.messageId ?? `scheduled:${suffix}`),
+                          scheduledTaskId: input.scheduledTaskId,
+                          text: input.text,
+                          attachments: [],
+                          dispatchMode: { type: "defer_start" },
+                          createdBy: input.createdBy ?? "user",
+                          creationSource: input.creationSource ?? "web",
+                        })
+                        .pipe(Effect.as({} as never)),
+                  }),
+                  Layer.mock(SecretRequests.SecretRequests)({}),
+                  Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+                    namedProjectsRoot: "/projects",
+                    isScratchProject: () => Effect.succeed(false),
+                  }),
+                  NodeServices.layer,
+                  NodeCrypto.layer,
+                  Scheduler.layer,
+                ),
+              ),
+            );
+            yield* Effect.gen(function* () {
+              const schedules = yield* ScheduledTaskService.ScheduledTaskService;
+              const input: ScheduledTaskUpsertInput = {
+                id: ScheduledTaskId.make(`task:${suffix}`),
+                title: "Summarize status",
+                prompt: "Summarize project status without running commands.",
+                enabled: true,
+                schedule: { type: "interval", everyMs: 60_000 },
+                projectId: ProjectId.make("project:snoozed-live"),
+                threadId,
+                workspaceStrategy: { type: "root" },
+                modelSelection,
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                createdBy: "user",
+                creationSource: "web",
+              };
+              yield* schedules.upsert(input);
+              const edited = yield* schedules.upsert({
+                ...input,
+                prompt: "Run project tests",
+                createdBy: "agent",
+                creationSource: "mcp",
+              });
+              assert.equal(edited.task.createdBy, "user");
+              assert.equal(edited.task.creationSource, "web");
+              yield* schedules.runNow({ id: edited.task.id });
+              const context = yield* orchestrator.getThreadRecords(threadId, ["messages"], {
+                latestMessageOnly: true,
+              });
+              assert.deepInclude(context.messages[0], {
+                text: edited.task.prompt,
+                scheduledTaskId: edited.task.id,
+                createdBy: "user",
+                creationSource: "web",
+              });
+            }).pipe(Effect.provide(scheduleLayer), Effect.scoped);
+          } else
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              threadId,
+              commandId: CommandId.make(`context:${suffix}`),
+              messageId: MessageId.make(`context:${suffix}`),
+              text: "Run the project tests. Keep the order of feedback, payload and wire checks.",
+              attachments: [],
+              postOnly: true,
+              dispatchMode: { type: "defer_start" },
+              createdBy: autoReview === "agent-context" ? "agent" : "user",
+              creationSource: autoReview === "agent-context" ? "mcp" : "web",
+            });
           if (kind === "user_input")
             yield* projections.apply({
               id: EventId.make(`question-item-${suffix}`),
@@ -2620,7 +2707,8 @@ it.effect(
             autoReview === "money" ||
               disabled ||
               autoReview === "question" ||
-              autoReview === "agent-context"
+              autoReview === "agent-context" ||
+              autoReview === "scheduled-context"
               ? 0
               : 1,
           );

@@ -82,7 +82,7 @@ import {
 import * as ProviderFailover from "./ProviderFailover.ts";
 import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
-import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { draftModelPickMatchesThread, modelSelectionsEqual } from "@t3tools/shared/model";
 import { modelSwitchSince } from "./modelSwitch.ts";
 import { combinePullRequestWatchWakes, type PullRequestWatchWake } from "./pullRequestWatch.ts";
 import { recordThreadOpen } from "@t3tools/shared/paletteSearch";
@@ -1079,7 +1079,11 @@ function threadAtRunStart(
 ): OrchestrationV2ThreadProjection["thread"] {
   const scheduled = projection.thread.scheduledModelSelection;
   if (scheduled == null || starting.model === "server") return projection.thread;
-  const cleared = { ...projection.thread, scheduledModelSelection: null };
+  const cleared = {
+    ...projection.thread,
+    scheduledModelSelection: null,
+    bypassProviderCooldown: false,
+  };
   if (starting.model === "named") {
     return starting.ordinal !== null && starting.ordinal <= scheduled.queuedThroughOrdinal
       ? projection.thread
@@ -2558,6 +2562,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
       const requestedSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const recoveryRun =
+        storedQueuedRun.failoverOfRunId !== undefined ||
+        storedQueuedRun.restartContinuationOfRunId !== undefined;
+      const consumesProviderCooldownBypass =
+        !recoveryRun &&
+        (storedQueuedRun.explicitModelSelection !== true ||
+          projection.thread.scheduledModelSelection == null ||
+          storedQueuedRun.ordinal >
+            projection.thread.scheduledModelSelection.queuedThroughOrdinal) &&
+        queuedMessage !== undefined &&
+        ProviderFailover.resendable(queuedMessage) &&
+        projection.thread.bypassProviderCooldown === true &&
+        draftModelPickMatchesThread(requestedSelection, nextTurnModelSelection(projection.thread));
       const modelSelection =
         queuedMessage === undefined
           ? requestedSelection
@@ -2569,13 +2586,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               run: {
                 ...storedQueuedRun,
                 bypassProviderCooldown:
-                  storedQueuedRun.bypassProviderCooldown === true ||
-                  projection.thread.bypassProviderCooldown === true ||
-                  (projection.thread.scheduledModelSelection != null &&
-                    modelSelectionsEqual(
-                      requestedSelection,
-                      projection.thread.scheduledModelSelection.modelSelection,
-                    )),
+                  storedQueuedRun.bypassProviderCooldown === true || consumesProviderCooldownBypass,
               },
               message: queuedMessage,
             });
@@ -2768,8 +2779,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const threadAtStart = threadAtRunStart(projection, {
         runId: queuedRun.id,
         ordinal: queuedRun.ordinal,
-        model:
-          queuedRun.explicitModelSelection !== true
+        model: recoveryRun
+          ? "server"
+          : queuedRun.explicitModelSelection !== true
             ? "default"
             : queuedMessage?.creationSource === "server"
               ? "server"
@@ -3245,7 +3257,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         [
           ...(selectionChanged ||
           threadAtStart !== projection.thread ||
-          projection.thread.bypassProviderCooldown === true
+          consumesProviderCooldownBypass
             ? [
                 {
                   type: !selectionChanged
@@ -3260,7 +3272,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     ...threadAtStart,
                     providerInstanceId: queuedRun.providerInstanceId,
                     modelSelection: queuedRun.modelSelection,
-                    bypassProviderCooldown: false,
+                    ...(consumesProviderCooldownBypass ? { bypassProviderCooldown: false } : {}),
                     updatedAt: now,
                   },
                 },
@@ -5406,6 +5418,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             return {
               ...thread,
               scheduledModelSelection: providerSwitchPlan.scheduled,
+              bypassProviderCooldown: true,
               updatedAt: now,
             };
           }
@@ -7978,30 +7991,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       modelSelection = queueTailModelSelection(projection);
     }
+    const recoveryRun =
+      command.failoverOfRunId !== undefined || command.restartContinuationOfRunId !== undefined;
+    const resendablePrompt = ProviderFailover.resendable({ ...incomingMessage, role: "user" });
+    const consumesProviderCooldownBypass =
+      !recoveryRun &&
+      resendablePrompt &&
+      projection.thread.bypassProviderCooldown === true &&
+      draftModelPickMatchesThread(modelSelection, nextTurnModelSelection(projection.thread));
     const bypassProviderCooldown =
-      (command.modelSelection !== undefined &&
-        !modelSelectionsEqual(command.modelSelection, projection.thread.modelSelection)) ||
-      projection.thread.bypassProviderCooldown === true ||
-      (projection.thread.scheduledModelSelection != null &&
-        modelSelectionsEqual(
-          modelSelection,
-          projection.thread.scheduledModelSelection.modelSelection,
-        ));
-    if (
-      command.failoverOfRunId === undefined &&
-      command.restartContinuationOfRunId === undefined &&
-      startsOrQueuesRun
-    ) {
+      (resendablePrompt &&
+        command.modelSelection !== undefined &&
+        !draftModelPickMatchesThread(
+          command.modelSelection,
+          nextTurnModelSelection(projection.thread),
+        )) ||
+      consumesProviderCooldownBypass;
+    if (!recoveryRun && startsOrQueuesRun) {
       modelSelection = yield* ProviderFailover.resolveProviderCooldownTarget({
         cooldown: providerCooldown,
         settings: serverSettings,
         projectId: projection.thread.projectId,
         modelSelection,
         run: { bypassProviderCooldown },
-        message: { ...command, role: "user" },
+        message: { ...incomingMessage, role: "user" },
       });
     }
-    if (projection.thread.bypassProviderCooldown === true && startsOrQueuesRun) {
+    if (consumesProviderCooldownBypass && startsOrQueuesRun) {
       const now = yield* DateTime.now;
       const event = yield* emit(
         events,
@@ -8432,8 +8448,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const threadAtStart = threadAtRunStart(projection, {
       runId: null,
       ordinal: null,
-      model:
-        command.modelSelection === undefined
+      model: recoveryRun
+        ? "server"
+        : command.modelSelection === undefined
           ? "default"
           : command.creationSource === "server"
             ? "server"

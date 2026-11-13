@@ -8,9 +8,11 @@ twelve recent user/assistant messages from its run, including recorded authorshi
 It can allow once, decline once, or escalate. It cannot grant session-wide access,
 raise a runtime mode, answer a question, or act through tools. Missing context,
 oversized evidence, unsupported reviewers and errors leave the request pending.
-Only direct web/mobile messages recorded as user-created, without an MCP sender
-or sender thread, are marked as authority. A `user` role alone is insufficient:
-agent, relay and unattributed messages provide context, not new grants. Text
+Only direct web/mobile messages recorded as user-created, without sender or
+automation markers, are marked as authority. Schedules retain their creator's
+metadata after prompt edits and do not record prompt-editor provenance, so a
+scheduled message never supplies a human grant. Other automation, agent, relay
+and unattributed messages likewise provide context, not new grants. Text
 addressing the reviewer is grounds to escalate. Replies must be one complete
 JSON object; prose, fences or multiple objects fail closed.
 

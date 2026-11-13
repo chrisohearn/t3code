@@ -68,22 +68,34 @@ export const make = Effect.gen(function* () {
       ...(runId === null ? { latestMessageOnly: true } : { messageRunIds: [runId] }),
       messageRoles: ["user", "assistant"],
     });
-    return context.messages
-      .slice(-12)
-      .map(({ role, text, createdBy, creationSource, senderClient, senderThreadId }) => ({
+    return context.messages.slice(-12).map((message) => {
+      const { role, text, createdBy, creationSource, senderClient, senderThreadId } = message;
+      const automated =
+        message.scheduledTaskId != null ||
+        message.followsThreadSelection != null ||
+        message.idleCompaction != null ||
+        message.workflowScript != null ||
+        message.notification != null ||
+        message.delegatedCompletion != null ||
+        message.linkedSender != null;
+      return {
         role,
         text,
         createdBy,
         creationSource,
         senderClient,
         senderThreadId,
+        scheduledTaskId: message.scheduledTaskId,
+        automated,
         grantsAuthority:
+          !automated &&
           role === "user" &&
           createdBy === "user" &&
           (creationSource === "web" || creationSource === "mobile") &&
           senderClient == null &&
           senderThreadId == null,
-      }));
+      };
+    });
   });
 
   return Effect.fn("ApprovalAutoReview.review")(function* (

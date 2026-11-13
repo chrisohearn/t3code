@@ -111,6 +111,7 @@ it.layer(layerTest)("CodexDriver", (it) => {
       const instanceId = ProviderInstanceId.make("restored-managed-account");
       const credentials = new Map<string, Uint8Array>();
       const catalogTokens: Array<string | undefined> = [];
+      const reviewPrompts: Array<string> = [];
       const probeEntered = yield* Deferred.make<void>();
       const resumeProbe = yield* Deferred.make<void>();
       const secrets = ServerSecretStore.ServerSecretStore.of({
@@ -158,6 +159,7 @@ it.layer(layerTest)("CodexDriver", (it) => {
         };
         const installation = yield* CodexInstallation.CodexInstallation;
         const serverConfig = yield* ServerConfig.ServerConfig;
+        const fileSystem = yield* FileSystem.FileSystem;
         const sharedHome = NodePath.join(serverConfig.stateDir, "shared-codex-home");
         const launches: Array<
           Parameters<CodexAdapterV2.CodexAppServerClientFactoryShape["open"]>[0]
@@ -210,8 +212,44 @@ it.layer(layerTest)("CodexDriver", (it) => {
           ),
           Effect.provideService(
             ChildProcessSpawner.ChildProcessSpawner,
-            ChildProcessSpawner.make(() =>
+            ChildProcessSpawner.make((command) =>
               Effect.gen(function* () {
+                if (ChildProcess.isStandardCommand(command)) {
+                  const args = command.args.map(String);
+                  if (args.includes("exec") || (args.includes("mcp") && args.includes("list"))) {
+                    const outputIndex = args.indexOf("--output-last-message");
+                    if (outputIndex !== -1) {
+                      const stdin = command.options.stdin;
+                      if (
+                        stdin &&
+                        typeof stdin === "object" &&
+                        "stream" in stdin &&
+                        Stream.isStream(stdin.stream)
+                      ) {
+                        reviewPrompts.push(
+                          yield* stdin.stream.pipe(Stream.decodeText(), Stream.mkString),
+                        );
+                      }
+                      yield* fileSystem.writeFileString(
+                        args[outputIndex + 1]!,
+                        JSON.stringify({ decision: "approve", reason: "Authorized tests" }),
+                      );
+                    }
+                    return ChildProcessSpawner.makeHandle({
+                      pid: ChildProcessSpawner.ProcessId(1),
+                      exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                      isRunning: Effect.succeed(false),
+                      kill: () => Effect.void,
+                      unref: Effect.succeed(Effect.void),
+                      stdin: Sink.drain,
+                      stdout: Stream.encodeText(Stream.make("[]")),
+                      stderr: Stream.empty,
+                      all: Stream.empty,
+                      getInputFd: () => Sink.drain,
+                      getOutputFd: () => Stream.empty,
+                    });
+                  }
+                }
                 if (replacementTiming === "during-probe") {
                   yield* Deferred.succeed(probeEntered, undefined);
                   yield* Deferred.await(resumeProbe);
@@ -289,6 +327,17 @@ it.layer(layerTest)("CodexDriver", (it) => {
         expect(launch.settings.launchArgs).not.toContain("dummy-owned-access");
         expect(launch.environment.OPENAI_API_KEY).toBeUndefined();
         expect(launch.environment.CODEX_HOME).toBe(launch.settings.homePath);
+        const reviewInput = {
+          cwd: serverConfig.stateDir,
+          evidence: '{"command":"node --test"}',
+          modelSelection: { instanceId, model: "gpt-5.4" },
+        };
+        expect(instance.textGeneration.reviewApproval).toBeTypeOf("function");
+        expect(yield* instance.textGeneration.reviewApproval!(reviewInput)).toEqual({
+          decision: "approve",
+          reason: "Authorized tests",
+        });
+        expect(reviewPrompts).toEqual([reviewInput.evidence]);
         const before = yield* instance.auth!.subscribe("test-owner").pipe(Stream.runHead);
         expect(Option.getOrThrow(before).phase).toBe("idle");
         yield* instance.auth!.logout(Effect.void);
@@ -298,6 +347,11 @@ it.layer(layerTest)("CodexDriver", (it) => {
         expect(after.installed).toBe(true);
         expect(after.models).toEqual([]);
         expect(Option.isNone(yield* store.get)).toBe(true);
+        const signedOutReview = yield* instance.textGeneration.reviewApproval!(reviewInput).pipe(
+          Effect.flip,
+        );
+        expect(signedOutReview.operation).toBe("reviewApproval");
+        expect(reviewPrompts).toEqual([reviewInput.evidence]);
         const signedOutScan = yield* instance.snapshotForCwd!(serverConfig.stateDir);
         expect(signedOutScan.skills).toEqual([]);
       }).pipe(
