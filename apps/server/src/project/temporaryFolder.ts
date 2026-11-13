@@ -55,7 +55,50 @@ const exists = (path: string) =>
     () => false,
   );
 
-const nodeProbe: FolderProbe = {
+const RESULT_TTL_MS = 30_000;
+const MAX_CACHED_PATHS = 256;
+
+/**
+ * One probe per path at a time, and a settled answer reused for a short while. A probe on a dead
+ * network mount never settles and pins a libuv thread, so a retry must join it, not add another.
+ */
+export function dedupeProbe(
+  probe: FolderProbe,
+  now: () => number = Date.now,
+  resultTtlMs = RESULT_TTL_MS,
+): FolderProbe {
+  const entries = new Map<
+    string,
+    { readonly answer: ReturnType<FolderProbe["inspect"]>; settledAt: number | null }
+  >();
+  return {
+    inspect: (path) => {
+      const known = entries.get(path);
+      if (
+        known !== undefined &&
+        (known.settledAt === null || now() - known.settledAt < resultTtlMs)
+      ) {
+        return known.answer;
+      }
+      const entry = { answer: probe.inspect(path), settledAt: null as number | null };
+      entries.delete(path);
+      entries.set(path, entry);
+      // Map order is insertion order, so the first key is the oldest.
+      if (entries.size > MAX_CACHED_PATHS) entries.delete(entries.keys().next().value!);
+      entry.answer.then(
+        () => {
+          entry.settledAt = now();
+        },
+        () => {
+          if (entries.get(path) === entry) entries.delete(path);
+        },
+      );
+      return entry.answer;
+    },
+  };
+}
+
+const nodeProbe: FolderProbe = dedupeProbe({
   inspect: async (path) => {
     // A missing folder is the usual case here, so inspect its nearest existing ancestor.
     let existing = path;
@@ -72,7 +115,7 @@ const nodeProbe: FolderProbe = {
       return { resolved: path, tmpfs: false };
     }
   },
-};
+});
 
 /**
  * A folder the system clears at reboot: a tmpfs, or under a well-known temporary directory.

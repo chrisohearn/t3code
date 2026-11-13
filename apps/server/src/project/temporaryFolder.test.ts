@@ -3,12 +3,17 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import { assert, it } from "@effect/vitest";
+import { assert, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 
-import { isTemporaryFolder, isTemporaryPath, temporaryFolderWarning } from "./temporaryFolder.ts";
+import {
+  dedupeProbe,
+  isTemporaryFolder,
+  isTemporaryPath,
+  temporaryFolderWarning,
+} from "./temporaryFolder.ts";
 
 it.effect.each([
   ["/tmp/review", true],
@@ -70,3 +75,30 @@ it.effect("resolves symlinks, and ignores a persistent TMPDIR", () =>
     assert.isTrue(yield* isTemporaryFolder(NodePath.join(sandbox, "missing")));
   }).pipe(Effect.scoped),
 );
+
+it("joins an unanswered probe for the same path and reuses a settled answer until it expires", async () => {
+  let clock = 0;
+  let calls = 0;
+  const answers = [new Promise<never>(() => {})];
+  const probe = dedupeProbe(
+    {
+      inspect: (path) => {
+        calls += 1;
+        return answers.shift() ?? Promise.resolve({ resolved: path, tmpfs: false });
+      },
+    },
+    () => clock,
+    1_000,
+  );
+  // The first probe never settles, as on a dead mount: later calls join it, not add another.
+  probe.inspect("/mnt/dead/a");
+  probe.inspect("/mnt/dead/a");
+  expect(calls).toBe(1);
+  // A different path is its own probe, and its answer is reused until the TTL passes.
+  await probe.inspect("/home/a");
+  await probe.inspect("/home/a");
+  expect(calls).toBe(2);
+  clock = 1_001;
+  await probe.inspect("/home/a");
+  expect(calls).toBe(3);
+});
