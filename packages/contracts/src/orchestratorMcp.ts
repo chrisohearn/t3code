@@ -41,6 +41,7 @@ import {
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
+  OrchestrationV2RunStop,
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
 import { ProviderOptionSelection, ProviderOptionSelectionValue } from "./model.ts";
@@ -487,6 +488,16 @@ export const OrchestratorMcpThreadRun = Schema.Struct({
   requestedAt: IsoDateTime,
   startedAt: Schema.NullOr(IsoDateTime),
   completedAt: Schema.NullOr(IsoDateTime),
+  /** Why a cancelled or interrupted run stopped, and the run a restart continued it as. */
+  stop: Schema.optional(
+    Schema.Struct({
+      ...OrchestrationV2RunStop.fields,
+      reason: Schema.optional(OrchestrationV2RunStop.fields.reason),
+      actor: Schema.optional(OrchestrationV2RunStop.fields.actor),
+      continuedAsRunId: Schema.optional(RunId),
+      label: Schema.String,
+    }),
+  ),
 });
 export type OrchestratorMcpThreadRun = typeof OrchestratorMcpThreadRun.Type;
 
