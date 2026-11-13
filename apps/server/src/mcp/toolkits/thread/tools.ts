@@ -203,8 +203,7 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     modelSelection: Schema.optional(ModelSelection),
     applyAt: Schema.optional(
       Schema.Literal("next_turn").annotate({
-        description:
-          "Busy thread: apply modelSelection from the next turn, queued messages included.",
+        description: "Busy thread: apply from the next turn, queued messages included.",
       }),
     ),
     runtimeMode: Schema.optional(RuntimeMode),

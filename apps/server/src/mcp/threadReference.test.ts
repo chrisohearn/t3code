@@ -13,13 +13,17 @@ const mcpThread = ThreadId.make(`mcp:${uuid}`);
 const launchThread = ThreadId.make(`mcp:launch:${"be52150e".repeat(8)}`);
 const nativeThread = ThreadId.make("7e56b504-8739-4f3f-80e7-298410d87ec0");
 const deletedThread = ThreadId.make("mcp:0dd09096-12e3-4179-87d5-42fa45c77d5e");
+// A deleted mcp: thread whose bare uuid is another, live thread.
+const replacedUuid = "29b25a73-a7a7-4321-bef4-2b4eb4386aa8";
+const deletedReplaced = ThreadId.make(`mcp:${replacedUuid}`);
+const liveReplaced = ThreadId.make(replacedUuid);
 
 const threads = {
   getThreadShell: (threadId: ThreadId) =>
     Effect.succeed(
-      threadId === deletedThread
+      threadId === deletedThread || threadId === deletedReplaced
         ? { ...liveThreadShell(threadId), deletedAt: DateTime.makeUnsafe(0) }
-        : [mcpThread, launchThread, nativeThread].includes(threadId)
+        : [mcpThread, launchThread, nativeThread, liveReplaced].includes(threadId)
           ? liveThreadShell(threadId)
           : null,
     ),
@@ -67,6 +71,13 @@ describe("resolveReadableThread", () => {
   it.effect("says a thread was deleted, and names the closest ids for one never here", () =>
     Effect.gen(function* () {
       expect((yield* refuse(deletedThread)).message).toBe(`Thread ${deletedThread} was deleted.`);
+      expect((yield* refuse(deletedReplaced)).message).toBe(
+        `Thread ${deletedReplaced} was deleted.`,
+      );
+      // A bare uuid of a deleted mcp: thread says so too.
+      expect((yield* refuse(deletedThread.slice(4))).message).toBe(
+        `Thread ${deletedThread} was deleted.`,
+      );
 
       const typo = yield* refuse("mcp:5d0b4a3e-0000-4000-8000-000000000000");
       expect(typo.code).toBe("thread_not_found");

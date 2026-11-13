@@ -8720,6 +8720,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         branch: null,
         worktreePath: process.cwd(),
       });
+      const pickedSelection = { ...modelSelection, model: "gpt-5.3" };
       const send = (key: string) =>
         orchestrator.dispatch({
           type: "message.dispatch",
@@ -8728,11 +8729,13 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           messageId: MessageId.make(`${threadId}:${key}`),
           text: key,
           attachments: [],
+          ...(key === "picked" ? { modelSelection: pickedSelection } : {}),
           dispatchMode: { type: key === "active" ? "start_immediately" : "queue_after_active" },
           createdBy: "agent",
           creationSource: "mcp",
         });
-      for (const key of ["active", "before-1", "before-2"]) yield* send(key);
+      // "picked" named its own model before the change was scheduled, so it keeps it.
+      for (const key of ["active", "before-1", "before-2", "picked"]) yield* send(key);
       yield* orchestrator.dispatch({
         type: "thread.model-selection.set",
         commandId: CommandId.make(`${threadId}:schedule`),
@@ -8747,7 +8750,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         scheduled.thread.scheduledModelSelection?.modelSelection,
         scheduledSelection,
       );
-      const [active, before1, before2, after] = scheduled.runs;
+      const [active, before1, before2, picked, after] = scheduled.runs;
       assert.deepEqual(after?.modelSelection, scheduledSelection);
 
       const complete = (runId: RunId) =>
@@ -8784,6 +8787,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(started2.status, "starting");
       assert.deepEqual(started2.modelSelection, scheduledSelection);
       assert.isNull(secondBoundary.thread.scheduledModelSelection ?? null);
+
+      const thirdBoundary = yield* complete(before2!.id);
+      const startedPick = thirdBoundary.runs.find((run) => run.id === picked!.id)!;
+      assert.equal(startedPick.status, "starting");
+      assert.deepEqual(startedPick.modelSelection, pickedSelection);
     }),
   );
 

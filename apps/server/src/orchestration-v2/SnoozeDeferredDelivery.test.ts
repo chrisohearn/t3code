@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -38,12 +39,24 @@ describe("snoozeDeferredReleases", () => {
   });
 });
 
-it.effect("resumes a held turn when its snooze ends or the thread is woken, once", () =>
+it.effect("resumes a held turn when the thread wakes, retrying a refused resume", () =>
   Effect.gen(function* () {
     yield* TestClock.setTime(startMs);
-    const rows = yield* Ref.make([deferred("snoozed", "2026-11-13T03:01:00.000Z")]);
-    const released = yield* Queue.unbounded<Readonly<Record<string, string>>>();
+    const rows = yield* Ref.make([
+      deferred("snoozed", "2026-11-13T03:01:00.000Z"),
+      deferred("failed", "2026-11-24T00:00:00.000Z"),
+    ]);
+    const attempts = yield* Queue.unbounded<Readonly<Record<string, string>>>();
+    const refuseNext = yield* Ref.make(new Set(["snoozed"]));
     const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
+    const snoozedShell = (status: string, completedAt: string | null) => ({
+      snoozedUntil: DateTime.makeUnsafe("2026-11-24T00:00:00.000Z"),
+      snoozedAt: DateTime.makeUnsafe("2026-11-13T02:00:00.000Z"),
+      latestRunCompletedAt: completedAt === null ? null : DateTime.makeUnsafe(completedAt),
+      status,
+      pendingRuntimeRequest: null,
+      pendingGuestMessageCount: 0,
+    });
     const layer = SnoozeDeferredDelivery.layerWorker.pipe(
       Layer.provide(
         Layer.mergeAll(
@@ -52,14 +65,30 @@ it.effect("resumes a held turn when its snooze ends or the thread is woken, once
             read: Ref.get(rows),
           }),
           Layer.mock(ThreadManagement.ThreadManagementService)({
-            // A release clears the turn's deferral, so the store stops listing it.
+            // "failed" failed after it was snoozed, which wakes it as the sidebar shows it.
+            getThreadShell: (threadId) =>
+              Effect.succeed(
+                (threadId === "failed"
+                  ? snoozedShell("failed", "2026-11-13T02:30:00.000Z")
+                  : snoozedShell("idle", null)) as never,
+              ),
+            // A refusal, such as a limited provider, releases nothing; a release clears the deferral.
             dispatch: (command) => {
-              const resumed = command as unknown as Readonly<Record<string, string>>;
-              return Ref.update(rows, (current) =>
-                current.filter((row) => row.threadId !== resumed["threadId"]),
-              ).pipe(
-                Effect.andThen(Queue.offer(released, resumed)),
-                Effect.as({ sequence: 1, storedEvents: [] }),
+              const attempt = command as unknown as Readonly<Record<string, string>>;
+              const threadId = attempt["threadId"]!;
+              return Queue.offer(attempts, attempt).pipe(
+                Effect.andThen(Ref.get(refuseNext)),
+                Effect.flatMap((refused) =>
+                  refused.has(threadId)
+                    ? Ref.update(refuseNext, (current) => {
+                        const next = new Set(current);
+                        next.delete(threadId);
+                        return next;
+                      }).pipe(Effect.andThen(Effect.fail("refused" as never)))
+                    : Ref.update(rows, (current) =>
+                        current.filter((row) => row.threadId !== threadId),
+                      ).pipe(Effect.as({ sequence: 1, storedEvents: [] })),
+                ),
               );
             },
           }),
@@ -70,20 +99,24 @@ it.effect("resumes a held turn when its snooze ends or the thread is woken, once
       ),
     );
     yield* Effect.gen(function* () {
+      // The first sweep releases the thread that woke on its failure, long before its date.
+      assert.equal((yield* Queue.take(attempts))["threadId"], "failed");
+
       yield* TestClock.adjust("60 seconds");
-      assert.deepEqual(yield* Queue.take(released), {
-        type: "queue.resume",
-        commandId: "snooze-deferred-release:run:snoozed",
-        threadId: "snoozed",
-      });
+      const refused = yield* Queue.take(attempts);
+      assert.equal(refused["threadId"], "snoozed");
+      yield* TestClock.adjust("60 seconds");
+      const retried = yield* Queue.take(attempts);
+      assert.equal(retried["threadId"], "snoozed");
+      assert.notEqual(retried["commandId"], refused["commandId"]);
 
       yield* Ref.set(rows, [deferred("woken", null)]);
       yield* Queue.offer(events, { type: "thread.unsnoozed" } as never);
       yield* TestClock.adjust("5 seconds");
-      assert.equal((yield* Queue.take(released))["threadId"], "woken");
+      assert.equal((yield* Queue.take(attempts))["threadId"], "woken");
 
       yield* TestClock.adjust("10 minutes");
-      assert.equal(yield* Queue.size(released), 0);
+      assert.equal(yield* Queue.size(attempts), 0);
     }).pipe(Effect.provide(layer));
   }),
 );

@@ -566,7 +566,7 @@ export type OrchestratorMcpThreadResult = typeof OrchestratorMcpThreadResult.Typ
 
 const RespectSnooze = Schema.optional(
   Schema.Boolean.annotate({
-    description: "Default true: keep a snooze; a send waits until it ends. false wakes the thread.",
+    description: "Default true: a snoozed thread waits. false wakes it.",
   }),
 );
 
@@ -581,7 +581,7 @@ export const OrchestratorMcpThreadPostInput = Schema.Struct({
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
-  respectSnooze: RespectSnooze,
+  respectSnooze: Schema.optional(Schema.Boolean),
 });
 export type OrchestratorMcpThreadPostInput = typeof OrchestratorMcpThreadPostInput.Type;
 export const OrchestratorMcpThreadPostResult = Schema.Struct({

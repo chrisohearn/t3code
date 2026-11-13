@@ -192,6 +192,7 @@ import * as RunExecutionService from "./RunExecutionService.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
+import { isSnoozed } from "./SnoozeState.ts";
 import { isRuntimePolicyAboveCeilingError, RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import {
   endOrphanedNativeSubagent,
@@ -969,13 +970,20 @@ function nextTurnModelSelection(
   return thread.scheduledModelSelection?.modelSelection ?? thread.modelSelection;
 }
 
-/** A run queued before a scheduled change starts with it, as one queued before a failover does. */
+/**
+ * A run queued before a scheduled change starts with it, as one queued before a failover does,
+ * unless its sender named a model.
+ */
 function queuedBeforeScheduledSelection(
   projection: Pick<OrchestrationV2ThreadProjection, "thread">,
   run: OrchestrationV2Run,
 ): boolean {
   const scheduled = projection.thread.scheduledModelSelection;
-  return scheduled != null && run.ordinal <= scheduled.queuedThroughOrdinal;
+  return (
+    scheduled != null &&
+    run.ordinal <= scheduled.queuedThroughOrdinal &&
+    run.explicitModelSelection !== true
+  );
 }
 
 /** Drops a scheduled change once the run starting now leaves no run queued before it. */
@@ -989,7 +997,7 @@ function threadAtRunStart(
     (run) =>
       run.id !== startingRunId &&
       run.status === "queued" &&
-      run.ordinal <= scheduled.queuedThroughOrdinal,
+      queuedBeforeScheduledSelection(projection, run),
   );
   return waiting ? projection.thread : { ...projection.thread, scheduledModelSelection: null };
 }
@@ -1019,11 +1027,14 @@ function queuedRunModelSelection(
 function queueTailModelSelection(
   projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
 ): ModelSelection {
-  return (
-    queuedRunsInDeliveryOrder(projection).findLast(
-      (run) => !queuedRunFollowsThread(projection, run),
-    )?.modelSelection ?? nextTurnModelSelection(projection.thread)
+  const tail = queuedRunsInDeliveryOrder(projection).findLast(
+    (run) => !queuedRunFollowsThread(projection, run),
   );
+  const scheduled = projection.thread.scheduledModelSelection;
+  // A pick queued before a scheduled change is older than it; later sends take the change.
+  return tail !== undefined && (scheduled == null || tail.ordinal > scheduled.queuedThroughOrdinal)
+    ? tail.modelSelection
+    : nextTurnModelSelection(projection.thread);
 }
 
 /**
@@ -3232,9 +3243,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .map((message) => message.id),
     );
     const now = yield* DateTime.now;
-    // A snooze's held turn waits for the thread to wake, not for later runs.
+    // A snooze's held turn waits for the thread to wake; once it has, a completed run (a usage
+    // limit's resume, say) releases it like the others.
+    const snoozeHolds =
+      held.some((run) => run.snoozeDeferred === true) &&
+      isSnoozed(
+        (yield* projectionStore
+          .getThreadShell(threadId)
+          .pipe(Effect.orElseSucceed(() => null))) ?? {
+          ...projection.thread,
+          status: "idle",
+          latestRunCompletedAt: null,
+          pendingRuntimeRequest: null,
+        },
+        DateTime.toEpochMillis(now),
+      );
     const released = held.filter(
-      (run) => unattended.has(run.userMessageId) && run.snoozeDeferred !== true,
+      (run) => unattended.has(run.userMessageId) && !(run.snoozeDeferred === true && snoozeHolds),
     );
     if (released.length === 0) return;
     yield* writeSystemEvents(
@@ -3244,7 +3269,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         runId: run.id,
         providerInstanceId: run.providerInstanceId,
         occurredAt: now,
-        payload: { ...run, queueHeld: false },
+        payload: { ...withoutSnoozeDeferral(run), queueHeld: false },
       })),
     );
   });
@@ -7002,18 +7027,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // A sender that respects the snooze leaves it: a post is only recorded, and a turn waits,
     // held behind the thread's last run, until the thread wakes. A thread with no run wakes,
     // and so does one the server snoozed until its usage limit resets: that is no one's hold.
+    // The snooze counts as the sidebar shows it: an error or a request has already woken it.
     const snoozeHeldUntil = projection.thread.snoozedUntil;
     const limitRecovery = projection.thread.limitRecovery;
     const respectsSnooze =
       command.respectSnooze === true &&
       !automaticWake &&
       snoozeHeldUntil != null &&
-      DateTime.toEpochMillis(snoozeHeldUntil) > DateTime.toEpochMillis(yield* DateTime.now) &&
       !(
         limitRecovery?.snooze === true &&
         DateTime.toEpochMillis(snoozeHeldUntil) === Date.parse(limitRecovery.resetAt)
       ) &&
-      (command.postOnly === true || latestExecutedRun(projection.runs) != null);
+      (command.postOnly === true || latestExecutedRun(projection.runs) != null) &&
+      isSnoozed(
+        (yield* projectionStore
+          .getThreadShell(command.threadId)
+          .pipe(Effect.orElseSucceed(() => null))) ?? {
+          ...projection.thread,
+          status: "idle",
+          latestRunCompletedAt: null,
+          pendingRuntimeRequest: null,
+        },
+        DateTime.toEpochMillis(yield* DateTime.now),
+      );
     if (projection.thread.snoozedUntil != null && !automaticWake && !respectsSnooze) {
       const now = yield* DateTime.now;
       const thread: OrchestrationV2AppThread = {
@@ -7712,6 +7748,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         status: "queued",
         ...(steerWhenReadyRunId === undefined ? {} : { steerWhenReadyRunId }),
         ...(respectsSnooze ? { snoozeDeferred: true } : {}),
+        ...(command.modelSelection === undefined ? {} : { explicitModelSelection: true }),
         ...(worktreeMissingRun !== undefined ||
         respectsSnooze ||
         (heldRunsToRelease.length === 0 &&

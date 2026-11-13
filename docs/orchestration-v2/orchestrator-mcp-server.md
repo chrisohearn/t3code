@@ -461,8 +461,9 @@ Sends a message to any ordinary or delegated thread in the environment:
 
 A snoozed target stays snoozed unless `respectSnooze: false`. The message's run
 is queued and held behind the thread's last run, marked `snoozeDeferred`, and
-`SnoozeDeferredDelivery` resumes the queue once the snooze ends or the thread is
-woken. A held run that something else releases stops being deferred, so a later
+`SnoozeDeferredDelivery` resumes the queue once the thread wakes (as `isSnoozed`
+decides, so an error or a request counts), with a fresh command id per attempt
+so a refused resume is retried; a usage limit's resume releases the turn too. A held run that something else releases stops being deferred, so a later
 failure hold is never released by that sweep. A thread that has never run, and a
 snooze the server set until a usage limit resets, wake as before. Messages from
 the app always wake the thread.

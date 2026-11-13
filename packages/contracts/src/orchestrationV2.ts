@@ -784,6 +784,8 @@ export const OrchestrationV2Run = Schema.Struct({
   queueHeld: Schema.optional(Schema.Boolean),
   /** Held by a send that respected a snooze; released when the thread wakes. */
   snoozeDeferred: Schema.optional(Schema.Boolean),
+  /** Queued with a model its sender named; a scheduled model change leaves it alone. */
+  explicitModelSelection: Schema.optional(Schema.Boolean),
   steerWhenReadyRunId: Schema.optional(RunId),
   requestedAt: Schema.DateTimeUtc,
   startedAt: Schema.NullOr(Schema.DateTimeUtc),

@@ -11,6 +11,7 @@ import * as DueHint from "../scheduling/DueHint.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import { isSnoozed } from "./SnoozeState.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 
 const RELEASE_RETRY_MS = 60_000;
@@ -80,8 +81,12 @@ const layerStore = Layer.effect(
   }),
 );
 
+// A failed run or a new request can wake a thread before its date, as the sidebar shows it.
 const affectsDeferral = (event: OrchestrationV2DomainEvent) =>
-  event.type.startsWith("thread.") || event.type === "run.created" || event.type === "run.updated";
+  event.type.startsWith("thread.") ||
+  event.type === "run.created" ||
+  event.type === "run.updated" ||
+  event.type === "runtime-request.updated";
 
 const makeSweep = Effect.gen(function* () {
   const store = yield* SnoozeDeferredStore;
@@ -97,12 +102,23 @@ const makeSweep = Effect.gen(function* () {
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     if (yield* due.isIdle(nowMs)) return;
     const readVersion = yield* due.version;
-    const { due: releases, wakeAtMs } = snoozeDeferredReleases(yield* store.read, nowMs);
+    const rows = yield* Effect.forEach(yield* store.read, (row) =>
+      row.snoozedUntil === null || Date.parse(row.snoozedUntil) <= nowMs
+        ? Effect.succeed(row)
+        : threads.getThreadShell(ThreadId.make(row.threadId)).pipe(
+            Effect.map((shell) =>
+              shell !== null && !isSnoozed(shell, nowMs) ? { ...row, snoozedUntil: null } : row,
+            ),
+            Effect.orElseSucceed(() => row),
+          ),
+    );
+    const { due: releases, wakeAtMs } = snoozeDeferredReleases(rows, nowMs);
     for (const thread of releases) {
       yield* threads
         .dispatch({
           type: "queue.resume",
-          commandId: CommandId.make(`snooze-deferred-release:${thread.firstRunId}`),
+          // One id per attempt: a refused resume (a limited provider) stays retryable.
+          commandId: CommandId.make(`snooze-deferred-release:${thread.firstRunId}:${nowMs}`),
           threadId: ThreadId.make(thread.threadId),
         })
         .pipe(

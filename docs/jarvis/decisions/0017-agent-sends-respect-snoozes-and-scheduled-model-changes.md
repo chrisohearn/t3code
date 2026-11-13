@@ -15,7 +15,7 @@ Accepted 2026-11-13. Number provisional until merge.
 **Scheduled model changes.** `t3_thread_configure` with `modelSelection` and `applyAt: "next_turn"` works on a busy thread instead of being refused.
 
 - The thread starts its next turn with the new model or options.
-- Messages already queued start with it too.
+- Messages already queued start with it too, unless their sender named a model.
 - Reading the configuration shows the pending change, and scheduling the current model cancels it.
 - Switching provider instance and changing `runtimeMode` still need an idle thread.
 

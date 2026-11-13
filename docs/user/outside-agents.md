@@ -101,8 +101,9 @@ T3 Code.
   change and caller appear in thread activity.
 - To change a busy thread's model or options, such as an inbox thread's effort,
   call `t3_thread_configure` with `modelSelection` and `applyAt: "next_turn"`.
-  Messages already queued start with it, and so do later agent messages. A
-  later message sent from the T3 app carries the composer's model instead.
+  Messages already queued start with it, and so do later agent messages,
+  except a message that named its own model, such as one sent from the T3 app
+  with the composer's model.
   Reading the configuration shows the pending change; scheduling the current
   model cancels it. Switching to another provider instance still needs an idle
   thread.
