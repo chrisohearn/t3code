@@ -497,13 +497,16 @@ function migrateLegacyProviderSettings(
 }
 
 /**
- * A settings file decoded as the server reads it, legacy `providers` blobs included, before any
- * managed policy; undefined when it does not decode.
+ * A settings file decoded as the server reads it, legacy `providers` blobs and a managed policy's
+ * defaults included; undefined when it does not decode. Locks and limits are the caller's to lay over.
  */
-export function decodeSettingsFileContents(raw: string): ServerSettings | undefined {
+export function decodeSettingsFileContents(
+  raw: string,
+  withDefaults: (persisted: unknown) => unknown = (persisted) => persisted,
+): ServerSettings | undefined {
   const parsed = decodeSettingsFileJsonExit(raw);
   if (Exit.isFailure(parsed)) return undefined;
-  const decoded = decodePersistedServerSettingsExit(parsed.value);
+  const decoded = decodePersistedServerSettingsExit(withDefaults(parsed.value));
   const legacy = decodeLegacyProviderSettingsJsonExit(raw);
   if (Exit.isFailure(decoded) || Exit.isFailure(legacy)) return undefined;
   const { providers } = legacy.value;

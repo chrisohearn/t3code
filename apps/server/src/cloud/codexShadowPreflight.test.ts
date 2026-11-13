@@ -5,6 +5,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
+import { unmanagedProviders } from "../policy/managedProviders.ts";
+import { unmanagedSettings } from "../policy/managedSettings.ts";
 import { inspectConfiguredCodexShadowHomes } from "./codexShadowPreflight.ts";
 
 it.layer(NodeServices.layer)("inspectConfiguredCodexShadowHomes", (it) => {
@@ -172,6 +174,63 @@ it.layer(NodeServices.layer)("inspectConfiguredCodexShadowHomes", (it) => {
             { instanceId: "codex_auth", status: "not-ready", entries: ["auth.json"] },
             { instanceId: "codex_secret", status: "unknown", entries: [] },
           ]);
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "inspects instances as the managed policy lays them out",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const stateDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-state-" });
+          const sharedHome = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3code-codex-shared-",
+          });
+          const shadow = path.join(stateDir, "providers", "codex", "codex_pro", "shadow");
+          yield* fileSystem.writeFileString(
+            path.join(stateDir, "settings.json"),
+            JSON.stringify({
+              providerInstances: {
+                codex_pro: {
+                  driver: "codex",
+                  config: { setupMode: "managed", homePath: sharedHome },
+                },
+              },
+            }),
+          );
+          yield* fileSystem.writeFileString(
+            path.join(sharedHome, "memories_v2_1.sqlite"),
+            "shared",
+          );
+          yield* fileSystem.makeDirectory(shadow, { recursive: true });
+          yield* fileSystem.writeFileString(path.join(shadow, "memories_v2_1.sqlite"), "own");
+          // A policy that pins CODEX_SQLITE_HOME away from the shared home.
+          const policy = {
+            settings: unmanagedSettings,
+            providers: {
+              ...unmanagedProviders,
+              applyLimits: (settings: Parameters<typeof unmanagedProviders.applyLimits>[0]) => ({
+                ...settings,
+                providerInstances: Object.fromEntries(
+                  Object.entries(settings.providerInstances).map(([id, instance]) => [
+                    id,
+                    {
+                      ...instance,
+                      environment: [
+                        { name: "CODEX_SQLITE_HOME", value: stateDir, sensitive: false },
+                      ],
+                    },
+                  ]),
+                ),
+              }),
+            },
+          };
+
+          const report = yield* inspectConfiguredCodexShadowHomes(stateDir, policy);
+
+          expect(report.status).toBe("not-ready");
+          expect(report.instances.map((instance) => instance.status)).toEqual(["not-ready"]);
         }),
     );
 

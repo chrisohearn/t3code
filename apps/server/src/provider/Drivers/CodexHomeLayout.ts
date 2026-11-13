@@ -507,16 +507,41 @@ export interface CodexShadowHomeConflict {
 }
 
 // Real paths see through symlinked parents, and on Windows the native call returns the stored case.
-const sqliteHomeIsShared = Effect.fnUntraced(function* (
+const pathIdentity = (fileSystem: FileSystem.FileSystem, path: Path.Path, value: string) =>
+  fileSystem.realPath(value).pipe(Effect.orElseSucceed(() => path.resolve(value)));
+
+const sameDirectory = Effect.fnUntraced(function* (
   fileSystem: FileSystem.FileSystem,
   path: Path.Path,
-  layout: CodexHomeLayout,
-  sqliteHome: string | undefined,
+  left: string,
+  right: string,
 ) {
-  if (sqliteHome === undefined) return false;
-  const identity = (value: string) =>
-    fileSystem.realPath(value).pipe(Effect.orElseSucceed(() => path.resolve(value)));
-  return (yield* identity(sqliteHome)) === (yield* identity(layout.sharedHomePath));
+  return (
+    (yield* pathIdentity(fileSystem, path, left)) === (yield* pathIdentity(fileSystem, path, right))
+  );
+});
+
+// A sibling backup needs a writable parent on the shadow's filesystem, or rename cannot reach it.
+const backupParentAccepts = Effect.fnUntraced(function* (
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+  effectiveHomePath: string,
+) {
+  const parent = path.dirname(effectiveHomePath);
+  const [shadowInfo, parentInfo, writable] = yield* Effect.all([
+    fileSystem.stat(effectiveHomePath).pipe(Effect.option),
+    fileSystem.stat(parent).pipe(Effect.option),
+    fileSystem.access(parent, { writable: true }).pipe(
+      Effect.as(true),
+      Effect.orElseSucceed(() => false),
+    ),
+  ]);
+  return (
+    writable &&
+    Option.isSome(shadowInfo) &&
+    Option.isSome(parentInfo) &&
+    shadowInfo.value.dev === parentInfo.value.dev
+  );
 });
 
 /** Read-only: what materializing this shadow home would have to move aside or refuse. */
@@ -532,6 +557,13 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
   if (layout.mode !== "authOverlay" || !effectiveHomePath) return [];
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  // A shadow that resolves to the shared home would have its shared databases moved aside.
+  if (yield* sameDirectory(fileSystem, path, effectiveHomePath, layout.sharedHomePath)) {
+    return yield* new CodexShadowHomePathConflictError({
+      sharedHomePath: layout.sharedHomePath,
+      effectiveHomePath,
+    });
+  }
   const context = { fileSystem, sharedHomePath: layout.sharedHomePath, effectiveHomePath };
   const sharedEntryNames = yield* fileSystem.readDirectory(layout.sharedHomePath).pipe(
     Effect.catchTags({
@@ -546,7 +578,10 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
             }),
     }),
   );
-  const autoSettle = yield* sqliteHomeIsShared(fileSystem, path, layout, options.sqliteHome);
+  const autoSettle =
+    options.sqliteHome !== undefined &&
+    (yield* sameDirectory(fileSystem, path, options.sqliteHome, layout.sharedHomePath)) &&
+    (yield* backupParentAccepts(fileSystem, path, effectiveHomePath));
   const conflicts: Array<CodexShadowHomeConflict> = [];
   // ensureShadowAuthIsPrivate refuses this one; nothing moves it aside.
   const authPath = path.join(effectiveHomePath, "auth.json");
@@ -678,15 +713,17 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
   if (layout.mode !== "authOverlay") return;
   const effectiveHomePath = layout.effectiveHomePath;
   if (!effectiveHomePath) return;
-  if (layout.sharedHomePath === effectiveHomePath) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  if (
+    layout.sharedHomePath === effectiveHomePath ||
+    (yield* sameDirectory(fileSystem, path, effectiveHomePath, layout.sharedHomePath))
+  ) {
     return yield* new CodexShadowHomePathConflictError({
       sharedHomePath: layout.sharedHomePath,
       effectiveHomePath,
     });
   }
-
-  const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
 
   const makeDirectory = (directoryPath: string) =>
     fileSystem.makeDirectory(directoryPath, { recursive: true }).pipe(

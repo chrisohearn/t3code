@@ -14,6 +14,7 @@ import {
   resolveCodexHomeLayout,
   withCodexSqliteHome,
 } from "./CodexHomeLayout.ts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 const decodeCodexSettingsValue = Schema.decodeSync(CodexSettings);
 
@@ -666,6 +667,58 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           }
           expect(yield* fileSystem.exists(path.join(backup, "memories_v2_1.sqlite"))).toBe(false);
         }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "refuses a shadow path that resolves to the shared home",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const aliasRoot = yield* makeTempDir("t3code-codex-alias-");
+          const aliasShadow = path.join(aliasRoot, "shadow");
+          yield* fileSystem.symlink(sharedHome, aliasShadow);
+          yield* writeTextFile(path.join(sharedHome, "memories_v2_1.sqlite"), "shared");
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: aliasShadow }),
+          );
+
+          const error = yield* materializeCodexShadowHome(layout, {
+            sqliteHome: sharedHome,
+          }).pipe(Effect.flip);
+
+          expect(error).toBeInstanceOf(CodexShadowHomePathConflictError);
+          expect(
+            yield* fileSystem.readFileString(path.join(sharedHome, "memories_v2_1.sqlite")),
+          ).toBe("shared");
+        }),
+    );
+
+    // Windows ignores the mode, and root writes regardless of it.
+    it.effect.skipIf(
+      !symlinksSupported ||
+        HostProcess.Platform.defaultValue() === "win32" ||
+        process.getuid?.() === 0,
+    )("refuses to move a shadow's own database when the backup's parent is read-only", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { sharedHome, shadowHome, layout, backup } = yield* prepareOwnDatabaseShadow();
+        const parent = path.dirname(shadowHome);
+        yield* fileSystem.chmod(parent, 0o555);
+
+        const error = yield* materializeCodexShadowHome(layout, { sqliteHome: sharedHome }).pipe(
+          Effect.flip,
+          Effect.ensuring(fileSystem.chmod(parent, 0o755).pipe(Effect.orDie)),
+        );
+
+        assert.instanceOf(error, CodexShadowHomeEntryConflictError);
+        expect(error.backupCommand).toContain(backup);
+        for (const name of ownDatabaseFiles) {
+          expect(yield* fileSystem.readFileString(path.join(shadowHome, name))).toBe(`own ${name}`);
+        }
+      }),
     );
   });
 });

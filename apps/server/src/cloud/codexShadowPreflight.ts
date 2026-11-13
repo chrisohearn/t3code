@@ -6,6 +6,9 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
+import type * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import { unmanagedSettings } from "../policy/managedSettings.ts";
+import { unmanagedProviders } from "../policy/managedProviders.ts";
 import { resolveManagedCodexHomeLayout } from "../provider/CodexManagedHome.ts";
 import {
   inspectCodexShadowHome,
@@ -36,12 +39,15 @@ export interface CodexShadowHomesPreflight {
 const decodeCodexSettings = Schema.decodeUnknownExit(CodexSettings);
 const CODEX = ProviderDriverKind.make("codex");
 
+type Policy = Pick<ManagedPolicy.ManagedPolicy["Service"], "settings" | "providers">;
+const unmanaged: Policy = { settings: unmanagedSettings, providers: unmanagedProviders };
+
 /**
  * Read-only: every configured Codex instance's shadow home, laid out the way its driver lays it
- * out. Managed-policy pins are not applied here, so a pinned field reads as the user stored it.
+ * out, with the managed policy laid over the stored settings as startup does.
  */
 export const inspectConfiguredCodexShadowHomes = Effect.fn("inspectConfiguredCodexShadowHomes")(
-  function* (stateDir: string) {
+  function* (stateDir: string, policy: Policy = unmanaged) {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const settingsPath = path.join(stateDir, "settings.json");
@@ -56,10 +62,14 @@ export const inspectConfiguredCodexShadowHomes = Effect.fn("inspectConfiguredCod
     if (raw._tag === "Success" && Option.isNone(raw.success)) {
       return { status: "ready", instances: [] } satisfies CodexShadowHomesPreflight;
     }
-    const settings =
+    const stored =
       raw._tag === "Success" && Option.isSome(raw.success)
-        ? decodeSettingsFileContents(raw.success.value)
+        ? decodeSettingsFileContents(raw.success.value, policy.settings.withDefaults)
         : undefined;
+    const settings =
+      stored === undefined
+        ? undefined
+        : policy.providers.applyLimits(policy.settings.applyLocks(stored));
     if (settings === undefined) {
       return {
         status: "not-ready",
