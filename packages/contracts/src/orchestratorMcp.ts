@@ -35,6 +35,7 @@ import {
 } from "./threadPullRequest.ts";
 import { secretRequestPageUrl } from "./secretRequest.ts";
 import { hasOnlyPairedSurrogates } from "./threadMetadataMcp.ts";
+import { ThreadFreeze } from "./threadFreeze.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2SenderClient,
@@ -473,6 +474,8 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   settledAt: Schema.NullOr(IsoDateTime),
   snoozed: Schema.Boolean,
   snoozedUntil: Schema.NullOr(IsoDateTime),
+  /** Set while the thread is frozen. Omitted by an environment on an older build. */
+  frozen: Schema.optional(Schema.NullOr(ThreadFreeze)),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -634,6 +637,10 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   taskId: Schema.optional(NodeId),
   status: OrchestrationV2RunStatus,
   delivery: Schema.Literals(["started", "queued", "steered", "restarted"]),
+  /** Set when the queued message is held: it starts only after the thread is unfrozen or resumed. */
+  held: Schema.optional(Schema.Literal(true)),
+  /** Set when a freeze holds the send. */
+  frozen: Schema.optional(Schema.Literal(true)),
   queue: Schema.optional(OrchestratorMcpQueueStanding),
   ...SnoozeNotice,
 });

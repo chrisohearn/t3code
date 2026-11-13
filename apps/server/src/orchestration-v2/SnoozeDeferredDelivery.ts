@@ -54,6 +54,8 @@ export const readSnoozeDeferredThreads = Effect.fn("SnoozeDeferredDelivery.read"
       AND json_extract(r.payload_json, '$.snoozeDeferred') = 1
       AND json_extract(r.payload_json, '$.queueHeld') = 1
       AND t.deleted_at IS NULL
+      -- A frozen thread refuses resumes; unfreezing it resumes the queue.
+      AND json_extract(t.payload_json, '$.frozen') IS NULL
     GROUP BY r.thread_id
   `;
   return rows.map((row): SnoozeDeferredThread => ({

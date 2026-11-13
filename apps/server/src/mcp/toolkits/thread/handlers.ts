@@ -34,6 +34,7 @@ import * as ScratchThreadPromotion from "../../../project/ScratchThreadPromotion
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
+import { freezeThread, unfreezeThread } from "../../threadFreeze.ts";
 import { ThreadToolkit } from "./tools.ts";
 
 const isApprovalKind = Schema.is(ProviderRequestKind);
@@ -496,6 +497,15 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   ),
   t3_thread_organize: writesThread((input, authorize) =>
     Effect.gen(function* () {
+      if (input.action === "freeze") {
+        return yield* freezeThread({ threadId: input.threadId, reason: input.reason });
+      }
+      if (input.action === "unfreeze") {
+        return yield* unfreezeThread({
+          threadId: input.threadId,
+          freshContext: input.freshContext,
+        });
+      }
       const { threads, projection, caller } = yield* readThread(input.threadId);
       if (input.action === "move") {
         const projectId = yield* required(input.projectId, "projectId");

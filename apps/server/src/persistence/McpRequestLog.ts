@@ -39,6 +39,8 @@ interface RequestEntry {
   readonly requestBytes: number;
   readonly responseBytes: number;
   readonly errorClass: string | null;
+  /** The MCP connection of the call, when the transport has one. */
+  readonly connection?: string | undefined;
 }
 export class McpRequestLog extends Context.Service<
   McpRequestLog,
@@ -60,14 +62,19 @@ const make = Effect.gen(function* () {
   const prune = Effect.fn("McpRequestLog.prune")(function* () {
     const now = yield* Clock.currentTimeMillis;
     yield* sql`DELETE FROM mcp_request_log WHERE started_at < ${now - RETENTION_MS}`;
+    yield* sql`DELETE FROM mcp_agent_summary WHERE last_at < ${now - RETENTION_MS}`;
     yield* sql`DELETE FROM mcp_request_log WHERE id <= (SELECT MAX(id) - ${MAX_ROWS} FROM mcp_request_log)`;
   });
   const record = Effect.fn("McpRequestLog.record")((entry: RequestEntry) =>
     sql
       .withTransaction(
         Effect.gen(function* () {
-          yield* sql`INSERT INTO mcp_request_log (client, session, tool, started_at, duration_ms, request_bytes, response_bytes, error_class)
-        VALUES (${entry.client}, ${entry.session}, ${entry.tool}, ${entry.startedAt}, ${entry.durationMs}, ${entry.requestBytes}, ${entry.responseBytes}, ${entry.errorClass})`;
+          yield* sql`INSERT INTO mcp_request_log (client, session, tool, started_at, duration_ms, request_bytes, response_bytes, error_class, connection)
+        VALUES (${entry.client}, ${entry.session}, ${entry.tool}, ${entry.startedAt}, ${entry.durationMs}, ${entry.requestBytes}, ${entry.responseBytes}, ${entry.errorClass}, ${entry.connection ?? null})`;
+          yield* sql`INSERT INTO mcp_agent_summary (client, last_id, last_at, last_tool, last_session)
+            VALUES (${entry.client}, last_insert_rowid(), ${entry.startedAt}, ${entry.tool}, ${entry.session})
+            ON CONFLICT(client) DO UPDATE SET last_id = excluded.last_id, last_at = excluded.last_at,
+              last_tool = excluded.last_tool, last_session = excluded.last_session`;
           yield* prune();
         }),
       )

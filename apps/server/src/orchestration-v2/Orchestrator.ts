@@ -133,6 +133,15 @@ import { notificationTurnItem } from "@t3tools/provider-core/server/notification
 import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
 import { CommandActor } from "./CommandActor.ts";
 import { serverRunStop } from "./RunStop.ts";
+import {
+  FREEZE_GATE_REFUSAL,
+  ThreadFreezeGate,
+  frozenRefusal,
+  liftedThread,
+  liftsFreeze,
+  ownerActor,
+  threadFreezePatch,
+} from "./ThreadFreeze.ts";
 import { quoteUserInputAnswers } from "./userInputAnswerQuotes.ts";
 import {
   cancelledBeforeStart,
@@ -2296,6 +2305,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
+        projection.thread.frozen != null ||
         projection.runs.some(isActiveRun)
       ) {
         return;
@@ -4181,6 +4191,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
     }
+    if (command.type === "thread.metadata.update" && command.frozen !== undefined) {
+      const gate = yield* Effect.serviceOption(ThreadFreezeGate);
+      if (!(Option.isSome(gate) && gate.value.op === "freeze")) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: FREEZE_GATE_REFUSAL,
+        });
+      }
+    }
     if (
       command.type === "thread.metadata.update" &&
       command.expectedWorktreePath !== undefined &&
@@ -4807,6 +4827,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return {
             ...thread,
             ...(command.title === undefined ? {} : { title: command.title }),
+            ...threadFreezePatch(command),
             ...(command.limitRecovery === undefined ? {} : { limitRecovery }),
             ...(command.limitRecovery !== undefined &&
             limitRecovery?.snooze === true &&
@@ -7230,7 +7251,63 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ) {
       dispatchMode = { type: "start_immediately" };
     }
-    const freshContext = command.freshContext === true;
+    // A frozen thread holds every send; only a paired owner client lifts the freeze by sending.
+    if (projection.thread.frozen != null && !command.postOnly) {
+      const actor = yield* Effect.serviceOption(CommandActor);
+      if (Option.isSome(actor) && liftsFreeze(actor.value.kind)) {
+        const liftedAt = yield* DateTime.now;
+        projection = {
+          ...projection,
+          thread: liftedThread(projection.thread, {
+            by: ownerActor(actor.value),
+            at: DateTime.formatIso(liftedAt),
+            freshContext: false,
+          }),
+        };
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "thread.metadata-updated",
+          threadId: command.threadId,
+          occurredAt: yield* DateTime.now,
+          payload: projection.thread,
+        });
+      }
+    }
+    const frozenHold = projection.thread.frozen != null && !command.postOnly;
+    // A compaction for a thread nobody is using would only sit in its held queue until unfreeze.
+    if (frozenHold && command.idleCompaction !== undefined) {
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.metadata-updated",
+        threadId: command.threadId,
+        occurredAt: yield* DateTime.now,
+        payload: projection.thread,
+      });
+      return;
+    }
+    const consumesFreshContext =
+      projection.thread.nextTurnFreshContext === true &&
+      !frozenHold &&
+      !command.postOnly &&
+      command.delegatedCompletion === undefined &&
+      command.notification === undefined;
+    const freshContext = command.freshContext === true || consumesFreshContext;
+    if (consumesFreshContext) {
+      projection = { ...projection, thread: { ...projection.thread, nextTurnFreshContext: false } };
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.metadata-updated",
+        threadId: command.threadId,
+        occurredAt: yield* DateTime.now,
+        payload: projection.thread,
+      });
+    }
     if (
       freshContext &&
       (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active")
@@ -7407,6 +7484,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
     }
+    if (frozenHold) {
+      if (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active") {
+        dispatchMode = { type: "queue_after_active" };
+      }
+      queuedRunStop = undefined;
+    }
     const dispatchText =
       delegatedCompletion === undefined
         ? command.text
@@ -7544,14 +7627,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
+    // A send to a frozen idle thread, or one held for a snooze, queues held behind the last run
+    // it executed (a frozen thread with no run yet gets no provider thread).
     const queueBehindRun =
-      activeRun ?? worktreeMissingRun ?? (respectsSnooze ? (latestRun ?? undefined) : undefined);
+      activeRun ??
+      worktreeMissingRun ??
+      (frozenHold || respectsSnooze ? (latestRun ?? undefined) : undefined);
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     const startsOrQueuesRun =
       dispatchMode.type === "defer_start" ||
       dispatchMode.type === "start_immediately" ||
       dispatchMode.type === "queue_after_active";
-    const shouldQueue = queueBehindRun !== undefined && startsOrQueuesRun;
+    const shouldQueue = (queueBehindRun !== undefined || frozenHold) && startsOrQueuesRun;
     // An explicit pick queued ahead reaches the thread only when its run starts. A goal or
     // restart command that stops the active run goes first, so nothing queued applies before it.
     // Buffered provider wakes drain output their own provider already produced.
@@ -7576,7 +7663,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (command.creationSource === "web" || command.creationSource === "mobile") &&
       command.scheduledTaskId === undefined;
     const heldRunsToRelease =
-      sentByUserFromClient && startsOrQueuesRun && !worktreeSetupUnresolved
+      sentByUserFromClient && startsOrQueuesRun && !worktreeSetupUnresolved && !frozenHold
         ? projection.runs.filter((run) => run.status === "queued" && run.queueHeld === true)
         : [];
     const releasedAt = yield* DateTime.now;
@@ -7603,10 +7690,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       const queueProviderThread =
         activeProviderThread ??
-        projection.providerThreads.find(
-          (candidate) => candidate.id === queueBehindRun.providerThreadId,
-        );
-      if (queueProviderThread === undefined) {
+        (queueBehindRun === undefined
+          ? undefined
+          : projection.providerThreads.find(
+              (candidate) => candidate.id === queueBehindRun.providerThreadId,
+            ));
+      if (queueProviderThread === undefined && queueBehindRun !== undefined) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
@@ -7616,11 +7705,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const now = yield* DateTime.now;
       const ordinal = nextRunOrdinal(projection);
       const runId = idAllocator.derive.run({ threadId: command.threadId, ordinal });
-      const targetProviderThread = freshContext
-        ? undefined
-        : modelSelection.instanceId === queueProviderThread.providerInstanceId
-          ? queueProviderThread
-          : rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0];
+      const targetProviderThread =
+        freshContext || queueProviderThread === undefined
+          ? undefined
+          : modelSelection.instanceId === queueProviderThread.providerInstanceId
+            ? queueProviderThread
+            : rootProviderThreadsForProvider(projection, modelSelection.instanceId)[0];
       const queuedAdapter = yield* providerAdapters
         .get(modelSelection.instanceId)
         .pipe(mapDispatchError(command));
@@ -7665,7 +7755,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const attemptId = idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
       const rootNodeId = idAllocator.derive.rootNode({ runId });
       const checkpointScope =
-        queueBehindRun.status === "preparing" || worktreeMissingRun !== undefined
+        queueBehindRun?.status === "preparing" || worktreeMissingRun !== undefined
           ? null
           : yield* runtimePolicy.resolve({ thread: projection.thread, modelSelection }).pipe(
               Effect.flatMap((resolvedRuntimePolicy) =>
@@ -7751,6 +7841,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.modelSelection === undefined ? {} : { explicitModelSelection: true }),
         ...(worktreeMissingRun !== undefined ||
         respectsSnooze ||
+        frozenHold ||
         (heldRunsToRelease.length === 0 &&
           queueIsHeld &&
           !wakeSkipsHold &&
@@ -15448,6 +15539,41 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             cause: `Thread ${command.threadId} is not active.`,
           });
         }
+        // Resuming a frozen thread lifts the freeze in the same command, so a refused resume
+        // changes nothing and can be retried. Only the gated unfreeze or a paired owner client may.
+        const frozen = projection.thread.frozen;
+        let resumedThread = projection.thread;
+        if (frozen != null) {
+          const gate = yield* Effect.serviceOption(ThreadFreezeGate);
+          const actor = yield* Effect.serviceOption(CommandActor);
+          const lift =
+            Option.isSome(gate) && gate.value.op === "unfreeze"
+              ? gate.value
+              : Option.isSome(actor) && liftsFreeze(actor.value.kind)
+                ? {
+                    by: ownerActor(actor.value),
+                    at: DateTime.formatIso(yield* DateTime.now),
+                    freshContext: false,
+                  }
+                : undefined;
+          if (lift === undefined) {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: frozenRefusal(frozen),
+            });
+          }
+          resumedThread = liftedThread(projection.thread, lift);
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "thread.metadata-updated",
+            threadId: command.threadId,
+            occurredAt: yield* DateTime.now,
+            payload: resumedThread,
+          });
+        }
         const selectedRunId = command.type === "queued-run.start" ? command.runId : undefined;
         const selectedRun =
           selectedRunId === undefined
@@ -15501,7 +15627,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             payload: { ...withoutSnoozeDeferral(run), queueHeld: false },
           });
         }
-        if (queued.length === 0) {
+        if (queued.length === 0 && frozen == null) {
           yield* emit(
             events,
             command,
