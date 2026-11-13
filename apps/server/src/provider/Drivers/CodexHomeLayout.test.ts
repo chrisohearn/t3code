@@ -279,7 +279,7 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
     );
 
     it.effect.skipIf(!symlinksSupported)(
-      "leaves the sidecars of a shadow's own database alone",
+      "leaves sidecars alone beside a shadow's own database or a link it cannot re-point",
       () => {
         const warnings: unknown[] = [];
         const logger = Logger.make(({ message, logLevel }) => {
@@ -295,6 +295,11 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           for (const name of ownFiles) {
             yield* writeTextFile(path.join(shadowHome, name), `live ${name}`);
           }
+          // The shared home has no jobs_1.sqlite, so nothing re-points this link.
+          const otherHome = yield* makeTempDir("t3code-codex-other-");
+          const foreignTarget = path.join(otherHome, "jobs_1.sqlite");
+          yield* fileSystem.symlink(foreignTarget, path.join(shadowHome, "jobs_1.sqlite"));
+          yield* writeTextFile(path.join(shadowHome, "jobs_1.sqlite-wal"), "frames");
 
           const layout = yield* resolveCodexHomeLayout(
             decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
@@ -306,12 +311,18 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
               `live ${name}`,
             );
           }
-          expect(warnings).toEqual([
-            [
-              "Left SQLite files alone in a Codex shadow home because its database is not the shared one.",
-              { path: path.join(shadowHome, "queue_1.sqlite") },
-            ],
-          ]);
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "jobs_1.sqlite"))).toBe(
+            foreignTarget,
+          );
+          expect(yield* fileSystem.readFileString(path.join(shadowHome, "jobs_1.sqlite-wal"))).toBe(
+            "frames",
+          );
+          const message =
+            "Left SQLite files alone in a Codex shadow home because its database is not the shared one.";
+          expect(warnings).toHaveLength(2);
+          for (const database of ["queue_1.sqlite", "jobs_1.sqlite"]) {
+            expect(warnings).toContainEqual([message, { path: path.join(shadowHome, database) }]);
+          }
         }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
       },
     );
