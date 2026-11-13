@@ -693,9 +693,20 @@ it.effect(
         nextCheckAt: null,
         warnings: [],
       });
-      expect(
-        yield* callTool("ledger_upsert", { key: "valid", ownerThreadId: "null" }).pipe(Effect.flip),
-      ).toMatchObject({ _tag: "InvalidParams" });
+      for (const fields of [
+        { ownerThreadId: "null" },
+        { ownerThreadId: "NuLl" },
+        { ownerThreadId: " null " },
+        { approval: { source: { threadId: " null ", itemId: "dialog" } } },
+        { approval: { source: { threadId, itemId: "NULL" } } },
+        { approval: { source: { threadId, itemId: "dialog", questionId: "NuLl" } } },
+      ]) {
+        const rejected = yield* callTool("ledger_upsert", { key: "valid", ...fields }).pipe(
+          Effect.flip,
+        );
+        expect(rejected).toMatchObject({ _tag: "InvalidParams" });
+        expect(rejected.message).toContain("JSON null");
+      }
       expect((yield* (yield* WorkLedger.WorkLedger).query({})).items).toMatchObject([
         { key: "valid", ownerThreadId: null, blocker: null, waitReason: null, nextCheckAt: null },
       ]);
@@ -709,7 +720,7 @@ it.effect(
       ).toMatchObject({ ownerThreadId: null, warnings: [] });
       const errors =
         yield* sql`SELECT error_class FROM mcp_request_log WHERE error_class IS NOT NULL`;
-      expect(errors).toEqual(Array.from({ length: 4 }, () => ({ error_class: "invalid_request" })));
+      expect(errors).toEqual(Array.from({ length: 9 }, () => ({ error_class: "invalid_request" })));
     }).pipe(
       Effect.provide(
         McpHttpServer.layerLedgerToolkit.pipe(

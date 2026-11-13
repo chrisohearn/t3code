@@ -373,6 +373,9 @@ const make = Effect.gen(function* () {
               warnings.push("Blocked work has no waitReason; defaulted to decision.");
             }
             if (
+              (input.status !== undefined ||
+                input.waitReason !== undefined ||
+                input.blocker !== undefined) &&
               /^(BLOCKED_TECH|WAIT_DECISION)\b/i.test(candidate.blocker ?? "") &&
               (candidate.waitReason === "external" || candidate.waitReason === "natural")
             ) {
@@ -392,16 +395,24 @@ const make = Effect.gen(function* () {
               if (ref !== null) candidate.ownerThreadId = ref.threadId;
               threadIds.add(candidate.ownerThreadId);
             }
+            const linkHref = (link: string) =>
+              (link.match(/^\[[^\]]*\]\((.*)\)$/)?.[1] ?? link).replace(/^<|>$/g, "");
             const normalizeLink = (link: string) => {
-              const href = (link.match(/^\[[^\]]*\]\((.*)\)$/)?.[1] ?? link).replace(/^<|>$/g, "");
+              const href = linkHref(link);
               const ref = parseThreadLinkHref(href);
               if (ref === null) return link;
               return formatThreadLink(ref).slice(1, -1);
             };
-            const removedLinks = new Set((removeLinks ?? []).map(normalizeLink));
+            const linkTarget = (link: string) => normalizeLink(linkHref(link));
+            const removedLinks = new Set((removeLinks ?? []).map(linkTarget));
             candidate.links = [
               ...new Set([...candidate.links, ...(addLinks ?? [])].map(normalizeLink)),
-            ].filter((link) => !removedLinks.has(link));
+            ].filter((link) => !removedLinks.has(linkTarget(link)));
+            if (candidate.links.length > 100)
+              return yield* new OrchestratorMcpFailure({
+                code: "invalid_request",
+                message: "A ledger item can have at most 100 links.",
+              });
             for (const link of candidate.links) {
               const ref = parseThreadLinkHref(link);
               if (ref === null) continue;

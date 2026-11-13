@@ -92,6 +92,19 @@ it.effect(
       expect((yield* ledger.upsert({ key: "a", nextAction: "Review" }, longCaller)).updatedBy).toBe(
         longCaller,
       );
+      const fullLinks = Array.from({ length: 100 }, (_, index) => `https://example.com/${index}`);
+      yield* ledger.upsert({ key: "a", links: fullLinks }, "caller");
+      const beforeOverflow = yield* ledger.history({ key: "a" });
+      expect(
+        yield* ledger
+          .upsert({ key: "a", addLinks: ["https://example.com/overflow"] }, "caller")
+          .pipe(Effect.flip),
+      ).toMatchObject({
+        code: "invalid_request",
+        message: "A ledger item can have at most 100 links.",
+      });
+      expect((yield* ledger.query({})).items[0]!.links).toEqual(fullLinks);
+      expect(yield* ledger.history({ key: "a" })).toEqual(beforeOverflow);
     }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
 
@@ -112,6 +125,7 @@ it.effect(
             "https://app.t3.codes/threads/env-1/also-missing",
             "[remote](<t3-thread://v2/remote/thread>)",
             "[local](<t3-thread://v1/angle-missing>)",
+            "[review](https://example.com/pr/old)",
           ],
           waitReason: "external",
           nextCheckAt: "1970-01-01T01:00:00+01:00",
@@ -123,6 +137,7 @@ it.effect(
         "t3-thread://v2/env-1/also-missing",
         "t3-thread://v2/remote/thread",
         "t3-thread://v1/angle-missing",
+        "[review](https://example.com/pr/old)",
       ]);
       expect(first.warnings).toHaveLength(4);
       expect(
@@ -183,7 +198,7 @@ it.effect(
         {
           key: "wait",
           addLinks: ["https://example.com/pr/1", "t3-thread://v1/angle-missing"],
-          removeLinks: ["[remote](<t3-thread://v2/remote/thread>)"],
+          removeLinks: ["[remote](<t3-thread://v2/remote/thread>)", "https://example.com/pr/old"],
           handoffArgs: args,
         },
         "12345678-full-session",
@@ -229,6 +244,12 @@ it.effect(
         for (const waitReason of ["external", "natural"] as const) {
           expect(
             (yield* ledger.upsert({ key: "wait", blocker, waitReason }, "caller-c")).warnings,
+          ).toContainEqual(expect.stringContaining("contradicts"));
+          expect(
+            (yield* ledger.upsert({ key: "wait", nextAction: "Review" }, "caller-c")).warnings,
+          ).not.toContainEqual(expect.stringContaining("contradicts"));
+          expect(
+            (yield* ledger.upsert({ key: "wait", status: "blocked" }, "caller-c")).warnings,
           ).toContainEqual(expect.stringContaining("contradicts"));
         }
       }

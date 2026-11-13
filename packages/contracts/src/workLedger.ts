@@ -37,6 +37,11 @@ const handoffArgs = Schema.Json.check(
       "handoffArgs must be at most 4096 UTF-8 bytes of JSON.",
   ),
 );
+const notStringNull = Schema.makeFilter(
+  (value: string) =>
+    value.trim().toLowerCase() !== "null" ||
+    'The string "null" is not an ID. Send JSON null to clear a nullable field.',
+);
 const fields = {
   title: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
   ownerKind,
@@ -49,14 +54,14 @@ const fields = {
   nextAction: Schema.NullOr(text),
   approvalNote: Schema.NullOr(text),
   links,
-  handoffArgs: Schema.NullOr(handoffArgs),
+  handoffArgs,
 };
 /** Chris's answer to a question dialog whose question names the row as `Ledger key: <key>`. */
 export const WorkLedgerApprovalSource = Schema.Struct({
-  threadId: ThreadId,
-  itemId: TurnItemId,
+  threadId: ThreadId.check(notStringNull),
+  itemId: TurnItemId.check(notStringNull),
   /** Which question of the dialog; needed when the dialog asked more than one. */
-  questionId: Schema.optional(TrimmedNonEmptyString),
+  questionId: Schema.optional(TrimmedNonEmptyString.check(notStringNull)),
 });
 export type WorkLedgerApprovalSource = typeof WorkLedgerApprovalSource.Type;
 /** Written only by the server after it verifies the source; the quotes come from the dialog. */
@@ -78,7 +83,7 @@ export type WorkLedgerApproval = typeof WorkLedgerApproval.Type;
 export const WorkLedgerItem = Schema.Struct({
   key: name,
   ...fields,
-  handoffArgs: Schema.optional(Schema.NullOr(handoffArgs)),
+  handoffArgs: Schema.optional(handoffArgs),
   // Optional: an environment on an older build omits it.
   approval: Schema.optional(Schema.NullOr(WorkLedgerApproval)),
   lastRunId: Schema.NullOr(RunId),
@@ -93,17 +98,7 @@ export type WorkLedgerItem = typeof WorkLedgerItem.Type;
 export const WorkLedgerUpsertInput = Schema.Struct({
   key: name,
   ...Schema.Struct(fields).mapFields(Struct.map(Schema.optional)).fields,
-  ownerThreadId: Schema.optional(
-    Schema.NullOr(
-      ThreadId.check(
-        Schema.makeFilter(
-          (value) =>
-            value.toLowerCase() !== "null" ||
-            "Use JSON null, not a string, to clear ownerThreadId.",
-        ),
-      ),
-    ),
-  ),
+  ownerThreadId: Schema.optional(Schema.NullOr(ThreadId.check(notStringNull))),
   addLinks: Schema.optional(links),
   removeLinks: Schema.optional(links),
   /** A source to verify as Chris's approval, or null to revoke the recorded one. */
