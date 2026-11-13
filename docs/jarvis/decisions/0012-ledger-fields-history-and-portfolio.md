@@ -10,7 +10,7 @@ Every material upsert retains its caller, time, and changed values. An unchanged
 
 Omitted fields stay unchanged; explicit null clears nullable fields. `links` still replaces the list, while `addLinks` and `removeLinks` apply normalized set changes; removals win. `handoffArgs` retains exact tool-call arguments as JSON bounded to 4096 UTF-8 bytes, not instructions or approval. Changing it withdraws an existing approval. A blocked row without a wait reason defaults to decision and warns. Contradictory `BLOCKED_TECH` or `WAIT_DECISION` prefixes with external/natural reasons warn without refusing the update.
 
-An owner thread belongs to the ledger's environment. References to other environments retain their scope as links.
+An owner thread belongs to the ledger's environment. JSON null clears it; the literal string "null" is refused on input. Older rows with that string remain readable so an explicit null can repair them. Jarvis-owned work need not have an owner thread; the Jarvis inbox is not its worker. References to other environments retain their scope as links.
 
 The portfolio joins open work with each owner thread's latest run, pending requests, and a short result excerpt. A worker with no run for over 24 hours is flagged for attention. It also counts open-to-blocked and blocked-to-open transitions in the last 24 hours, flagging more than three as flapping, including work without an owner thread. Neither flag establishes failure or authorizes a restart. The web panel reads the same ledger and provides no editing controls.
 

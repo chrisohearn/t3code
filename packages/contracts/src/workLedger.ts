@@ -93,6 +93,17 @@ export type WorkLedgerItem = typeof WorkLedgerItem.Type;
 export const WorkLedgerUpsertInput = Schema.Struct({
   key: name,
   ...Schema.Struct(fields).mapFields(Struct.map(Schema.optional)).fields,
+  ownerThreadId: Schema.optional(
+    Schema.NullOr(
+      ThreadId.check(
+        Schema.makeFilter(
+          (value) =>
+            value.toLowerCase() !== "null" ||
+            "Use JSON null, not a string, to clear ownerThreadId.",
+        ),
+      ),
+    ),
+  ),
   addLinks: Schema.optional(links),
   removeLinks: Schema.optional(links),
   /** A source to verify as Chris's approval, or null to revoke the recorded one. */

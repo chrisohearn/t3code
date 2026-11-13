@@ -649,6 +649,17 @@ it.effect(
   "classifies ledger parameter refusals as invalid_request and accepts explicit null clears",
   () =>
     Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const upsertTool = server.tools.find(({ tool }) => tool.name === "ledger_upsert")!;
+      const nullable = { anyOf: expect.arrayContaining([{ type: "null" }]) };
+      expect(upsertTool.tool.inputSchema).toMatchObject({
+        properties: {
+          ownerThreadId: nullable,
+          blocker: nullable,
+          waitReason: nullable,
+          nextCheckAt: nullable,
+        },
+      });
       for (const [name, args] of [
         ["ledger_query", { status: "BLOCKED_TECH" }],
         ["ledger_query", { cursor: "x".repeat(257) }],
@@ -657,19 +668,48 @@ it.effect(
         const result = yield* callTool(name, args).pipe(Effect.flip);
         expect(result).toMatchObject({ _tag: "InvalidParams" });
       }
-      const args = { key: "valid", title: "Task", ownerKind: "t3", ownerName: "worker" };
+      const args = { key: "valid", title: "Task", ownerKind: "jarvis", ownerName: "chief" };
       expect(
-        yield* callTool("ledger_upsert", { ...args, waitReason: "natural" }),
+        yield* callTool("ledger_upsert", {
+          ...args,
+          ownerThreadId: threadId,
+          blocker: "Waiting for event",
+          waitReason: "natural",
+          nextCheckAt: "2026-11-13T12:00:00.000Z",
+        }),
       ).not.toMatchObject({ isError: true });
-      const cleared = yield* callTool("ledger_upsert", { key: "valid", waitReason: null });
-      expect(JSON.stringify(cleared)).toContain('"waitReason":null');
+      const cleared = yield* callTool("ledger_upsert", {
+        key: "valid",
+        ownerThreadId: null,
+        blocker: null,
+        waitReason: null,
+        nextCheckAt: null,
+      });
+      expect(cleared.structuredContent).toMatchObject({
+        ownerKind: "jarvis",
+        ownerThreadId: null,
+        blocker: null,
+        waitReason: null,
+        nextCheckAt: null,
+        warnings: [],
+      });
+      expect(
+        yield* callTool("ledger_upsert", { key: "valid", ownerThreadId: "null" }).pipe(Effect.flip),
+      ).toMatchObject({ _tag: "InvalidParams" });
+      expect((yield* (yield* WorkLedger.WorkLedger).query({})).items).toMatchObject([
+        { key: "valid", ownerThreadId: null, blocker: null, waitReason: null, nextCheckAt: null },
+      ]);
       expect(
         yield* callTool("ledger_query", { cursor: null, ownerName: null, waitReason: null }),
       ).not.toMatchObject({ isError: true });
       const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE work_ledger SET owner_thread_id = 'null' WHERE work_key = 'valid'`;
+      expect(
+        (yield* callTool("ledger_upsert", { key: "valid", ownerThreadId: null })).structuredContent,
+      ).toMatchObject({ ownerThreadId: null, warnings: [] });
       const errors =
         yield* sql`SELECT error_class FROM mcp_request_log WHERE error_class IS NOT NULL`;
-      expect(errors).toEqual(Array.from({ length: 3 }, () => ({ error_class: "invalid_request" })));
+      expect(errors).toEqual(Array.from({ length: 4 }, () => ({ error_class: "invalid_request" })));
     }).pipe(
       Effect.provide(
         McpHttpServer.layerLedgerToolkit.pipe(
