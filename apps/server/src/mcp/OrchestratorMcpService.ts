@@ -115,7 +115,7 @@ import type {
 } from "../orchestration-v2/ProjectionStore.ts";
 import { delegatedTaskResultRun, runOutcome } from "../orchestration-v2/RestartBackgroundNote.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
-import { runStopDetail } from "../orchestration-v2/RunStop.ts";
+import { mayHaveRestartContinuation, runStopDetail } from "../orchestration-v2/RunStop.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
@@ -3172,9 +3172,9 @@ const make = Effect.gen(function* () {
           excludeSilentMaintenance: true,
         })
         .pipe(Effect.mapError(threadManagementFailure));
-      // A stopped run may have been continued as a later run; only then are the others read.
+      // Only a run a restart can continue needs the others read; t3_thread_read uses the same rule.
       const continuationRuns =
-        run === undefined || !["cancelled", "interrupted", "failed"].includes(run.status)
+        run === undefined || !mayHaveRestartContinuation(run)
           ? []
           : (yield* threadManagement
               .getThreadRecords(input.threadId, ["runs"])

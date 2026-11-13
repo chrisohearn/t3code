@@ -85,6 +85,8 @@ export const McpEventData = Schema.Struct({
   state: Schema.String,
   runId: Schema.optionalKey(Schema.String),
   resourceId: Schema.optionalKey(Schema.String),
+  /** Why a cancelled or interrupted run stopped, e.g. `server_shutdown` for a restart. */
+  stopReason: Schema.optionalKey(Schema.String),
   parentThreadId: Schema.NullOr(ThreadId),
   relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
 });

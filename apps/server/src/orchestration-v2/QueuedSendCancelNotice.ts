@@ -17,7 +17,8 @@ import { runStopLabel } from "./RunStop.ts";
 
 /**
  * Tells an agent when a message it sent to another thread was cancelled before it ran, so a
- * sender never assumes delivery. The notice is posted, not queued: it informs without a turn.
+ * sender never assumes delivery. The notice is posted, not queued: it informs without a turn, and
+ * a settled or snoozed sender stays that way (server notices reopen nothing; see Orchestrator).
  */
 export class QueuedSendCancelNotice extends Context.Service<
   QueuedSendCancelNotice,
