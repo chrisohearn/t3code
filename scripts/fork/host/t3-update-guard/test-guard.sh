@@ -202,6 +202,54 @@ restore_db "$root/snap" >/dev/null 2>&1 || fail 'restore failed'
 [[ "$(cat "$T3HOME/userdata/state.sqlite")" == old && -e "$T3HOME/userdata/extra.sqlite-wal" ]] || fail 'restore incomplete'
 pass 'a database restore is staged first, so a failed copy leaves the live files untouched'
 unset -f cp
+# --- Provider canary (2026-11-13 incident) and release archive check.
+sqlite3 "$DB" "create table if not exists orchestration_v2_projection_turn_items (turn_item_id text, thread_id text, run_id text, type text, status text, updated_at text, payload_json text);" 2>/dev/null || true
+sqlite3 "$DB" "delete from orchestration_v2_projection_turn_items;"
+fail_item() { sqlite3 "$DB" "insert into orchestration_v2_projection_turn_items (turn_item_id, type, status, updated_at) values ('turn-item:run:$1:signal:provider-session-open-failure','error','failed','$2');"; }
+service_uptime() { echo 400; }; CANARY_POLL_SECONDS=0
+at=$(now '-3 minutes')
+provider_canary "$at" >/dev/null || fail 'canary failed with no session failures'
+fail_item a "$(now '-2 minutes')"; fail_item b "$(now '-1 minute')"
+r=$(provider_canary "$at") && fail 'canary passed with 2 new session failures'
+[[ "$r" == '2 provider session(s) failed to open after the restart (0 in the 30 min before)' ]] || fail "canary reason: $r"
+fail_item c "$(now '-10 minutes')"; fail_item d "$(now '-8 minutes')"; fail_item e "$(now '-6 minutes')"
+provider_canary "$at" >/dev/null || fail 'canary blamed the new build for failures that were already happening'
+pass 'provider canary fails on new session-open failures, not on ones that predate the restart'
+sqlite3 "$DB" "delete from orchestration_v2_projection_turn_items;"
+
+# A build that serves but fails the canary is marked bad and rolled back, with the reason reported.
+latest_release() { echo 2; }; active_runs() { echo 0; }; quiet_seconds() { echo 99999; }
+svc() { return 0; }; wait_inactive() { return 0; }; snapshot_db() { echo "$root/snap"; }
+binary_of() { echo /bin/true; }; installed() { return 0; }; is_trusted() { return 0; }
+cur_v=1; active_version() { echo "$cur_v"; }; write_state_for() { :; }
+service_version() { echo 2; }; can_open() { return 0; }
+restart_on() { echo "$1" > "$root/recovery"; }
+provider_canary() { echo 'new build breaks sessions'; return 1; }
+rm -f "$root/recovery" "$GUARD_STATE/bad/2" "$GUARD_STATE/deferred-since"
+HEALTH_WAIT_SECONDS=30 cmd_update >/dev/null 2>&1 && fail 'canary failure reported as success'
+[[ -e "$GUARD_STATE/bad/2" ]] || fail 'canary failure did not mark the release bad'
+[[ "$(cat "$root/recovery")" == 1 ]] || fail 'canary failure did not restart the old build'
+grep -q 'failed the provider canary: new build breaks sessions' "$REPORTS_DEFERRED" "$REPORTS" 2>/dev/null || fail 'canary failure not reported'
+pass 'a build that serves but fails the canary is marked bad, rolled back and reported'
+unset -f provider_canary
+service_version() { echo 1; }; active_version() { echo 1; }
+rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2"
+
+# A checksummed archive without the binary is rejected. (Earlier tests stub release_binary_sha.)
+source <(sed -n '/^release_binary_sha() {/,/^}/p' "$root/functions")
+mkdir -p "$root/rel/t3-9.9.9-linux-x64"; echo x > "$root/rel/t3-9.9.9-linux-x64/README"
+tar czf "$root/rel/t3-9.9.9-linux-x64.tar.gz" -C "$root/rel" t3-9.9.9-linux-x64
+(cd "$root/rel" && sha256sum t3-9.9.9-linux-x64.tar.gz > SHA256SUMS)
+curl() { local out="" url=""; while (( $# )); do case "$1" in -o) out=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac; done; cp "$root/rel/${url##*/}" "$out"; }
+release_binary_sha 9.9.9 >/dev/null 2>&1 && fail 'archive without the binary accepted'
+cp -r "$root/rel/t3-9.9.9-linux-x64" "$root/rel2"; echo bin > "$root/rel2/t3"; rm -rf "$root/rel/t3-9.9.9-linux-x64"; mv "$root/rel2" "$root/rel/t3-9.9.9-linux-x64"
+tar czf "$root/rel/t3-9.9.9-linux-x64.tar.gz" -C "$root/rel" t3-9.9.9-linux-x64
+(cd "$root/rel" && sha256sum t3-9.9.9-linux-x64.tar.gz > SHA256SUMS)
+sha=$(release_binary_sha 9.9.9 2>/dev/null) || fail 'good archive rejected'
+[[ "$sha" == "$(printf 'bin\n' | sha256sum | cut -d' ' -f1)" ]] || fail "binary sha wrong: $sha"
+unset -f curl
+pass 'release verification rejects an archive without the binary and hashes the real one'
+
 timeout() { printf '%s\n' "$*" > "$root/timeout"; }
 systemctl --user is-active t3code.service
 [[ "$(cat "$root/timeout")" == '--kill-after=2 15 /usr/bin/systemctl --user is-active t3code.service' ]] || fail timeout
