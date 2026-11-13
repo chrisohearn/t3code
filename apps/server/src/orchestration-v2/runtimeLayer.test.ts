@@ -8022,6 +8022,156 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       }),
   );
 
+  it.effect("keeps a scheduled model change through server continuations on the old model", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const scheduledSelection = { ...modelSelection, model: "gpt-5.5" };
+      const scenario = (name: string) =>
+        Effect.gen(function* () {
+          const threadId = ThreadId.make(`runtime-layer-schedule-server-${name}`);
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`${threadId}:create`),
+            threadId,
+            projectId: ProjectId.make(`${threadId}:project`),
+            createdBy: "user",
+            creationSource: "web",
+            title: "Scheduled change and a restart",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: process.cwd(),
+          });
+          // A restart continuation names the run's own model and comes from the server.
+          const send = (key: string, kind: "agent" | "server", queue: boolean) =>
+            orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`${threadId}:${key}`),
+              threadId,
+              messageId: MessageId.make(`${threadId}:${key}`),
+              text: key,
+              attachments: [],
+              ...(kind === "server" ? { modelSelection } : {}),
+              dispatchMode: { type: queue ? "queue_after_active" : "start_immediately" },
+              createdBy: "agent",
+              creationSource: kind === "server" ? "server" : "mcp",
+            });
+          const run = (key: string) =>
+            orchestrator
+              .getThreadProjection(threadId)
+              .pipe(
+                Effect.map((projection) =>
+                  projection.runs.find(
+                    (candidate) => candidate.userMessageId === MessageId.make(`${threadId}:${key}`),
+                  )!,
+                ),
+              );
+          const complete = (key: string) =>
+            Effect.gen(function* () {
+              const current = yield* run(key);
+              yield* eventSink.write({
+                events: [
+                  {
+                    id: EventId.make(`${current.id}:completed`),
+                    type: "run.updated",
+                    threadId,
+                    runId: current.id,
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...current, status: "completed", completedAt: yield* DateTime.now },
+                  },
+                ],
+              });
+              yield* orchestrator.resumeQueuedRuns;
+            });
+          const scheduledNow = () =>
+            orchestrator
+              .getThreadProjection(threadId)
+              .pipe(Effect.map(({ thread }) => thread.scheduledModelSelection ?? null));
+          yield* send("active", "agent", false);
+          yield* orchestrator.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make(`${threadId}:schedule`),
+            threadId,
+            modelSelection: scheduledSelection,
+            applyAt: "next_turn",
+          });
+          return { threadId, send, run, complete, scheduledNow };
+        });
+
+      // Queued behind the busy run.
+      const queued = yield* scenario("queued");
+      yield* queued.send("continuation", "server", true);
+      yield* queued.send("after", "agent", true);
+      assert.deepEqual((yield* queued.run("after")).modelSelection, scheduledSelection);
+      yield* queued.complete("active");
+      const continuation = yield* queued.run("continuation");
+      assert.equal(continuation.status, "starting");
+      assert.deepEqual(continuation.modelSelection, modelSelection);
+      assert.isNotNull(yield* queued.scheduledNow());
+      yield* queued.complete("continuation");
+      const after = yield* queued.run("after");
+      assert.equal(after.status, "starting");
+      assert.deepEqual(after.modelSelection, scheduledSelection);
+      assert.isNull(yield* queued.scheduledNow());
+
+      // Started at once on the idle thread, after the busy run ended.
+      const immediate = yield* scenario("immediate");
+      yield* immediate.complete("active");
+      yield* immediate.send("continuation", "server", false);
+      assert.deepEqual((yield* immediate.run("continuation")).modelSelection, modelSelection);
+      assert.isNotNull(yield* immediate.scheduledNow());
+      yield* immediate.complete("continuation");
+      yield* immediate.send("next", "agent", false);
+      assert.deepEqual((yield* immediate.run("next")).modelSelection, scheduledSelection);
+      assert.isNull(yield* immediate.scheduledNow());
+    }),
+  );
+
+  it.effect("keeps the snooze of a thread that never ran while delivering to it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-layer-snooze-never-ran");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        createdBy: "user",
+        creationSource: "web",
+        title: "Never ran",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make(`${threadId}:snooze`),
+        threadId,
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${threadId}:first`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:first`),
+        text: "first",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        respectSnooze: true,
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(projection.runs[0]?.status, "starting");
+      assert.isUndefined(projection.runs[0]?.snoozeDeferred);
+      assert.isNotNull(projection.thread.snoozedUntil ?? null);
+    }),
+  );
+
   it.effect("delivers to a snoozed thread that counts as awake without ending its snooze", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

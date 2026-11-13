@@ -998,6 +998,7 @@ function queuedBeforeScheduledSelection(
 /**
  * A scheduled change lasts until a turn on the default model takes it with nothing queued before
  * the change still waiting, explicit picks included. A model named after the change replaces it.
+ * A server continuation repeats an earlier run's model and leaves the change alone.
  */
 function threadAtRunStart(
   projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs">,
@@ -1005,13 +1006,13 @@ function threadAtRunStart(
     readonly runId: OrchestrationV2Run["id"] | null;
     /** Null for a turn starting now, which is newer than any scheduled change. */
     readonly ordinal: number | null;
-    readonly namedModel: boolean;
+    readonly model: "default" | "named" | "server";
   },
 ): OrchestrationV2ThreadProjection["thread"] {
   const scheduled = projection.thread.scheduledModelSelection;
-  if (scheduled == null) return projection.thread;
+  if (scheduled == null || starting.model === "server") return projection.thread;
   const cleared = { ...projection.thread, scheduledModelSelection: null };
-  if (starting.namedModel) {
+  if (starting.model === "named") {
     return starting.ordinal !== null && starting.ordinal <= scheduled.queuedThroughOrdinal
       ? projection.thread
       : cleared;
@@ -1050,10 +1051,16 @@ function queuedRunModelSelection(
 function queueTailModelSelection(
   projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
 ): ModelSelection {
-  const tail = queuedRunsInDeliveryOrder(projection).findLast(
-    (run) => !queuedRunFollowsThread(projection, run),
-  );
   const scheduled = projection.thread.scheduledModelSelection;
+  // With a change pending, a queued server continuation's repeated model is no one's new pick.
+  const serverRepeat = (run: OrchestrationV2Run) =>
+    scheduled != null &&
+    run.explicitModelSelection === true &&
+    projection.messages.find((message) => message.id === run.userMessageId)?.creationSource ===
+      "server";
+  const tail = queuedRunsInDeliveryOrder(projection).findLast(
+    (run) => !queuedRunFollowsThread(projection, run) && !serverRepeat(run),
+  );
   // A pick queued before a scheduled change is older than it; later sends take the change.
   return tail !== undefined && (scheduled == null || tail.ordinal > scheduled.queuedThroughOrdinal)
     ? tail.modelSelection
@@ -2569,7 +2576,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const threadAtStart = threadAtRunStart(projection, {
         runId: queuedRun.id,
         ordinal: queuedRun.ordinal,
-        namedModel: queuedRun.explicitModelSelection === true,
+        model:
+          queuedRun.explicitModelSelection !== true
+            ? "default"
+            : queuedMessage?.creationSource === "server"
+              ? "server"
+              : "named",
       });
       // The picker may already have moved ahead of the native conversation.
       const switchFromActiveProvider =
@@ -8083,11 +8095,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const selectionChanged =
       !modelSelectionsEqual(projection.thread.modelSelection, modelSelection) ||
       projection.thread.providerInstanceId !== modelSelection.instanceId;
-    // Server continuations repeat an earlier run's model; they name nothing new.
     const threadAtStart = threadAtRunStart(projection, {
       runId: null,
       ordinal: null,
-      namedModel: command.modelSelection !== undefined && command.creationSource !== "server",
+      model:
+        command.modelSelection === undefined
+          ? "default"
+          : command.creationSource === "server"
+            ? "server"
+            : "named",
     });
     if (selectionChanged || threadAtStart !== projection.thread) {
       yield* emit(

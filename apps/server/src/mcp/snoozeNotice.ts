@@ -15,7 +15,7 @@ export function snoozeNotice(
     held: `${prefix} The message waits, held, until it wakes. Pass respectSnooze: false to wake it now.`,
     posted: `${prefix} The message was recorded and the thread stays snoozed.`,
     steered: `${prefix} The message joined its running turn, and the thread stays snoozed.`,
-    delivered: `${prefix} It counts as awake for now (a pending request or an error), so the message was delivered; the snooze stays.`,
+    delivered: `${prefix} It counts as awake for now (it never ran, or a request, guest message or error woke it), so the message went ahead as usual: started or queued. The snooze stays.`,
     woke: `${prefix} This message ended the snooze.`,
   }[outcome];
   return { snoozedUntil: until, warning };
