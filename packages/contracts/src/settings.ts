@@ -1574,6 +1574,18 @@ export const ServerSettings = Schema.Struct({
 
   /** Sent by the Usage tab with each summary request to this environment; edit in settings.json. Invalid values are ignored. */
   usageModelFilter: ForwardCompatibleOptional(UsageModelFilter),
+
+  /** Fork: the server, not the agent, acknowledges these threads' messages. Bad entries drop alone. */
+  acknowledgeOnlyThreadIds: Schema.Array(Schema.Unknown).pipe(
+    Schema.decodeTo(
+      Schema.Array(ThreadId),
+      SchemaTransformation.transform<ReadonlyArray<string>, ReadonlyArray<unknown>>({
+        decode: (values) => values.filter(Schema.is(ThreadId)),
+        encode: (values) => values,
+      }),
+    ),
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -1953,6 +1965,8 @@ export const ServerSettingsPatch = Schema.Struct({
   usageModelAliases: Schema.optionalKey(
     Schema.Record(TrimmedNonEmptyString, Schema.NullOr(TrimmedNonEmptyString)),
   ),
+
+  acknowledgeOnlyThreadIds: Schema.optionalKey(Schema.Array(ThreadId)),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 

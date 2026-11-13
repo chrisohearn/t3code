@@ -30,6 +30,7 @@ import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { freezeThread, unfreezeThread } from "../../threadFreeze.ts";
+import type * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import { ThreadToolkit } from "./tools.ts";
 
 const isApprovalKind = Schema.is(ProviderRequestKind);
@@ -106,6 +107,36 @@ const required = <A>(value: A | undefined, name: string) =>
         }),
       )
     : Effect.succeed(value);
+// Who answers a thread's messages is environment policy, so it needs full access both ways.
+const configureAcknowledgeOnly = Effect.fn("mcp.configureAcknowledgeOnly")(function* (
+  threads: ThreadManagementService.ThreadManagementService["Service"],
+  thread: Pick<
+    OrchestrationV2ThreadProjection["thread"],
+    "id" | "modelSelection" | "runtimeMode" | "interactionMode"
+  >,
+  input: {
+    readonly acknowledgeOnly?: boolean | undefined;
+    readonly modelSelection?: unknown;
+    readonly runtimeMode?: unknown;
+  },
+) {
+  yield* McpToolAccess.requireFullAccess("change who answers a thread");
+  if (input.modelSelection !== undefined || input.runtimeMode !== undefined) {
+    return yield* new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message: "Set acknowledgeOnly separately from modelSelection and runtimeMode.",
+    });
+  }
+  const acknowledgeOnly = yield* required(input.acknowledgeOnly, "acknowledgeOnly");
+  yield* threads.setAcknowledgeOnly(thread.id, acknowledgeOnly).pipe(Effect.mapError(unavailable));
+  return {
+    threadId: thread.id,
+    modelSelection: thread.modelSelection,
+    runtimeMode: thread.runtimeMode,
+    interactionMode: thread.interactionMode,
+    acknowledgeOnly,
+  };
+});
 const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A, E, R>(
   handle: (params: P, authorize: McpToolAccess.AuthorizeThread) => Effect.Effect<A, E, R>,
 ) => McpToolAccess.writesThreads((params: P) => [params.threadId], handle);
@@ -224,10 +255,14 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     ),
   ),
   t3_thread_configure: McpToolAccess.either(
-    (input) => input.modelSelection === undefined && input.runtimeMode === undefined,
+    (input) =>
+      input.modelSelection === undefined &&
+      input.runtimeMode === undefined &&
+      input.acknowledgeOnly === undefined,
     McpToolAccess.reads((input) =>
       Effect.gen(function* () {
         const {
+          threads,
           projection: { thread },
         } = yield* readThread(input.threadId);
         return {
@@ -235,6 +270,9 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           modelSelection: thread.modelSelection,
           runtimeMode: thread.runtimeMode,
           interactionMode: thread.interactionMode,
+          acknowledgeOnly: yield* threads
+            .acknowledgeOnly(thread.id)
+            .pipe(Effect.mapError(unavailable)),
         };
       }),
     ),
@@ -244,6 +282,9 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           threads,
           projection: { thread },
         } = yield* readThread(input.threadId);
+        if (input.acknowledgeOnly !== undefined) {
+          return yield* configureAcknowledgeOnly(threads, thread, input);
+        }
         if (input.runtimeMode !== undefined) {
           if (input.modelSelection !== undefined) {
             return yield* new OrchestratorMcpFailure({
