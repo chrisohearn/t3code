@@ -399,7 +399,9 @@ it.effect(
           threadTitle: expect.any(String),
           resultExcerpt: "é".repeat(512),
           pullRequestUrls: ["https://github.com/acme/app/pull/1"],
+          state: "failed",
         });
+        expect(body).not.toHaveProperty("stopReason");
         yield* f.call(rebuilt.setInbox({ threadId: null }));
         expect(yield* f.call(rebuilt.prepareNotify({}))).toMatchObject({
           reason: "no_pinned_inbox",
@@ -410,6 +412,89 @@ it.effect(
         ).toBe("access_denied");
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("relays a failover run's result, not a blocker for the run that failed over to it", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.grantWrite(f.principal);
+      const threadId = ThreadId.make("failover-source");
+      const inbox = ThreadId.make("failover-inbox");
+      const runId = RunId.make("failing-run");
+      const fallbackRunId = RunId.make("fallback-run");
+      yield* f.call(f.service.setInbox({ threadId: inbox }));
+      const notification = yield* f.call(
+        ThreadNotifications.prepare({}).pipe(Effect.provideService(McpEvents.McpEvents, f.service)),
+      );
+      f.projections.set(threadId, idleThreadProjection(liveThreadShell(threadId)));
+      const now = DateTime.makeUnsafe(1);
+      const instanceId = ProviderInstanceId.make("replay");
+      const run = {
+        id: runId,
+        threadId,
+        ordinal: 1,
+        providerInstanceId: instanceId,
+        modelSelection: { instanceId, model: "fixture" },
+        providerThreadId: null,
+        userMessageId: MessageId.make("failover-message"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "failed" as const,
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        checkpointId: null,
+        contextHandoffId: null,
+      };
+      const failover = {
+        reason: "usage_limit" as const,
+        modelSelection: { instanceId: ProviderInstanceId.make("claude"), model: "opus" },
+      };
+      yield* f.store.appendAgentEvents({
+        events: [
+          {
+            id: EventId.make("failing-pending"),
+            threadId,
+            occurredAt: now,
+            type: "run.updated",
+            payload: { ...run, failover: { ...failover, state: "pending" } },
+          },
+          {
+            id: EventId.make("failing-dispatched"),
+            threadId,
+            occurredAt: now,
+            type: "run.updated",
+            payload: {
+              ...run,
+              failover: { ...failover, state: "dispatched", runId: fallbackRunId },
+            },
+          },
+          {
+            id: EventId.make("fallback-completed"),
+            threadId,
+            occurredAt: now,
+            type: "run.updated",
+            payload: {
+              ...run,
+              id: fallbackRunId,
+              ordinal: 2,
+              status: "completed",
+              failoverOfRunId: runId,
+            },
+          },
+        ],
+      });
+      yield* f.call(ThreadNotifications.finish(notification, threadId, runId, "ledger/failover"));
+      yield* f.service.drain();
+      expect(f.inboxSends).toHaveLength(1);
+      expect(json(f.inboxSends[0]!.text.slice("[T3 event relay]\n".length))).toMatchObject({
+        eventName: "thread.run.result",
+        runId: fallbackRunId,
+        state: "completed",
+      });
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
 it.effect("recovers the source result when an idempotent retry follows a lost binding", () =>
@@ -1107,7 +1192,7 @@ it("says why a cancelled run stopped, so a restart cancel does not read as a fai
   };
   const observe = (
     payload: Omit<typeof run, "status"> & {
-      readonly status: "cancelled" | "rolled_back";
+      readonly status: "cancelled" | "interrupted" | "rolled_back";
       readonly stop?: { reason: string; actor: { kind: string } };
     },
   ) =>
@@ -1131,6 +1216,34 @@ it("says why a cancelled run stopped, so a restart cancel does not read as a fai
     observe({ ...run, stop: { reason: "server_shutdown", actor: { kind: "server" } } }),
   ).toMatchObject({ state: "cancelled", stopReason: "server_shutdown" });
   expect(observe(run)).not.toHaveProperty("stopReason");
+  // The inbox relay says the same, so a restart cancel reads as one on that route too.
+  const relayed = (payload: Parameters<typeof observe>[0]) =>
+    Relay.relayEventState({
+      id: EventId.make("restart-event"),
+      threadId,
+      runId: run.id,
+      occurredAt: DateTime.makeUnsafe(0),
+      type: "run.updated",
+      payload,
+    });
+  expect(
+    relayed({ ...run, stop: { reason: "server_shutdown", actor: { kind: "server" } } }),
+  ).toEqual({ state: "cancelled", stopReason: "server_shutdown" });
+  expect(relayed(run)).toEqual({ state: "cancelled" });
+  expect(
+    relayed({
+      ...run,
+      status: "interrupted",
+      stop: { reason: "provider_interrupted", actor: { kind: "server" } },
+    }),
+  ).toEqual({ state: "interrupted", stopReason: "provider_interrupted" });
+  expect(
+    relayed({
+      ...run,
+      status: "rolled_back",
+      stop: { reason: "server_shutdown", actor: { kind: "server" } },
+    }),
+  ).toEqual({ state: "rolled_back" });
   expect(
     observe({
       ...run,

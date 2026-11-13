@@ -1,9 +1,33 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { claudeRateLimitEventToUpdate, claudeUsageResponseToLimits } from "./claudeUsageLimits.ts";
+import {
+  claudeRateLimitEventToUpdate,
+  claudeUsageResponseToLimits,
+  claudeUsageLimitScope,
+} from "./claudeUsageLimits.ts";
 
 const checkedAt = "2026-07-18T10:00:00.000Z";
 const noNames = { overageIncluded: undefined } as const;
+
+it("distinguishes account limits from named model limits without cooling the whole account", () => {
+  for (const types of [
+    ["seven_day_fable"],
+    ["seven_day_opus"],
+    ["seven_day_model"],
+    ["seven_day_overage_included"],
+    ["model_requires_usage_credits"],
+  ]) {
+    expect(claudeUsageLimitScope(types, "")).toBe("model");
+  }
+  expect(
+    claudeUsageLimitScope([], "usage limit reached until the 7-day Fable limit resets in 145h"),
+  ).toBe("model");
+  expect(claudeUsageLimitScope([], "7-day model limit")).toBe("model");
+  expect(claudeUsageLimitScope(["five_hour", "seven_day_fable"], "")).toBe("account");
+  expect(claudeUsageLimitScope(["seven_day"], "")).toBe("account");
+  expect(claudeUsageLimitScope([], "You've hit your 5-hour limit")).toBe("account");
+  expect(claudeUsageLimitScope(["unknown"], "rate limit reached")).toBeUndefined();
+});
 
 describe("claudeUsageResponseToLimits", () => {
   it("maps the session, weekly, and model-scoped weekly windows", () => {
@@ -197,6 +221,22 @@ describe("claudeUsageResponseToLimits", () => {
     expect(
       claudeUsageResponseToLimits({ checkedAt, response: utilizationOnly }).limits.windows,
     ).toEqual([monthlyWindow]);
+  });
+
+  it("flags a $0 cap instead of reporting a monthly window", () => {
+    const response = {
+      rate_limits_available: true,
+      rate_limits: {
+        five_hour: null,
+        seven_day: null,
+        extra_usage: { is_enabled: true, used_credits: 0, monthly_limit: 0, utilization: null },
+      },
+    };
+    expect(claudeUsageResponseToLimits({ checkedAt, response }).limits).toEqual({
+      checkedAt,
+      windows: [],
+      zeroSpendCap: true,
+    });
   });
 
   it("omits disabled budgets and refuses invalid money without an enabled fallback", () => {

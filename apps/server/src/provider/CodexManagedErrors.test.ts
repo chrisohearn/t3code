@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { classifyCodexManagedError } from "./CodexManagedErrors.ts";
+import { classifyCodexManagedError, codexManagedAccountFailure } from "./CodexManagedErrors.ts";
 it("maps streamed failures to safe actionable messages and reconnect decisions", () => {
   assert.deepEqual(
     classifyCodexManagedError({
@@ -29,6 +29,7 @@ it("maps streamed failures to safe actionable messages and reconnect decisions",
   );
   assert.isUndefined(classifyCodexManagedError(undefined));
   assert.isUndefined(classifyCodexManagedError({ error: "unknown" }));
+  assert.isUndefined(codexManagedAccountFailure("subscription_sharing_unsupported_capability"));
 });
 
 it("distinguishes unsupported tools from input items without exposing the raw response", () => {
