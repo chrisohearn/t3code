@@ -1,5 +1,7 @@
 import * as ThreadLaunchMcp from "../../ThreadLaunchMcpService.ts";
 import * as McpClientThreads from "../../../persistence/McpClientThreads.ts";
+import * as LaunchPresets from "../../../persistence/LaunchPresets.ts";
+import * as ThreadRoles from "../../../persistence/ThreadRoles.ts";
 
 import {
   NonNegativeInt,
@@ -126,6 +128,8 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
   dependencies: [
     ...shared.dependencies,
     ThreadLaunchMcp.ThreadLaunchMcpService,
+    LaunchPresets.LaunchPresets,
+    ThreadRoles.ThreadRoles,
     McpClientThreads.McpClientThreads,
     ThreadLaunchService.ThreadLaunchService,
     ManagedProjectFolders.ManagedProjectFolders,

@@ -1,10 +1,14 @@
 import * as McpClientThreads from "../../../persistence/McpClientThreads.ts";
 import * as ThreadLaunchMcp from "../../ThreadLaunchMcpService.ts";
+import * as ThreadRoles from "../../../persistence/ThreadRoles.ts";
+import * as LaunchPresets from "../../../persistence/LaunchPresets.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   GitCommandError,
+  OrchestratorMcpFailure,
+  type LaunchPreset,
   ProjectId,
   ProviderInstanceId,
   ProviderDriverKind,
@@ -62,7 +66,13 @@ const clientLaunchHarness = (input: {
   readonly hostedAppUrl?: string;
   /** The orchestrator refuses the new thread's mode, as under a managed ceiling. */
   readonly refusedByCeiling?: true;
+  readonly presets?: Readonly<Record<string, Partial<LaunchPreset>>>;
+  /** The launch fails before it creates the thread. */
+  readonly failsBeforeThread?: true;
 }) => {
+  const roleStore = new Map<string, string>();
+  // The role as it stood when each launch reached the orchestrator, which starts the first turn.
+  const rolesAtLaunch: Array<string | undefined> = [];
   const projectId = ProjectId.make("project:client-target");
   const modelSelection = {
     instanceId: ProviderInstanceId.make("claudeAgent"),
@@ -131,7 +141,19 @@ const clientLaunchHarness = (input: {
     Layer.mock(ThreadLaunch.ThreadLaunchService)({
       checkWorktreeBase: input.checkWorktreeBase ?? (() => Effect.void),
       launch: (launch) => {
+        if (input.failsBeforeThread)
+          return Effect.fail(
+            new ThreadLaunch.ThreadLaunchError({
+              operation: "create-thread",
+              commandId: launch.commandId,
+              projectId: launch.projectId,
+              cause: "refused",
+            }),
+          );
         input.launched.push(launch);
+        rolesAtLaunch.push(
+          launch.threadId === undefined ? undefined : roleStore.get(launch.threadId),
+        );
         if (input.refusedByCeiling) {
           return Effect.fail(
             new ThreadLaunch.ThreadLaunchError({
@@ -178,6 +200,39 @@ const clientLaunchHarness = (input: {
     }),
     Layer.mock(PeerForwarding.PeerForwarding)({}),
     Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/projects" }),
+    Layer.mock(ThreadRoles.ThreadRoles)({
+      get: (threadId) => {
+        const text = roleStore.get(threadId);
+        return Effect.succeed(
+          text === undefined
+            ? undefined
+            : { text, revision: 1, updatedAt: "2026-01-01T00:00:00Z", updatedBy: "test" },
+        );
+      },
+      set: (threadId, role) =>
+        Effect.sync(() => {
+          if (role === null) roleStore.delete(threadId);
+          else roleStore.set(threadId, role);
+        }),
+    }),
+    Layer.mock(LaunchPresets.LaunchPresets)({
+      get: (name) => {
+        const preset = input.presets?.[name];
+        return preset === undefined
+          ? Effect.fail(
+              new OrchestratorMcpFailure({
+                code: "invalid_request",
+                message: `Launch preset "${name}" was not found.`,
+              }),
+            )
+          : Effect.succeed({
+              name,
+              updatedAt: "2026-01-01T00:00:00Z",
+              updatedBy: "test",
+              ...preset,
+            });
+      },
+    }),
     DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer)),
   ).pipe(
     Layer.provideMerge(GitVcsDriver.layer),
@@ -194,6 +249,8 @@ const clientLaunchHarness = (input: {
     modelSelection,
     projectDefaults,
     provenance,
+    rolesAtLaunch,
+    roleStore,
     dependencies: layerDependencies,
   };
 };
@@ -298,6 +355,108 @@ it.effect(
         message: "Example Corp limits threads to Supervised.",
       });
     }),
+);
+
+it.effect("a launch applies its preset, explicit fields win, and the role is stored first", () =>
+  Effect.gen(function* () {
+    const presetModel = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-preset" };
+    const preset = {
+      modelSelection: presetModel,
+      runtimeMode: "auto-accept-edits",
+      standingRole: "Be brief.",
+      doneFormat: "DONE: <summary>",
+      workspaceStrategy: { type: "worktree", baseRef: "origin/main", startFromOrigin: true },
+    } as const;
+    const launchWith = Effect.fn("test.launchWithPreset")(function* (
+      ceiling: RuntimeMode,
+      params: Record<string, unknown>,
+    ) {
+      const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+      const harness = clientLaunchHarness({
+        runtimeModeCeiling: ceiling,
+        launched,
+        presets: { worker: preset },
+      });
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+            Layer.provide(harness.dependencies),
+          ),
+        ),
+      );
+      const result = yield* toolkit
+        .handle("t3_thread_launch", { title: "Work", projectId: harness.projectId, ...params })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(harness.dependencies));
+      return { result: result.at(-1)?.result, launched, rolesAtLaunch: harness.rolesAtLaunch };
+    });
+    const doneRole = "Your final message must follow this format:\nDONE: <summary>";
+
+    const fromPreset = yield* launchWith("full-access", { preset: "worker", message: "Go" });
+    expect(fromPreset.launched[0]).toMatchObject({
+      modelSelection: presetModel,
+      runtimeMode: "auto-accept-edits",
+      workspaceStrategy: { type: "worktree", baseRef: "origin/main" },
+    });
+    expect(fromPreset.rolesAtLaunch).toEqual([`Be brief.\n\n${doneRole}`]);
+
+    const explicit = yield* launchWith("full-access", {
+      preset: "worker",
+      runtimeMode: "approval-required",
+      workspaceStrategy: { type: "root" },
+      standingRole: "Explicit.",
+    });
+    expect(explicit.launched[0]).toMatchObject({
+      modelSelection: presetModel,
+      runtimeMode: "approval-required",
+      workspaceStrategy: { type: "root" },
+    });
+    expect(explicit.rolesAtLaunch).toEqual([`Explicit.\n\n${doneRole}`]);
+
+    // A preset is never a way past the caller's own mode.
+    const escalated = yield* launchWith("approval-required", { preset: "worker" });
+    expect(escalated.result).toMatchObject({ code: "runtime_mode_escalation_denied" });
+    expect(escalated.launched).toHaveLength(0);
+
+    const unknown = yield* launchWith("full-access", { preset: "missing" });
+    expect(unknown.result).toMatchObject({ code: "invalid_request" });
+    expect(unknown.launched).toHaveLength(0);
+  }),
+);
+
+it.effect("a failed launch keeps the role of a thread that exists and drops the rest", () =>
+  Effect.gen(function* () {
+    const launchFailing = Effect.fn("test.launchFailing")(function* (
+      failure: { readonly refusedByCeiling: true } | { readonly failsBeforeThread: true },
+    ) {
+      const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+      const harness = clientLaunchHarness({
+        runtimeModeCeiling: "full-access",
+        launched,
+        presets: { worker: { standingRole: "Be brief." } },
+        ...failure,
+      });
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+            Layer.provide(harness.dependencies),
+          ),
+        ),
+      );
+      yield* toolkit
+        .handle("t3_thread_launch", {
+          title: "Work",
+          projectId: harness.projectId,
+          preset: "worker",
+          message: "Go",
+        })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(harness.dependencies));
+      return [...harness.roleStore.values()];
+    });
+    // The orchestrator refused after the thread existed: its role stays.
+    expect(yield* launchFailing({ refusedByCeiling: true })).toEqual(["Be brief."]);
+    // Nothing was created: no role is left for a thread that never was.
+    expect(yield* launchFailing({ failsBeforeThread: true })).toEqual([]);
+  }),
 );
 
 it.effect("a launch steps an inherited mode down to the provider's, and refuses one it lacks", () =>

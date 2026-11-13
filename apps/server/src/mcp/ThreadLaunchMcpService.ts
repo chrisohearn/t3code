@@ -37,6 +37,8 @@ import { newCommandId, readCaller, resolveProjectId, unavailable } from "./threa
 import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
+import * as LaunchPresets from "../persistence/LaunchPresets.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
 import { McpAttachmentInput } from "./toolkits/attachment/input.ts";
 import {
   OrchestratorMcpClientRequestId,
@@ -47,6 +49,9 @@ import {
   ProviderInteractionMode,
   OrchestrationV2ThreadLaunchWorkspaceStrategy,
   OrchestrationV2DelegatedFrom,
+  LaunchPresetName,
+  StandingRole,
+  composeStandingRole,
   RunId,
   OrchestrationV2RunStatus,
   type OrchestrationV2LinkOrigin,
@@ -80,6 +85,10 @@ export const launchInput = Schema.Struct({
   ),
   attachments: Schema.optional(Schema.Array(McpAttachmentInput).check(Schema.isMaxLength(8))),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+  preset: Schema.optional(
+    LaunchPresetName.annotate({ description: "A `t3_preset` name; explicit fields win." }),
+  ),
+  standingRole: Schema.optional(StandingRole),
   /** Set by a linked environment launching its agent's delegated task here; ignored otherwise. */
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
 });
@@ -211,6 +220,15 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       const launchedModel =
         launched === null || launched.deletedAt !== null ? undefined : launched.modelSelection;
       const replaying = launchedModel !== undefined;
+      const preset =
+        input.preset === undefined || replaying
+          ? undefined
+          : yield* (yield* LaunchPresets.LaunchPresets).get(input.preset);
+      // Explicit fields win. A scratch launch has no checkout to choose.
+      const workspaceStrategy =
+        input.workspaceStrategy ?? (input.scratch === true ? undefined : preset?.workspaceStrategy);
+      const requestedModel = input.modelSelection ?? preset?.modelSelection;
+      const presetMode = input.runtimeMode === undefined ? preset?.runtimeMode : undefined;
       const project = replaying
         ? undefined
         : yield* Project.ProjectService.pipe(
@@ -229,16 +247,16 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
               }),
             ),
           );
-      if (project !== undefined && input.workspaceStrategy?.type === "existing_worktree")
-        yield* assertProjectWorktree(project.workspaceRoot, input.workspaceStrategy.worktreePath);
-      if (!replaying && input.modelSelection !== undefined) {
-        const { instanceId, model } = input.modelSelection;
+      if (project !== undefined && workspaceStrategy?.type === "existing_worktree")
+        yield* assertProjectWorktree(project.workspaceRoot, workspaceStrategy.worktreePath);
+      if (!replaying && requestedModel !== undefined) {
+        const { instanceId, model } = requestedModel;
         const providers = yield* (yield* ProviderRegistry.ProviderRegistry).getProviders;
         const provider = providers.find((candidate) => candidate.instanceId === instanceId);
         if (provider !== undefined) yield* requireAdvertisedModel(provider, model);
       }
       // Reject unresolved base refs and blocked branch names before accepting a launch; worktree provisioning happens later.
-      const strategy = input.workspaceStrategy;
+      const strategy = workspaceStrategy;
       if (!replaying && strategy?.type === "worktree")
         yield* ThreadLaunch.ThreadLaunchService.pipe(
           Effect.flatMap((launches) =>
@@ -266,7 +284,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
             )
           : undefined;
       const modelSelection =
-        input.modelSelection ??
+        requestedModel ??
         launchedModel ??
         caller?.modelSelection ??
         (projectDefaults
@@ -289,21 +307,34 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
             "Pass modelSelection: the project has no default model. orchestrator_capabilities lists providers and models.",
         });
       let startedRuntimeMode =
-        projectDefaults !== undefined && input.runtimeMode === undefined
+        projectDefaults !== undefined && input.runtimeMode === undefined && presetMode === undefined
           ? yield* resolveRuntimeMode(runtimeMode, projectDefaults.defaultRuntimeMode).pipe(
               Effect.orElseSucceed(() => runtimeMode),
             )
           : runtimeMode;
       if (!replaying) {
         const providers = yield* (yield* ProviderRegistry.ProviderRegistry).getProviders;
-        startedRuntimeMode = yield* resolveRuntimeMode(startedRuntimeMode, input.runtimeMode, {
-          modelSelection,
-          supportedRuntimeModes: providers.find(
-            (provider) => provider.instanceId === modelSelection.instanceId,
-          )?.supportedRuntimeModes,
-        });
+        // A preset's mode counts as asked for, so it is held to the caller's own mode.
+        startedRuntimeMode = yield* resolveRuntimeMode(
+          presetMode === undefined ? startedRuntimeMode : runtimeMode,
+          input.runtimeMode ?? presetMode,
+          {
+            modelSelection,
+            supportedRuntimeModes: providers.find(
+              (provider) => provider.instanceId === modelSelection.instanceId,
+            )?.supportedRuntimeModes,
+          },
+        );
       }
       const notification = yield* ThreadNotifications.prepare(input.notify);
+      // The first turn starts when the launch commits, so the role is stored before it.
+      const standingRole = composeStandingRole({
+        standingRole: input.standingRole ?? preset?.standingRole,
+        doneFormat: preset?.doneFormat,
+      });
+      const roles = standingRole === undefined ? undefined : yield* ThreadRoles.ThreadRoles;
+      const roleOwner = McpInvocationContext.actorLabel(scope);
+      if (roles !== undefined && !replaying) yield* roles.set(threadId, standingRole!, roleOwner);
       const result = yield* ThreadMessageIntake.launchThread({
         commandId,
         threadId,
@@ -312,7 +343,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         modelSelection,
         runtimeMode: startedRuntimeMode,
         interactionMode,
-        workspaceStrategy: input.workspaceStrategy ?? { type: "root" },
+        workspaceStrategy: workspaceStrategy ?? { type: "root" },
         ...(input.message === undefined && attachments.length === 0
           ? {}
           : {
@@ -333,6 +364,17 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         // Kept only alongside linkOrigin: thread.create drops it otherwise.
         ...(input.delegatedFrom === undefined ? {} : { delegatedFrom: input.delegatedFrom }),
       }).pipe(
+        // A failure after the thread committed leaves its role; only a launch that never
+        // created the thread loses the one stored for it.
+        Effect.tapError(() =>
+          roles !== undefined && !replaying
+            ? Effect.gen(function* () {
+                const created = yield* context.threads.getThreadShell(threadId);
+                if (created === null || created.deletedAt !== null)
+                  yield* roles.set(threadId, null, roleOwner);
+              }).pipe(Effect.ignore({ log: true }))
+            : Effect.void,
+        ),
         Effect.mapError((error) => {
           if (error._tag === "AttachmentClaimError") {
             return new OrchestratorMcpFailure({

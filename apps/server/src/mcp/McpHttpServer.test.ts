@@ -1,6 +1,8 @@
 import * as RequestLog from "../persistence/McpRequestLog.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
+import * as LaunchPresets from "../persistence/LaunchPresets.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -311,6 +313,8 @@ const layerRecordingTools = (calls: Array<unknown>) => {
         Layer.mock(OrchestratorMcpService.OrchestratorMcpService)({}),
         Layer.mock(McpClientThreads.McpClientThreads)({}),
         Layer.mock(ThreadLaunchMcp.ThreadLaunchMcpService)({}),
+        Layer.mock(ThreadRoles.ThreadRoles)({}),
+        Layer.mock(LaunchPresets.LaunchPresets)({}),
         Layer.mock(ProjectService.ProjectService)({}),
         Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
         Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({

@@ -347,6 +347,12 @@ const make = Effect.gen(function* () {
           ...(runtimeMode === undefined ? {} : { runtimeMode }),
           ...(interactionMode === undefined ? {} : { interactionMode }),
           message: task,
+          // The preset resolves there. Its checkout kind never applies: a remote task runs in
+          // that project's checkout.
+          ...(input.preset === undefined
+            ? {}
+            : { preset: input.preset, workspaceStrategy: { type: "root" as const } }),
+          ...(input.standingRole === undefined ? {} : { standingRole: input.standingRole }),
           clientRequestId: `delegate:${scope.thread.threadId}:${key}`,
           // The thread there shows it is this thread's subagent, with a way back.
           delegatedFrom: {

@@ -5,6 +5,8 @@ import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as AgentRegistry from "../persistence/AgentRegistry.ts";
 import * as McpRequestLog from "../persistence/McpRequestLog.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
+import * as LaunchPresets from "../persistence/LaunchPresets.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -63,6 +65,8 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(McpBridgeMetrics.McpBridgeMetrics)({}),
   Layer.mock(McpClientThreads.McpClientThreads)({}),
   Layer.mock(WorkLedger.WorkLedger)({}),
+  Layer.mock(ThreadRoles.ThreadRoles)({}),
+  Layer.mock(LaunchPresets.LaunchPresets)({}),
   Layer.mock(McpRequestLog.McpRequestLog)({}),
   Layer.mock(AgentRegistry.AgentRegistry)({}),
   Layer.mock(AssetSigner)({}),
