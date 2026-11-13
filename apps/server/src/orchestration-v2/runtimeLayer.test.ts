@@ -73,6 +73,7 @@ import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import { CommandActor } from "./CommandActor.ts";
 import { ROLLBACK_FAILED_MESSAGE } from "./CheckpointRollbackService.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -2166,7 +2167,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         requestId,
         answers: { color: "  Blue  ", sizes: ["Small", "Large"], note: "" },
       };
-      const accepted = yield* orchestrator.dispatch(command);
+      const accepted = yield* orchestrator.dispatch(command).pipe(
+        Effect.provideService(CommandActor, {
+          kind: "owner_client",
+          client: { sessionId: "session1", clientLabel: "Chris's Mac" },
+        }),
+      );
       const repeated = yield* orchestrator.dispatch(command);
       assert.equal(repeated.sequence, accepted.sequence);
       const answered = yield* orchestrator.getThreadProjection(threadId);
@@ -2179,6 +2185,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       if (answeredItem?.type === "user_input_request") {
         assert.deepEqual(answeredItem.questionAnswer, {
           requestId,
+          answeredBy: "owner_client",
+          answeringClient: { sessionId: "session1", clientLabel: "Chris's Mac" },
+          quotesById: {
+            color: [{ kind: "text", text: "Blue", prefilled: false }],
+            sizes: [
+              { kind: "text", text: "Small", prefilled: false },
+              { kind: "text", text: "Large", prefilled: false },
+            ],
+            note: [{ kind: "text", text: "", prefilled: false }],
+          },
           answers: command.answers,
           attachmentsByQuestionId: {},
           questionTextById: {

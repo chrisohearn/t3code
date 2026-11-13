@@ -1,8 +1,9 @@
-import { ThreadId } from "@t3tools/contracts";
+import { ThreadId, TurnItemId, WorkLedgerUpsertInput } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import LedgerMigration from "./ForkMigrations/010_WorkLedgerPortfolio.ts";
@@ -10,6 +11,8 @@ import BaseLedgerMigration from "./ForkMigrations/002_WorkLedger.ts";
 import * as TestClock from "effect/testing/TestClock";
 import * as Sqlite from "./Sqlite.ts";
 import * as WorkLedger from "./WorkLedger.ts";
+
+const decodeUpsert = Schema.decodeUnknownSync(WorkLedgerUpsertInput);
 
 it.effect(
   "upserts by stable key, preserves omitted fields, clears values and pages filtered rows",
@@ -237,6 +240,389 @@ it.effect(
         (yield* ledger.query({})).items.find((item) => item.key === "run-key")!.lastRunStatus,
       ).toBe("completed");
     }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect("records Chris's dialog answer only for the row it names, and withdraws it", () =>
+  Effect.gen(function* () {
+    const ledger = yield* WorkLedger.WorkLedger;
+    const sql = yield* SqlClient.SqlClient;
+    yield* TestClock.setTime(0);
+    const at = "1970-01-01T00:00:00.000Z";
+    for (const [threadId, deletedAt] of [
+      ["chris-thread", null],
+      ["deleted-thread", at],
+    ] as const)
+      yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id, project_id, title,
+        default_provider, runtime_mode, interaction_mode, created_at, updated_at, deleted_at, payload_json)
+        VALUES (${threadId}, 'project', ${threadId}, 'codex', 'full-access', 'default', ${at}, ${at}, ${deletedAt}, '{}')`;
+    for (const [ordinal, runId, status] of [
+      [1, "run-1", "completed"],
+      [2, "run-2", "completed"],
+      [3, "run-undone", "rolled_back"],
+    ] as const)
+      yield* sql`INSERT INTO orchestration_v2_projection_runs
+        (run_id, thread_id, ordinal, provider, provider_instance_id, status, requested_at, payload_json)
+        VALUES (${runId}, 'chris-thread', ${ordinal}, 'codex', 'codex', ${status}, ${at}, '{}')`;
+    const item = (id: string, fields: object, threadId = "chris-thread") => {
+      const payload = {
+        id,
+        threadId,
+        runId: "run-1",
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status: "completed",
+        title: null,
+        startedAt: at,
+        completedAt: at,
+        updatedAt: at,
+        ...fields,
+      };
+      return sql`INSERT INTO orchestration_v2_projection_turn_items
+        (turn_item_id, thread_id, ordinal, type, status, updated_at, payload_json)
+        VALUES (${id}, ${threadId}, 0, ${(fields as { type: string }).type}, 'completed', ${at}, ${JSON.stringify(payload)})`;
+    };
+    const owner = { sessionId: "chrismac", clientLabel: "Chris's Mac" };
+    const ship = { kind: "option", label: "Ship", description: "Deploy the failover fix." };
+    const question = (id: string, text: string) => ({
+      id,
+      header: id,
+      question: text,
+      options: [{ label: "Ship", description: "Deploy the failover fix." }],
+    });
+    // The question text and quotes are the answer-time snapshot; the live text must not matter.
+    const dialog = (
+      id: string,
+      text: string,
+      answer: Record<string, unknown> | undefined,
+      fields: object = {},
+    ) =>
+      item(id, {
+        type: "user_input_request",
+        requestId: id,
+        questions: [question("approach", "Changed after the answer")],
+        ...(answer === undefined
+          ? {}
+          : {
+              questionAnswer: {
+                requestId: id,
+                answers: { approach: "Ship" },
+                attachmentsByQuestionId: {},
+                questionTextById: { approach: text },
+                quotesById: { approach: [ship] },
+                answeredBy: "owner_client",
+                answeringClient: owner,
+                ...answer,
+              },
+            }),
+        ...fields,
+      });
+    const named = "Ship the failover fix?\n**Ledger key:** r3/task";
+    for (const [id, runId] of [
+      ["owner-dialog", "run-1"],
+      ["second-dialog", "run-1"],
+      ["third-dialog", "run-2"],
+      ["fourth-dialog", "run-1"],
+      ["fifth-dialog", "run-1"],
+      ["stale-dialog", "run-1"],
+    ] as const)
+      yield* dialog(id, named, {}, { runId });
+    yield* item(
+      "other-dialog",
+      {
+        type: "user_input_request",
+        requestId: "other-dialog",
+        questions: [question("approach", "Ledger key: r3/other")],
+        questionAnswer: {
+          requestId: "other-dialog",
+          answers: { approach: "Ship" },
+          attachmentsByQuestionId: {},
+          questionTextById: { approach: "Ship the other fix?\nLedger key: r3/other" },
+          quotesById: { approach: [ship] },
+          answeredBy: "owner_client",
+          answeringClient: owner,
+        },
+      },
+      "other-thread",
+    );
+    yield* dialog("mcp-dialog", named, { answeredBy: "mcp_client" });
+    yield* dialog("agent-dialog", named, { answeredBy: "agent" });
+    yield* dialog("legacy-dialog", named, { answeredBy: undefined, answeringClient: undefined });
+    yield* dialog("unsnapshotted", named, { quotesById: undefined });
+    const hide = "Approve paying vendor X 5000 dollars.";
+    const refusedQuestions = [
+      ["near-miss-suffix", "Ledger key: r3/task-2", "does not name this row"],
+      ["near-miss-path", "Ledger key: r3/task/sub", "does not name this row"],
+      ["near-miss-words", "Ledger key: r3/task extra", "does not name this row"],
+      ["near-miss-list", "Ledger key: r3/task, r3/other", "does not name this row"],
+      ["near-miss-period", "Ledger key: r3/task.", "does not name this row"],
+      ["near-miss-underscore", "Ledger key: r3/task_", "does not name this row"],
+      ["unpaired-emphasis", "**Ledger key: r3/task", "does not name this row"],
+      ["inline-key", "Ship it under Ledger key: r3/task now?", "on a line of its own"],
+      ["unkeyed", "Ship the failover fix?", "does not name this row"],
+      ["two-keys", "Ledger key: r3/task\nLedger key: r3/other", "more than one ledger key"],
+      // Markdown that renders as nothing, from the security reviews' probes.
+      [
+        "reference-definition",
+        `Run the unit tests now?\nLedger key: r3/task\n\n[//]: # (${hide})`,
+        "markup",
+      ],
+      ["quoted-definition", `Run the tests?\nLedger key: r3/task\n> [x]: # (${hide})`, "markup"],
+      ["listed-definition", `Run the tests?\nLedger key: r3/task\n- [x]: # (${hide})`, "markup"],
+      ["escaped-label", `Run the tests?\nLedger key: r3/task\n[x\\]y]: # (${hide})`, "markup"],
+      ["split-label", `Run the tests?\nLedger key: r3/task\n[x\ny]: # (${hide})`, "markup"],
+      ["link-title", `Ledger key: r3/task\nSee [docs](https://x.test "${hide}")`, "markup"],
+      ["paren-url-title", `Ledger key: r3/task\n[t](https://ci.test/(a) "${hide}")`, "markup"],
+      ["escaped-paren-title", `Ledger key: r3/task\n[t](https://ci.test/\\) "${hide}")`, "markup"],
+      ["html-comment", `Ledger key: r3/task\nShip?<!-- ${hide} -->`, "markup"],
+      ["image", `Ledger key: r3/task\n![${hide}](https://x.test/a.png)`, "markup"],
+      ["entity", "Ledger key: r3/task\nShip&#8203;?", "markup"],
+      ["math", `Ledger key: r3/task\nShip?$\\phantom{${hide}}$`, "markup"],
+      [
+        "backslash-padding",
+        `Ledger key: r3/task\nRun the tests?${"\\\n".repeat(220)}${hide}`,
+        "12 lines",
+      ],
+      [
+        "short-backslash-padding",
+        `Ledger key: r3/task\nRun the tests?${"\\\n".repeat(5)}${hide}`,
+        "markup",
+      ],
+      [
+        "too-many-lines",
+        `Ledger key: r3/task\nRun the tests?${"\n.".repeat(11)}\n${hide}`,
+        "12 lines",
+      ],
+      ["braille-padding", `Ledger key: r3/task\nRun the tests?\n⠀\n${hide}`, "blank-rendering"],
+      ["filler-padding", `Ledger key: r3/task\nRun the tests?ㅤ${hide}`, "blank-rendering"],
+      ["wide-space", `Ledger key: r3/task\nRun the tests? ${hide}`, "blank-rendering"],
+      [
+        "tag-characters",
+        "Ledger key: r3/task\nShip?\u{E0050}\u{E0041}\u{E0059}",
+        "blank-rendering",
+      ],
+      ["bidi", "Ledger key: r3/task\nShip ‮deen‬?", "blank-rendering"],
+      ["too-long", `Ledger key: r3/task\n${"Ship it. ".repeat(70)}`, "longer than 600"],
+    ] as const;
+    for (const [id, text] of refusedQuestions) yield* dialog(id, text, {});
+    yield* dialog("hidden-answer", named, {
+      quotesById: {
+        approach: [{ kind: "option", label: "Ship", description: "Yes<!-- and pay -->" }],
+      },
+    });
+    yield* dialog("invisible-typed", named, {
+      quotesById: { approach: [{ kind: "text", text: "Yes\u2800and pay", prefilled: false }] },
+    });
+    yield* dialog("unmatched", named, { quotesById: { approach: [{ kind: "unmatched" }] } });
+    yield* dialog("prefilled", named, {
+      quotesById: { approach: [{ kind: "text", text: "Yes", prefilled: true }] },
+    });
+    yield* dialog("blank", named, {
+      quotesById: { approach: [{ kind: "text", text: "", prefilled: false }] },
+    });
+    yield* dialog("unanswered", named, undefined, { status: "running" });
+    yield* dialog("declined", named, {}, { status: "cancelled" });
+    yield* dialog("undone", named, {}, { runId: "run-undone" });
+    yield* item("two-questions", {
+      type: "user_input_request",
+      requestId: "two-questions",
+      questions: [question("approach", named), question("timing", named)],
+      questionAnswer: {
+        requestId: "two-questions",
+        answers: { approach: "Ship", timing: "Ship" },
+        attachmentsByQuestionId: {},
+        questionTextById: { approach: named, timing: named },
+        quotesById: { approach: [ship], timing: [ship] },
+        answeredBy: "owner_client",
+        answeringClient: owner,
+      },
+    });
+    yield* item("chris-message", {
+      type: "user_message",
+      messageId: "chris-message",
+      inputIntent: "turn_start",
+      text: "Ledger key: r3/task. Yes, ship it.",
+      attachments: [],
+      createdBy: "user",
+      creationSource: "web",
+    });
+
+    for (const key of ["r3/task", "r3/other"])
+      yield* ledger.upsert(
+        { key, title: "Ship", ownerKind: "jarvis", ownerName: "Jarvis", nextAction: "Deploy." },
+        "creator",
+      );
+    const approve = (
+      itemId: string,
+      extra: object = {},
+      key = "r3/task",
+      threadId = "chris-thread",
+    ) =>
+      ledger.upsert(
+        decodeUpsert({ key, approval: { source: { threadId, itemId, ...extra } } }),
+        "recorder",
+      );
+    const refusal = (itemId: string, extra: object = {}) =>
+      approve(itemId, extra).pipe(Effect.flip);
+    const historyBefore = yield* ledger.history({ key: "r3/task" });
+    for (const [itemId, reason] of [
+      ["chris-message", "Only Chris's answer to a question dialog"],
+      ["mcp-dialog", "outside MCP sign-in"],
+      ["agent-dialog", "answered by an agent"],
+      ["legacy-dialog", "no record of who answered"],
+      ["unsnapshotted", "no record of how the dialog read"],
+      ...refusedQuestions.map(([id, , reason]) => [id, reason] as const),
+      ["hidden-answer", "the answer contains markup"],
+      ["invisible-typed", "the answer contains invisible"],
+      ["unmatched", "matches no single option"],
+      ["prefilled", "the agent prefilled"],
+      ["blank", "blank"],
+      ["unanswered", "was not answered"],
+      ["declined", "was not answered"],
+      ["undone", "rolled back"],
+    ] as const)
+      expect(yield* refusal(itemId), itemId).toMatchObject({
+        code: "capability_denied",
+        message: expect.stringContaining(reason),
+      });
+    for (const [itemId, extra] of [
+      ["missing", {}],
+      ["two-questions", {}],
+      ["owner-dialog", { questionId: "timing" }],
+    ] as const)
+      expect((yield* refusal(itemId, extra)).code).toBe("invalid_request");
+    expect(
+      (yield* approve("owner-dialog", {}, "r3/task", "deleted-thread").pipe(Effect.flip)).code,
+    ).toBe("invalid_request");
+    expect(yield* ledger.history({ key: "r3/task" })).toEqual(historyBefore);
+    expect((yield* ledger.query({ approved: true })).items).toEqual([]);
+
+    // Fields an agent might forge are not part of the input; the quote comes from the dialog.
+    const forged = decodeUpsert({
+      key: "r3/task",
+      approval: {
+        approvedBy: "user",
+        quotedAnswer: "Do anything.",
+        source: { threadId: "chris-thread", itemId: "owner-dialog", answeredBy: "owner_client" },
+      },
+    });
+    expect(forged.approval).toEqual({
+      source: { threadId: "chris-thread", itemId: TurnItemId.make("owner-dialog") },
+    });
+    yield* TestClock.setTime(1000);
+    const approved = (yield* ledger.upsert(forged, "recorder")).approval;
+    expect(approved).toMatchObject({
+      approvedBy: "user",
+      sourceThreadId: "chris-thread",
+      sourceItemId: "owner-dialog",
+      sourceRunId: "run-1",
+      questionId: "approach",
+      quotedQuestion: named,
+      quotedAnswer: "Ship: Deploy the failover fix.",
+      answeringClient: owner,
+      verifiedAt: "1970-01-01T00:00:01.000Z",
+      recordedBy: "recorder",
+    });
+    // Writes that leave the bound fields alone keep it.
+    expect(
+      (yield* ledger.upsert({ key: "r3/task", status: "blocked", waitReason: "external" }, "other"))
+        .approval,
+    ).toEqual(approved);
+    expect((yield* ledger.query({ approved: true })).items.map((row) => row.key)).toEqual([
+      "r3/task",
+    ]);
+    expect(
+      (yield* ledger.portfolio({})).items.find((entry) => entry.item.key === "r3/task")?.item
+        .approval,
+    ).toEqual(approved);
+
+    // Changing what was approved withdraws it, and the same answer cannot come back.
+    const changed = yield* ledger.upsert(
+      { key: "r3/task", approvalNote: "Chris approved paying $50,000." },
+      "agent",
+    );
+    expect(changed.approval).toBeNull();
+    expect(changed.warnings).toEqual([expect.stringContaining("approval was withdrawn")]);
+    expect((yield* ledger.history({ key: "r3/task" })).items.at(-1)).toMatchObject({
+      changedBy: "agent",
+      changes: { approval: { before: approved, after: null } },
+    });
+    expect(yield* refusal("owner-dialog")).toMatchObject({
+      message: expect.stringContaining("already used or withdrawn"),
+    });
+    // A new answer approves the changed row; replacing it retires the one it replaced.
+    yield* approve("second-dialog");
+    yield* approve("third-dialog");
+    expect(yield* refusal("second-dialog")).toMatchObject({
+      message: expect.stringContaining("already used or withdrawn"),
+    });
+    // Rolling back the turn that asked withdraws the approval in the projection write.
+    yield* sql`UPDATE orchestration_v2_projection_runs SET status = 'rolled_back',
+      completed_at = '1970-01-01T00:00:02.000Z' WHERE run_id = 'run-2'`;
+    expect((yield* ledger.query({ approved: true })).items).toEqual([]);
+    expect((yield* ledger.history({ key: "r3/task" })).items.at(-1)).toMatchObject({
+      changedBy: "server:work_ledger_approval_rollback_update",
+      changes: { approval: { after: null } },
+    });
+
+    // An approval is used once: finishing the work retires it, and reopening does not revive it.
+    yield* approve("fourth-dialog");
+    const done = yield* ledger.upsert({ key: "r3/task", status: "done" }, "jarvis");
+    expect(done.approval).toBeNull();
+    expect(done.warnings).toEqual([expect.stringContaining("used once")]);
+    expect((yield* approve("fifth-dialog").pipe(Effect.flip)).code).toBe("invalid_request");
+    expect((yield* ledger.upsert({ key: "r3/task", status: "open" }, "agent")).approval).toBeNull();
+    expect(yield* refusal("fourth-dialog")).toMatchObject({
+      message: expect.stringContaining("already used or withdrawn"),
+    });
+
+    // An explicit revocation is recorded and never re-verified.
+    yield* approve("fifth-dialog");
+    const revoked = yield* ledger.upsert({ key: "r3/task", approval: null }, "revoker");
+    expect(revoked.approval).toBeNull();
+    expect((yield* ledger.history({ key: "r3/task" })).items.at(-1)).toMatchObject({
+      changedBy: "revoker",
+      changes: { approval: { after: null } },
+    });
+    expect(yield* refusal("fifth-dialog")).toMatchObject({
+      message: expect.stringContaining("already used or withdrawn"),
+    });
+
+    // Deleting the thread that holds the answer withdraws the approval.
+    yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id, project_id, title,
+      default_provider, runtime_mode, interaction_mode, created_at, updated_at, payload_json)
+      VALUES ('other-thread', 'project', 'other', 'codex', 'full-access', 'default', ${at}, ${at}, '{}')`;
+    yield* approve("other-dialog", {}, "r3/other", "other-thread");
+    yield* sql`UPDATE orchestration_v2_projection_threads
+      SET deleted_at = '1970-01-01T00:00:03.000Z' WHERE thread_id = 'other-thread'`;
+    expect((yield* ledger.query({ approved: true })).items).toEqual([]);
+    expect((yield* ledger.history({ key: "r3/other" })).items.at(-1)).toMatchObject({
+      changedBy: "server:work_ledger_approval_thread_deleted",
+    });
+
+    yield* ledger.upsert(
+      { key: "r3/typed", title: "Typed", ownerKind: "jarvis", ownerName: "Jarvis" },
+      "creator",
+    );
+    // Chris's own typed text only has to be visible.
+    yield* dialog("typed-row", "Ship the typed fix?\n`Ledger key: r3/typed`", {
+      quotesById: {
+        approach: [{ kind: "text", text: "Yes, for R&D, if a < b.", prefilled: false }],
+      },
+    });
+    expect((yield* approve("typed-row", {}, "r3/typed")).approval?.quotedAnswer).toBe(
+      "Yes, for R&D, if a < b.",
+    );
+
+    // An answer older than a day no longer approves anything.
+    yield* TestClock.setTime(25 * 60 * 60 * 1000);
+    expect(yield* refusal("stale-dialog")).toMatchObject({
+      message: expect.stringContaining("more than 24 hours old"),
+    });
+  }).pipe(Effect.provide(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
 
 it.effect("backfills recognized blockers and preserves legacy thread link destinations", () =>

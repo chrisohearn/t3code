@@ -130,6 +130,8 @@ import {
 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
 import { McpApprovalAnswerContext } from "../mcp/McpApprovalAnswerContext.ts";
+import { CommandActor } from "./CommandActor.ts";
+import { quoteUserInputAnswers } from "./userInputAnswerQuotes.ts";
 import {
   cancelledBeforeStart,
   continuationFailedBeforePrompt,
@@ -10919,6 +10921,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
 
       const approvalTurnItem = context.item;
+      const answerActor = yield* Effect.serviceOption(CommandActor);
       const mcpAnswer = yield* Effect.serviceOption(McpApprovalAnswerContext);
       if (
         Option.isSome(mcpAnswer) &&
@@ -11190,6 +11193,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ? {
                   questionAnswer: {
                     requestId: command.requestId,
+                    ...(Option.isSome(answerActor)
+                      ? {
+                          answeredBy: answerActor.value.kind,
+                          ...(answerActor.value.client === undefined
+                            ? {}
+                            : { answeringClient: answerActor.value.client }),
+                        }
+                      : {}),
+                    quotesById: quoteUserInputAnswers(approvalTurnItem.questions, answers),
                     answers,
                     attachmentsByQuestionId: command.attachmentsByQuestionId ?? {},
                     questionTextById: Object.fromEntries(
