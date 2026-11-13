@@ -1727,8 +1727,14 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const serverConfig = yield* ServerConfig;
   const homeLayout = yield* resolveCodexHomeLayout(config);
+  const processEnvironment = withCodexSqliteHome(
+    homeLayout,
+    yield* mergeProviderInstanceEnvironment(environment, hostEnvironment),
+  );
 
-  yield* materializeCodexShadowHome(homeLayout).pipe(
+  yield* materializeCodexShadowHome(homeLayout, {
+    sqliteHome: processEnvironment.CODEX_SQLITE_HOME,
+  }).pipe(
     Effect.mapError(
       (cause) =>
         new ProviderAdapterDriverCreateError({
@@ -1750,10 +1756,7 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
   return yield* makeCodexAdapterV2({
     instanceId,
     settings,
-    environment: withCodexSqliteHome(
-      homeLayout,
-      yield* mergeProviderInstanceEnvironment(environment, hostEnvironment),
-    ),
+    environment: processEnvironment,
     clientFactory,
     digest,
     fileSystem,

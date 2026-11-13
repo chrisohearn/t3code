@@ -1,10 +1,12 @@
 import { ProviderDriverKind, type CodexSettings } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as PlatformError from "effect/PlatformError";
 
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -126,10 +128,21 @@ export class CodexShadowHomeEntryConflictError extends Schema.TaggedError<CodexS
     entryName: Schema.String,
     linkPath: Schema.String,
     targetPath: Schema.String,
+    backupCommand: Schema.optional(Schema.String),
+    strandedBackupPath: Schema.optional(Schema.String),
   },
 ) {
   override get message(): string {
-    return `Cannot create Codex shadow home entry '${this.entryName}' because '${this.linkPath}' already exists and is not a symlink.`;
+    const base = `Cannot create Codex shadow home entry '${this.entryName}' because '${this.linkPath}' already exists and is not a symlink.`;
+    const stranded =
+      this.strandedBackupPath === undefined
+        ? ""
+        : ` Some of its files were moved to '${this.strandedBackupPath}' and could not be moved back.`;
+    const command =
+      this.backupCommand === undefined
+        ? ""
+        : ` Stop Codex for this instance, then move the shadow's own database and its SQLite files aside: ${this.backupCommand}`;
+    return `${base}${stranded}${command}`;
   }
 }
 
@@ -469,8 +482,178 @@ const ensureShadowAuthIsPrivate = Effect.fn("CodexHomeLayout.ensureShadowAuthIsP
   },
 );
 
-export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome")(function* (
+function shadowLinkEntryNames(sharedEntryNames: ReadonlyArray<string>): ReadonlySet<string> {
+  const entries = new Set<string>(KNOWN_SHARED_DIRECTORIES);
+  for (const entryName of sharedEntryNames) {
+    if (
+      !PRIVATE_ENTRY_NAMES.has(entryName) &&
+      !SHADOW_LOCAL_ENTRY_NAMES.has(entryName) &&
+      !SQLITE_SIDECAR_PATTERN.test(entryName)
+    ) {
+      entries.add(entryName);
+    }
+  }
+  return entries;
+}
+
+/** A regular file or directory in a shadow home where materializing would place a shared link. */
+export interface CodexShadowHomeConflict {
+  readonly entryName: string;
+  readonly path: string;
+  /** The shadow's own SQLite database and its sidecars, which must move together. */
+  readonly sqliteFiles: ReadonlyArray<string> | undefined;
+  /** Materializing moves it aside because Codex opens its databases in the shared home. */
+  readonly autoSettle: boolean;
+}
+
+function sqliteHomeIsShared(
+  path: Path.Path,
   layout: CodexHomeLayout,
+  sqliteHome: string | undefined,
+): boolean {
+  return sqliteHome !== undefined && path.resolve(sqliteHome) === layout.sharedHomePath;
+}
+
+/** Read-only: what materializing this shadow home would have to move aside or refuse. */
+export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(function* (
+  layout: CodexHomeLayout,
+  options: { readonly sqliteHome: string | undefined },
+): Effect.fn.Return<
+  ReadonlyArray<CodexShadowHomeConflict>,
+  CodexShadowHomeError,
+  FileSystem.FileSystem | Path.Path
+> {
+  const effectiveHomePath = layout.effectiveHomePath;
+  if (layout.mode !== "authOverlay" || !effectiveHomePath) return [];
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const context = { fileSystem, sharedHomePath: layout.sharedHomePath, effectiveHomePath };
+  const sharedEntryNames = yield* fileSystem.readDirectory(layout.sharedHomePath).pipe(
+    Effect.catchTags({
+      PlatformError: (cause) =>
+        cause.reason._tag === "NotFound"
+          ? Effect.succeed<ReadonlyArray<string>>([])
+          : new CodexShadowHomeFileSystemError({
+              ...context,
+              operation: "readDirectory",
+              path: layout.sharedHomePath,
+              cause,
+            }),
+    }),
+  );
+  const autoSettle = sqliteHomeIsShared(path, layout, options.sqliteHome);
+  const conflicts: Array<CodexShadowHomeConflict> = [];
+  for (const entryName of shadowLinkEntryNames(sharedEntryNames)) {
+    if (PRIVATE_ENTRY_NAMES.has(entryName) || REPLACEABLE_SHARED_RUNTIME_ENTRIES.has(entryName)) {
+      continue;
+    }
+    const entryPath = path.join(effectiveHomePath, entryName);
+    const state = yield* readLinkState({ ...context, entryName, linkPath: entryPath });
+    if (state._tag !== "NotSymlink") continue;
+    if (!SQLITE_DATABASE_PATTERN.test(entryName)) {
+      conflicts.push({ entryName, path: entryPath, sqliteFiles: undefined, autoSettle: false });
+      continue;
+    }
+    const sqliteFiles = [entryName];
+    for (const suffix of SQLITE_SIDECAR_SUFFIXES) {
+      const sidecar = `${entryName}${suffix}`;
+      const sidecarState = yield* readLinkState({
+        ...context,
+        entryName: sidecar,
+        linkPath: path.join(effectiveHomePath, sidecar),
+      });
+      if (sidecarState._tag !== "Missing") sqliteFiles.push(sidecar);
+    }
+    conflicts.push({ entryName, path: entryPath, sqliteFiles, autoSettle });
+  }
+  return conflicts;
+});
+
+function backupDirectoryFor(path: Path.Path, effectiveHomePath: string, millis: number): string {
+  const stamp = DateTime.formatIso(DateTime.makeUnsafe(millis))
+    .replace(/\.\d{3}Z$/, "Z")
+    .replace(/[-:]/g, "");
+  return path.join(
+    path.dirname(effectiveHomePath),
+    `${path.basename(effectiveHomePath)}-conflict-backup-${stamp}`,
+  );
+}
+
+function backupCommandFor(
+  platform: NodeJS.Platform,
+  directory: string,
+  files: ReadonlyArray<string>,
+): string {
+  if (platform === "win32") {
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+    return `New-Item -ItemType Directory -Force -Path ${quote(directory)} | Out-Null; Move-Item -LiteralPath ${files.map(quote).join(",")} -Destination ${quote(directory)}`;
+  }
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  return `mkdir -p ${quote(directory)} && mv ${files.map(quote).join(" ")} ${quote(directory)}/`;
+}
+
+// Moves a shadow's own database with its sidecars, all or nothing. Rename is the only
+// operation, so a file Windows holds open or a backup on another filesystem refuses the move.
+const moveShadowDatabaseAside = Effect.fn("CodexHomeLayout.moveShadowDatabaseAside")(
+  function* (input: {
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly sharedHomePath: string;
+    readonly effectiveHomePath: string;
+    readonly conflict: CodexShadowHomeConflict & { readonly sqliteFiles: ReadonlyArray<string> };
+    readonly backupDirectory: string;
+  }): Effect.fn.Return<
+    { readonly moved: true } | { readonly moved: false; readonly stranded: boolean },
+    never,
+    Path.Path
+  > {
+    const path = yield* Path.Path;
+    const { fileSystem, conflict, backupDirectory } = input;
+    const made = yield* fileSystem
+      .makeDirectory(backupDirectory, { recursive: true })
+      .pipe(Effect.exit);
+    if (made._tag === "Failure") return { moved: false, stranded: false };
+    const moved: Array<string> = [];
+    for (const name of conflict.sqliteFiles) {
+      const destination = path.join(backupDirectory, name);
+      // Rename replaces an existing file, so never move onto an earlier backup.
+      const destinationState = yield* readLinkState({
+        ...input,
+        entryName: name,
+        linkPath: destination,
+      }).pipe(Effect.option);
+      const renamed =
+        Option.isSome(destinationState) && destinationState.value._tag === "Missing"
+          ? yield* fileSystem
+              .rename(path.join(input.effectiveHomePath, name), destination)
+              .pipe(Effect.exit)
+          : undefined;
+      if (renamed === undefined || renamed._tag === "Failure") {
+        let stranded = false;
+        for (const back of moved.toReversed()) {
+          const restored = yield* fileSystem
+            .rename(path.join(backupDirectory, back), path.join(input.effectiveHomePath, back))
+            .pipe(Effect.exit);
+          if (restored._tag === "Failure") stranded = true;
+        }
+        return { moved: false, stranded };
+      }
+      moved.push(name);
+    }
+    return { moved: true };
+  },
+);
+
+// Shadow setup runs again for each session; concurrent runs must not split a database from its WAL.
+const shadowHomeLock = Semaphore.makeUnsafe(1);
+
+export const materializeCodexShadowHome = (
+  layout: CodexHomeLayout,
+  options: { readonly sqliteHome: string | undefined },
+) => shadowHomeLock.withPermit(materializeCodexShadowHomeUnlocked(layout, options));
+
+const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome")(function* (
+  layout: CodexHomeLayout,
+  options: { readonly sqliteHome: string | undefined },
 ) {
   if (layout.mode !== "authOverlay") return;
   const effectiveHomePath = layout.effectiveHomePath;
@@ -522,16 +705,7 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
         }),
     }),
   );
-  const entries = new Set<string>(KNOWN_SHARED_DIRECTORIES);
-  for (const entryName of sharedEntryNames) {
-    if (
-      !PRIVATE_ENTRY_NAMES.has(entryName) &&
-      !SHADOW_LOCAL_ENTRY_NAMES.has(entryName) &&
-      !SQLITE_SIDECAR_PATTERN.test(entryName)
-    ) {
-      entries.add(entryName);
-    }
-  }
+  const entries = shadowLinkEntryNames(sharedEntryNames);
 
   yield* Effect.forEach(
     PRIVATE_ENTRY_NAMES,
@@ -546,6 +720,47 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
           }),
     { discard: true },
   );
+
+  const conflicts = yield* inspectCodexShadowHome(layout, options);
+  const platform = yield* HostProcess.Platform;
+  const backupDirectory = backupDirectoryFor(
+    path,
+    effectiveHomePath,
+    yield* Clock.currentTimeMillis,
+  );
+  for (const conflict of conflicts) {
+    if (conflict.sqliteFiles === undefined) continue;
+    const sqliteConflict = { ...conflict, sqliteFiles: conflict.sqliteFiles };
+    const result = conflict.autoSettle
+      ? yield* moveShadowDatabaseAside({
+          fileSystem,
+          sharedHomePath: layout.sharedHomePath,
+          effectiveHomePath,
+          conflict: sqliteConflict,
+          backupDirectory,
+        })
+      : { moved: false as const, stranded: false };
+    if (result.moved) {
+      yield* Effect.logWarning(
+        "Moved a Codex shadow home's own SQLite database aside so the shadow can share the home's database.",
+        { files: conflict.sqliteFiles, backup: backupDirectory },
+      );
+      continue;
+    }
+    return yield* new CodexShadowHomeEntryConflictError({
+      sharedHomePath: layout.sharedHomePath,
+      effectiveHomePath,
+      entryName: conflict.entryName,
+      linkPath: conflict.path,
+      targetPath: path.join(layout.sharedHomePath, conflict.entryName),
+      backupCommand: backupCommandFor(
+        platform,
+        backupDirectory,
+        conflict.sqliteFiles.map((name) => path.join(effectiveHomePath, name)),
+      ),
+      ...(result.stranded ? { strandedBackupPath: backupDirectory } : {}),
+    });
+  }
 
   yield* settleShadowSqliteSidecars({
     fileSystem,

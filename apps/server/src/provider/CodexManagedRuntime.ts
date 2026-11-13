@@ -91,7 +91,18 @@ export const makeCodexManagedRuntime = Effect.fn("makeCodexManagedRuntime")(func
       environmentId,
       profileKey,
     ]);
-    yield* materializeCodexShadowHome(homeLayout).pipe(
+    // Ambient CLI overrides cannot redirect a T3-owned token to a different provider.
+    const environment = withCodexSqliteHome(homeLayout, {
+      ...options.environment,
+      CODEX_HOME: homePath,
+    });
+    delete environment.ACCESS_TOKEN;
+    delete environment.T3CODE_CODEX_LAUNCH_ARGS;
+    delete environment.OPENAI_API_KEY;
+    delete environment.OPENAI_BASE_URL;
+    yield* materializeCodexShadowHome(homeLayout, {
+      sqliteHome: environment.CODEX_SQLITE_HOME,
+    }).pipe(
       Effect.provideService(FileSystem.FileSystem, fs),
       Effect.provideService(Path.Path, path),
       Effect.mapError(
@@ -113,15 +124,6 @@ export const makeCodexManagedRuntime = Effect.fn("makeCodexManagedRuntime")(func
           }),
       ),
     );
-    // Ambient CLI overrides cannot redirect a T3-owned token to a different provider.
-    const environment = withCodexSqliteHome(homeLayout, {
-      ...options.environment,
-      CODEX_HOME: homePath,
-    });
-    delete environment.ACCESS_TOKEN;
-    delete environment.T3CODE_CODEX_LAUNCH_ARGS;
-    delete environment.OPENAI_API_KEY;
-    delete environment.OPENAI_BASE_URL;
     return {
       config: decodeSettings({
         enabled: options.enabled,

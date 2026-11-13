@@ -211,6 +211,9 @@ for protocol in 3 4; do
   grep -q '"status":"ready"' "$logs/preflight-$protocol.json" ||
     fail "service preflight on the live database (launcher protocol $protocol)" "preflight-$protocol.json"
 done
+# Codex shadow homes the new build would refuse to set up; `auto-settle` ones it moves aside itself.
+grep -q '"codexShadowHomes":{"status":"ready"' "$logs/preflight-4.json" ||
+  fail "Codex shadow home preflight (an instance's shadow conflicts with its shared home)" preflight-4.json
 
 if [[ -n "$dry_run" ]]; then
   keep_worktree=1
