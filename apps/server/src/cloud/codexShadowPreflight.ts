@@ -89,7 +89,8 @@ export const inspectConfiguredCodexShadowHomes = Effect.fn("inspectConfiguredCod
     const instances: Array<CodexShadowHomeReport> = [];
     // A default instance has no stored config and so no shadow home; only stored ones can.
     for (const [instanceId, instance] of Object.entries(settings.providerInstances)) {
-      if (instance.driver !== CODEX) continue;
+      // A policy that disallows the driver keeps startup from setting up any of its homes.
+      if (instance.driver !== CODEX || !policy.providers.isDriverAllowed(CODEX)) continue;
       const decoded = decodeCodexSettings(instance.config ?? {});
       if (decoded._tag === "Failure") {
         instances.push({

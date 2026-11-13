@@ -231,6 +231,13 @@ it.layer(NodeServices.layer)("inspectConfiguredCodexShadowHomes", (it) => {
 
           expect(report.status).toBe("not-ready");
           expect(report.instances.map((instance) => instance.status)).toEqual(["not-ready"]);
+          // Startup never sets up a Codex instance the policy disallows.
+          expect(
+            yield* inspectConfiguredCodexShadowHomes(stateDir, {
+              ...policy,
+              providers: { ...policy.providers, isDriverAllowed: () => false },
+            }),
+          ).toEqual({ status: "ready", instances: [] });
         }),
     );
 
