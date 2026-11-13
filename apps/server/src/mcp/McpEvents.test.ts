@@ -1085,6 +1085,51 @@ it.each([
   );
 });
 
+it("says why a cancelled run stopped, so a restart cancel does not read as a failure", () => {
+  const threadId = ThreadId.make("restart-thread");
+  const instanceId = ProviderInstanceId.make("fixture");
+  const run = {
+    id: RunId.make("restart-run"),
+    threadId,
+    ordinal: 75,
+    providerInstanceId: instanceId,
+    modelSelection: { instanceId, model: "fixture" },
+    providerThreadId: null,
+    userMessageId: MessageId.make("restart-message"),
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "cancelled" as const,
+    requestedAt: DateTime.makeUnsafe(0),
+    startedAt: DateTime.makeUnsafe(0),
+    completedAt: DateTime.makeUnsafe(0),
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  const observe = (
+    payload: typeof run & { readonly stop?: { reason: string; actor: { kind: string } } },
+  ) =>
+    McpEvents.observeEvent(
+      {
+        sequence: 10,
+        commandId: null,
+        event: {
+          id: EventId.make("restart-event"),
+          threadId,
+          runId: run.id,
+          occurredAt: DateTime.makeUnsafe(0),
+          type: "run.updated",
+          payload,
+        },
+      },
+      { lineage: { rootThreadId: threadId, parentThreadId: null, relationshipToParent: null } },
+      "https://app.example.com/thread",
+    )?.data;
+  expect(
+    observe({ ...run, stop: { reason: "server_shutdown", actor: { kind: "server" } } }),
+  ).toMatchObject({ state: "cancelled", stopReason: "server_shutdown" });
+  expect(observe(run)).not.toHaveProperty("stopReason");
+});
+
 it.effect(
   "emits a minimal pending-decision observation without approval execution or resolved-request prose",
   () =>

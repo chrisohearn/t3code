@@ -80,6 +80,7 @@ export const observeEvent = (
   let name: McpEventName;
   let state: string;
   let resourceId: string | undefined;
+  let stopReason: string | undefined;
   switch (event.type) {
     case "run.updated":
     case "subagent.updated":
@@ -95,6 +96,7 @@ export const observeEvent = (
         return;
       name = state === "failed" ? "thread.blocker" : "thread.run.result";
       resourceId = event.payload.id;
+      if (event.type === "run.updated") stopReason = event.payload.stop?.reason;
       break;
     case "runtime-request.updated":
       if (event.payload.status !== "pending") return;
@@ -122,6 +124,7 @@ export const observeEvent = (
       state,
       ...(event.runId === undefined ? {} : { runId: event.runId }),
       ...(resourceId === undefined ? {} : { resourceId }),
+      ...(stopReason === undefined ? {} : { stopReason }),
       parentThreadId: thread.lineage.parentThreadId,
       relationshipToParent: thread.lineage.relationshipToParent,
     },

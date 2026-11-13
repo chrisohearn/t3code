@@ -1101,6 +1101,31 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       expect(projection.turnItems.filter((item) => item.type === "user_message")).toMatchObject([
         { messageId: command.messageId, postOnly: true, inputIntent: "post" },
       ]);
+
+      // A notice the server posts for the record leaves a settled, snoozed thread as it was.
+      yield* orchestrator.dispatch({
+        type: "thread.settle",
+        commandId: CommandId.make("post-settle-again"),
+        threadId,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make("post-snooze-again"),
+        threadId,
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        ...command,
+        createdBy: "agent",
+        creationSource: "server",
+        commandId: CommandId.make("post-server-notice"),
+        messageId: MessageId.make("post-server-notice"),
+        text: "Your message was not delivered.",
+      });
+      const noticed = yield* orchestrator.getThreadProjection(threadId);
+      expect(noticed.thread.settledOverride).toBe("settled");
+      expect(noticed.thread.snoozedUntil).not.toBeNull();
+      expect(noticed.messages.map((message) => message.id)).toContain("post-server-notice");
     }),
   );
 
