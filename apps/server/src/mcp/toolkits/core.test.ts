@@ -1308,11 +1308,21 @@ it.effect("schedules a model change on a busy thread and shows it until it appli
       scheduledModelSelection: scheduled,
     });
 
-    for (const refused of [
-      { runtimeMode: "approval-required", applyAt: "next_turn" },
-      { modelSelection: { instanceId: "claudeAgent", model: "opus" }, applyAt: "next_turn" },
-    ]) {
-      expect(declaredFailure(yield* call(refused))).toMatchObject({ code: "invalid_request" });
+    for (const [refused, code] of [
+      [{ runtimeMode: "approval-required", applyAt: "next_turn" }, "invalid_request"],
+      [{ applyAt: "next_turn" }, "invalid_request"],
+      [
+        { modelSelection: { instanceId: "claudeAgent", model: "opus" }, applyAt: "next_turn" },
+        "invalid_request",
+      ],
+      [
+        { modelSelection: { instanceId: "codex", model: "gpt-9" }, applyAt: "next_turn" },
+        "model_unavailable",
+      ],
+    ] as const) {
+      expect(declaredFailure(yield* call(refused)), JSON.stringify(refused)).toMatchObject({
+        code,
+      });
     }
     expect(commands).toHaveLength(1);
   }).pipe(
@@ -1335,6 +1345,13 @@ it.effect("schedules a model change on a busy thread and shows it until it appli
                 commands.push(command);
                 return { sequence: 7 } as never;
               }),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([
+              { instanceId: "codex", models: [{ slug: "gpt-5" }, { slug: "gpt-6" }] } as never,
+            ]),
           }),
         ),
       ),

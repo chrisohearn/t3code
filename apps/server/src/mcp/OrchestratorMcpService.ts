@@ -413,7 +413,7 @@ function knownOptions(
 }
 
 /** Skip checks without descriptors; reject duplicate IDs because consumers disagree on precedence. */
-function invalidOptionSelections(
+export function invalidOptionSelections(
   selections: ReadonlyArray<ProviderOptionSelection>,
   descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
 ): ReadonlyArray<string> {

@@ -13,7 +13,12 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { modelSelectionCommandType } from "@t3tools/shared/model";
+import * as Option from "effect/Option";
+import { modelSelectionCommandType, withLegacyUltracodeEffort } from "@t3tools/shared/model";
+
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
+import { invalidOptionSelections } from "../../OrchestratorMcpService.ts";
+import { advertisedModel, requireAdvertisedModel } from "../../providerModels.ts";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -223,7 +228,10 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     ),
   ),
   t3_thread_configure: McpToolAccess.either(
-    (input) => input.modelSelection === undefined && input.runtimeMode === undefined,
+    (input) =>
+      input.modelSelection === undefined &&
+      input.runtimeMode === undefined &&
+      input.applyAt === undefined,
     McpToolAccess.reads((input) =>
       Effect.gen(function* () {
         const {
@@ -294,6 +302,28 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           });
         }
         const applyAt = input.applyAt;
+        // A scheduled selection is checked now: a bad one would fail each queued message in turn.
+        const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
+        if (applyAt !== undefined && Option.isSome(registry)) {
+          const provider = (yield* registry.value.getProviders).find(
+            (candidate) => candidate.instanceId === modelSelection.instanceId,
+          );
+          if (provider !== undefined) {
+            yield* requireAdvertisedModel(provider, modelSelection.model);
+            const descriptors = advertisedModel(provider, modelSelection.model)?.capabilities
+              ?.optionDescriptors;
+            const invalid = invalidOptionSelections(
+              withLegacyUltracodeEffort(descriptors, modelSelection.options) ?? [],
+              descriptors,
+            );
+            if (invalid.length > 0) {
+              return yield* new OrchestratorMcpFailure({
+                code: "invalid_request",
+                message: `modelSelection.options rejected: ${invalid.join(" ")}`,
+              });
+            }
+          }
+        }
         const result = yield* threads
           .dispatch({
             type,

@@ -4141,6 +4141,58 @@ describe("OrchestratorMcpService thread lookup", () => {
       }),
   );
 
+  it.effect("reports where a queued send waits behind the active run", () =>
+    Effect.gen(function* () {
+      const sent = yield* Ref.make(0);
+      const startedAt = DateTime.makeUnsafe(0);
+      const runs = [
+        {
+          id: RunId.make("run:active"),
+          ordinal: 1,
+          status: "running",
+          requestedAt: startedAt,
+          startedAt,
+        },
+        { id: RunId.make("run:ahead"), ordinal: 2, status: "queued", userMessageId: "m:ahead" },
+        { id: RunId.make("run:mine"), ordinal: 3, status: "queued", userMessageId: "m:mine" },
+      ];
+      const filters: Array<unknown> = [];
+      yield* TestClock.adjust("90 seconds");
+      const result = yield* Effect.gen(function* () {
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* mcp.sendToThread(client, { threadId: launched.id, message: "hello" });
+      }).pipe(
+        Effect.provide(
+          service([launched], sent, {
+            getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(launched)),
+            sendToThread: () =>
+              Effect.succeed({
+                delivery: "queued",
+                run: { id: RunId.make("run:mine"), status: "queued" },
+              } as never),
+            getThreadRecords: (_threadId, _fields, filter) => {
+              filters.push(filter);
+              return Effect.succeed({
+                runs,
+                messages: [{ id: "m:ahead" }, { id: "m:mine" }],
+              } as unknown as OrchestrationV2ThreadProjection);
+            },
+          }),
+        ),
+      );
+      assert.deepEqual(result.queue, {
+        position: 2,
+        messagesAhead: 1,
+        activeRunId: RunId.make("run:active"),
+        activeRunAgeSeconds: 90,
+      });
+      assert.deepEqual(filters, [
+        { runStatuses: ["preparing", "starting", "running", "waiting", "queued"] },
+        { messageIds: ["m:ahead", "m:mine"] },
+      ]);
+    }),
+  );
+
   it.effect(
     "seeds coordinator rollover while leaving ordinary sends and clean resets unchanged",
     () =>
