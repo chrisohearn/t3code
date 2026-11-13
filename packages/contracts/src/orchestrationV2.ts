@@ -1,5 +1,6 @@
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import { withRecordIdTable } from "./orchestrationV2IdTable.ts";
+import { ThreadFreeze, ThreadUnfreeze } from "./threadFreeze.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -536,6 +537,12 @@ export const OrchestrationV2AppThread = Schema.Struct({
       }),
     ),
   ),
+  /** Set while an operator has frozen the thread: no run starts until it is lifted. */
+  frozen: Schema.optional(Schema.NullOr(ThreadFreeze)),
+  /** Who lifted the last freeze. */
+  unfrozen: Schema.optional(Schema.NullOr(ThreadUnfreeze)),
+  /** Set by an unfreeze: the next message that starts a run starts on a fresh provider context. */
+  nextTurnFreshContext: Schema.optional(Schema.Boolean),
   deletedAt: Schema.NullOr(Schema.DateTimeUtc),
 });
 export type OrchestrationV2AppThread = typeof OrchestrationV2AppThread.Type;
@@ -3284,6 +3291,8 @@ export const OrchestrationV2Command = Schema.Union([
     limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
     /** Link (object) or unlink (null) a pull request; absent leaves it unchanged. */
     linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
+    /** Freeze the thread. Only `t3_thread_organize` may set it; lifting goes through `queue.resume`. */
+    frozen: Schema.optional(ThreadFreeze),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request.link"),

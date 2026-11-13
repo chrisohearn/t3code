@@ -20,6 +20,7 @@ import {
   RunId,
   NonNegativeInt,
   ProjectId,
+  ThreadFreeze,
 } from "@t3tools/contracts";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Schema from "effect/Schema";
@@ -34,7 +35,7 @@ import * as PendingApproval from "../../PendingApprovalMcpService.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
-    "Pin, snooze, settle, archive, or mark unread. move: file an idle No project thread into existing `projectId`; keeps its folder. Omit `threadId` for this thread. `snooze` needs `snoozedUntil`. Settling this thread applies at turn end. A failed turn or queued message leaves it active.",
+    "Pin, snooze, settle, archive, or mark unread. move: file an idle No project thread into existing `projectId`; keeps its folder. Omit `threadId` for this thread. `snooze` needs `snoozedUntil`. Settling this thread applies at turn end. A failed turn or queued message leaves it active. freeze (needs `reason`): stop the run, hold the queue and delegates, start nothing until unfreeze. unfreeze: resume; `freshContext` needs an empty queue.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
@@ -49,14 +50,30 @@ const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
       "unarchive",
       "mark_unread",
       "move",
+      "freeze",
+      "unfreeze",
     ]),
     snoozedUntil: Schema.optional(IsoDateTime),
     projectId: Schema.optional(ProjectId),
+    reason: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(500))),
+    freshContext: Schema.optional(Schema.Boolean),
   }),
   success: Schema.Union([
     OrchestrationV2DispatchCommandResult,
     Schema.Struct({ moved: Schema.Literal(true), threadIds: Schema.Array(ThreadId) }),
     Schema.Struct({ settlesWhenTurnEnds: Schema.Literal(true) }),
+    Schema.Struct({
+      frozen: Schema.Literal(true),
+      freeze: ThreadFreeze,
+      interruptedRunId: Schema.NullOr(RunId),
+      queuedMessages: NonNegativeInt,
+    }),
+    Schema.Struct({
+      frozen: Schema.Literal(false),
+      wasFrozen: Schema.Boolean,
+      queuedMessages: NonNegativeInt,
+      freshContextNext: Schema.optional(Schema.Literal(true)),
+    }),
   ]),
   failure: OrchestratorMcpFailure,
   failureMode: "return" as const,

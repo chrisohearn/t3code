@@ -22,6 +22,7 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
+import * as Hash from "effect/Hash";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -2130,4 +2131,100 @@ it.effect.each(["capability_denied", "invalid_request"] as const)(
       expect(JSON.stringify(entries)).not.toContain("private failure details");
     }).pipe(Effect.provide(layer));
   },
+);
+
+it.effect(
+  "logs the connection of each call by its Mcp-Session-Id, over the real HTTP transport",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const entries: Array<{ readonly connection?: string | undefined }> = [];
+        const scope: McpInvocationContext.McpThreadInvocationScope = {
+          environmentId,
+          requestNamespace: "shared-token",
+          thread: {
+            threadId: ThreadId.make("thread-shared"),
+            providerSessionId: "provider-session",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+        const toolkit = Toolkit.make(
+          Tool.make("probe", {
+            success: Schema.Struct({}),
+            failure: OrchestratorMcpFailure,
+            failureMode: "return",
+          }),
+        );
+        const serverLayer = McpHttpServer.layerMcpTransport(
+          McpHttpServer.toolkitRegistration(
+            toolkit,
+            McpToolAccess.toLayer(toolkit, {
+              probe: McpToolAccess.reads(() => Effect.succeed({})),
+            }),
+          ),
+        ).pipe(
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+          Layer.provide(
+            Layer.mock(RequestLog.McpRequestLog)({
+              record: (entry) => Effect.sync(() => void entries.push(entry)),
+            }),
+          ),
+          Layer.provide(
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              resolve: () => Effect.succeed(scope),
+            }),
+          ),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const httpClient = yield* HttpClient.HttpClient;
+        const headers = {
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer shared-token",
+        };
+        const connect = Effect.gen(function* () {
+          const initialize = yield* httpClient.post("/mcp", {
+            headers,
+            body: HttpBody.text(
+              `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+              "application/json",
+            ),
+          });
+          const sessionId = initialize.headers["mcp-session-id"]!;
+          const call = httpClient
+            .post("/mcp", {
+              headers: {
+                ...headers,
+                "mcp-session-id": sessionId,
+                "mcp-protocol-version": "2025-06-18",
+              },
+              body: HttpBody.text(
+                `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"probe","arguments":{}}}`,
+                "application/json",
+              ),
+            })
+            .pipe(Effect.flatMap((response) => response.text));
+          return { sessionId, call };
+        });
+        // Two agents on one sign-in, each with its own MCP session; one makes parallel calls.
+        const first = yield* connect;
+        const second = yield* connect;
+        yield* Effect.all([first.call, first.call, second.call], { concurrency: "unbounded" });
+        const [a1, a2, b1] = [...entries].toSorted((left, right) =>
+          String(left.connection).localeCompare(String(right.connection)),
+        );
+        expect(entries).toHaveLength(3);
+        expect(new Set(entries.map((entry) => entry.connection)).size).toBe(2);
+        expect(a1?.connection).toBeDefined();
+        expect([a1, a2, b1].every((entry) => entry?.connection !== undefined)).toBe(true);
+        expect(new Set(entries.map((entry) => entry.connection))).toEqual(
+          new Set([first.sessionId, second.sessionId].map((id) => Hash.string(id).toString(16))),
+        );
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

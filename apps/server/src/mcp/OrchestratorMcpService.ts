@@ -953,6 +953,7 @@ function threadDetail(
     ...threadSettlement(projection.thread),
     ...threadSnooze(shell, nowMs),
     ...threadBackgroundWork(shell),
+    frozen: projection.thread.frozen ?? null,
     createdAt: DateTime.formatIso(projection.thread.createdAt),
     updatedAt: DateTime.formatIso(projection.thread.updatedAt),
   };
@@ -3539,6 +3540,8 @@ const make = Effect.gen(function* () {
         ...(result.run.delegatedTaskId === undefined ? {} : { taskId: result.run.delegatedTaskId }),
         status: result.run.status,
         delivery: result.delivery,
+        ...(result.run.queueHeld === true ? { held: true as const } : {}),
+        ...(target.thread.frozen == null ? {} : { frozen: true as const }),
       } satisfies OrchestratorMcpThreadSendResult;
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {

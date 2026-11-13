@@ -98,6 +98,7 @@ function queueWorkflowStatesEqual(
   return (
     left.activeRun === right.activeRun &&
     left.isHeld === right.isHeld &&
+    left.frozen === right.frozen &&
     left.canSendNow === right.canSendNow &&
     left.canPromoteToSteer === right.canPromoteToSteer &&
     left.promoteSkipsCompaction === right.promoteSkipsCompaction &&

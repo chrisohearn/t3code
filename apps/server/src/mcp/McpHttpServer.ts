@@ -6,6 +6,7 @@ import * as McpRequestLog from "../persistence/McpRequestLog.ts";
 import * as McpBridgeMetrics from "./McpBridgeMetrics.ts";
 import * as BridgeStatus from "../persistence/McpBridgeStatus.ts";
 import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
+import * as AgentRegistry from "../persistence/AgentRegistry.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
 import { LedgerToolkit } from "./toolkits/ledger/tools.ts";
@@ -16,6 +17,7 @@ import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Hash from "effect/Hash";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -325,7 +327,12 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     const limited = McpInvocationContext.withRuntimeModeCeiling(attributed, runtimeModeCeiling);
     const linkedEnvironments = yield* linksEnabled;
     if (limited.client?.linked === true && !linkedEnvironments) return linkedEnvironmentsOff;
-    return { ...limited, linkedEnvironments };
+    const mcpSessionId = request.headers["mcp-session-id"];
+    return {
+      ...limited,
+      linkedEnvironments,
+      ...(mcpSessionId === undefined ? {} : { connection: Hash.string(mcpSessionId).toString(16) }),
+    };
   });
   // Untraced: a span here would wrap the tool call; the HTTP server span already covers it.
   return Effect.fnUntraced(function* (httpEffect) {
@@ -1222,6 +1229,7 @@ const withToolAnalytics =
                                 result,
                                 exit._tag === "Failure" ? exit.cause : undefined,
                               ),
+                              connection: scope.connection,
                             })
                             .pipe(Effect.ignoreCause);
                         }
@@ -1566,4 +1574,5 @@ export const layer = Layer.merge(
   Layer.provide(McpClientThreads.layer),
   Layer.provide(McpBridgeMetrics.layer),
   Layer.provide(McpRequestLog.layer),
+  Layer.provide(AgentRegistry.layer),
 );
