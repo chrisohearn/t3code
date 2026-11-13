@@ -3,6 +3,7 @@ import {
   EnvironmentConnectReachability,
   McpEventSubscriptionsResult,
   McpEventWatch,
+  McpEventSubscriptionDuplicates,
   OrchestratorMcpFailure,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -14,11 +15,14 @@ import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as McpEvents from "./McpEvents.ts";
 import * as Metrics from "./McpBridgeMetrics.ts";
+import { RelayDiagnostics } from "./McpEventRelay.ts";
 export const BridgeStatusResult = Schema.Struct({
+  ...RelayDiagnostics.fields,
   serviceStartedAt: Schema.String,
   tunnel: Schema.NullOr(EnvironmentConnectReachability),
   daysUntilSessionExpires: Schema.Number,
   subscriptions: McpEventSubscriptionsResult.fields.subscriptions,
+  subscriptionDuplicates: McpEventSubscriptionDuplicates,
   inboxThreadId: McpEventSubscriptionsResult.fields.inboxThreadId,
   watches: Schema.Array(McpEventWatch),
   relayFailures: Schema.Number,

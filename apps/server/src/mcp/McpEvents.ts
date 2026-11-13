@@ -14,6 +14,7 @@ import {
   McpEventArguments,
   McpEventData,
   McpEventWatch,
+  McpEventSubscriptionDuplicates,
   McpEventsError,
   type McpEventSubscribe,
   type McpEventInboxInput,
@@ -163,11 +164,12 @@ export class McpEvents extends Context.Service<
       clientRequestId?: string,
     ) => Effect.Effect<McpThreadNotifyResult, McpEventsError, Invocation.McpInvocationContext>;
     readonly bridgeStatus: () => Effect.Effect<
-      {
+      typeof Relay.RelayDiagnostics.Type & {
         readonly serviceStartedAt: string;
         readonly tunnel: EnvironmentConnectReachability | null;
         readonly daysUntilSessionExpires: number;
         readonly subscriptions: McpEventSubscriptionsResult["subscriptions"];
+        readonly subscriptionDuplicates: typeof McpEventSubscriptionDuplicates.Type;
         readonly inboxThreadId: ThreadId | null;
         readonly relayFailures: number;
         readonly relayPending: number;
@@ -640,6 +642,7 @@ const make = Effect.gen(function* () {
           status: "unavailable" as const,
           subscriptionIds: [],
           reason: "no_pinned_inbox",
+          warning: yield* relay.missingInbox(scope.client.sessionId),
         }
       );
     }),
@@ -666,7 +669,18 @@ const make = Effect.gen(function* () {
       const listing = yield* listSubscriptions();
       const listed = listing.subscriptions;
       const watches = new Map<string, typeof McpEventWatch.Type>();
+      const overlaps = new Map<string, (typeof McpEventSubscriptionDuplicates.Type)[number]>();
       for (const sub of listed.filter((sub) => sub.status === "active")) {
+        const key = yield* encodeJson([sub.arguments.threadId, sub.name]).pipe(
+          Effect.mapError(storage),
+        );
+        const overlap = overlaps.get(key);
+        overlaps.set(key, {
+          threadId: sub.arguments.threadId,
+          name: sub.name,
+          subscriptionIds: [...(overlap?.subscriptionIds ?? []), sub.id],
+          callbackGroups: [...new Set([...(overlap?.callbackGroups ?? []), sub.callbackGroup])],
+        });
         const watch = watches.get(sub.callbackGroup);
         watches.set(sub.callbackGroup, {
           callbackGroup: sub.callbackGroup,
@@ -687,6 +701,9 @@ const make = Effect.gen(function* () {
         ),
         inboxThreadId: listing.inboxThreadId,
         subscriptions: listed,
+        subscriptionDuplicates: [...overlaps.values()].filter(
+          (group) => group.subscriptionIds.length > 1,
+        ),
         watches: [...watches.values()],
         ...(yield* relay.status(principal.sessionId)),
         lastSuccessfulEventDeliveryAt:

@@ -3475,6 +3475,9 @@ const make = Effect.gen(function* () {
       ).pipe(Effect.provideService(Invocation.McpInvocationContext, scope));
       return {
         ...(notify === undefined ? {} : { notify }),
+        ...(notify !== undefined && "warning" in notify && notify.warning !== undefined
+          ? { warning: notify.warning }
+          : {}),
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
         messageId,

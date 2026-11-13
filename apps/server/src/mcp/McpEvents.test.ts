@@ -154,8 +154,8 @@ const fixture = Effect.gen(function* () {
       Effect.map((built) => Context.get(built, McpEvents.McpEvents)),
     );
   const service = yield* build();
-  const principal = AuthSessionId.make("principal-1");
-  const other = AuthSessionId.make("principal-2");
+  const principal = AuthSessionId.make("caller01-session");
+  const other = AuthSessionId.make("caller02-session");
   for (const sessionId of [principal, other])
     yield* sessions.create({
       sessionId,
@@ -288,6 +288,111 @@ const fixture = Effect.gen(function* () {
     unlinkCloud: () => storedSecrets.clear(),
   };
 });
+
+it.effect("warns about the caller's missing pin without sharing another sign-in's inbox", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.grantWrite(f.principal);
+      yield* f.grantWrite(f.other);
+      yield* f.call(f.service.setInbox({ threadId: ThreadId.make("other-inbox") }), f.other);
+      const result = yield* f.call(f.service.prepareNotify({}));
+      expect(result).toMatchObject({
+        status: "unavailable",
+        reason: "no_pinned_inbox",
+        warning: expect.stringContaining(f.principal.slice(0, 8)),
+      });
+      expect("warning" in result && result.warning).toContain(f.other.slice(0, 8));
+      const status = yield* f.call(f.service.bridgeStatus());
+      expect(status.inboxThreadId).toBeNull();
+      expect(status.relayAlerts).toContainEqual(
+        expect.objectContaining({ reason: "no_pinned_inbox" }),
+      );
+      const sql = Context.get(f.context, SqlClient.SqlClient);
+      expect(yield* sql`SELECT id FROM mcp_event_relay_outbox`).toEqual([]);
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect(
+  "reuses canonical subscription identities and reports overlaps without deleting callbacks",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const input = inputFor(ThreadId.make("duplicate-watch"));
+        const [first, second] = yield* Effect.all(
+          [
+            f.call(f.service.subscribe(input)),
+            f.call(
+              f.service.subscribe({
+                ...input,
+                delivery: { ...input.delivery, url: "https://CALLBACKS.example.com:443/events" },
+              }),
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
+        expect(second.id).toBe(first.id);
+        expect((yield* f.call(f.service.listSubscriptions())).subscriptions).toHaveLength(1);
+        yield* f.call(
+          f.service.subscribe({
+            ...input,
+            delivery: { ...input.delivery, url: "https://callbacks.example.com/another" },
+          }),
+        );
+        const status = yield* f.call(f.service.bridgeStatus());
+        expect(status.subscriptionDuplicates).toEqual([
+          expect.objectContaining({
+            threadId: input.arguments.threadId,
+            name: input.name,
+            subscriptionIds: expect.arrayContaining([first.id]),
+            callbackGroups: expect.any(Array),
+          }),
+        ]);
+        expect(status.subscriptions).toHaveLength(2);
+        expect(encode(status.subscriptionDuplicates)).not.toContain(input.delivery.url);
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect(
+  "treats null relay expiry as none and collects only stale closed or expired bindings",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        yield* f.call(f.service.setInbox({ threadId: ThreadId.make("expiry-inbox") }));
+        const prepared = yield* f.call(
+          f.service.prepareNotify({ events: ["thread.resource-released"] }),
+        );
+        if ("status" in prepared) return yield* Effect.die("expected relay");
+        for (const run of ["unbounded", "expired", "closed", "recent"]) {
+          yield* f.call(
+            f.service.notifyThread(prepared, ThreadId.make("expiry-source"), RunId.make(run)),
+          );
+        }
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`UPDATE mcp_event_relay_bindings SET expires_at = NULL WHERE run_id = 'unbounded'`;
+        yield* sql`UPDATE mcp_event_relay_bindings SET expires_at = 0 WHERE run_id = 'expired'`;
+        yield* sql`UPDATE mcp_event_relay_bindings SET closed_at = 0 WHERE run_id = 'closed'`;
+        yield* TestClock.adjust("2 days");
+        yield* sql`UPDATE mcp_event_relay_bindings SET closed_at = ${yield* Clock.currentTimeMillis} WHERE run_id = 'recent'`;
+        yield* f.append([ThreadId.make("expiry-source")]);
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(1);
+        const status = yield* f.call(f.service.bridgeStatus());
+        expect(status.relayBindings).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ runId: "unbounded", expiresAt: null, closedAt: null }),
+            expect.objectContaining({ runId: "recent", closedAt: expect.any(String) }),
+          ]),
+        );
+        expect(status.relayBindings).toHaveLength(2);
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
 
 it.effect(
   "binds notify to a pinned inbox without creating subscriptions and survives rebuild",

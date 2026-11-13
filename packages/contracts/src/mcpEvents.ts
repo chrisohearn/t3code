@@ -70,6 +70,15 @@ export const McpEventWatch = Schema.Struct({
   soonestExpiry: Schema.String,
 });
 
+export const McpEventSubscriptionDuplicates = Schema.Array(
+  Schema.Struct({
+    threadId: ThreadId,
+    name: McpEventName,
+    subscriptionIds: Schema.Array(Schema.String),
+    callbackGroups: Schema.Array(Schema.String),
+  }),
+);
+
 export const McpEventSubscriptionResult = Schema.Struct({
   id: Schema.String,
   refreshBefore: Schema.String,
@@ -121,5 +130,6 @@ export const McpThreadNotifyResult = Schema.Struct({
   relay: Schema.optional(Schema.String),
   subscriptionIds: Schema.Array(Schema.String),
   reason: Schema.optional(Schema.String),
+  warning: Schema.optional(Schema.String),
 });
 export type McpThreadNotifyResult = typeof McpThreadNotifyResult.Type;

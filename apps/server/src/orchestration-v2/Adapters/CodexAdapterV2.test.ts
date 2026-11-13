@@ -954,6 +954,7 @@ describe("CodexAdapterV2 process exit", () => {
 
   it.effect("counts the app-server as a running agent until its session closes", () => {
     let runningAgents = 0;
+    const commands: Array<ReadonlyArray<unknown>> = [];
     const factoryLayer = CodexAdapterV2.layerAppServerClientFactory.pipe(
       Layer.provide(
         Layer.mock(PortScanner.PortDiscovery)({
@@ -974,23 +975,32 @@ describe("CodexAdapterV2 process exit", () => {
       Layer.provide(
         Layer.succeed(
           ChildProcessSpawner.ChildProcessSpawner,
-          ChildProcessSpawner.make(() =>
-            Effect.succeed(
+          ChildProcessSpawner.make((command) => {
+            const args = ChildProcess.isStandardCommand(command) ? command.args : [];
+            commands.push(args);
+            const listing = args.includes("mcp");
+            return Effect.succeed(
               ChildProcessSpawner.makeHandle({
                 pid: ChildProcessSpawner.ProcessId(999_999_999),
-                exitCode: Effect.never,
+                exitCode: listing ? Effect.succeed(ChildProcessSpawner.ExitCode(0)) : Effect.never,
                 isRunning: Effect.succeed(true),
                 kill: () => Effect.void,
                 unref: Effect.succeed(Effect.void),
                 stdin: Sink.drain,
-                stdout: Stream.never,
+                stdout: listing
+                  ? Stream.succeed(
+                      new TextEncoder().encode(
+                        '[{"name":"t3_omarchy"},{"name":"t3_macbook"},{"name":"other"}]',
+                      ),
+                    )
+                  : Stream.never,
                 stderr: Stream.empty,
                 all: Stream.empty,
                 getInputFd: () => Sink.drain,
                 getOutputFd: () => Stream.empty,
               }),
-            ),
-          ),
+            );
+          }),
         ),
       ),
     );
@@ -1009,6 +1019,18 @@ describe("CodexAdapterV2 process exit", () => {
           .pipe(Effect.tap(() => Effect.sync(() => assert.equal(runningAgents, 1)))),
       );
       assert.equal(runningAgents, 0);
+      assert.deepEqual(commands, [
+        ["mcp", "list", "--json"],
+        [
+          "app-server",
+          "-c",
+          "thread_unload_delay_secs=0",
+          "-c",
+          "mcp_servers.t3_omarchy.enabled=false",
+          "-c",
+          "mcp_servers.t3_macbook.enabled=false",
+        ],
+      ]);
     }).pipe(Effect.provide(factoryLayer));
   });
 });

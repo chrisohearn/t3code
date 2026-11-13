@@ -28,6 +28,28 @@ describe("codexAppServerArgs", () => {
       ...row.expected,
     ]);
   });
+  it("disables inherited T3 sign-ins after user overrides without disabling other MCPs", () => {
+    const args = codexAppServerArgs(
+      "-c mcp_servers.t3_omarchy.enabled=true -c mcp_servers.other.enabled=true",
+      ["t3_omarchy", "t3_macbook", "other", "t3-code", "t3-code-direct"],
+    );
+    NodeAssert.deepStrictEqual(args.slice(-4), [
+      "-c",
+      "mcp_servers.t3_omarchy.enabled=false",
+      "-c",
+      "mcp_servers.t3_macbook.enabled=false",
+    ]);
+    NodeAssert.ok(args.includes("mcp_servers.other.enabled=true"));
+  });
+  it("does not create a transport-less override for absent inherited entries", () => {
+    NodeAssert.deepStrictEqual(codexAppServerArgs(undefined, ["t3_macbook"]), [
+      "app-server",
+      "-c",
+      "thread_unload_delay_secs=0",
+      "-c",
+      "mcp_servers.t3_macbook.enabled=false",
+    ]);
+  });
 });
 
 describe("codexExecLaunchArgs", () => {

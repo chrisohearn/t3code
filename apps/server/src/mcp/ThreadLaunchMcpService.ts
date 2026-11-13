@@ -84,6 +84,7 @@ export const launchInput = Schema.Struct({
 });
 export const launchResult = Schema.Struct({
   notify: Schema.optional(McpThreadNotifyResult),
+  warning: Schema.optional(Schema.String),
   threadId: ThreadId,
   link: Schema.optional(Schema.String),
   projectId: ProjectId,
@@ -378,6 +379,9 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       );
       return {
         ...(notify === undefined ? {} : { notify }),
+        ...(notify !== undefined && "warning" in notify && notify.warning !== undefined
+          ? { warning: notify.warning }
+          : {}),
         threadId: thread.id,
         link: McpInvocationContext.threadLinkFor(scope, thread.id, thread.title),
         projectId: thread.projectId,
