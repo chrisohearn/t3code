@@ -274,10 +274,11 @@ const fixture = Effect.gen(function* () {
     setTunnel: (status: EnvironmentConnectReachability) => {
       tunnel = status;
     },
-    linkCloud: (mode: "managed" | "publish_only" | "revoked") => {
+    linkCloud: (mode: "managed" | "publish_only" | "revoked" | "web") => {
       const bytes = (value: string) => new TextEncoder().encode(value);
       storedSecrets.set(CLOUD_LINKED_USER_ID, bytes("cloud-user"));
       storedSecrets.set(RELAY_URL_SECRET, bytes("https://relay.example.com"));
+      if (mode === "web") return;
       storedSecrets.set(
         CLOUD_CLI_DESIRED_LINK_SECRET,
         bytes(mode === "publish_only" ? "publish_only" : "managed"),
@@ -1392,6 +1393,7 @@ it.effect.each(["reachable", "deadline"] as const)(
 it.effect.each([
   ["CLI managed link whose tunnel config is not stored yet", "managed", true],
   ["CLI publish-only link", "publish_only", false],
+  ["web or mobile link", "web", false],
   ["revoked link", "revoked", false],
   ["server with no cloud link", null, false],
 ] as const)("startup hold on not_linked for a %s", ([, link, held]) =>
