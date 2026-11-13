@@ -720,6 +720,10 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
               isDatabase: sqliteFiles !== undefined,
             })),
           ).toContainEqual({ entryName: "notes.sqlite", autoSettle: false, isDatabase: false });
+
+          // A sidecar name on a directory keeps the database from moving at all.
+          yield* writeTextFile(path.join(shadowHome, "memories_v2_1.sqlite-journal", "kept"), "");
+          expect(yield* settles(sharedHome)).not.toContain(true);
         }),
     );
 

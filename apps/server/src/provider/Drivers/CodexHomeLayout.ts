@@ -630,16 +630,30 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
       continue;
     }
     const sqliteFiles = [entryName];
+    // Sidecars are files, or links an older build made; anything else is not moved.
+    let sidecarsMovable = true;
     for (const suffix of SQLITE_SIDECAR_SUFFIXES) {
       const sidecar = `${entryName}${suffix}`;
+      const sidecarPath = path.join(effectiveHomePath, sidecar);
       const sidecarState = yield* readLinkState({
         ...context,
         entryName: sidecar,
-        linkPath: path.join(effectiveHomePath, sidecar),
+        linkPath: sidecarPath,
       });
-      if (sidecarState._tag !== "Missing") sqliteFiles.push(sidecar);
+      if (sidecarState._tag === "Missing") continue;
+      sqliteFiles.push(sidecar);
+      if (sidecarState._tag === "NotSymlink") {
+        const sidecarInfo = yield* fileSystem.stat(sidecarPath).pipe(Effect.option);
+        if (Option.isNone(sidecarInfo) || sidecarInfo.value.type !== "File")
+          sidecarsMovable = false;
+      }
     }
-    conflicts.push({ entryName, path: entryPath, sqliteFiles, autoSettle });
+    conflicts.push({
+      entryName,
+      path: entryPath,
+      sqliteFiles,
+      autoSettle: autoSettle && sidecarsMovable,
+    });
   }
   return conflicts;
 });
