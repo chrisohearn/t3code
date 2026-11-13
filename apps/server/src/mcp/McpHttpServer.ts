@@ -9,6 +9,10 @@ import * as ThreadLaunchMcp from "./ThreadLaunchMcpService.ts";
 import * as AgentRegistry from "../persistence/AgentRegistry.ts";
 import * as McpClientThreads from "../persistence/McpClientThreads.ts";
 import * as WorkLedger from "../persistence/WorkLedger.ts";
+import * as ThreadRoles from "../persistence/ThreadRoles.ts";
+import * as LaunchPresets from "../persistence/LaunchPresets.ts";
+import { PresetToolkit } from "./toolkits/preset/tools.ts";
+import * as PresetHandlers from "./toolkits/preset/handlers.ts";
 import { LedgerToolkit } from "./toolkits/ledger/tools.ts";
 import * as LedgerHandlers from "./toolkits/ledger/handlers.ts";
 import * as Cause from "effect/Cause";
@@ -1097,21 +1101,16 @@ const withToolAnalytics =
     const scheduledRunOf = (threadId: string, runId: RunId | null) =>
       Option.isNone(threads) || runId === null
         ? Effect.succeed(false)
-        : threads.value
-            .getThreadRecords(ThreadId.make(threadId), ["runs", "messages"], {
+        : Effect.gen(function* () {
+            const id = ThreadId.make(threadId);
+            const { runs } = yield* threads.value.getThreadRecords(id, ["runs"], {
               runIds: [runId],
-              messageRoles: ["user"],
-            })
-            .pipe(
-              Effect.map((records) => {
-                const run = records.runs.find((candidate) => candidate.id === runId);
-                return records.messages.some(
-                  (message) =>
-                    message.id === run?.userMessageId && message.scheduledTaskId !== undefined,
-                );
-              }),
-              Effect.orElseSucceed(() => false),
-            );
+            });
+            const run = runs.find((candidate) => candidate.id === runId);
+            if (run === undefined) return false;
+            const messages = yield* threads.value.getMessagesById(id, [run.userMessageId]);
+            return messages.get(run.userMessageId)?.scheduledTaskId !== undefined;
+          }).pipe(Effect.orElseSucceed(() => false));
     const record =
       /* Request instrumentation already owns the span; keep this helper in that context. */
       Effect.fnUntraced(
@@ -1394,8 +1393,13 @@ export const layerOrchestratorToolkit = toolkitRegistration(
 
 export const layerLedgerToolkit = toolkitRegistration(LedgerToolkit, LedgerHandlers.layer);
 
+export const layerPresetToolkit = toolkitRegistration(PresetToolkit, PresetHandlers.layer).pipe(
+  Layer.provide(LaunchPresets.layer),
+);
+
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer).pipe(
   Layer.provide(PendingApproval.layer),
+  Layer.provide(ThreadRoles.layer),
 );
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
@@ -1416,7 +1420,10 @@ const layerEnvironmentToolkit = toolkitRegistration(
 export const layerProjectRegistration = toolkitRegistration(
   ProjectToolkit,
   ProjectHandlers.layer,
-).pipe(Layer.provide(ThreadLaunchMcp.layer));
+).pipe(
+  Layer.provide(ThreadLaunchMcp.layer),
+  Layer.provide(Layer.mergeAll(ThreadRoles.layer, LaunchPresets.layer)),
+);
 
 export const layerAttachmentToolkit = toolkitRegistration(
   AttachmentToolkit,
@@ -1494,6 +1501,7 @@ export const layerTools = Layer.mergeAll(
     Layer.provide(BridgeStatusService.layer),
   ),
   layerLedgerToolkit,
+  layerPresetToolkit,
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,
@@ -1571,6 +1579,8 @@ export const layer = Layer.merge(
 ).pipe(
   Layer.provide(layerEvents),
   Layer.provide(WorkLedger.layer),
+  Layer.provide(ThreadRoles.layer),
+  Layer.provide(LaunchPresets.layer),
   Layer.provide(McpClientThreads.layer),
   Layer.provide(McpBridgeMetrics.layer),
   Layer.provide(McpRequestLog.layer),

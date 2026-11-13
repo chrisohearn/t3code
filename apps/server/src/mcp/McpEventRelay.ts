@@ -12,6 +12,7 @@ import {
   ThreadId,
   RunId,
   type McpThreadNotify,
+  type OrchestrationV2DomainEvent,
   mcpClientScopes,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -38,6 +39,30 @@ const DELIVERED_RETENTION_MS = 86400_000;
 const denied = () => new McpEventsError({ code: -32001, reason: "access_denied" });
 const storage = () => new McpEventsError({ code: -32603, reason: "storage" });
 const encode = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
+/**
+ * The relayed event's state, and why a cancelled or interrupted run stopped, as webhook event
+ * data carries them; `server_shutdown` / `server_restart` mark a restart, not a real cancel.
+ */
+export function relayEventState(event: OrchestrationV2DomainEvent): {
+  readonly state?: string;
+  readonly stopReason?: string;
+} {
+  switch (event.type) {
+    case "run.updated": {
+      const { status, stop } = event.payload;
+      return (status === "cancelled" || status === "interrupted") && stop !== undefined
+        ? { state: status, stopReason: stop.reason }
+        : { state: status };
+    }
+    case "runtime-request.updated":
+      return { state: event.payload.status };
+    case "provider-session.detached":
+      return { state: "detached" };
+    default:
+      return {};
+  }
+}
 const Modes = { runtimeMode: RuntimeMode, interactionMode: ProviderInteractionMode };
 const Pin = Schema.Struct({ inboxThreadId: ThreadId, ...Modes });
 const Binding = Schema.Struct({
@@ -252,6 +277,9 @@ const make = Effect.gen(function* () {
         .pipe(Stream.take(256), Stream.runCollect, Effect.mapError(storage));
       let through = Math.max(binding.scanCursor, floor);
       let finished = false;
+      // A failover run continues the bound run's work, so the relay follows it (and its own
+      // failover) and relays that run's result, as the webhook path reports it.
+      let boundRunId = binding.runId;
       for (const stored of batch) {
         through = stored.sequence;
         if (!("event" in stored) || stored.event.threadId !== binding.threadId) continue;
@@ -261,10 +289,23 @@ const make = Effect.gen(function* () {
           event.payload.userMessageId.startsWith(RELAY_MESSAGE_ID_PREFIX)
         )
           continue;
+        if (
+          (event.type === "run.created" || event.type === "run.updated") &&
+          event.payload.failoverOfRunId === boundRunId
+        ) {
+          boundRunId = event.payload.id;
+        }
         const runId = event.type === "run.updated" ? event.payload.id : event.runId;
         const threadLevelRelease =
           event.type === "provider-session.detached" && runId === undefined;
-        if (!threadLevelRelease && runId !== binding.runId) continue;
+        if (!threadLevelRelease && runId !== boundRunId) continue;
+        // A run failing over is not a blocker: its failover run reports the outcome. A skip is.
+        if (
+          event.type === "run.updated" &&
+          event.payload.failover !== undefined &&
+          event.payload.failover.state !== "skipped"
+        )
+          continue;
         const outcome =
           event.type === "run.updated" &&
           ["completed", "failed", "interrupted", "cancelled", "rolled_back"].includes(
@@ -282,14 +323,14 @@ const make = Effect.gen(function* () {
         if (name === undefined || !binding.events.includes(name)) continue;
         const records = yield* threads
           .getThreadRecords(binding.threadId, ["messages"], {
-            messageRunIds: [RunId.make(binding.runId)],
+            messageRunIds: [RunId.make(boundRunId)],
           })
           .pipe(Effect.mapError(storage));
         const text =
           records.messages
-            .filter((message) => message.runId === binding.runId && message.role === "assistant")
+            .filter((message) => message.runId === boundRunId && message.role === "assistant")
             .at(-1)?.text ?? "";
-        const sourceKey = outcome ? `run:${binding.runId}:outcome` : event.id;
+        const sourceKey = outcome ? `run:${boundRunId}:outcome` : event.id;
         yield* enqueue({
           ...binding,
           sourceKey,
@@ -302,7 +343,8 @@ const make = Effect.gen(function* () {
             threadId: binding.threadId,
             threadTitle: excerpt(records.thread.title),
             runId: runId ?? null,
-            ...(threadLevelRelease ? { boundRunId: binding.runId } : {}),
+            ...relayEventState(event),
+            ...(threadLevelRelease ? { boundRunId } : {}),
             ledgerKey: binding.ledgerKey === null ? null : excerpt(binding.ledgerKey),
             occurredAt: DateTime.formatIso(event.occurredAt),
             resultExcerpt: excerpt(text),
@@ -323,7 +365,7 @@ const make = Effect.gen(function* () {
           break;
         }
       }
-      yield* sql`UPDATE mcp_event_relay_bindings SET scan_cursor = ${through}, expires_at = CASE WHEN ${finished ? 1 : 0} = 1 THEN 0 ELSE expires_at END WHERE id = ${binding.id}`.pipe(
+      yield* sql`UPDATE mcp_event_relay_bindings SET scan_cursor = ${through}, run_id = ${boundRunId}, expires_at = CASE WHEN ${finished ? 1 : 0} = 1 THEN 0 ELSE expires_at END WHERE id = ${binding.id}`.pipe(
         Effect.mapError(storage),
       );
       behind ||= !finished && through < latest;

@@ -3,6 +3,7 @@ import { CommandActor } from "../../../orchestration-v2/CommandActor.ts";
 import {
   ProviderRequestKind,
   type CommandId,
+  MessageId,
   type RuntimeRequestId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
@@ -30,6 +31,7 @@ import {
   readThread,
   unavailable,
 } from "../../threadAccess.ts";
+import * as ThreadRoles from "../../../persistence/ThreadRoles.ts";
 import * as ScratchThreadPromotion from "../../../project/ScratchThreadPromotion.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
@@ -55,6 +57,29 @@ function queueEntry(
     truncated: characters.length > limit,
   };
 }
+const configuration = (
+  thread: Pick<
+    OrchestrationV2ThreadProjection["thread"],
+    "id" | "modelSelection" | "scheduledModelSelection" | "runtimeMode" | "interactionMode"
+  >,
+  role: ThreadRoles.ThreadRoleRecord | undefined,
+) => ({
+  threadId: thread.id,
+  modelSelection: thread.modelSelection,
+  ...(thread.scheduledModelSelection == null
+    ? {}
+    : {
+        scheduledModelSelection: {
+          modelSelection: thread.scheduledModelSelection.modelSelection,
+          afterRunId: thread.scheduledModelSelection.afterRunId,
+        },
+      }),
+  runtimeMode: thread.runtimeMode,
+  interactionMode: thread.interactionMode,
+  ...(role === undefined
+    ? {}
+    : { standingRole: role.text, standingRoleSetBy: `${role.updatedBy}, ${role.updatedAt}` }),
+});
 const withMcpCommandActor = Effect.fn("mcp.withCommandActor")(function* <A, E, R>(
   effect: Effect.Effect<A, E, R>,
 ) {
@@ -117,7 +142,7 @@ const configureAcknowledgeOnly = Effect.fn("mcp.configureAcknowledgeOnly")(funct
   threads: ThreadManagementService.ThreadManagementService["Service"],
   thread: Pick<
     OrchestrationV2ThreadProjection["thread"],
-    "id" | "modelSelection" | "runtimeMode" | "interactionMode"
+    "id" | "modelSelection" | "scheduledModelSelection" | "runtimeMode" | "interactionMode"
   >,
   input: {
     readonly acknowledgeOnly?: boolean | undefined;
@@ -269,7 +294,8 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       input.modelSelection === undefined &&
       input.runtimeMode === undefined &&
       input.applyAt === undefined &&
-      input.acknowledgeOnly === undefined,
+      input.acknowledgeOnly === undefined &&
+      input.standingRole === undefined,
     McpToolAccess.reads((input) =>
       Effect.gen(function* () {
         const {
@@ -277,18 +303,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           projection: { thread },
         } = yield* readThread(input.threadId);
         return {
-          threadId: thread.id,
-          modelSelection: thread.modelSelection,
-          ...(thread.scheduledModelSelection == null
-            ? {}
-            : {
-                scheduledModelSelection: {
-                  modelSelection: thread.scheduledModelSelection.modelSelection,
-                  afterRunId: thread.scheduledModelSelection.afterRunId,
-                },
-              }),
-          runtimeMode: thread.runtimeMode,
-          interactionMode: thread.interactionMode,
+          ...configuration(thread, yield* (yield* ThreadRoles.ThreadRoles).get(thread.id)),
           acknowledgeOnly: yield* threads
             .acknowledgeOnly(thread.id)
             .pipe(Effect.mapError(unavailable)),
@@ -303,6 +318,44 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         } = yield* readThread(input.threadId);
         if (input.acknowledgeOnly !== undefined) {
           return yield* configureAcknowledgeOnly(threads, thread, input);
+        }
+        if (input.standingRole !== undefined) {
+          if (
+            input.modelSelection !== undefined ||
+            input.runtimeMode !== undefined ||
+            input.applyAt !== undefined
+          ) {
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "Set standingRole separately from modelSelection and runtimeMode.",
+            });
+          }
+          // The role is instructions for another agent, and for the caller's own thread a way
+          // to drop its own rules, so only full access writes it. An outside client, an agent
+          // for its own thread and an agent for another all meet the same rule.
+          yield* McpToolAccess.requireFullAccess("change a thread's standing role");
+          const scope = yield* McpInvocationContext.McpInvocationContext;
+          const roles = yield* ThreadRoles.ThreadRoles;
+          // The visible record comes first: a role never changes without a note in the thread.
+          const commandId = yield* newCommandId();
+          yield* threads
+            .dispatch({
+              type: "message.dispatch",
+              postOnly: true,
+              commandId,
+              threadId: thread.id,
+              ...(scope.thread === undefined ? {} : { senderThreadId: scope.thread.threadId }),
+              ...McpInvocationContext.messageSenderFor(scope),
+              messageId: MessageId.make(commandId),
+              text: `Standing role ${input.standingRole.trim() === "" ? "cleared" : "set"} by ${McpInvocationContext.actorLabel(scope)}.`,
+              attachments: [],
+              dispatchMode: { type: "start_immediately" },
+              createdBy: "agent",
+              creationSource: "mcp",
+            })
+            .pipe(withMcpCommandActor, Effect.mapError(dispatchFailure));
+          yield* roles.set(thread.id, input.standingRole, McpInvocationContext.actorLabel(scope));
+          return configuration(thread, yield* roles.get(thread.id));
         }
         if (input.runtimeMode !== undefined) {
           if (input.modelSelection !== undefined) {
@@ -475,7 +528,16 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     (input) => input.action === "list" || input.action === "read",
     McpToolAccess.reads((input) =>
       Effect.gen(function* () {
-        const { projection } = yield* readThread(input.threadId, ["runs", "messages"]);
+        const { threads, projection: queued } = yield* readThread(input.threadId, ["runs"], {
+          runStatuses: ["queued"],
+        });
+        const messages = yield* threads
+          .getMessagesById(
+            queued.thread.id,
+            queued.runs.map((run) => run.userMessageId),
+          )
+          .pipe(Effect.mapError(unavailable));
+        const projection = { runs: queued.runs, messages: [...messages.values()] };
         if (input.action === "list") {
           const runs = queuedRunsInDeliveryOrder(projection);
           const cursor = input.cursor ?? 0;
