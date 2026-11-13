@@ -25,6 +25,9 @@ One outcome tracked in the work ledger under a stable key.
 **inbox**:
 The T3 thread where agents leave requests for Jarvis.
 
+**acknowledge-only mode**:
+A thread setting under which T3 answers each message with a fixed acknowledgement instead of running an agent. The run still ends normally, so its result still wakes Jarvis.
+
 **event subscription**:
 An arrangement to receive notice when a selected kind of change happens in T3.
 

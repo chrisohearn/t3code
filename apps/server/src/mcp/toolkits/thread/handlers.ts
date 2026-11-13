@@ -106,6 +106,21 @@ const required = <A>(value: A | undefined, name: string) =>
         }),
       )
     : Effect.succeed(value);
+const readThreadConfiguration = Effect.fn("mcp.readThreadConfiguration")(function* (
+  threadId: ThreadId | undefined,
+) {
+  const {
+    threads,
+    projection: { thread },
+  } = yield* readThread(threadId);
+  return {
+    threadId: thread.id,
+    modelSelection: thread.modelSelection,
+    runtimeMode: thread.runtimeMode,
+    interactionMode: thread.interactionMode,
+    acknowledgeOnly: yield* threads.acknowledgeOnly(thread.id).pipe(Effect.mapError(unavailable)),
+  };
+});
 const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A, E, R>(
   handle: (params: P, authorize: McpToolAccess.AuthorizeThread) => Effect.Effect<A, E, R>,
 ) => McpToolAccess.writesThreads((params: P) => [params.threadId], handle);
@@ -224,60 +239,79 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     ),
   ),
   t3_thread_configure: McpToolAccess.either(
-    (input) => input.modelSelection === undefined && input.runtimeMode === undefined,
-    McpToolAccess.reads((input) =>
-      Effect.gen(function* () {
-        const {
-          projection: { thread },
-        } = yield* readThread(input.threadId);
-        return {
-          threadId: thread.id,
-          modelSelection: thread.modelSelection,
-          runtimeMode: thread.runtimeMode,
-          interactionMode: thread.interactionMode,
-        };
-      }),
-    ),
-    writesThread((input) =>
-      Effect.gen(function* () {
-        const {
-          threads,
-          projection: { thread },
-        } = yield* readThread(input.threadId);
-        if (input.runtimeMode !== undefined) {
-          if (input.modelSelection !== undefined) {
+    (input) =>
+      input.modelSelection === undefined &&
+      input.runtimeMode === undefined &&
+      input.acknowledgeOnly === undefined,
+    McpToolAccess.reads((input) => readThreadConfiguration(input.threadId)),
+    McpToolAccess.either(
+      (input) => input.acknowledgeOnly !== undefined,
+      // Who answers the thread's messages is environment policy, so it needs full access.
+      McpToolAccess.writesEnvironment((input) =>
+        Effect.gen(function* () {
+          const acknowledgeOnly = yield* required(input.acknowledgeOnly, "acknowledgeOnly");
+          if (input.modelSelection !== undefined || input.runtimeMode !== undefined) {
             return yield* new OrchestratorMcpFailure({
               code: "invalid_request",
-              message: "Set runtimeMode separately from modelSelection.",
+              message: "Set acknowledgeOnly separately from modelSelection and runtimeMode.",
             });
           }
-          const scope = yield* McpInvocationContext.McpInvocationContext;
-          const actor =
-            scope.thread !== undefined
-              ? `MCP thread ${scope.thread.threadId}`
-              : scope.client !== undefined
-                ? `MCP client "${scope.client.label}" (${scope.client.sessionId.slice(0, 8)})`
-                : "MCP caller";
+          const {
+            threads,
+            projection: { thread },
+          } = yield* readThread(input.threadId);
+          yield* threads
+            .setAcknowledgeOnly(thread.id, acknowledgeOnly)
+            .pipe(Effect.mapError(unavailable));
+          return yield* readThreadConfiguration(thread.id);
+        }),
+      ),
+      writesThread((input) =>
+        Effect.gen(function* () {
+          const {
+            threads,
+            projection: { thread },
+          } = yield* readThread(input.threadId);
+          if (input.runtimeMode !== undefined) {
+            if (input.modelSelection !== undefined) {
+              return yield* new OrchestratorMcpFailure({
+                code: "invalid_request",
+                message: "Set runtimeMode separately from modelSelection.",
+              });
+            }
+            const scope = yield* McpInvocationContext.McpInvocationContext;
+            const actor =
+              scope.thread !== undefined
+                ? `MCP thread ${scope.thread.threadId}`
+                : scope.client !== undefined
+                  ? `MCP client "${scope.client.label}" (${scope.client.sessionId.slice(0, 8)})`
+                  : "MCP caller";
+            const result = yield* threads
+              .dispatch({
+                type: "thread.runtime-mode.set",
+                threadId: thread.id,
+                commandId: yield* newCommandId(),
+                runtimeMode: input.runtimeMode,
+              })
+              .pipe(
+                Effect.provideService(RuntimeModeChangeActor, actor),
+                Effect.mapError(dispatchFailure),
+              );
+            return { sequence: result.sequence };
+          }
+          const modelSelection = yield* required(input.modelSelection, "modelSelection");
+          const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
           const result = yield* threads
             .dispatch({
-              type: "thread.runtime-mode.set",
+              type,
               threadId: thread.id,
               commandId: yield* newCommandId(),
-              runtimeMode: input.runtimeMode,
+              modelSelection,
             })
-            .pipe(
-              Effect.provideService(RuntimeModeChangeActor, actor),
-              Effect.mapError(dispatchFailure),
-            );
+            .pipe(Effect.mapError(dispatchFailure));
           return { sequence: result.sequence };
-        }
-        const modelSelection = yield* required(input.modelSelection, "modelSelection");
-        const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
-        const result = yield* threads
-          .dispatch({ type, threadId: thread.id, commandId: yield* newCommandId(), modelSelection })
-          .pipe(Effect.mapError(dispatchFailure));
-        return { sequence: result.sequence };
-      }),
+        }),
+      ),
     ),
   ),
   t3_pending_request: McpToolAccess.either(

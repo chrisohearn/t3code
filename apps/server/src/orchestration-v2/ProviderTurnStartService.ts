@@ -34,6 +34,7 @@ import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
+import * as AcknowledgeOnly from "./AcknowledgeOnly.ts";
 import * as ProviderFailover from "./ProviderFailover.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
@@ -452,6 +453,25 @@ export const layer: Layer.Layer<
         return yield* new ProviderTurnStartError({
           runId,
           cause: `Run ${runId} is missing its execution projection state.`,
+        });
+      }
+      const settings = yield* serverSettings.getSettings.pipe(
+        Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
+      );
+      if (AcknowledgeOnly.isAcknowledgeOnlyThread(settings, projection.thread.id)) {
+        return yield* AcknowledgeOnly.settleAcknowledgeOnlyRun({
+          eventSink,
+          idAllocator,
+          run,
+          attempt,
+          rootNode,
+          providerThread,
+          message,
+          nextTurnItemOrdinal:
+            Math.max(
+              0,
+              ...projection.turnItems.filter((item) => item.runId === runId).map((i) => i.ordinal),
+            ) + 1,
         });
       }
       const settleRunBeforeStart = Effect.fn("orchestrationV2.providerTurnStart.settleBeforeStart")(
