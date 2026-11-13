@@ -777,17 +777,25 @@ provider_canary() {
 late_canary() {
   local v at bad age
   [[ -r "$GUARD_STATE/canary-pending" ]] || return 0
-  read -r v at <"$GUARD_STATE/canary-pending" || { rm -f "$GUARD_STATE/canary-pending"; return 0; }
+  # Skip while another service change runs; released before cmd_update takes the lock itself.
+  exec 8>>"$LOCK"
+  flock -n 8 || { exec 8>&-; return 0; }
+  if ! read -r v at <"$GUARD_STATE/canary-pending"; then
+    rm -f "$GUARD_STATE/canary-pending"; exec 8>&-; return 0
+  fi
   age=$(( $(date +%s) - $(date -u -d "$at" +%s 2>/dev/null || echo 0) ))
   if [[ "$(active_version)" != "$v" ]] || (( age > 7200 )); then
-    rm -f "$GUARD_STATE/canary-pending"
-    return 0
+    rm -f "$GUARD_STATE/canary-pending"; exec 8>&-; return 0
   fi
   bad=$(broken_instances "$at" | paste -sd ' ' -)
-  [[ -n "$bad" ]] || return 0
+  [[ -n "$bad" ]] || { exec 8>&-; return 0; }
   rm -f "$GUARD_STATE/canary-pending"
+  # Not "bad": launch skips bad builds, and this one is running on a migrated database. The
+  # rejected marker only stops the updater from deploying it again after a manual rollback.
+  mkdir -p "$GUARD_STATE/rejected" && date -Is >"$GUARD_STATE/rejected/$v"
   hold_updates "$v broke provider sessions after it went live (instance:threads): $bad; check, then roll back or fix"
   report "$v broke provider sessions after it went live (instance:threads): $bad. Automatic updates held; roll back with t3-service-update <previous version> or fix the cause, then t3-service-update resume."
+  exec 8>&-
 }
 
 # After a rollback restart (systemctl --no-block), give the server time to come up and queue its
@@ -935,6 +943,10 @@ cmd_update() {
     fi
     return
   fi
+  if [[ -z "$target" && -e "$GUARD_STATE/rejected/$latest" ]]; then
+    log "update: $latest was rejected by the late canary; skipping (run t3-service-update $latest to retry)"
+    return 0
+  fi
   if is_bad "$latest" && [[ -z "$target" ]]; then
     log "update: $latest failed here before; skipping (run t3-service-update $latest to retry)"
     return 0
@@ -995,7 +1007,7 @@ cmd_update() {
   is_healthy "$cur" || { is_trusted "$cur" && [[ "$(service_version)" == "$cur" ]] && record_healthy "$cur"; }
   sha=$(release_binary_sha "$latest") || { log "update: $latest is not a verified release in $TRUSTED_REPOS"; return 1; }
   printf '%s  %s\n' "$sha" "$latest" >"$GUARD_STATE/trusted/$latest.sha256"
-  rm -f "$GUARD_STATE/bad/$latest"
+  rm -f "$GUARD_STATE/bad/$latest" "$GUARD_STATE/rejected/$latest"
 
   if [[ -n "$now_flag" ]]; then
     blockers=$(force_blockers | paste -sd ';' -)

@@ -279,11 +279,16 @@ at=$(now '-20 minutes'); printf '7 %s\n' "$at" > "$GUARD_STATE/canary-pending"
 late_canary; [[ -e "$GUARD_STATE/canary-pending" && ! -e "$AUTO_HOLD" ]] || fail 'late canary acted with nothing broken'
 run_row ok9 P completed "$(now '-2 hours')" "$(now '-2 hours')"
 open_fail L1 P "$(now '-5 minutes')"; open_fail L2 P "$(now '-4 minutes')"
+exec 9>&-
 late_canary; [[ -f "$AUTO_HOLD" && ! -e "$GUARD_STATE/canary-pending" ]] || fail 'late break not held'
 grep -q 'broke provider sessions after it went live' "$AUTO_HOLD" || fail 'late hold reason'
+[[ -e "$GUARD_STATE/rejected/7" && ! -e "$GUARD_STATE/bad/7" ]] || fail 'late break not marked rejected (and must not be marked bad)'
 rm -f "$AUTO_HOLD"; printf '7 %s\n' "$(now '-3 hours')" > "$GUARD_STATE/canary-pending"
 late_canary; [[ ! -e "$GUARD_STATE/canary-pending" && ! -e "$AUTO_HOLD" ]] || fail 'expired late canary not cleared'
-pass 'an idle deploy is re-checked on later ticks for 2 h, and a late break holds and reports'
+( exec 9>>"$LOCK"; flock -n 9; printf '7 %s\n' "$(now '-10 minutes')" > "$GUARD_STATE/canary-pending"; rm -f "$AUTO_HOLD"
+  late_canary; [[ -e "$GUARD_STATE/canary-pending" && ! -e "$AUTO_HOLD" ]] || fail 'late canary ran while another update held the lock' ) || exit 1
+rm -f "$GUARD_STATE/canary-pending"
+pass 'an idle deploy is re-checked on later ticks for 2 h; a late break holds, reports and marks the release rejected; it skips while an update holds the lock'
 sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"
 active_version() { echo 1; }
 
