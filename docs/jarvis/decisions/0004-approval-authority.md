@@ -1,6 +1,6 @@
 # Jarvis relays authority and answers individual prompts
 
-Accepted 2026-11-12. Amended 2026-11-13 by [0016](0016-no-human-in-the-loop.md): for a task with intake answers, the agent that heard them may take the sensitive actions they spell out. Spending money always needs Chris's fresh go-ahead, and anything intake didn't cover goes to Chris through Jarvis. Passing approval from T3 to Jarvis still follows 0015.
+Accepted 2026-11-12. Amended 2026-11-13 by [0016](0016-no-human-in-the-loop.md): for a task with intake answers, the agent that asked, and workers it hands the task to, may take the sensitive actions they spell out. Spending money always needs Chris's fresh go-ahead, and anything intake didn't cover goes to Chris through Jarvis. Passing approval from T3 to Jarvis still follows 0015.
 
 ## Decision
 

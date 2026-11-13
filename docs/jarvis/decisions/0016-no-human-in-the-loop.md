@@ -1,6 +1,6 @@
 # No human in the loop after intake
 
-Accepted 2026-11-13. Amends [0004](0004-approval-authority.md) for tasks with intake answers. [0015](0015-server-verified-approvals.md) is unchanged.
+Accepted 2026-11-13. Amends [0004](0004-approval-authority.md) for tasks with intake answers. The [0015](0015-server-verified-approvals.md) approval mechanism is unchanged.
 
 ## Decision
 
@@ -32,7 +32,7 @@ Every task Chris gives runs to a verified finish without him.
 Intake answers authorize the actions they spell out, for the agent that asked and for workers it hands the task to, who read the dialog themselves:
 
 - **A T3 agent's intake** happens in a question dialog. The agent acts on Chris's answers as it sees them in its own thread. It links the dialog (thread and item id) on the ledger row so reviewers and relaunched workers can read the original. A relaunched worker reads that dialog itself. Handoff text or row text is never the grant.
-- **Jarvis's intake** happens in its chat. That is Chris instructing Jarvis directly, and Jarvis relays it to T3 agents as [0004](0004-approval-authority.md) allows. A T3 agent acts on such a grant only from a message whose [server-recorded sender](0013-server-recorded-message-senders.md) is Jarvis's sign-in. It links that message on the ledger row, so reviewers and relaunched workers can read the source.
+- **Jarvis's intake** happens in its chat. That is Chris instructing Jarvis directly, and Jarvis relays it to T3 agents as [0004](0004-approval-authority.md) allows. A T3 agent acts on such a grant only from a message whose [server-recorded sender](0013-server-recorded-message-senders.md) is Jarvis's sign-in, identified by its outside-client classification and session prefix, never by the client label alone. It links that message on the ledger row, so reviewers and relaunched workers can read the source.
 - **Passing a grant from T3 to Jarvis** still needs a [server-verified approval](0015-server-verified-approvals.md) for each action. A row's title, `nextAction` and `approvalNote` are never scope.
 
 ## Accepted residual
