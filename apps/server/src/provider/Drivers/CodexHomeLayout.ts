@@ -45,6 +45,8 @@ const REPLACEABLE_SHARED_RUNTIME_ENTRIES = new Set([
 // Windows SQLite names -wal/-shm beside a symlinked database rather than its target,
 // which gave each shadow home a private WAL for a shared database (#79).
 const SQLITE_SIDECAR_PATTERN = /^(.+\.sqlite)-(?:wal|shm|journal)$/;
+const SQLITE_DATABASE_PATTERN = /\.sqlite$/i;
+const SQLITE_SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
 
 /** Points an auth overlay's SQLite databases at the shared home so they keep one WAL. */
 export function withCodexSqliteHome(
@@ -320,6 +322,19 @@ const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (inpu
 
   const resolvedExisting = path.resolve(path.dirname(link), state.target);
   if (resolvedExisting !== target) {
+    // The filesystem's own lookup applies its case rules; a dangling sidecar link still counts.
+    const sidecarStates = SQLITE_DATABASE_PATTERN.test(input.entryName)
+      ? yield* Effect.forEach(SQLITE_SIDECAR_SUFFIXES, (suffix) =>
+          readLinkState({ ...input, linkPath: `${link}${suffix}` }),
+        )
+      : [];
+    const sidecarsRemain = sidecarStates.some((sidecar) => sidecar._tag !== "Missing");
+    if (sidecarsRemain) {
+      return yield* Effect.logWarning(
+        "Kept a Codex shadow home database link pointing at another home because SQLite files beside it belong to that database.",
+        { path: link },
+      );
+    }
     yield* input.fileSystem.remove(link).pipe(
       Effect.catchTags({
         PlatformError: (cause) =>
@@ -373,6 +388,7 @@ const settleShadowSqliteSidecars = Effect.fn("CodexHomeLayout.settleShadowSqlite
 
     for (const [database, sidecarNames] of sidecarsByDatabase) {
       // A shadow's own database (say, from an older Codex) may be open; its sidecars are live.
+      // Beside a link to another home they belong to that database; ensureSymlink keeps both.
       const databasePath = path.join(input.effectiveHomePath, database);
       const databaseState = yield* readLinkState({
         ...input,

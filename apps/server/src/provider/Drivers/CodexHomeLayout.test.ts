@@ -235,6 +235,11 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           for (const name of ["logs_2.sqlite", "goals_1.sqlite"]) {
             yield* writeTextFile(path.join(sharedHome, name), "shared");
           }
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          yield* materializeCodexShadowHome(layout);
+
           // Windows SQLite leaves these beside the symlinked database (#79).
           yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-wal"), "");
           yield* writeTextFile(path.join(shadowHome, "state_5.sqlite-shm"), "index");
@@ -244,16 +249,13 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
             path.join(sharedHome, "goals_1.sqlite-wal"),
             path.join(shadowHome, "goals_1.sqlite-wal"),
           );
-
-          const layout = yield* resolveCodexHomeLayout(
-            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
-          );
-          yield* materializeCodexShadowHome(layout);
           yield* materializeCodexShadowHome(layout);
 
-          expect(yield* fileSystem.readLink(path.join(shadowHome, "state_5.sqlite"))).toBe(
-            path.join(sharedHome, "state_5.sqlite"),
-          );
+          for (const name of ["state_5.sqlite", "logs_2.sqlite"]) {
+            expect(yield* fileSystem.readLink(path.join(shadowHome, name))).toBe(
+              path.join(sharedHome, name),
+            );
+          }
           const shadowEntries = yield* fileSystem.readDirectory(shadowHome);
           expect(shadowEntries.filter((name) => /-(?:wal|shm|journal)$/.test(name))).toEqual([]);
           const staleEntries = shadowEntries.filter((name) => name.includes(".stale-")).toSorted();
@@ -270,7 +272,62 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
     );
 
     it.effect.skipIf(!symlinksSupported)(
-      "leaves the sidecars of a shadow's own database alone",
+      "keeps a link to another home while SQLite files sit beside it",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const otherHome = yield* makeTempDir("t3code-codex-other-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          // Goals_1 differs only in case, so it is the same entry where names ignore case.
+          const databases = ["state_5.sqlite", "logs_2.sqlite", "Goals_1.sqlite", "jobs_1.sqlite"];
+          for (const name of databases) {
+            yield* writeTextFile(path.join(sharedHome, name), "shared");
+          }
+          yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
+          for (const name of [
+            "state_5.sqlite",
+            "logs_2.sqlite",
+            "goals_1.sqlite",
+            "jobs_1.sqlite",
+          ]) {
+            yield* fileSystem.symlink(path.join(otherHome, name), path.join(shadowHome, name));
+          }
+          for (const name of ["logs_2.sqlite-wal", "goals_1.sqlite-wal"]) {
+            yield* writeTextFile(path.join(shadowHome, name), "frames");
+          }
+          // An older build linked sidecars too; this one's target is gone.
+          yield* fileSystem.symlink(
+            path.join(otherHome, "jobs_1.sqlite-wal"),
+            path.join(shadowHome, "jobs_1.sqlite-wal"),
+          );
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          yield* materializeCodexShadowHome(layout);
+
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "state_5.sqlite"))).toBe(
+            path.join(sharedHome, "state_5.sqlite"),
+          );
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "jobs_1.sqlite"))).toBe(
+            path.join(otherHome, "jobs_1.sqlite"),
+          );
+          for (const name of ["logs_2.sqlite", "goals_1.sqlite"]) {
+            expect(yield* fileSystem.readLink(path.join(shadowHome, name))).toBe(
+              path.join(otherHome, name),
+            );
+            expect(yield* fileSystem.readFileString(path.join(shadowHome, `${name}-wal`))).toBe(
+              "frames",
+            );
+          }
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "leaves sidecars alone beside a shadow's own database or a link it cannot re-point",
       () => {
         const warnings: unknown[] = [];
         const logger = Logger.make(({ message, logLevel }) => {
@@ -286,6 +343,11 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           for (const name of ownFiles) {
             yield* writeTextFile(path.join(shadowHome, name), `live ${name}`);
           }
+          // The shared home has no jobs_1.sqlite, so nothing re-points this link.
+          const otherHome = yield* makeTempDir("t3code-codex-other-");
+          const foreignTarget = path.join(otherHome, "jobs_1.sqlite");
+          yield* fileSystem.symlink(foreignTarget, path.join(shadowHome, "jobs_1.sqlite"));
+          yield* writeTextFile(path.join(shadowHome, "jobs_1.sqlite-wal"), "frames");
 
           const layout = yield* resolveCodexHomeLayout(
             decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
@@ -297,12 +359,18 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
               `live ${name}`,
             );
           }
-          expect(warnings).toEqual([
-            [
-              "Left SQLite files alone in a Codex shadow home because its database is not the shared one.",
-              { path: path.join(shadowHome, "queue_1.sqlite") },
-            ],
-          ]);
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "jobs_1.sqlite"))).toBe(
+            foreignTarget,
+          );
+          expect(yield* fileSystem.readFileString(path.join(shadowHome, "jobs_1.sqlite-wal"))).toBe(
+            "frames",
+          );
+          const message =
+            "Left SQLite files alone in a Codex shadow home because its database is not the shared one.";
+          expect(warnings).toHaveLength(2);
+          for (const database of ["queue_1.sqlite", "jobs_1.sqlite"]) {
+            expect(warnings).toContainEqual([message, { path: path.join(shadowHome, database) }]);
+          }
         }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
       },
     );
