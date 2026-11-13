@@ -92,6 +92,22 @@ export const inspectConfiguredCodexShadowHomes = Effect.fn("inspectConfiguredCod
         continue;
       }
       const config = decoded.value;
+      // The registry reads secret references before setup; this read-only check does not.
+      const secretPath = instance.environment?.find(
+        (variable) =>
+          typeof variable.value !== "string" &&
+          ["CODEX_HOME", "CODEX_SQLITE_HOME"].includes(variable.name.toUpperCase()),
+      );
+      if (secretPath !== undefined) {
+        instances.push({
+          instanceId,
+          shadowHomePath: "",
+          status: "unknown",
+          conflicts: [],
+          detail: `${secretPath.name} comes from a secret, which this check does not read.`,
+        });
+        continue;
+      }
       const environment = yield* mergeProviderInstanceEnvironment(instance.environment);
       // Mirrors CodexManagedProvider and CodexDriver, which pick the layout by setup mode.
       const layout =

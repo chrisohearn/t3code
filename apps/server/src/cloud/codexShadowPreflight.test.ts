@@ -119,6 +119,62 @@ it.layer(NodeServices.layer)("inspectConfiguredCodexShadowHomes", (it) => {
         }),
     );
 
+    it.effect.skipIf(!symlinksSupported)(
+      "is not ready for a shared auth.json or a home path held in a secret",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const stateDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-state-" });
+          const sharedHome = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3code-codex-shared-",
+          });
+          const authShadow = path.join(stateDir, "auth-shadow");
+          yield* fileSystem.writeFileString(path.join(sharedHome, "auth.json"), "{}");
+          yield* fileSystem.makeDirectory(authShadow, { recursive: true });
+          yield* fileSystem.symlink(
+            path.join(sharedHome, "auth.json"),
+            path.join(authShadow, "auth.json"),
+          );
+          yield* fileSystem.writeFileString(
+            path.join(stateDir, "settings.json"),
+            JSON.stringify({
+              providerInstances: {
+                codex_auth: {
+                  driver: "codex",
+                  config: { homePath: sharedHome, shadowHomePath: authShadow },
+                },
+                codex_secret: {
+                  driver: "codex",
+                  config: { homePath: sharedHome, shadowHomePath: path.join(stateDir, "s") },
+                  environment: [
+                    {
+                      name: "CODEX_SQLITE_HOME",
+                      value: "",
+                      secret: { provider: "vault", reference: "codex/sqlite-home" },
+                    },
+                  ],
+                },
+              },
+            }),
+          );
+
+          const report = yield* inspectConfiguredCodexShadowHomes(stateDir);
+
+          expect(report.status).toBe("not-ready");
+          expect(
+            report.instances.map(({ instanceId, status, conflicts }) => ({
+              instanceId,
+              status,
+              entries: conflicts.map((conflict) => conflict.entryName),
+            })),
+          ).toEqual([
+            { instanceId: "codex_auth", status: "not-ready", entries: ["auth.json"] },
+            { instanceId: "codex_secret", status: "unknown", entries: [] },
+          ]);
+        }),
+    );
+
     it.effect("is not ready when settings.json exists but cannot be read", () =>
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;

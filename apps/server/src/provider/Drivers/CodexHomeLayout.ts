@@ -548,6 +548,21 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
   );
   const autoSettle = yield* sqliteHomeIsShared(fileSystem, path, layout, options.sqliteHome);
   const conflicts: Array<CodexShadowHomeConflict> = [];
+  // ensureShadowAuthIsPrivate refuses this one; nothing moves it aside.
+  const authPath = path.join(effectiveHomePath, "auth.json");
+  const authState = yield* readLinkState({
+    ...context,
+    entryName: "auth.json",
+    linkPath: authPath,
+  });
+  if (authState._tag === "Symlink") {
+    conflicts.push({
+      entryName: "auth.json",
+      path: authPath,
+      sqliteFiles: undefined,
+      autoSettle: false,
+    });
+  }
   for (const entryName of shadowLinkEntryNames(sharedEntryNames)) {
     if (PRIVATE_ENTRY_NAMES.has(entryName) || REPLACEABLE_SHARED_RUNTIME_ENTRIES.has(entryName)) {
       continue;
