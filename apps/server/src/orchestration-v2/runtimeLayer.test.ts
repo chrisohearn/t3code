@@ -8602,6 +8602,93 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("starts every message queued behind a scheduled model change with it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("runtime-layer-scheduled-model-change");
+      const scheduledSelection = { ...modelSelection, model: "gpt-5.5" };
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        createdBy: "user",
+        creationSource: "web",
+        title: "Scheduled model change",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      const send = (key: string) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}:${key}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:${key}`),
+          text: key,
+          attachments: [],
+          dispatchMode: { type: key === "active" ? "start_immediately" : "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+      for (const key of ["active", "before-1", "before-2"]) yield* send(key);
+      yield* orchestrator.dispatch({
+        type: "thread.model-selection.set",
+        commandId: CommandId.make(`${threadId}:schedule`),
+        threadId,
+        modelSelection: scheduledSelection,
+        applyAt: "next_turn",
+      });
+      yield* send("after");
+      const scheduled = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(scheduled.thread.modelSelection, modelSelection);
+      assert.deepEqual(
+        scheduled.thread.scheduledModelSelection?.modelSelection,
+        scheduledSelection,
+      );
+      const [active, before1, before2, after] = scheduled.runs;
+      assert.deepEqual(after?.modelSelection, scheduledSelection);
+
+      const complete = (runId: RunId) =>
+        Effect.gen(function* () {
+          const current = yield* orchestrator.getThreadProjection(threadId);
+          yield* eventSink.write({
+            events: [
+              {
+                id: EventId.make(`${runId}:completed`),
+                type: "run.updated",
+                threadId,
+                runId,
+                occurredAt: yield* DateTime.now,
+                payload: {
+                  ...current.runs.find((run) => run.id === runId)!,
+                  status: "completed",
+                  completedAt: yield* DateTime.now,
+                },
+              },
+            ],
+          });
+          yield* orchestrator.resumeQueuedRuns;
+          return yield* orchestrator.getThreadProjection(threadId);
+        });
+      const firstBoundary = yield* complete(active!.id);
+      const started1 = firstBoundary.runs.find((run) => run.id === before1!.id)!;
+      assert.equal(started1.status, "starting");
+      assert.deepEqual(started1.modelSelection, scheduledSelection);
+      assert.deepEqual(firstBoundary.thread.modelSelection, scheduledSelection);
+      assert.isNotNull(firstBoundary.thread.scheduledModelSelection ?? null);
+
+      const secondBoundary = yield* complete(before1!.id);
+      const started2 = secondBoundary.runs.find((run) => run.id === before2!.id)!;
+      assert.equal(started2.status, "starting");
+      assert.deepEqual(started2.modelSelection, scheduledSelection);
+      assert.isNull(secondBoundary.thread.scheduledModelSelection ?? null);
+    }),
+  );
+
   it.effect("keeps a buffered provider wake on its own provider behind a queued pick", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

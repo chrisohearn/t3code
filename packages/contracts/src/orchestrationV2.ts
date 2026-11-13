@@ -456,6 +456,18 @@ const LenientThreadOpens = Schema.NullOr(OrchestrationV2ThreadOpens).pipe(
   Schema.catchDecoding(() => Effect.succeedSome(null)),
 );
 
+/**
+ * A model change asked for while a run was active. Runs queued through `queuedThroughOrdinal`
+ * and every later turn start with it; the first start that leaves none of those queued clears it.
+ */
+export const OrchestrationV2ScheduledModelSelection = Schema.Struct({
+  modelSelection: ModelSelection,
+  afterRunId: RunId,
+  queuedThroughOrdinal: NonNegativeInt,
+});
+export type OrchestrationV2ScheduledModelSelection =
+  typeof OrchestrationV2ScheduledModelSelection.Type;
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
   id: ThreadId,
@@ -463,6 +475,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   title: TrimmedNonEmptyString,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
+  scheduledModelSelection: Schema.optional(Schema.NullOr(OrchestrationV2ScheduledModelSelection)),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   branch: Schema.NullOr(TrimmedNonEmptyString),
@@ -3333,6 +3346,8 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     modelSelection: ModelSelection,
+    /** While a run is active, schedule the change for the next turn start instead of refusing. */
+    applyAt: Schema.optional(Schema.Literal("next_turn")),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),

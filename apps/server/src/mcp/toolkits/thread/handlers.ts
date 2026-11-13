@@ -232,6 +232,14 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         return {
           threadId: thread.id,
           modelSelection: thread.modelSelection,
+          ...(thread.scheduledModelSelection == null
+            ? {}
+            : {
+                scheduledModelSelection: {
+                  modelSelection: thread.scheduledModelSelection.modelSelection,
+                  afterRunId: thread.scheduledModelSelection.afterRunId,
+                },
+              }),
           runtimeMode: thread.runtimeMode,
           interactionMode: thread.interactionMode,
         };
@@ -248,6 +256,13 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
             return yield* new OrchestratorMcpFailure({
               code: "invalid_request",
               message: "Set runtimeMode separately from modelSelection.",
+            });
+          }
+          if (input.applyAt !== undefined) {
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message:
+                "applyAt schedules a modelSelection; runtimeMode changes only on an idle thread.",
             });
           }
           const scope = yield* McpInvocationContext.McpInvocationContext;
@@ -272,10 +287,31 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         }
         const modelSelection = yield* required(input.modelSelection, "modelSelection");
         const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
+        if (input.applyAt !== undefined && type === "provider.switch") {
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: `applyAt schedules a model or option change on this thread's provider instance (${thread.providerInstanceId}). Switch to ${modelSelection.instanceId} while the thread is idle.`,
+          });
+        }
+        const applyAt = input.applyAt;
         const result = yield* threads
-          .dispatch({ type, threadId: thread.id, commandId: yield* newCommandId(), modelSelection })
+          .dispatch({
+            type,
+            threadId: thread.id,
+            commandId: yield* newCommandId(),
+            modelSelection,
+            ...(applyAt === undefined ? {} : { applyAt }),
+          })
           .pipe(Effect.mapError(dispatchFailure));
-        return { sequence: result.sequence };
+        if (applyAt === undefined) return { sequence: result.sequence };
+        const scheduled = (yield* readThread(thread.id)).projection.thread.scheduledModelSelection;
+        return scheduled == null
+          ? { sequence: result.sequence }
+          : {
+              status: "scheduled" as const,
+              afterRunId: scheduled.afterRunId,
+              sequence: result.sequence,
+            };
       }),
     ),
   ),
