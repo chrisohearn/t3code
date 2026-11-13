@@ -323,7 +323,8 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
   // Fork: fork migrations run after every upstream migration, so only on a full run.
   const executedForkMigrations =
     toMigrationInclusive === undefined ? yield* runForkMigrations() : [];
-  if (repairedForkMigrations.length > 0 || executedForkMigrations.length > 0) {
+  const hasForkChanges = repairedForkMigrations.length > 0 || executedForkMigrations.length > 0;
+  if (hasForkChanges) {
     yield* Effect.log("Fork migrations ran successfully").pipe(
       Effect.annotateLogs({
         moved: repairedForkMigrations.map(([from, to, name]) => `${from}_${name} -> fork ${to}`),
@@ -332,7 +333,7 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
     );
   }
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
-  yield* migrations.length === 0
+  yield* migrations.length === 0 && !hasForkChanges
     ? Effect.logDebug("Database schema is current")
     : Effect.log(DATABASE_MIGRATIONS_FINISHED_MESSAGE).pipe(Effect.annotateLogs({ migrations }));
 
