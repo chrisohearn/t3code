@@ -19,6 +19,24 @@ import {
 const SESSION_MINS = 5 * 60;
 const WEEK_MINS = 7 * 24 * 60;
 
+export function claudeUsageLimitScope(
+  types: ReadonlyArray<string>,
+  message: string,
+): "account" | "model" | undefined {
+  if (
+    types.some((type) => type === "five_hour" || type === "seven_day") ||
+    /5[- ]hour limit/i.test(message)
+  ) {
+    return "account";
+  }
+  if (
+    types.some((type) => /^seven_day_(?!overage|extra)[a-z_]+$/.test(type)) ||
+    /7[- ]day (?:model|fable|opus|sonnet|haiku) limit/i.test(message)
+  )
+    return "model";
+  return undefined;
+}
+
 const WINDOWS: Readonly<
   Record<string, Pick<ServerProviderUsageWindow, "kind" | "label" | "windowDurationMins">>
 > = {

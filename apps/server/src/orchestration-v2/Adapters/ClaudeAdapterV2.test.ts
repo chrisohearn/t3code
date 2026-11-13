@@ -7348,7 +7348,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
-  it.effect("keeps a later future-window event-supplied Claude reset over the embedded reset", () =>
+  it.effect.each([
+    { rateLimitType: "five_hour", scope: "account", proseOnly: false },
+    { rateLimitType: "seven_day_fable", scope: "model", proseOnly: false },
+    { rateLimitType: "unknown", scope: "model", proseOnly: true },
+  ] as const)("preserves Claude limit scope and the later reset: $rateLimitType", (scenario) =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;
       yield* harness.runtime.startTurn(
@@ -7375,13 +7379,18 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         makeAssistantErrorFrame({
           uuid: "00000000-0000-4000-8000-000000000684",
           error: "rate_limit",
-          apiErrorParams: {
-            rate_limit_info: {
-              status: "rejected",
-              rateLimitType: "five_hour",
-              resetsAt: 1791804000,
-            },
-          },
+          text: scenario.proseOnly
+            ? "Usage limit reached until the 7-day Fable limit resets in 145h"
+            : "Usage limit reached.",
+          apiErrorParams: scenario.proseOnly
+            ? undefined
+            : {
+                rate_limit_info: {
+                  status: "rejected",
+                  rateLimitType: scenario.rateLimitType,
+                  resetsAt: 1791804000,
+                },
+              },
         }),
         makeResultFrame({
           uuid: "00000000-0000-4000-8000-000000000685",
@@ -7396,6 +7405,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       if (terminal.status !== "failed") return;
       assert.equal(terminal.failure.class, "usage_limit");
       assert.equal(terminal.failure.resetAt, "2026-10-12T12:20:00.000Z");
+      assert.equal(terminal.failure.limitScope, scenario.scope);
       assert.equal(terminal.accountFailure, "usage_limit");
       assert.equal(terminal.noWorkObserved, true);
     }).pipe(

@@ -79,6 +79,7 @@ import {
   managedRuntimeModeCeilingMessage,
 } from "@t3tools/contracts";
 import * as ProviderFailover from "./ProviderFailover.ts";
+import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { modelSwitchSince } from "./modelSwitch.ts";
@@ -1418,6 +1419,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const providerCooldown = yield* ProviderCooldown.ProviderCooldown;
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
@@ -2306,7 +2308,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const queuedMessage = projection.messages.find(
         (candidate) => candidate.id === storedQueuedRun.userMessageId,
       );
-      const modelSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const requestedSelection = queuedRunModelSelection(projection, storedQueuedRun);
+      const modelSelection =
+        queuedMessage === undefined
+          ? requestedSelection
+          : yield* ProviderFailover.resolveProviderCooldownTarget({
+              cooldown: providerCooldown,
+              settings: serverSettings,
+              projectId: projection.thread.projectId,
+              modelSelection: requestedSelection,
+              message: queuedMessage,
+            });
       const queuedRun = {
         ...storedQueuedRun,
         modelSelection,
@@ -7095,6 +7107,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       dispatchMode = { type: "start_immediately" };
     }
     const freshContext = command.freshContext === true;
+    if (
+      command.failoverOfRunId === undefined &&
+      command.restartContinuationOfRunId === undefined &&
+      (dispatchMode.type === "start_immediately" || dispatchMode.type === "queue_after_active")
+    ) {
+      modelSelection = yield* ProviderFailover.resolveProviderCooldownTarget({
+        cooldown: providerCooldown,
+        settings: serverSettings,
+        projectId: projection.thread.projectId,
+        modelSelection,
+        message: { ...command, role: "user" },
+      });
+    }
     if (
       freshContext &&
       (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active")
@@ -16530,4 +16555,5 @@ export const layer: Layer.Layer<
   | ThreadForkServiceV2
 > = Layer.effect(OrchestratorV2, makeOrchestrator()).pipe(
   Layer.provide(ThreadCommandExecutor.layer),
+  Layer.provide(ProviderCooldown.layer),
 );

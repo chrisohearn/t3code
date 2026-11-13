@@ -35,6 +35,7 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ProviderFailover from "./ProviderFailover.ts";
+import * as ProviderCooldown from "../provider/ProviderCooldown.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
@@ -189,11 +190,13 @@ export const layer: Layer.Layer<
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
+    const providerCooldown = yield* ProviderCooldown.ProviderCooldown;
     const resolveFailoverTarget = (
       input: Parameters<typeof ProviderFailover.resolveProviderFailoverTarget>[0],
     ) =>
       ProviderFailover.resolveProviderFailoverTarget(input).pipe(
         Effect.provideService(ServerSettings.ServerSettingsService, serverSettings),
+        Effect.provideService(ProviderCooldown.ProviderCooldown, providerCooldown),
       );
 
     const resolveRecreateBase = Effect.fn("ProviderTurnStartService.resolveRecreateBase")(
@@ -1963,4 +1966,4 @@ export const layer: Layer.Layer<
       ),
     });
   }),
-);
+).pipe(Layer.provide(ProviderCooldown.layer));

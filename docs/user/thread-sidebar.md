@@ -258,6 +258,16 @@ pick another model in the composer to switch back. It never happens after the
 agent replied, used a tool or changed a file, after you steered the turn or
 pressed Stop, or a second time for the same message. Otherwise the limit choices
 below apply.
+
+A model-specific limit can switch to a different fallback model on the same
+account. Account-wide limits need another instance. Administrators can optionally
+set `secondaryFallbackModelSelection` in `settings.json` (the same selection shape
+as `fallbackModelSelection`) for that case; it is unset by default. After an
+account limit with a known reset time, the running server routes new prompts to
+an available configured fallback until that reset or a successful turn on the
+original instance. Provider status shows the cooldown. Restarting the server
+clears learned cooldowns; it does not change the configured fallbacks.
+
 Press **Resume** in an empty composer to continue a limited or interrupted turn
 manually. Do this when the provider reports no reset time, because nothing
 continues the turn on its own.

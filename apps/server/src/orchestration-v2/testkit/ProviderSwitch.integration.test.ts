@@ -3659,11 +3659,15 @@ describe("orchestration v2 provider switching", () => {
             responseByRunOrdinal: { 1: "Queued for Jarvis: ready" },
             capturedTurns,
             failedRunOrdinals: new Set([2]),
-            failure: makeProviderFailure({
-              message: "You've hit your usage limit.",
-              code: "subscription_sharing_usage_limit_exceeded",
-              class: "usage_limit",
-            }),
+            failure: {
+              ...makeProviderFailure({
+                message: "You've hit your usage limit.",
+                code: "subscription_sharing_usage_limit_exceeded",
+                class: "usage_limit",
+              }),
+              limitScope: "account",
+              resetAt: "2099-01-01T00:00:00.000Z",
+            },
             failedTerminalEvidence: { noWorkObserved: true, accountFailure: "usage_limit" },
           }),
           makeTestAdapter({
@@ -3742,6 +3746,25 @@ describe("orchestration v2 provider switching", () => {
           assert.include(delivered, role);
           assert.include(delivered, "is this thread's first message");
           assert.equal(delivered.split("Queue: the audit finished.").length - 1, 1);
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("command:account-failover:cooldown"),
+            threadId,
+            messageId: MessageId.make("message:account-failover:cooldown"),
+            text: "Queue: another task.",
+            attachments: [],
+            modelSelection: CODEX_MODEL_SELECTION,
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "agent",
+            creationSource: "mcp",
+          });
+          yield* worker.drain();
+          const cooled = yield* waitForIdle(threadId);
+          assert.deepEqual(cooled.runs.at(-1)?.modelSelection, CLAUDE_MODEL_SELECTION);
+          assert.deepEqual(
+            (yield* Ref.get(capturedTurns)).map((turn) => turn.driver),
+            [CODEX_DRIVER, CODEX_DRIVER, CLAUDE_DRIVER, CLAUDE_DRIVER],
+          );
         }).pipe(
           Effect.provide(
             ProviderReplayHarness.layerWithRegistry(

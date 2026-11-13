@@ -26,6 +26,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ModelManifest from "./ModelManifest.ts";
+import * as ProviderCooldown from "./ProviderCooldown.ts";
 import { applyProviderCompatibility } from "./providerCompatibility.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
@@ -380,6 +381,7 @@ export const layer = Layer.effect(
     const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
     const serviceScope = yield* Effect.scope;
     const config = yield* ServerConfig.ServerConfig;
+    const cooldown = yield* ProviderCooldown.ProviderCooldown;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
 
@@ -1168,17 +1170,36 @@ export const layer = Layer.effect(
       }
     });
 
+    const withCooldowns = Effect.fn("ProviderRegistry.withCooldowns")(function* (
+      providers: ReadonlyArray<ServerProvider>,
+    ) {
+      return ProviderCooldown.withProviderCooldowns(providers, yield* cooldown.getAll);
+    });
+    const getProviders = Ref.get(providersRef).pipe(Effect.flatMap(withCooldowns));
     return {
-      getProviders: Ref.get(providersRef),
+      getProviders,
       refresh: (provider?: ProviderDriverKind) =>
-        refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
+        refresh(provider).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
       refreshInstance: (instanceId: ProviderInstanceId) =>
-        refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+        refreshInstance(instanceId).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
       reloadSecretsAndRefresh: (instanceId?: ProviderInstanceId) =>
-        reloadSecretsAndRefresh(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+        reloadSecretsAndRefresh(instanceId).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
       refreshWorkspaceSnapshot: (input) =>
-        refreshWorkspaceSnapshot(input).pipe(Effect.catchCause(recoverRefreshFailure)),
-      refreshAfterUpdate,
+        refreshWorkspaceSnapshot(input).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(withCooldowns),
+        ),
+      refreshAfterUpdate: (...args) =>
+        refreshAfterUpdate(...args).pipe(Effect.flatMap(withCooldowns)),
       invalidateModelCaches,
       refreshModelCatalog: refreshModelCatalog().pipe(
         Effect.catchCause(recoverRefreshFailure),
@@ -1187,8 +1208,11 @@ export const layer = Layer.effect(
       getProviderMaintenanceCapabilitiesForInstance,
       setProviderMaintenanceActionState,
       get streamChanges() {
-        return Stream.fromPubSub(changesPubSub);
+        return Stream.merge(
+          Stream.fromPubSub(changesPubSub).pipe(Stream.mapEffect(withCooldowns)),
+          cooldown.changes.pipe(Stream.mapEffect(() => getProviders)),
+        );
       },
     } satisfies ProviderRegistry["Service"];
   }),
-);
+).pipe(Layer.provide(ProviderCooldown.layer));

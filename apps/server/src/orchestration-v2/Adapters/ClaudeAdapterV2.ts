@@ -208,6 +208,7 @@ import {
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
   claudeRateLimitEventToUpdate,
+  claudeUsageLimitScope,
   type ClaudeScopedLimitNames,
 } from "../../provider/claudeUsageLimits.ts";
 import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapshot";
@@ -4812,6 +4813,7 @@ interface ActiveClaudeTurnContext {
   latestAssistantRateLimit: {
     readonly type: string | null;
     readonly resetAt: string | null;
+    readonly scope?: "account" | "model" | undefined;
   } | null;
   // Set while this turn's latest compaction status reports a failure, with
   // Claude's error text when it sent one.
@@ -10249,7 +10251,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               // Subagent uuids exist only in the sidechain transcript, so resume and fork cannot target them.
               context.nativeMessageCursor = message.uuid;
               context.latestAssistantRateLimit =
-                message.error === "rate_limit" ? { type: null, resetAt: null } : null;
+                message.error === "rate_limit"
+                  ? {
+                      type: null,
+                      resetAt: null,
+                      scope: claudeUsageLimitScope(
+                        [],
+                        textFromClaudeContent(message.message.content),
+                      ),
+                    }
+                  : null;
               if (message.error === "rate_limit" && isClaudeBlockedAssistantRateLimit(message)) {
                 const info = message.api_error_params.rate_limit_info;
                 const overageAllowed =
@@ -10259,6 +10270,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   info.overageInUse === true;
                 if (!overageAllowed) {
                   context.latestAssistantRateLimit = {
+                    scope: context.latestAssistantRateLimit?.scope,
                     type: typeof info.rateLimitType === "string" ? info.rateLimitType : "unknown",
                     resetAt: claudeUsageLimitResetAt(info.resetsAt),
                   };
@@ -11256,9 +11268,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     failureHint,
                     usageLimited,
                   );
+            const limitScope =
+              claudeUsageLimitScope(
+                [
+                  ...context.rejectedRateLimitTypes,
+                  ...(assistantLimit?.type == null ? [] : [assistantLimit.type]),
+                ],
+                message.subtype === "success" ? message.result : message.errors.join("\n"),
+              ) ?? assistantLimit?.scope;
             const terminalFailure =
               resultFailure?.class === "usage_limit"
-                ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
+                ? {
+                    ...resultFailure,
+                    resetAt: resetAt ?? resultFailure.resetAt ?? null,
+                    ...(limitScope === undefined ? {} : { limitScope }),
+                  }
                 : resultFailure;
             const accountFailure =
               terminalFailure === null

@@ -3957,56 +3957,88 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
-  it.effect("reports a thread another Codex client is writing to as in use", () =>
+  it.effect.each(["exhaust", "recover"] as const)("bounds active-writer retries: %s", (outcome) =>
     Effect.scoped(
       Effect.gen(function* () {
         const nativeThreadId = "thread-open-elsewhere";
+        const resumed = yield* Queue.unbounded<void>();
+        const preamble = codexReplayPreamble({
+          nativeThreadId,
+          nativeTurnId: "unused-turn",
+          prompt: "unused-prompt",
+        });
+        const started = preamble[4];
+        assert(started?.type === "emit_inbound");
+        const entries: Array<CodexReplay.CodexAppServerReplayEntry> = preamble.slice(0, 5);
+        for (let attempt = 0; attempt < (outcome === "recover" ? 2 : 4); attempt++) {
+          const requestId = 3 + attempt;
+          entries.push(
+            {
+              type: "expect_outbound",
+              label: "thread/resume",
+              frame: {
+                id: requestId,
+                method: "thread/resume",
+                params: {
+                  threadId: nativeThreadId,
+                  excludeTurns: true,
+                  cwd: CODEX_TEST_RUNTIME_POLICY.cwd,
+                  model: CODEX_TEST_MODEL_SELECTION.model,
+                  config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                },
+              },
+            },
+            outcome === "recover" && attempt === 1
+              ? withReplayRequestId(started, requestId)
+              : {
+                  type: "emit_inbound",
+                  label: "resume result",
+                  frame: {
+                    id: requestId,
+                    error: {
+                      code: -32600,
+                      message: `thread ${nativeThreadId} already has an active writer`,
+                    },
+                  },
+                },
+          );
+        }
         const harness = yield* makeCodexReplayHarness(
           makeCodexReplayTranscript({
             scenario: "codex-resume-active-writer",
-            entries: [
-              ...codexReplayPreamble({
-                nativeThreadId,
-                nativeTurnId: "unused-turn",
-                prompt: "unused-prompt",
-              }).slice(0, 5),
-              {
-                type: "expect_outbound",
-                label: "thread/resume",
-                frame: {
-                  id: 3,
-                  method: "thread/resume",
-                  params: {
-                    threadId: nativeThreadId,
-                    excludeTurns: true,
-                    cwd: CODEX_TEST_RUNTIME_POLICY.cwd,
-                    model: CODEX_TEST_MODEL_SELECTION.model,
-                    config: CodexAdapterV2.CODEX_THREAD_CONFIG,
-                  },
-                },
-              },
-              {
-                type: "emit_inbound",
-                label: "active writer",
-                frame: {
-                  id: 3,
-                  error: {
-                    code: -32600,
-                    message: `thread ${nativeThreadId} already has an active writer`,
-                  },
-                },
-              },
-            ],
+            entries,
           }),
+          () => Effect.void,
+          (method) =>
+            method === "thread/resume"
+              ? Queue.offer(resumed, undefined).pipe(Effect.asVoid)
+              : Effect.void,
         );
 
-        const error = yield* Effect.flip(
-          harness.runtime.resumeThread({
+        const resume = yield* harness.runtime
+          .resumeThread({
             providerThread: harness.providerThread,
             modelSelection: CODEX_TEST_MODEL_SELECTION,
             runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
-          }),
-        );
+          })
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Queue.take(resumed);
+        yield* TestClock.adjust("250 millis");
+        yield* Queue.take(resumed);
+        if (outcome === "exhaust") {
+          yield* TestClock.adjust("500 millis");
+          yield* Queue.take(resumed);
+          yield* TestClock.adjust("1 second");
+          yield* Queue.take(resumed);
+        }
+        const result = yield* Fiber.join(resume);
+        if (outcome === "recover") {
+          assert.equal(result._tag, "Success");
+          return;
+        }
+        assert.equal(result._tag, "Failure");
+        if (result._tag !== "Failure") return;
+        const error = result.failure;
 
         assert.equal(error._tag, "ProviderAdapterThreadInUseError");
         assert.nestedPropertyVal(error, "providerThreadId", harness.providerThread.id);
