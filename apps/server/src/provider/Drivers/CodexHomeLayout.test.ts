@@ -713,6 +713,33 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
     );
 
     it.effect.skipIf(!symlinksSupported)(
+      "puts every database back when a later one cannot be moved",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const { sharedHome, shadowHome, layout, backup } = yield* prepareOwnDatabaseShadow();
+          yield* writeTextFile(path.join(sharedHome, "goals_1.sqlite"), "shared");
+          yield* writeTextFile(path.join(shadowHome, "goals_1.sqlite"), "own goals_1.sqlite");
+          const order = yield* inspectCodexShadowHome(layout, { sqliteHome: sharedHome });
+          // Block the database that moves last, so an earlier one has already moved.
+          const last = order.at(-1)!.entryName;
+          yield* writeTextFile(path.join(backup, last, "held"), "");
+
+          const error = yield* materializeCodexShadowHome(layout, { sqliteHome: sharedHome }).pipe(
+            Effect.flip,
+          );
+
+          assert.instanceOf(error, CodexShadowHomeEntryConflictError);
+          for (const name of [...ownDatabaseFiles, "goals_1.sqlite"]) {
+            expect(yield* fileSystem.readFileString(path.join(shadowHome, name))).toBe(
+              `own ${name}`,
+            );
+          }
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
       "refuses a shadow path that resolves to the shared home",
       () =>
         Effect.gen(function* () {

@@ -659,14 +659,14 @@ function backupCommandFor(
   return `mkdir -p ${quote(directory)} && mv ${files.map(quote).join(" ")} ${quote(directory)}/`;
 }
 
-// Moves a shadow's own database with its sidecars, all or nothing. Rename is the only
+// Moves the shadow's own databases with their sidecars, all or nothing. Rename is the only
 // operation, so a file Windows holds open or a backup on another filesystem refuses the move.
 const moveShadowDatabaseAside = Effect.fn("CodexHomeLayout.moveShadowDatabaseAside")(
   function* (input: {
     readonly fileSystem: FileSystem.FileSystem;
     readonly sharedHomePath: string;
     readonly effectiveHomePath: string;
-    readonly conflict: CodexShadowHomeConflict & { readonly sqliteFiles: ReadonlyArray<string> };
+    readonly files: ReadonlyArray<string>;
     readonly backupDirectory: string;
   }): Effect.fn.Return<
     { readonly moved: true } | { readonly moved: false; readonly stranded: boolean },
@@ -674,13 +674,13 @@ const moveShadowDatabaseAside = Effect.fn("CodexHomeLayout.moveShadowDatabaseAsi
     Path.Path
   > {
     const path = yield* Path.Path;
-    const { fileSystem, conflict, backupDirectory } = input;
+    const { fileSystem, files, backupDirectory } = input;
     const made = yield* fileSystem
       .makeDirectory(backupDirectory, { recursive: true })
       .pipe(Effect.exit);
     if (made._tag === "Failure") return { moved: false, stranded: false };
     const moved: Array<string> = [];
-    for (const name of conflict.sqliteFiles) {
+    for (const name of files) {
       const destination = path.join(backupDirectory, name);
       // Rename replaces an existing file, so never move onto an earlier backup.
       const destinationState = yield* readLinkState({
@@ -816,38 +816,38 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
         });
   }
   const sqliteConflicts = blocker === undefined ? conflicts : [blocker];
-  for (const conflict of sqliteConflicts) {
-    if (conflict.sqliteFiles === undefined) continue;
-    const sqliteConflict = { ...conflict, sqliteFiles: conflict.sqliteFiles };
-    const result = conflict.autoSettle
-      ? yield* moveShadowDatabaseAside({
-          fileSystem,
-          sharedHomePath: layout.sharedHomePath,
-          effectiveHomePath,
-          conflict: sqliteConflict,
+  const first = sqliteConflicts.find((conflict) => conflict.sqliteFiles !== undefined);
+  if (first !== undefined) {
+    const files = sqliteConflicts.flatMap((conflict) => conflict.sqliteFiles ?? []);
+    const result =
+      blocker === undefined
+        ? yield* moveShadowDatabaseAside({
+            fileSystem,
+            sharedHomePath: layout.sharedHomePath,
+            effectiveHomePath,
+            files,
+            backupDirectory,
+          })
+        : { moved: false as const, stranded: false };
+    if (!result.moved) {
+      return yield* new CodexShadowHomeEntryConflictError({
+        sharedHomePath: layout.sharedHomePath,
+        effectiveHomePath,
+        entryName: first.entryName,
+        linkPath: first.path,
+        targetPath: path.join(layout.sharedHomePath, first.entryName),
+        backupCommand: backupCommandFor(
+          platform,
           backupDirectory,
-        })
-      : { moved: false as const, stranded: false };
-    if (result.moved) {
-      yield* Effect.logWarning(
-        "Moved a Codex shadow home's own SQLite database aside so the shadow can share the home's database.",
-        { files: conflict.sqliteFiles, backup: backupDirectory },
-      );
-      continue;
+          files.map((name) => path.join(effectiveHomePath, name)),
+        ),
+        ...(result.stranded ? { strandedBackupPath: backupDirectory } : {}),
+      });
     }
-    return yield* new CodexShadowHomeEntryConflictError({
-      sharedHomePath: layout.sharedHomePath,
-      effectiveHomePath,
-      entryName: conflict.entryName,
-      linkPath: conflict.path,
-      targetPath: path.join(layout.sharedHomePath, conflict.entryName),
-      backupCommand: backupCommandFor(
-        platform,
-        backupDirectory,
-        conflict.sqliteFiles.map((name) => path.join(effectiveHomePath, name)),
-      ),
-      ...(result.stranded ? { strandedBackupPath: backupDirectory } : {}),
-    });
+    yield* Effect.logWarning(
+      "Moved a Codex shadow home's own SQLite database aside so the shadow can share the home's database.",
+      { files, backup: backupDirectory },
+    );
   }
 
   yield* settleShadowSqliteSidecars({
