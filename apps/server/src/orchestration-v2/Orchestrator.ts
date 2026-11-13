@@ -15613,7 +15613,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           });
         }
         const now = yield* DateTime.now;
-        const queued = projection.runs.filter((run) => run.status === "queued");
+        // Resuming (an unfreeze included) leaves a snooze's held turns while the thread sleeps.
+        const snoozeHolds =
+          projection.runs.some((run) => run.status === "queued" && run.snoozeDeferred === true) &&
+          isSnoozed(
+            (yield* projectionStore
+              .getThreadShell(command.threadId)
+              .pipe(Effect.orElseSucceed(() => null))) ?? {
+              ...projection.thread,
+              status: "idle",
+              latestRunCompletedAt: null,
+              pendingRuntimeRequest: null,
+            },
+            DateTime.toEpochMillis(now),
+          );
+        const queued = projection.runs.filter(
+          (run) => run.status === "queued" && !(snoozeHolds && run.snoozeDeferred === true),
+        );
         for (const run of queued) {
           yield* emit(
             events,
