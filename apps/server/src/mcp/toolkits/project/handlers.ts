@@ -108,7 +108,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         const created = yield* projects
           .create({ ...input, workspaceRoot, commandId, projectId: ProjectId.make(commandId) })
           .pipe(Effect.mapError(projectFailure));
-        const warning = temporaryFolderWarning(workspaceRoot);
+        const warning = yield* temporaryFolderWarning(workspaceRoot);
         return warning === undefined ? created : { ...created, warning };
       }),
     // Linked work may bring the repository it works in; an existing

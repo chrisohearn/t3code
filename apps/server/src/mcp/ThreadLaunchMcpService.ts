@@ -373,7 +373,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       }
       const run = result.projection.runs.find((run) => run.userMessageId === messageId);
       const warning =
-        project === undefined ? undefined : temporaryFolderWarning(project.workspaceRoot);
+        project === undefined ? undefined : yield* temporaryFolderWarning(project.workspaceRoot);
       const notify = yield* ThreadNotifications.finish(
         notification,
         thread.id,

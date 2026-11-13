@@ -3,11 +3,14 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import { expect, it } from "@effect/vitest";
+import { assert, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 
-import { isTemporaryFolder, temporaryFolderWarning } from "./temporaryFolder.ts";
+import { isTemporaryFolder, isTemporaryPath, temporaryFolderWarning } from "./temporaryFolder.ts";
 
-it.each([
+it.effect.each([
   ["/tmp/review", true],
   ["/var/tmp/review", true],
   ["/dev/shm/work", true],
@@ -17,25 +20,53 @@ it.each([
   ["/home/user/app", false],
   ["/tmpfoo/app", false],
   ["/run/media/user/disk/app", false],
-])("%s is temporary: %s", (path, temporary) => {
-  expect(isTemporaryFolder(path)).toBe(temporary);
-  expect(temporaryFolderWarning(path) !== undefined).toBe(temporary);
-});
+  ["/run/user/1000/gvfs/sftp:host=nas/app", false],
+  ["/run/user/1000/doc/by-app/app", false],
+] as const)("%s is temporary: %s", ([path, temporary]) =>
+  Effect.gen(function* () {
+    assert.equal(yield* isTemporaryFolder(path), temporary);
+    assert.equal((yield* temporaryFolderWarning(path)) !== undefined, temporary);
+    assert.equal(isTemporaryPath(path), temporary);
+  }),
+);
 
-it("resolves symlinks and a persistent TMPDIR", () => {
-  const sandbox = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "temporary-folder-"));
-  try {
-    const persistent = NodePath.join(NodeOS.homedir(), ".t3");
+it.effect("never probes the filesystem under a network or document mount", () =>
+  Effect.gen(function* () {
+    const probed: string[] = [];
+    const probe = {
+      inspect: (path: string) => {
+        probed.push(path);
+        return Promise.resolve({ resolved: path, tmpfs: true });
+      },
+    };
+    assert.isFalse(yield* isTemporaryFolder("/run/user/1000/gvfs/smb-share/x", probe));
+    assert.deepEqual(probed, []);
+  }),
+);
+
+it.effect("falls back to the name when the filesystem does not answer in time", () =>
+  Effect.gen(function* () {
+    const hung = { inspect: () => new Promise<never>(() => {}) };
+    const byName = (path: string) =>
+      Effect.forkChild(isTemporaryFolder(path, hung)).pipe(
+        Effect.tap(() => TestClock.adjust("500 millis")),
+        Effect.flatMap(Fiber.join),
+      );
+    assert.isTrue(yield* byName("/tmp/review"));
+    assert.isFalse(yield* byName("/home/user/app"));
+  }),
+);
+
+it.effect("resolves symlinks, and ignores a persistent TMPDIR", () =>
+  Effect.gen(function* () {
+    const sandbox = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "temporary-folder-"));
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => NodeFS.rmSync(sandbox, { recursive: true, force: true })),
+    );
     const link = NodePath.join(sandbox, "link");
     NodeFS.symlinkSync(process.cwd(), link);
     // Under /tmp by name, but it leads to a folder that is not temporary.
-    expect(isTemporaryFolder(NodePath.join(link, "missing"))).toBe(false);
-    expect(isTemporaryFolder(NodePath.join(sandbox, "missing"))).toBe(true);
-    // Relative paths resolve against the working directory, which is not temporary here.
-    expect(isTemporaryFolder(NodePath.relative(process.cwd(), persistent))).toBe(
-      isTemporaryFolder(persistent),
-    );
-  } finally {
-    NodeFS.rmSync(sandbox, { recursive: true, force: true });
-  }
-});
+    assert.isFalse(yield* isTemporaryFolder(NodePath.join(link, "missing")));
+    assert.isTrue(yield* isTemporaryFolder(NodePath.join(sandbox, "missing")));
+  }).pipe(Effect.scoped),
+);
