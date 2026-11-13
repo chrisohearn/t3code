@@ -303,6 +303,28 @@ unset -f provider_canary restore_db can_open
 source <(sed -n '/^restore_db() {/,/^}/p' "$root/functions")
 service_version() { echo 1; }; active_version() { echo 1; }; rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2"
 
+# prove never records a build the update marked bad, and skips while an update holds the lock.
+# Earlier tests ran cmd_update in this shell, which still holds the service lock on fd 9.
+exec 9>&-
+(
+  source "$root/functions"
+  active_version() { echo 5; }; service_version() { echo 5; }; service_uptime() { echo 100; }
+  is_trusted() { return 0; }; outage_end() { :; }; log() { :; }
+  mkdir -p "$GUARD_STATE/bad" "$GUARD_STATE/healthy" "$(dirname "$STATE_FILE")"; touch "$STATE_FILE"
+  date -Is > "$GUARD_STATE/bad/5"; rm -f "$GUARD_STATE/healthy/5"*
+  cmd_prove >/dev/null 2>&1
+  [[ -e "$GUARD_STATE/bad/5" ]] || fail 'prove cleared a bad marker'
+  ! is_healthy 5 || fail 'prove recorded a bad build healthy'
+  rm -f "$GUARD_STATE/bad/5"
+  exec 9>>"$LOCK"; flock -n 9
+  cmd_prove >/dev/null 2>&1
+  ! is_healthy 5 || fail 'prove recorded health while an update held the lock'
+  exec 9>&-
+  cmd_prove >/dev/null 2>&1
+  is_healthy 5 || fail 'prove did not record a good build'
+) || exit 1
+pass 'prove skips a build marked bad, skips while an update holds the lock, and records a good build'
+
 # A checksummed archive without the binary is rejected. (Earlier tests stub release_binary_sha.)
 source <(sed -n '/^release_binary_sha() {/,/^}/p' "$root/functions")
 mkdir -p "$root/rel/t3-9.9.9-linux-x64"; echo x > "$root/rel/t3-9.9.9-linux-x64/README"

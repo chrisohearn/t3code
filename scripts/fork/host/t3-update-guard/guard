@@ -462,17 +462,20 @@ record_healthy() {
 # Once the service has served the active version for a minute, record it as healthy.
 cmd_prove() {
   local v up i
-  # cmd_update proves (and may mark bad) the build it installs; racing it could clear a bad marker.
-  exec 8>>"$LOCK"
-  flock -n 8 || { log "prove: a service change is in progress; it does its own health check"; return 0; }
-  exec 8>&-
   for i in $(seq 1 20); do
     v=$(active_version)
     up=$(service_uptime) || up=0
     if (( up >= 60 )) && [[ "$(service_version)" == "$v" ]]; then
       is_trusted "$v" || trust "$v" || { log "prove: $v serves but is unverified"; return 1; }
+      # cmd_update proves, and may mark bad, the build it installs. Record only under the service
+      # lock (held briefly, so a crash-loop rollback is never locked out), and never record a
+      # build marked bad: record_healthy would clear that marker.
+      exec 8>>"$LOCK"
+      flock -n 8 || { exec 8>&-; log "prove: a service change is in progress; it does its own health check"; return 0; }
+      if is_bad "$v"; then exec 8>&-; log "prove: $v is marked bad; not recording it healthy"; return 0; fi
       is_healthy "$v" || record_healthy "$v"
       cp -f "$STATE_FILE" "$GUARD_STATE/healthy/$v.json"
+      exec 8>&-
       outage_end "$v"
       return 0
     fi
