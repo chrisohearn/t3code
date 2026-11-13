@@ -7153,31 +7153,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
       return;
     }
-    // A scheduled task or webhook that fires again on a frozen thread adds nothing while its
-    // earlier copy is still held.
-    if (frozenHold && command.scheduledTaskId !== undefined) {
-      const heldMessageIds = projection.runs
-        .filter((run) => run.status === "queued")
-        .map((run) => run.userMessageId);
-      const held =
-        heldMessageIds.length === 0
-          ? []
-          : (yield* projectionStore
-              .getThreadRecords(command.threadId, ["messages"], { messageIds: heldMessageIds })
-              .pipe(mapDispatchError(command))).messages;
-      if (held.some((message) => message.scheduledTaskId === command.scheduledTaskId)) {
-        yield* emit(
-          events,
-          command,
-        )({
-          type: "thread.metadata-updated",
-          threadId: command.threadId,
-          occurredAt: yield* DateTime.now,
-          payload: projection.thread,
-        });
-        return;
-      }
-    }
     const consumesFreshContext =
       projection.thread.nextTurnFreshContext === true &&
       !frozenHold &&

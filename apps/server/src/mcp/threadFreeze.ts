@@ -8,7 +8,6 @@ import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
-import { CommandActor } from "../orchestration-v2/CommandActor.ts";
 import { ThreadFreezeGate } from "../orchestration-v2/ThreadFreeze.ts";
 import { type McpInvocationScope, messageSenderFor } from "./McpInvocationContext.ts";
 import { assertLiveCaller, dispatchFailure, newCommandId, readThread } from "./threadAccess.ts";
@@ -30,11 +29,6 @@ const freezeActor = (scope: McpInvocationScope, label: string): ThreadFreezeActo
     ? { kind: "unknown", label: label.slice(0, 128) }
     : { kind: "agent", label: label.slice(0, 128), threadId: scope.thread.threadId };
 };
-
-const asAgent = <A, E, R>(effect: Effect.Effect<A, E, R>, scope: McpInvocationScope) =>
-  Effect.provideService(effect, CommandActor, {
-    kind: scope.thread === undefined ? "mcp_client" : "agent",
-  });
 
 const nowIso = Effect.map(Clock.currentTimeMillis, (ms) =>
   DateTime.formatIso(DateTime.makeUnsafe(ms)),
@@ -68,7 +62,6 @@ export const freezeThread = Effect.fn("mcp.freezeThread")(function* (input: {
       .dispatch({ type: "thread.metadata.update", commandId: base, threadId, frozen: freeze })
       .pipe(
         Effect.provideService(ThreadFreezeGate, { op: "freeze" }),
-        (effect) => asAgent(effect, scope),
         Effect.mapError(dispatchFailure),
       );
   }
@@ -76,7 +69,7 @@ export const freezeThread = Effect.fn("mcp.freezeThread")(function* (input: {
   const stopId = CommandId.make(`${base}:stop`);
   const stopped = yield* threads
     .dispatch({ type: "thread.stop", commandId: stopId, threadId, reason: stopReason })
-    .pipe((effect) => asAgent(effect, scope), Effect.mapError(dispatchFailure));
+    .pipe(Effect.mapError(dispatchFailure));
   yield* threads
     .stopDelegatedTasks({ threadId, commandId: stopId, reason: stopReason })
     .pipe(Effect.mapError(dispatchFailure));
@@ -133,7 +126,6 @@ export const unfreezeThread = Effect.fn("mcp.unfreezeThread")(function* (input: 
         at: yield* nowIso,
         freshContext: input.freshContext === true,
       }),
-      (effect) => asAgent(effect, scope),
       Effect.mapError(dispatchFailure),
     );
   return {

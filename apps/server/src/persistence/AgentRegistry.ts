@@ -9,6 +9,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+const LAUNCHED_CAP = 200;
 
 export const RegistryInput = Schema.Struct({
   cursor: Schema.optional(Schema.String.check(Schema.isMaxLength(300))),
@@ -38,6 +39,8 @@ export const RegistryItem = Schema.Struct({
   attribution: Schema.Literals(["attributed", "shared, unattributable"]),
   /** MCP connections a sign-in used in the last 24h, among calls logged since connections were recorded. */
   connections: Schema.optional(Schema.Number),
+  /** The sign-in launched more threads than the registry counts, so `runs24h` is partial. */
+  truncated: Schema.optional(Schema.Literal(true)),
 });
 export const RegistryResult = Schema.Struct({
   scope: Schema.Literals(["all", "own"]),
@@ -167,9 +170,14 @@ const make = Effect.gen(function* () {
             signInIds.map((id) => [id, []]),
           );
           if (signInIds.length > 0) {
+            // The newest threads of each sign-in, capped per sign-in; a sign-in that hits the cap
+            // is flagged, since its run count then covers only those threads.
             for (const row of yield* sql<{ readonly sessionId: string; readonly threadId: string }>`
-              SELECT session_id AS "sessionId", thread_id AS "threadId" FROM mcp_client_threads
-              WHERE ${sql.in("session_id", signInIds)} LIMIT 500`) {
+              SELECT session_id AS "sessionId", thread_id AS "threadId" FROM (
+                SELECT session_id, thread_id,
+                  ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at DESC) AS newest
+                FROM mcp_client_threads WHERE ${sql.in("session_id", signInIds)}
+              ) WHERE newest <= ${LAUNCHED_CAP}`) {
               launched.get(row.sessionId)?.add(row.threadId);
             }
             for (const row of yield* sql<{
@@ -224,6 +232,7 @@ const make = Effect.gen(function* () {
                   ? ("shared, unattributable" as const)
                   : ("attributed" as const),
                 connections: spans.length,
+                ...(reached.size >= LAUNCHED_CAP ? { truncated: true as const } : {}),
               };
             }
             const thread = threads.get(row.client);

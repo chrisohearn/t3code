@@ -270,30 +270,33 @@ it.effect("unfreeze with freshContext starts only the next message fresh", () =>
 );
 
 it.effect(
-  "a frozen thread collapses repeated scheduled copies and holds a send before any run",
+  "repeat deliveries to a frozen thread are all held, and a never-run thread starts on unfreeze",
   () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threads = yield* ThreadManagementService.ThreadManagementService;
       const id = threadId("held");
       yield* create(id);
       yield* send(id, "first");
       yield* freeze(id);
-      const scheduled = (key: string) =>
-        orchestrator.dispatch({
-          type: "message.dispatch",
-          commandId: CommandId.make(`send:${id}:${key}`),
+      // Each delivery carries its own content, so each is kept: sendToThread needs the message back.
+      for (const key of ["one", "two"]) {
+        const result = yield* threads.sendToThread({
+          projectId: ProjectId.make("project:thread-freeze"),
+          commandId: CommandId.make(`webhook:${id}:${key}`),
           threadId: id,
           messageId: MessageId.make(`message:${id}:${key}`),
-          text: "nightly",
+          scheduledTaskId: ScheduledTaskId.make("task:webhook"),
+          text: `payload ${key}`,
           attachments: [],
-          dispatchMode: { type: "start_immediately" },
+          mode: "auto",
           createdBy: "agent",
           creationSource: "server",
-          scheduledTaskId: ScheduledTaskId.make("task:nightly"),
         });
-      yield* scheduled("one");
-      yield* scheduled("two");
-      assert.deepEqual((yield* state(id)).runs, ["interrupted", "queued:held"]);
+        assert.equal(result.delivery, "queued");
+        assert.equal(result.run.queueHeld, true);
+      }
+      assert.deepEqual((yield* state(id)).runs, ["interrupted", "queued:held", "queued:held"]);
 
       const never = threadId("never");
       yield* create(never);
@@ -305,7 +308,36 @@ it.effect(
           frozen: freezeRecord,
         })
         .pipe(Effect.provideService(ThreadFreezeGate, { op: "freeze" }));
-      yield* send(never, "waiting", { by: "agent" });
+      const held = yield* threads.sendToThread({
+        projectId: ProjectId.make("project:thread-freeze"),
+        commandId: CommandId.make("send:never:waiting"),
+        threadId: never,
+        messageId: MessageId.make("message:never:waiting"),
+        text: "waiting",
+        attachments: [],
+        mode: "auto",
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      assert.equal(held.delivery, "queued");
       assert.deepEqual((yield* state(never)).runs, ["queued:held"]);
+
+      yield* orchestrator
+        .dispatch({
+          type: "queue.resume",
+          commandId: CommandId.make("freeze:never:unfreeze"),
+          threadId: never,
+        })
+        .pipe(
+          Effect.provideService(ThreadFreezeGate, {
+            op: "unfreeze",
+            by: { kind: "agent", label: "Coordinator" },
+            at: "2026-11-13T01:00:00.000Z",
+            freshContext: false,
+          }),
+        );
+      const started = yield* state(never);
+      assert.equal(started.frozen, null);
+      assert.notInclude(started.runs[0], "queued");
     }).pipe(Effect.provide(layerTest)),
 );

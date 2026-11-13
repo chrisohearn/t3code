@@ -81,6 +81,11 @@ it.effect(
           ${iso(0)}, ${iso(0)}, 'idle', 0)`;
       yield* sql`INSERT INTO mcp_client_threads (thread_id, session_id, client_label, created_at)
         VALUES ('thread:frozen', ${shared}, 'Codex', ${iso(0)})`;
+      // A sign-in past the per-sign-in cap is flagged: its run count covers only the newest threads.
+      for (let index = 0; index < 201; index += 1) {
+        yield* sql`INSERT INTO mcp_client_threads (thread_id, session_id, client_label, created_at)
+        VALUES (${`thread:bulk:${index}`}, ${reconnecting}, 'Jarvis', ${iso(index)})`;
+      }
       for (const [id, threadId, at, ordinal] of [
         ["r-recent", "thread:frozen", now - 1_000, 3],
         ["r-cron", "thread:cron", now - 2_000, 2],
@@ -126,7 +131,12 @@ it.effect(
         attribution: "shared, unattributable",
         frozen: null,
       });
-      expect(second.items[1]).toMatchObject({ attribution: "attributed", connections: 2 });
+      expect(second.items[1]).toMatchObject({
+        attribution: "attributed",
+        connections: 2,
+        truncated: true,
+      });
+      expect(second.items[2]?.truncated).toBeUndefined();
 
       const own = yield* registry.list({}, { sessionId: reconnecting, seesAll: false });
       expect(own).toMatchObject({ scope: "own", items: [{ id: "03857f09" }], nextCursor: null });

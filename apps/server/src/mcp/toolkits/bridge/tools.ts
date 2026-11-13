@@ -40,7 +40,7 @@ export const BridgeToolkit = Toolkit.make(
     .annotate(Tool.Destructive, false),
   Tool.make("agent_registry", {
     description:
-      "List agents that called this server in 14 days, newest first: sign-ins, threads, scheduled tasks, delegates. Shows kind, label, session prefix, last tool, 24h calls and runs, frozen. 'shared, unattributable': a sign-in on overlapping MCP connections, so calls can't be tied to one agent. Non-full-access sign-ins see only their own. Page with nextCursor.",
+      "List agents that called in 14 days, newest first: sign-ins, threads, scheduled tasks, delegates. 'shared, unattributable': a sign-in on overlapping MCP connections, so calls can't be tied to one agent. Others see only their own. Page with nextCursor.",
     parameters: AgentRegistry.RegistryInput,
     success: AgentRegistry.RegistryResult,
     failure: OrchestratorMcpFailure,
