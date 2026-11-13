@@ -2085,6 +2085,119 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }).pipe(Effect.provide(Layer.fresh(layerTest))),
   );
 
+  it.effect.each(["completed", "failed", "interrupted"] as const)(
+    "closes run-bound items still active when a run ends %s, and leaves background tools",
+    (endStatus) =>
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make(`thread:run-end-items:${endStatus}`);
+        const runId = RunId.make(`run:run-end-items:${endStatus}`);
+        const run: OrchestrationV2Run = {
+          id: runId,
+          threadId,
+          ordinal: 1,
+          providerInstanceId,
+          modelSelection,
+          providerThreadId: null,
+          userMessageId: MessageId.make(`message:run-end-items:${endStatus}`),
+          rootNodeId: null,
+          activeAttemptId: null,
+          status: "running",
+          queuePosition: null,
+          requestedAt: now,
+          startedAt: now,
+          completedAt: null,
+          checkpointId: null,
+          contextHandoffId: null,
+        };
+        const itemBase = (id: string, ordinal: number) => ({
+          id: TurnItemId.make(`turn-item:run-end-items:${endStatus}:${id}`),
+          threadId,
+          runId,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "running" as const,
+          title: id,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+        });
+        const compaction: OrchestrationV2TurnItem = {
+          ...itemBase("compaction", 1),
+          type: "compaction",
+          driver: null,
+        };
+        const reasoning: OrchestrationV2TurnItem = {
+          ...itemBase("reasoning", 2),
+          type: "reasoning",
+          text: "thinking",
+          streaming: true,
+        };
+        const background: OrchestrationV2TurnItem = {
+          ...itemBase("background", 3),
+          type: "dynamic_tool",
+          toolName: "mcp__background",
+          input: {},
+        };
+        const itemEvent = (payload: OrchestrationV2TurnItem): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`event:${payload.id}`),
+          type: "turn-item.updated",
+          threadId,
+          runId,
+          occurredAt: now,
+          payload,
+        });
+        yield* eventSink.write({
+          events: [
+            threadCreatedEvent({
+              id: `event:run-end-items:${endStatus}:thread`,
+              thread: makeThread(threadId, now),
+              now,
+            }),
+            {
+              id: EventId.make(`event:run-end-items:${endStatus}:run`),
+              type: "run.created",
+              threadId,
+              runId,
+              providerInstanceId,
+              occurredAt: now,
+              payload: run,
+            },
+            itemEvent(compaction),
+            itemEvent(background),
+          ],
+        });
+        // The reasoning item arrives in the same batch that ends the run.
+        yield* eventSink.write({
+          events: [
+            itemEvent(reasoning),
+            {
+              id: EventId.make(`event:run-end-items:${endStatus}:ended`),
+              type: "run.updated",
+              threadId,
+              runId,
+              providerInstanceId,
+              occurredAt: now,
+              payload: { ...run, status: endStatus, completedAt: now },
+            },
+          ],
+        });
+        const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"]);
+        const statusOf = (item: OrchestrationV2TurnItem) =>
+          turnItems.find((candidate) => candidate.id === item.id)?.status;
+        const expected = endStatus === "failed" ? "cancelled" : endStatus;
+        assert.equal(statusOf(compaction), expected);
+        assert.equal(statusOf(reasoning), expected);
+        assert.equal(statusOf(background), "running");
+      }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
   it.effect("guards post-terminal provider-thread writes by attempt and run ordinal", () =>
     Effect.gen(function* () {
       const eventSink = yield* EventSink.EventSinkV2;

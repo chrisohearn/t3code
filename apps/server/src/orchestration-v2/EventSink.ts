@@ -1,5 +1,6 @@
 import {
   CommandId,
+  EventId,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
@@ -31,6 +32,12 @@ import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventS
 import { projectStoredEventForWire } from "./WireProjection.ts";
 import { makeRunOutcomeRecorder, type RunOutcome } from "./RunMetrics.ts";
 import { makeRunStopStamper, type RunStopContext } from "./RunStop.ts";
+import {
+  RUN_BOUND_ITEM_TYPES,
+  isActiveRunBoundItem,
+  itemStatusForEndedRun,
+  settleItemForEndedRun,
+} from "./RunItemSettlement.ts";
 
 import * as ScheduledTaskChanges from "../scheduledTasks/ScheduledTaskChanges.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
@@ -378,7 +385,11 @@ const layerBase: Layer.Layer<
       unstamped: ReadonlyArray<OrchestrationV2DomainEvent>,
       context: RunStopContext = {},
     ) =>
-      Effect.flatMap(stampRunStops(unstamped, context), (events) => normalizeStampedEvents(events));
+      stampRunStops(unstamped, context).pipe(
+        Effect.flatMap(normalizeStampedEvents),
+        // After normalization, so the closing events keep the positions their items already have.
+        Effect.flatMap(closeEndedRunItems),
+      );
 
     const normalizeStampedEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
       const runOrdinals = new Map(
@@ -421,6 +432,48 @@ const layerBase: Layer.Layer<
         { concurrency: 1 },
       );
     };
+
+    // A todo list, compaction or reasoning item never outlives its run, but providers rarely close
+    // them. Close what is still active here, in the transaction that ends the run.
+    // The enclosing write span already traces this per-batch step.
+    const closeEndedRunItems = Effect.fnUntraced(function* (
+      events: ReadonlyArray<OrchestrationV2DomainEvent>,
+    ) {
+      const closing: Array<OrchestrationV2DomainEvent> = [];
+      for (const event of events) {
+        if (event.type !== "run.updated" || itemStatusForEndedRun(event.payload.status) === null)
+          continue;
+        const run = event.payload;
+        const latestInBatch = new Map<string, OrchestrationV2TurnItem>();
+        for (const candidate of events) {
+          if (candidate.type === "turn-item.updated" && candidate.payload.runId === run.id) {
+            latestInBatch.set(candidate.payload.id, candidate.payload);
+          }
+        }
+        const stored = yield* projectionStore.getThreadRecords(run.threadId, ["turnItems"], {
+          turnItemRunId: run.id,
+          turnItemTypes: [...RUN_BOUND_ITEM_TYPES],
+          turnItemStatuses: ["pending", "running", "waiting"],
+        });
+        for (const item of stored.turnItems) {
+          if (!latestInBatch.has(item.id)) latestInBatch.set(item.id, item);
+        }
+        for (const item of latestInBatch.values()) {
+          if (!isActiveRunBoundItem(item)) continue;
+          closing.push({
+            id: EventId.make(`${event.id}:close:${item.id}`),
+            type: "turn-item.updated",
+            threadId: run.threadId,
+            runId: run.id,
+            ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: event.occurredAt,
+            payload: settleItemForEndedRun(item, run.status),
+          });
+        }
+      }
+      return closing.length === 0 ? events : [...events, ...closing];
+    });
 
     const applyStoredEvents =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
