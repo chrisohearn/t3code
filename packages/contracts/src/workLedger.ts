@@ -9,6 +9,7 @@ import {
   TurnItemId,
 } from "./baseSchemas.ts";
 import { UserInputAnsweringClient } from "./providerPolicy.ts";
+import { OrchestrationV2SenderClient } from "./orchestrationV2.ts";
 
 const text = Schema.String.check(Schema.isMaxLength(8000));
 const name = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
@@ -26,6 +27,21 @@ const pageLimit = Schema.optional(
   NonNegativeInt.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
 );
 const ownerKind = Schema.Literals(["jarvis", "vision", "t3", "human"]);
+const links = Schema.Array(Schema.String.check(Schema.isMaxLength(4096))).check(
+  Schema.isMaxLength(100),
+);
+const handoffArgs = Schema.Json.check(
+  Schema.makeFilter(
+    (value) =>
+      new TextEncoder().encode(JSON.stringify(value)).byteLength <= 4096 ||
+      "handoffArgs must be at most 4096 UTF-8 bytes of JSON.",
+  ),
+);
+const notStringNull = Schema.makeFilter(
+  (value: string) =>
+    value.trim().toLowerCase() !== "null" ||
+    'The string "null" is not an ID. Send JSON null to clear a nullable field.',
+);
 const fields = {
   title: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
   ownerKind,
@@ -37,14 +53,15 @@ const fields = {
   nextCheckAt: Schema.NullOr(IsoDateTime),
   nextAction: Schema.NullOr(text),
   approvalNote: Schema.NullOr(text),
-  links: Schema.Array(Schema.String.check(Schema.isMaxLength(4096))).check(Schema.isMaxLength(100)),
+  links,
+  handoffArgs,
 };
 /** Chris's answer to a question dialog whose question names the row as `Ledger key: <key>`. */
 export const WorkLedgerApprovalSource = Schema.Struct({
-  threadId: ThreadId,
-  itemId: TurnItemId,
+  threadId: ThreadId.check(notStringNull),
+  itemId: TurnItemId.check(notStringNull),
   /** Which question of the dialog; needed when the dialog asked more than one. */
-  questionId: Schema.optional(TrimmedNonEmptyString),
+  questionId: Schema.optional(TrimmedNonEmptyString.check(notStringNull)),
 });
 export type WorkLedgerApprovalSource = typeof WorkLedgerApprovalSource.Type;
 /** Written only by the server after it verifies the source; the quotes come from the dialog. */
@@ -66,6 +83,7 @@ export type WorkLedgerApproval = typeof WorkLedgerApproval.Type;
 export const WorkLedgerItem = Schema.Struct({
   key: name,
   ...fields,
+  handoffArgs: Schema.optional(handoffArgs),
   // Optional: an environment on an older build omits it.
   approval: Schema.optional(Schema.NullOr(WorkLedgerApproval)),
   lastRunId: Schema.NullOr(RunId),
@@ -80,6 +98,9 @@ export type WorkLedgerItem = typeof WorkLedgerItem.Type;
 export const WorkLedgerUpsertInput = Schema.Struct({
   key: name,
   ...Schema.Struct(fields).mapFields(Struct.map(Schema.optional)).fields,
+  ownerThreadId: Schema.optional(Schema.NullOr(ThreadId.check(notStringNull))),
+  addLinks: Schema.optional(links),
+  removeLinks: Schema.optional(links),
   /** A source to verify as Chris's approval, or null to revoke the recorded one. */
   approval: Schema.optional(Schema.NullOr(Schema.Struct({ source: WorkLedgerApprovalSource }))),
 });
@@ -117,6 +138,7 @@ export const WorkLedgerHistoryEntry = Schema.Struct({
   key: name,
   changedAt: IsoDateTime,
   changedBy: TrimmedNonEmptyString,
+  changedByClient: Schema.optional(Schema.NullOr(OrchestrationV2SenderClient)),
   changes: Schema.Record(
     Schema.String,
     Schema.Struct({ before: Schema.Unknown, after: Schema.Unknown }),
@@ -141,6 +163,8 @@ export const PortfolioStatusResult = Schema.Struct({
       pendingRequestCount: NonNegativeInt,
       resultExcerpt: Schema.NullOr(Schema.String),
       staleWorker: Schema.Boolean,
+      openBlockedFlips24h: Schema.optional(NonNegativeInt),
+      flapping: Schema.optional(Schema.Boolean),
     }),
   ),
   nextCursor: Schema.NullOr(name),

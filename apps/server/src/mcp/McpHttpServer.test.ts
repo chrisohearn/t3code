@@ -27,6 +27,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
@@ -43,6 +44,7 @@ import * as McpOAuth from "../auth/McpOAuth.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as Sqlite from "../persistence/Sqlite.ts";
+import * as WorkLedger from "../persistence/WorkLedger.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 
 import * as DeviceService from "../device/DeviceService.ts";
@@ -75,7 +77,7 @@ const invocation = {
     providerInstanceId: ProviderInstanceId.make("codex"),
   },
   client: undefined,
-  capabilities: new Set(["preview"] as const),
+  capabilities: new Set(["preview", "orchestration"] as const),
   issuedAt: 1,
 };
 const client = McpSchema.McpServerClient.of({
@@ -642,6 +644,94 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
     expect(calls[4]).toStrictEqual({ projectId: "project-1", projectIcon: null });
   }).pipe(Effect.provide(layerRecordingTools(calls)));
 });
+
+it.effect(
+  "classifies ledger parameter refusals as invalid_request and accepts explicit null clears",
+  () =>
+    Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const upsertTool = server.tools.find(({ tool }) => tool.name === "ledger_upsert")!;
+      const nullable = { anyOf: expect.arrayContaining([{ type: "null" }]) };
+      expect(upsertTool.tool.inputSchema).toMatchObject({
+        properties: {
+          ownerThreadId: nullable,
+          blocker: nullable,
+          waitReason: nullable,
+          nextCheckAt: nullable,
+        },
+      });
+      for (const [name, args] of [
+        ["ledger_query", { status: "BLOCKED_TECH" }],
+        ["ledger_query", { cursor: "x".repeat(257) }],
+        ["ledger_upsert", { key: "bad", nextAction: "x".repeat(8001) }],
+      ] as const) {
+        const result = yield* callTool(name, args).pipe(Effect.flip);
+        expect(result).toMatchObject({ _tag: "InvalidParams" });
+      }
+      const args = { key: "valid", title: "Task", ownerKind: "jarvis", ownerName: "chief" };
+      expect(
+        yield* callTool("ledger_upsert", {
+          ...args,
+          ownerThreadId: threadId,
+          blocker: "Waiting for event",
+          waitReason: "natural",
+          nextCheckAt: "2026-11-13T12:00:00.000Z",
+        }),
+      ).not.toMatchObject({ isError: true });
+      const cleared = yield* callTool("ledger_upsert", {
+        key: "valid",
+        ownerThreadId: null,
+        blocker: null,
+        waitReason: null,
+        nextCheckAt: null,
+      });
+      expect(cleared.structuredContent).toMatchObject({
+        ownerKind: "jarvis",
+        ownerThreadId: null,
+        blocker: null,
+        waitReason: null,
+        nextCheckAt: null,
+        warnings: [],
+      });
+      for (const fields of [
+        { ownerThreadId: "null" },
+        { ownerThreadId: "NuLl" },
+        { ownerThreadId: " null " },
+        { approval: { source: { threadId: " null ", itemId: "dialog" } } },
+        { approval: { source: { threadId, itemId: "NULL" } } },
+        { approval: { source: { threadId, itemId: "dialog", questionId: "NuLl" } } },
+      ]) {
+        const rejected = yield* callTool("ledger_upsert", { key: "valid", ...fields }).pipe(
+          Effect.flip,
+        );
+        expect(rejected).toMatchObject({ _tag: "InvalidParams" });
+        expect(rejected.message).toContain("JSON null");
+      }
+      expect((yield* (yield* WorkLedger.WorkLedger).query({})).items).toMatchObject([
+        { key: "valid", ownerThreadId: null, blocker: null, waitReason: null, nextCheckAt: null },
+      ]);
+      expect(
+        yield* callTool("ledger_query", { cursor: null, ownerName: null, waitReason: null }),
+      ).not.toMatchObject({ isError: true });
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE work_ledger SET owner_thread_id = 'null' WHERE work_key = 'valid'`;
+      expect(
+        (yield* callTool("ledger_upsert", { key: "valid", ownerThreadId: null })).structuredContent,
+      ).toMatchObject({ ownerThreadId: null, warnings: [] });
+      const errors =
+        yield* sql`SELECT error_class FROM mcp_request_log WHERE error_class IS NOT NULL`;
+      expect(errors).toEqual(Array.from({ length: 9 }, () => ({ error_class: "invalid_request" })));
+    }).pipe(
+      Effect.provide(
+        McpHttpServer.layerLedgerToolkit.pipe(
+          Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
+          Layer.provideMerge(WorkLedger.layer.pipe(Layer.provideMerge(Sqlite.layerMemory))),
+          Layer.provideMerge(RequestLog.layer.pipe(Layer.provideMerge(Sqlite.layerMemory))),
+        ),
+      ),
+    ),
+);
 
 it.effect("rejects arguments a tool does not declare instead of dropping them", () => {
   const calls: Array<unknown> = [];

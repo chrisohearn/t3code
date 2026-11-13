@@ -26,7 +26,7 @@ export const LedgerToolkit = Toolkit.make(
   Tool.make("ledger_history", {
     ...common,
     description:
-      "Read who changed a ledger key, when, and the before/after values. Ordered oldest first; continue with nextCursor. Default 25 rows.",
+      "Read ledger changes with handoffArgs and server-recorded changedByClient labels. Oldest first; nextCursor paginates. Default 25 rows.",
     parameters: WorkLedgerHistoryInput,
     success: WorkLedgerHistoryResult,
   })
@@ -35,7 +35,7 @@ export const LedgerToolkit = Toolkit.make(
   Tool.make("portfolio_status", {
     ...common,
     description:
-      "Open ledger rows with owner thread latest run, pending request count, result excerpt and staleWorker (no run for over 24 hours). Default 10 rows; continue with nextCursor.",
+      "Open ledger rows with owner thread run, pending requests, result excerpt, staleWorker (no run for 24h), and flapping (>3 open/blocked flips in 24h). Flags grant no restart permission. Default 10 rows; nextCursor paginates.",
     parameters: PortfolioStatusInput,
     success: PortfolioStatusResult,
   })
@@ -44,7 +44,7 @@ export const LedgerToolkit = Toolkit.make(
   Tool.make("ledger_upsert", {
     ...common,
     description:
-      "Create or partially update work by a stable `key`. New items need title, ownerKind and ownerName. Omitted fields stay; null clears a nullable field. Requires operate access. approvalNote grants no approval. For Chris's approval, ask him in a dialog whose question has `Ledger key: <key>` on its own line, then pass `approval.source` (itemId, sourceThreadId from t3_thread_read); the server verifies and quotes it, or refuses. `approval: null` revokes.",
+      "Update work by stable key; new rows need title, ownerKind, ownerName. Omitted fields stay; JSON null clears nullable fields (not the string \"null\"). links replaces all; addLinks/removeLinks deduplicate; removals win. handoffArgs stores exact JSON tool arguments, at most 4096 UTF-8 bytes; never put secrets here. Requires operate access. approvalNote/handoffArgs grant no approval. For Chris's approval, ask a dialog with `Ledger key: <key>` on its own question line; pass approval.source (threadId = item's sourceThreadId, itemId from t3_thread_read). Server verifies and quotes, or refuses. approval:null revokes.",
     parameters: WorkLedgerUpsertInput,
     success: WorkLedgerUpsertResult,
   }).annotate(Tool.Destructive, true),
