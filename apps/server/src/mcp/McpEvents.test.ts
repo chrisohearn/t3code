@@ -1,3 +1,5 @@
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { CLOUD_LINKED_USER_ID, RELAY_URL_SECRET } from "../cloud/config.ts";
 import * as ConnectReachability from "../cloud/ConnectReachability.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -94,7 +96,11 @@ const fixture = Effect.gen(function* () {
   > = [];
   let sendWork: Effect.Effect<void, McpEventsError> = Effect.void;
   const writable = new Set<string>();
+  const storedSecrets = new Map<string, Uint8Array>();
   const dependencies = Layer.mergeAll(
+    Layer.mock(ServerSecretStore.ServerSecretStore)({
+      get: (name) => Effect.sync(() => Option.fromNullishOr(storedSecrets.get(name))),
+    }),
     Layer.succeed(ConnectReachability.ConnectReachability, {
       latest: Effect.sync(() => Option.some(tunnel)),
       check: Effect.sync(() => tunnel),
@@ -266,6 +272,10 @@ const fixture = Effect.gen(function* () {
     deleted,
     setTunnel: (status: EnvironmentConnectReachability) => {
       tunnel = status;
+    },
+    linkCloud: () => {
+      storedSecrets.set(CLOUD_LINKED_USER_ID, new TextEncoder().encode("cloud-user"));
+      storedSecrets.set(RELAY_URL_SECRET, new TextEncoder().encode("https://relay.example.com"));
     },
   };
 });
@@ -1369,6 +1379,35 @@ it.effect.each(["reachable", "deadline"] as const)(
         );
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each([
+  ["linked server whose tunnel config is not stored yet", true, 1],
+  ["server with no cloud link", false, 0],
+] as const)("startup hold on not_linked for a %s", ([, linked, held]) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      // The fixture's tunnel reads not_linked, as the first check after a restart does
+      // before the relay stores the tunnel config again.
+      if (linked) f.linkCloud();
+      const input = inputFor(ThreadId.make("startup-not-linked"));
+      yield* f.call(f.service.subscribe(input));
+      yield* f.append([input.arguments.threadId]);
+      const drain = yield* Effect.forkChild(f.service.drain());
+      yield* TestClock.adjust("1 second");
+      expect(f.sent).toHaveLength(1 - held);
+      f.setTunnel({
+        status: "reachable",
+        checkedAt: "1970-01-01T00:00:01.000Z",
+        readyConnections: 1,
+        protocol: "quic",
+      });
+      yield* TestClock.adjust("5 seconds");
+      yield* Fiber.join(drain);
+      expect(f.sent).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
 it.effect(
