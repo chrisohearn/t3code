@@ -1355,6 +1355,7 @@ it.effect("schedules a model change on a busy thread and shows it until it appli
     for (const [refused, code] of [
       [{ runtimeMode: "approval-required", applyAt: "next_turn" }, "invalid_request"],
       [{ applyAt: "next_turn" }, "invalid_request"],
+      [{ acknowledgeOnly: true, applyAt: "next_turn" }, "invalid_request"],
       [
         { modelSelection: { instanceId: "claudeAgent", model: "opus" }, applyAt: "next_turn" },
         "invalid_request",

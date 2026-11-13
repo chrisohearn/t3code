@@ -995,20 +995,35 @@ function queuedBeforeScheduledSelection(
   );
 }
 
-/** Drops a scheduled change once the run starting now leaves no run queued before it. */
+/**
+ * A scheduled change lasts until a turn on the default model takes it with nothing queued before
+ * the change still waiting, explicit picks included. A model named after the change replaces it.
+ * A server continuation repeats an earlier run's model and leaves the change alone.
+ */
 function threadAtRunStart(
   projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs">,
-  startingRunId: OrchestrationV2Run["id"] | null,
+  starting: {
+    readonly runId: OrchestrationV2Run["id"] | null;
+    /** Null for a turn starting now, which is newer than any scheduled change. */
+    readonly ordinal: number | null;
+    readonly model: "default" | "named" | "server";
+  },
 ): OrchestrationV2ThreadProjection["thread"] {
   const scheduled = projection.thread.scheduledModelSelection;
-  if (scheduled == null) return projection.thread;
+  if (scheduled == null || starting.model === "server") return projection.thread;
+  const cleared = { ...projection.thread, scheduledModelSelection: null };
+  if (starting.model === "named") {
+    return starting.ordinal !== null && starting.ordinal <= scheduled.queuedThroughOrdinal
+      ? projection.thread
+      : cleared;
+  }
   const waiting = projection.runs.some(
     (run) =>
-      run.id !== startingRunId &&
+      run.id !== starting.runId &&
       run.status === "queued" &&
-      queuedBeforeScheduledSelection(projection, run),
+      run.ordinal <= scheduled.queuedThroughOrdinal,
   );
-  return waiting ? projection.thread : { ...projection.thread, scheduledModelSelection: null };
+  return waiting ? projection.thread : cleared;
 }
 
 function queuedRunFollowsThread(
@@ -1036,10 +1051,16 @@ function queuedRunModelSelection(
 function queueTailModelSelection(
   projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
 ): ModelSelection {
-  const tail = queuedRunsInDeliveryOrder(projection).findLast(
-    (run) => !queuedRunFollowsThread(projection, run),
-  );
   const scheduled = projection.thread.scheduledModelSelection;
+  // With a change pending, a queued server continuation's repeated model is no one's new pick.
+  const serverRepeat = (run: OrchestrationV2Run) =>
+    scheduled != null &&
+    run.explicitModelSelection === true &&
+    projection.messages.find((message) => message.id === run.userMessageId)?.creationSource ===
+      "server";
+  const tail = queuedRunsInDeliveryOrder(projection).findLast(
+    (run) => !queuedRunFollowsThread(projection, run) && !serverRepeat(run),
+  );
   // A pick queued before a scheduled change is older than it; later sends take the change.
   return tail !== undefined && (scheduled == null || tail.ordinal > scheduled.queuedThroughOrdinal)
     ? tail.modelSelection
@@ -2552,7 +2573,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         projection.thread.modelSelection,
         queuedRun.modelSelection,
       );
-      const threadAtStart = threadAtRunStart(projection, queuedRun.id);
+      const threadAtStart = threadAtRunStart(projection, {
+        runId: queuedRun.id,
+        ordinal: queuedRun.ordinal,
+        model:
+          queuedRun.explicitModelSelection !== true
+            ? "default"
+            : queuedMessage?.creationSource === "server"
+              ? "server"
+              : "named",
+      });
       // The picker may already have moved ahead of the native conversation.
       const switchFromActiveProvider =
         followsCurrent &&
@@ -7045,20 +7075,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.notification !== undefined ||
       command.delegatedCompletion !== undefined ||
       serverNotice;
-    // A sender that respects the snooze leaves it: a post is only recorded, and a turn waits,
-    // held behind the thread's last run, until the thread wakes. A thread with no run wakes,
-    // and so does one the server snoozed until its usage limit resets: that is no one's hold.
-    // The snooze counts as the sidebar shows it: an error or a request has already woken it.
+    // A sender that respects the snooze keeps its dated hold (a usage-limit snooze is no one's).
+    // While the thread is snoozed as the sidebar shows it, a turn waits behind its last run; a
+    // thread that counts as awake, or never ran, gets the message now.
     const snoozeHeldUntil = projection.thread.snoozedUntil;
     const limitRecovery = projection.thread.limitRecovery;
-    const respectsSnooze =
+    const keepsSnooze =
       command.respectSnooze === true &&
       !automaticWake &&
       snoozeHeldUntil != null &&
+      DateTime.toEpochMillis(snoozeHeldUntil) > DateTime.toEpochMillis(yield* DateTime.now) &&
       !(
         limitRecovery?.snooze === true &&
         DateTime.toEpochMillis(snoozeHeldUntil) === Date.parse(limitRecovery.resetAt)
-      ) &&
+      );
+    const respectsSnooze =
+      keepsSnooze &&
       (command.postOnly === true || latestExecutedRun(projection.runs) != null) &&
       isSnoozed(
         (yield* projectionStore
@@ -7071,7 +7103,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
         DateTime.toEpochMillis(yield* DateTime.now),
       );
-    if (projection.thread.snoozedUntil != null && !automaticWake && !respectsSnooze) {
+    if (projection.thread.snoozedUntil != null && !automaticWake && !keepsSnooze) {
       const now = yield* DateTime.now;
       const thread: OrchestrationV2AppThread = {
         ...projection.thread,
@@ -8063,7 +8095,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const selectionChanged =
       !modelSelectionsEqual(projection.thread.modelSelection, modelSelection) ||
       projection.thread.providerInstanceId !== modelSelection.instanceId;
-    const threadAtStart = threadAtRunStart(projection, null);
+    const threadAtStart = threadAtRunStart(projection, {
+      runId: null,
+      ordinal: null,
+      model:
+        command.modelSelection === undefined
+          ? "default"
+          : command.creationSource === "server"
+            ? "server"
+            : "named",
+    });
     if (selectionChanged || threadAtStart !== projection.thread) {
       yield* emit(
         events,

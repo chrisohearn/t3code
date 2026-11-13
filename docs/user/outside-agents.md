@@ -103,7 +103,8 @@ T3 Code.
   call `t3_thread_configure` with `modelSelection` and `applyAt: "next_turn"`.
   Messages already queued start with it, and so do later agent messages,
   except a message that named its own model, such as one sent from the T3 app
-  with the composer's model.
+  with the composer's model. The change stays pending until a message on the
+  default model starts with it.
   Reading the configuration shows the pending change; scheduling the current
   model cancels it. Switching to another provider instance still needs an idle
   thread.
@@ -112,6 +113,8 @@ T3 Code.
   been going.
 - A snoozed thread stays snoozed. `t3_thread_send` holds the message until the
   snooze ends or someone wakes the thread, and `t3_thread_post` only records it.
+  A thread that counts as awake, such as one waiting on a request, gets the
+  message at once and keeps its snooze.
   Both return `snoozedUntil` and a warning. Pass `respectSnooze: false` to wake
   the thread now. Messages sent from the T3 app still wake it.
 

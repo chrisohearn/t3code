@@ -1318,7 +1318,7 @@ const make = Effect.gen(function* () {
   const snoozeOutcome = Effect.fn("OrchestratorMcpService.snoozeOutcome")(function* (
     threadId: ThreadId,
     snoozedUntil: DateTime.Utc | null | undefined,
-    kept: "held" | "posted" | "steered",
+    kept: "held" | "posted" | "steered" | "delivered",
   ) {
     const nowMs = yield* Clock.currentTimeMillis;
     if (snoozedUntil == null || DateTime.toEpochMillis(snoozedUntil) <= nowMs) return {};
@@ -3539,7 +3539,11 @@ const make = Effect.gen(function* () {
         ...(yield* snoozeOutcome(
           input.threadId,
           target.thread.snoozedUntil,
-          result.run.snoozeDeferred === true ? "held" : "steered",
+          result.run.snoozeDeferred === true
+            ? "held"
+            : result.delivery === "steered"
+              ? "steered"
+              : "delivered",
         )),
         threadId: input.threadId,
         link: threadLinkFor(scope, input.threadId, target.thread.title),
