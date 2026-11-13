@@ -483,6 +483,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   title: TrimmedNonEmptyString,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
+  bypassProviderCooldown: Schema.optional(Schema.Boolean),
   scheduledModelSelection: Schema.optional(Schema.NullOr(OrchestrationV2ScheduledModelSelection)),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
@@ -808,6 +809,7 @@ export const OrchestrationV2Run = Schema.Struct({
   ordinal: PositiveInt,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
+  bypassProviderCooldown: Schema.optional(Schema.Boolean),
   providerThreadId: Schema.NullOr(ProviderThreadId),
   userMessageId: MessageId,
   rootNodeId: Schema.NullOr(NodeId),
@@ -1673,6 +1675,7 @@ export const OrchestrationV2ProviderFailure = Schema.Struct({
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
   retryable: Schema.NullOr(Schema.Boolean),
   resetAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  limitScope: Schema.optional(Schema.Literals(["account", "model"])),
 });
 export type OrchestrationV2ProviderFailure = typeof OrchestrationV2ProviderFailure.Type;
 

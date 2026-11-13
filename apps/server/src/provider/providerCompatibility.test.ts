@@ -10,6 +10,7 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as ServerConfig from "../config.ts";
 import * as ModelManifest from "./ModelManifest.ts";
+import * as ProviderCooldown from "./ProviderCooldown.ts";
 import * as ProviderRegistry from "./ProviderRegistry.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
@@ -296,6 +297,7 @@ it.effect("a remote policy refresh preserves a newer health result on the regist
     );
     yield* Effect.gen(function* () {
       const registry = yield* ProviderRegistry.ProviderRegistry;
+      const cooldown = yield* ProviderCooldown.ProviderCooldown;
       yield* Deferred.await(started);
       assert.strictEqual(
         (yield* registry.getProviders)[0]?.compatibilityAdvisory?.status,
@@ -315,9 +317,25 @@ it.effect("a remote policy refresh preserves a newer health result on the regist
       assert.strictEqual(updated?.compatibilityAdvisory?.status, "supported");
       assert.strictEqual(updated?.status, "error");
       assert.strictEqual(updated?.message, "Authentication failed");
+      const changes = yield* Stream.toPull(registry.streamChanges);
+      const limited = yield* changes.pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* cooldown.observe(provider.instanceId, {
+        status: "failed",
+        failure: {
+          class: "usage_limit",
+          limitScope: "account",
+          code: null,
+          message: "5-hour limit",
+          retryable: false,
+          resetAt: "1970-01-01T00:05:00.000Z",
+        },
+      });
+      assert.include((yield* Fiber.join(limited))[0]?.[0]?.message, "Account usage limit");
+      yield* cooldown.observe(provider.instanceId, { status: "completed" });
+      assert.strictEqual((yield* changes)[0]?.[0]?.message, "Authentication failed");
     }).pipe(
       Effect.provide(
-        ProviderRegistry.layer.pipe(
+        Layer.mergeAll(ProviderRegistry.layer, ProviderCooldown.layer).pipe(
           Layer.provide(layerDependencies),
           Layer.provide(
             Layer.mock(ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator)({}),

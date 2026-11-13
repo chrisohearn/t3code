@@ -6,7 +6,6 @@ import {
   CommandId,
   MessageId,
   NodeId,
-  type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2CheckpointScope,
   type OrchestrationV2DomainEvent,
@@ -3443,7 +3442,7 @@ it.effect.each([
     const { finalEvents, committedEffects } = yield* captureRootRunTermination({
       key,
       shouldFinalizeRun: () => Effect.succeed(true),
-      ...(scenario.target ? { failoverTarget: fallback } : {}),
+      ...(scenario.target ? { failoverTarget: { account: fallback, model: fallback } } : {}),
       events: (ids) => {
         const terminal = rootTerminalEvent(ids, "failed");
         const failed =
@@ -3519,7 +3518,7 @@ function captureRootRunTermination(input: {
   readonly afterStart?: (
     closed: Deferred.Deferred<void>,
   ) => Effect.Effect<void, never, PreviewAgentActivity.PreviewAgentActivity>;
-  readonly failoverTarget?: ModelSelection;
+  readonly failoverTarget?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["failoverTarget"];
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);

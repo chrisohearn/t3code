@@ -4115,55 +4115,87 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
-  it.effect("reports a thread another Codex client is writing to as in use", () =>
+  it.effect.each(["exhaust", "recover"] as const)("bounds active-writer retries: %s", (outcome) =>
     Effect.gen(function* () {
       const nativeThreadId = "thread-open-elsewhere";
+      const resumed = yield* Queue.unbounded<void>();
+      const preamble = codexReplayPreamble({
+        nativeThreadId,
+        nativeTurnId: "unused-turn",
+        prompt: "unused-prompt",
+      });
+      const started = preamble[4];
+      assert(started?.type === "emit_inbound");
+      const entries: Array<CodexReplay.CodexAppServerReplayEntry> = preamble.slice(0, 5);
+      for (let attempt = 0; attempt < (outcome === "recover" ? 2 : 4); attempt++) {
+        const requestId = 3 + attempt;
+        entries.push(
+          {
+            type: "expect_outbound",
+            label: "thread/resume",
+            frame: {
+              id: requestId,
+              method: "thread/resume",
+              params: {
+                threadId: nativeThreadId,
+                excludeTurns: true,
+                cwd: CODEX_TEST_RUNTIME_POLICY.cwd,
+                model: CODEX_TEST_MODEL_SELECTION.model,
+                config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+              },
+            },
+          },
+          outcome === "recover" && attempt === 1
+            ? withReplayRequestId(started, requestId)
+            : {
+                type: "emit_inbound",
+                label: "resume result",
+                frame: {
+                  id: requestId,
+                  error: {
+                    code: -32600,
+                    message: `thread ${nativeThreadId} already has an active writer`,
+                  },
+                },
+              },
+        );
+      }
       const harness = yield* makeCodexReplayHarness(
         makeCodexReplayTranscript({
           scenario: "codex-resume-active-writer",
-          entries: [
-            ...codexReplayPreamble({
-              nativeThreadId,
-              nativeTurnId: "unused-turn",
-              prompt: "unused-prompt",
-            }).slice(0, 5),
-            {
-              type: "expect_outbound",
-              label: "thread/resume",
-              frame: {
-                id: 3,
-                method: "thread/resume",
-                params: {
-                  threadId: nativeThreadId,
-                  excludeTurns: true,
-                  cwd: CODEX_TEST_RUNTIME_POLICY.cwd,
-                  model: CODEX_TEST_MODEL_SELECTION.model,
-                  config: CodexAdapterV2.CODEX_THREAD_CONFIG,
-                },
-              },
-            },
-            {
-              type: "emit_inbound",
-              label: "active writer",
-              frame: {
-                id: 3,
-                error: {
-                  code: -32600,
-                  message: `thread ${nativeThreadId} already has an active writer`,
-                },
-              },
-            },
-          ],
+          entries,
         }),
+        () => Effect.void,
+        (method) =>
+          method === "thread/resume"
+            ? Queue.offer(resumed, undefined).pipe(Effect.asVoid)
+            : Effect.void,
       );
 
-      const error = yield* Effect.flip(
-        harness.runtime.resumeThread({
+      const resume = yield* harness.runtime
+        .resumeThread({
           providerThread: harness.providerThread,
           modelSelection: CODEX_TEST_MODEL_SELECTION,
           runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
-        }),
-      );
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Queue.take(resumed);
+      yield* TestClock.adjust("250 millis");
+      yield* Queue.take(resumed);
+      if (outcome === "exhaust") {
+        yield* TestClock.adjust("500 millis");
+        yield* Queue.take(resumed);
+        yield* TestClock.adjust("1 second");
+        yield* Queue.take(resumed);
+      }
+      const result = yield* Fiber.join(resume);
+      if (outcome === "recover") {
+        assert.equal(result._tag, "Success");
+        return;
+      }
+      assert.equal(result._tag, "Failure");
+      if (result._tag !== "Failure") return;
+      const error = result.failure;
 
       assert.equal(error._tag, "ProviderAdapterThreadInUseError");
       assert.nestedPropertyVal(error, "providerThreadId", harness.providerThread.id);
@@ -6765,6 +6797,49 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       expectedCode: "subscription_sharing_v2_invalid_user",
       expectedMessage: "could not validate",
     },
+    {
+      name: "sharing-unsupported-namespace-terminal",
+      code: "other",
+      message: JSON.stringify({
+        error: {
+          code: "subscription_sharing_unsupported_capability",
+          message: "tool 'namespace' is not supported; dummy-sensitive",
+        },
+      }),
+      notification: false,
+      expectedClass: "provider_error",
+      expectedCode: "subscription_sharing_unsupported_capability",
+      expectedMessage: "namespace",
+    },
+    {
+      name: "sharing-unsupported-additional-tools-notification",
+      code: "other",
+      details: JSON.stringify({
+        error: {
+          code: "subscription_sharing_unsupported_capability",
+          message: "input item 'additional_tools' is not supported; dummy-sensitive",
+        },
+      }),
+      notification: true,
+      expectedClass: "provider_error",
+      expectedCode: "subscription_sharing_unsupported_capability",
+      expectedMessage: "additional_tools",
+    },
+    {
+      name: "sharing-unsupported-namespace-retry",
+      code: "other",
+      details: JSON.stringify({
+        error: {
+          code: "subscription_sharing_unsupported_capability",
+          message: "tool 'namespace' is not supported; dummy-sensitive",
+        },
+      }),
+      notification: true,
+      willRetry: true,
+      expectedClass: "provider_error",
+      expectedCode: "subscription_sharing_unsupported_capability",
+      expectedMessage: "namespace",
+    },
   ] as const)("classifies Codex terminal failures from $name evidence", (scenario) =>
     Effect.gen(function* () {
       const nativeThreadId = `native-limit-${scenario.name}`;
@@ -7097,6 +7172,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.equal(terminal.failure.code, scenario.expectedCode);
         assert.include(terminal.failure.message, scenario.expectedMessage);
         assert.equal(terminal.failure.resetAt, null);
+        if (scenario.expectedCode === "subscription_sharing_unsupported_capability") {
+          assert.include(
+            terminal.failure.message,
+            `Codex instance "${CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID}"`,
+          );
+          assert.notInclude(terminal.failure.message, "dummy-sensitive");
+        }
       }
     }).pipe(
       Effect.provide(
