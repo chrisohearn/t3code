@@ -149,6 +149,25 @@ it.effect(
       });
       assert.deepEqual(stopOf(rewritten), [ownerStop]);
 
+      // A message that replaces the running turn asks for the interrupt; its reason is held too.
+      const replaced = run(5);
+      stored.set(replaced.id, replaced);
+      yield* stamp([interruptRequest(replaced.id)], { commandType: "message.dispatch" }).pipe(
+        Effect.provideService(CommandActor, owner),
+      );
+      assert.deepEqual(
+        stopOf(yield* stamp([runUpdated({ ...replaced, status: "interrupted" })], {})),
+        [{ ...ownerStop, reason: "replaced", commandType: "message.dispatch" }],
+      );
+
+      // An interrupt no Stop asked for, written outside any command, is the provider's.
+      const dropped = run(4);
+      stored.set(dropped.id, dropped);
+      assert.deepEqual(
+        stopOf(yield* stamp([runUpdated({ ...dropped, status: "interrupted" })], {})),
+        [{ reason: "provider_interrupted", actor: { kind: "server" } }],
+      );
+
       // A run the queue holds again is no longer stopped.
       const held = run(2, {
         status: "queued",
@@ -192,4 +211,25 @@ it("labels a restart cancel with the run that continued it", () => {
     "removed from the queue before it started by an agent (session ab3aa7f5) from thread mcp:8270",
   );
   assert.isUndefined(runStopDetail(run(77, { status: "completed" }), []));
+
+  // A finished run lost only the background work it left running; one with none is not continued.
+  const finished = run(80, {
+    status: "completed",
+    restartCancelledBackgroundWork: [{ kind: "shell", label: "vp test" }],
+  });
+  const resumed = run(81, { restartContinuationOfRunId: finished.id });
+  assert.equal(
+    runStopDetail(finished, [finished, resumed])?.label,
+    "completed; its background work was cut short by restart, continued as run 81",
+  );
+  const { restartCancelledBackgroundWork: _work, ...plain } = finished;
+  assert.isUndefined(runStopDetail(plain, [plain, resumed]));
+
+  // A continuation that failed before its prompt was taken reads as retried.
+  const failedStart = run(82, { status: "failed", restartContinuationOfRunId: finished.id });
+  const retry = run(83, { restartContinuationOfRunId: failedStart.id });
+  assert.equal(
+    runStopDetail(failedStart, [failedStart, retry])?.label,
+    "failed to start; retried as run 83",
+  );
 });

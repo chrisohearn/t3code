@@ -1032,11 +1032,19 @@ const isRequestErrorCode = Schema.is(OrchestratorMcpFailure.fields.code);
 const decodeDeclaredFailure = Schema.decodeUnknownOption(
   Schema.fromJsonString(OrchestratorMcpFailure),
 );
-const requestErrorClass = (result: McpSchema.CallToolResult | undefined) => {
+const requestErrorClass = (
+  result: McpSchema.CallToolResult | undefined,
+  cause?: Cause.Cause<unknown>,
+) => {
   const outcome = toolOutcome(result);
   if (outcome.outcome === "ok") return null;
   if (isRequestErrorCode(outcome.errorCode)) return outcome.errorCode;
-  if (result === undefined) return "execution_failure";
+  if (result === undefined)
+    return cause?.reasons.some(
+      (reason) => Cause.isFailReason(reason) && Predicate.isTagged(reason.error, "InvalidParams"),
+    )
+      ? "invalid_request"
+      : "execution_failure";
   for (const content of result.content) {
     if (content.type !== "text") continue;
     const failure = decodeDeclaredFailure(content.text);
@@ -1210,7 +1218,10 @@ const withToolAnalytics =
                                 ),
                               ),
                               responseBytes,
-                              errorClass: requestErrorClass(result),
+                              errorClass: requestErrorClass(
+                                result,
+                                exit._tag === "Failure" ? exit.cause : undefined,
+                              ),
                             })
                             .pipe(Effect.ignoreCause);
                         }

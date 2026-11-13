@@ -728,6 +728,7 @@ export const OrchestrationV2RunStopReason = Schema.Literals([
   "server_shutdown",
   "server_restart",
   "stopped",
+  "provider_interrupted",
   "queue_cancelled",
   "steered",
   "replaced",

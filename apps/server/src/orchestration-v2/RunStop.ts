@@ -30,7 +30,6 @@ const REVIVED: ReadonlySet<OrchestrationV2Run["status"]> = new Set([
   "preparing",
   "starting",
 ]);
-const STOP_COMMANDS = new Set(["thread.stop", "run.interrupt", "subagent.stop"]);
 const SUPERSEDED_COMMAND_ID = /^(command:system:stale-question:|server:delegated-task-question)/;
 
 export function runStopReason(context: RunStopContext): OrchestrationV2RunStopReason {
@@ -114,7 +113,8 @@ export const makeRunStopStamper = <E, R>(
     events: ReadonlyArray<OrchestrationV2DomainEvent>,
     context: RunStopContext,
   ) {
-    if (STOP_COMMANDS.has(context.commandType ?? "")) {
+    // Any command can ask for an interrupt: a Stop, or a message or steer that replaces the turn.
+    if (context.commandType !== undefined) {
       for (const event of events) {
         if (event.type === "turn-item.updated" && event.payload.type === "run_interrupt_request") {
           if (event.payload.runId !== null) {
@@ -147,10 +147,14 @@ export const makeRunStopStamper = <E, R>(
         );
         continue;
       }
-      // The provider's confirmation, or the effect worker's settle after a Stop, has no actor.
-      const reason = runStopReason(context);
+      // An interrupt written outside any command came from the provider or its runtime, unless a
+      // Stop asked for it: the provider's confirmation and the worker's settle carry no actor.
+      const reason =
+        context.commandType === undefined && run.status === "interrupted"
+          ? "provider_interrupted"
+          : runStopReason(context);
       const pending =
-        (reason === "stopped" || reason === "other") &&
+        (reason === "stopped" || reason === "provider_interrupted" || reason === "other") &&
         Option.isNone(yield* Effect.serviceOption(CommandActor))
           ? requested.get(run.id)
           : undefined;
@@ -166,6 +170,7 @@ const REASON_TEXT: Record<OrchestrationV2RunStopReason, string> = {
   server_shutdown: "cancelled by restart",
   server_restart: "cancelled by restart",
   stopped: "stopped",
+  provider_interrupted: "interrupted by the provider",
   queue_cancelled: "removed from the queue before it started",
   steered: "delivered into the running turn instead",
   replaced: "replaced by a newer message",
@@ -189,16 +194,24 @@ const actorText = new Map<string, string>(Object.entries(ACTOR_TEXT));
 
 /** One line that says why a run stopped and where its work went, for thread reads. */
 export function runStopLabel(input: {
+  readonly status?: OrchestrationV2Run["status"];
   readonly stop: OrchestrationV2RunStop | undefined;
   readonly continuedAs: Pick<OrchestrationV2Run, "id" | "ordinal"> | undefined;
 }): string {
   const { stop, continuedAs } = input;
+  // A continuation that failed before its prompt was taken is retried as another run.
+  if (input.status === "failed" && continuedAs !== undefined) {
+    return `failed to start; retried as run ${continuedAs.ordinal}`;
+  }
+  // A finished or waiting run a restart continued lost only background work it left running.
   const reason =
-    stop === undefined
-      ? continuedAs === undefined
-        ? "stopped; no reason was recorded"
-        : "cut short by restart"
-      : (reasonText.get(stop.reason) ?? stop.reason.replaceAll("_", " "));
+    input.status !== undefined && !STOPPED.has(input.status)
+      ? `${input.status}; its background work was cut short by restart`
+      : stop === undefined
+        ? continuedAs === undefined
+          ? "stopped; no reason was recorded"
+          : "cut short by restart"
+        : (reasonText.get(stop.reason) ?? stop.reason.replaceAll("_", " "));
   const actor =
     stop === undefined ||
     stop.reason === "server_shutdown" ||
@@ -211,14 +224,34 @@ export function runStopLabel(input: {
     : `${reason}${actor}, continued as run ${continuedAs.ordinal}`;
 }
 
+/**
+ * Runs a restart can continue: cancelled ones, finished ones whose background work it cut, and a
+ * continuation that failed before its prompt was taken (retried). Reads look for a continuation
+ * only for these, so every read reports the same thing.
+ */
+export function mayHaveRestartContinuation(
+  run: Pick<
+    OrchestrationV2Run,
+    "status" | "restartCancelledBackgroundWork" | "restartContinuationOfRunId"
+  >,
+): boolean {
+  return (
+    run.status === "cancelled" ||
+    (run.status === "failed" && run.restartContinuationOfRunId !== undefined) ||
+    (run.restartCancelledBackgroundWork?.length ?? 0) > 0
+  );
+}
+
 /** Shown on a cancelled or interrupted run, or one a restart continued. */
 export function runStopDetail(run: OrchestrationV2Run, runs: ReadonlyArray<OrchestrationV2Run>) {
-  const continuedAs = runs.find((candidate) => candidate.restartContinuationOfRunId === run.id);
+  const continuedAs = mayHaveRestartContinuation(run)
+    ? runs.find((candidate) => candidate.restartContinuationOfRunId === run.id)
+    : undefined;
   if (!STOPPED.has(run.status) && continuedAs === undefined) return undefined;
   return {
     ...run.stop,
     ...(continuedAs === undefined ? {} : { continuedAsRunId: continuedAs.id }),
-    label: runStopLabel({ stop: run.stop, continuedAs }),
+    label: runStopLabel({ status: run.status, stop: run.stop, continuedAs }),
   };
 }
 
