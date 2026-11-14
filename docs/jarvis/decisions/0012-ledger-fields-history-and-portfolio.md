@@ -1,6 +1,6 @@
 # Ledger fields, history and portfolio
 
-Accepted 2026-11-12.
+Accepted 2026-11-12. Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)) the ledger is the dot-t3code-mcp sidecar: wait reasons and history carry over, while run metadata and `portfolio_status` apply only to pre-switch rows on T3's ledger.
 
 ## Decision
 

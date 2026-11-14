@@ -1,6 +1,6 @@
 # No human in the loop after intake
 
-Accepted 2026-11-13. Amends [0004](0004-approval-authority.md) for tasks with intake answers. The [0015](0015-server-verified-approvals.md) approval mechanism is unchanged.
+Accepted 2026-11-13. Amends [0004](0004-approval-authority.md) for tasks with intake answers. The [0015](0015-server-verified-approvals.md) approval mechanism is unchanged. Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)) it is recorded on T3's own ledger, while work state lives in the sidecar.
 
 ## Decision
 

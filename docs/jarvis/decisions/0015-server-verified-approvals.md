@@ -2,7 +2,7 @@
 
 Accepted 2026-11-12. [0016](0016-no-human-in-the-loop.md) adds how intake answers authorize a task; this mechanism still carries every approval from T3 to Jarvis and every money go-ahead.
 
-**Superseded for new work on 2026-11-14 by [0020](0020-ledger-of-record-is-the-sidecar.md).** The sidecar ledger has no verified approvals: it refuses `approval` and the `approved` filter. Approvals recorded on the fork ledger before the switch stay readable there. Money still needs Chris's own fresh go-ahead.
+**Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)):** work state lives in the dot-t3code-mcp sidecar, which has no verified approvals. This mechanism stays in force on T3's own ledger, and recording an `approval` there is the one write still allowed on it. Use the same key as the sidecar row.
 
 ## Decision
 
