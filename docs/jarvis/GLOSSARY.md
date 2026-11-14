@@ -17,7 +17,7 @@ A named ChatGPT assistant, such as Jarvis or Vision.
 The connection through which an outside assistant works with T3 on Omarchy.
 
 **work ledger**:
-The shared record of work, its owners, progress, blockers, and next actions. Since 2026-11-14 it is kept in the dot-t3code-mcp sidecar (the `ledger` MCP server). T3's own ledger is a frozen, read-only fallback.
+The shared record of work, its owners, progress, blockers, and next actions. Since 2026-11-14 it is kept in the dot-t3code-mcp sidecar (the `ledger` MCP server). T3's own ledger is frozen for work state; the only writes still allowed there record and retire server-verified approvals ([0020](decisions/0020-ledger-of-record-is-the-sidecar.md)).
 
 **work item**:
 One outcome tracked in the work ledger under a stable key.
