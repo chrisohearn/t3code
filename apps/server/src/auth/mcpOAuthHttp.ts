@@ -106,7 +106,10 @@ export const layer = HttpApiBuilder.group(
             client_id: client.clientId,
             client_name: client.name,
             redirect_uris: client.redirectUris,
-            grant_types: ["authorization_code" as const, "refresh_token" as const],
+            // Upstream builds decode a link's answer with only authorization_code, and never renew.
+            grant_types: client.peerLink
+              ? ["authorization_code" as const]
+              : ["authorization_code" as const, "refresh_token" as const],
             response_types: ["code" as const],
             token_endpoint_auth_method: "none" as const,
           })),

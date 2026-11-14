@@ -234,7 +234,12 @@ it.effect("registers loopback and https clients and never redirects for an unver
 
       const registered = yield* register(handler);
       expect(registered.status).toBe(201);
-      const { client_id: clientId } = (yield* json<unknown>(registered)) as { client_id: string };
+      const registeredBody = (yield* json<unknown>(registered)) as {
+        client_id: string;
+        grant_types: ReadonlyArray<string>;
+      };
+      expect(registeredBody.grant_types).toEqual(["authorization_code", "refresh_token"]);
+      const clientId = registeredBody.client_id;
 
       const forged = yield* handler(
         at(
@@ -386,6 +391,73 @@ it.live("signs in with a pairing code and issues a token only /mcp accepts", () 
           ),
         ),
       ).toEqual(original);
+    }),
+  ),
+);
+
+// Mirrors upstream T3 Code's AuthMcpRegisteredClient, which every upstream build links with.
+const UpstreamAuthMcpRegisteredClient = Schema.Struct({
+  client_id: Schema.String,
+  client_name: Schema.String,
+  redirect_uris: Schema.Array(Schema.String),
+  grant_types: Schema.Array(Schema.Literal("authorization_code")),
+  response_types: Schema.Array(Schema.Literal("code")),
+  token_endpoint_auth_method: Schema.Literal("none"),
+});
+const decodeUpstreamRegisteredClient = Schema.decodeUnknownEffect(UpstreamAuthMcpRegisteredClient);
+const isUpstreamRegisteredClient = Schema.is(UpstreamAuthMcpRegisteredClient);
+
+it.live("registers a peer link in the shape upstream builds decode, and signs it in", () =>
+  withRoutes((handler, auth) =>
+    Effect.gen(function* () {
+      const registerAs = (softwareId?: string) =>
+        handler(
+          at("/oauth/mcp/register", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: encodeJson({
+              client_name: "T3 Code · Studio",
+              redirect_uris: [REDIRECT],
+              ...(softwareId === undefined ? {} : { software_id: softwareId }),
+            }),
+          }),
+        ).pipe(Effect.flatMap(json<unknown>));
+
+      const peerBody = yield* registerAs(MCP_PEER_LINK_SOFTWARE_ID);
+      expect((peerBody as { grant_types: unknown }).grant_types).toEqual(["authorization_code"]);
+      const peer = yield* decodeUpstreamRegisteredClient(peerBody);
+      expect(isUpstreamRegisteredClient(yield* registerAs())).toBe(false);
+
+      const params = authorizeParams(peer.client_id);
+      const pairing = yield* auth.issuePairingCredential();
+      const approved = yield* decide(handler, params, {
+        _tag: "pairing-code",
+        access: "auto",
+        code: pairing.credential,
+      });
+      expect(approved.status).toBe(200);
+      const tokenResponse = yield* handler(
+        at(
+          "/oauth/mcp/token",
+          form({
+            grant_type: "authorization_code",
+            code: new URL(approved.redirectTo!).searchParams.get("code")!,
+            redirect_uri: params.redirect_uri,
+            client_id: peer.client_id,
+            code_verifier: verifier,
+            resource: `${ORIGIN}/mcp`,
+          }),
+        ),
+      );
+      expect(tokenResponse.status).toBe(200);
+      const token = yield* json<{ access_token: string }>(tokenResponse);
+      expect(token).toMatchObject({ token_type: "Bearer", scope: expect.any(String) });
+      const signedIn = yield* auth.authenticateMcpClient(
+        HttpServerRequest.fromWeb(
+          at("/mcp", { headers: { authorization: `Bearer ${token.access_token}` } }),
+        ),
+      );
+      expect(signedIn).toMatchObject({ access: "auto", peerLink: true });
     }),
   ),
 );
