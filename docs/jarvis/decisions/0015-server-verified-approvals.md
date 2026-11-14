@@ -2,6 +2,8 @@
 
 Accepted 2026-11-12. [0016](0016-no-human-in-the-loop.md) adds how intake answers authorize a task; this mechanism still carries every approval from T3 to Jarvis and every money go-ahead.
 
+**Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)):** work state lives in the dot-t3code-mcp sidecar, except work that needs a server-verified approval. That work stays whole on T3's own ledger, so this mechanism applies unchanged.
+
 ## Decision
 
 A ledger row you own with `approval.approvedBy == "user"` is Chris's approval, used once, for exactly what its quote states.

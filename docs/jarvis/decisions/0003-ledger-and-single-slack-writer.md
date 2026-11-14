@@ -1,10 +1,10 @@
 # The ledger owns shared work state
 
-Accepted 2026-11-12.
+Accepted 2026-11-12. Amended 2026-11-14 by [0020](0020-ledger-of-record-is-the-sidecar.md).
 
 ## Decision
 
-The T3 fork's work ledger tracks all shared work. The Slack Bugs List mirrors the ledger and has one writer, the F01 thread.
+The work ledger tracks all shared work. Since 2026-11-14 that is the dot-t3code-mcp sidecar (the `ledger` MCP server), except work that needs a server-verified approval, which stays whole on T3's ledger ([0020](0020-ledger-of-record-is-the-sidecar.md)). Before that it was the T3 fork's ledger. The Slack Bugs List mirrors the ledger and has one writer, the F01 thread.
 
 At Chris's request on November 12, the audit owner maintains the [upgrade register](../upgrades.md) as a dated view of approved scope, owners, PRs and status. The ledger and GitHub remain authoritative for current work and PR state. Update the register from those sources; it does not replace them.
 

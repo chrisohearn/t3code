@@ -1,6 +1,6 @@
 # Jarvis relays authority and answers individual prompts
 
-Accepted 2026-11-12. Amended 2026-11-13 by [0016](0016-no-human-in-the-loop.md): for a task with intake answers, the agent that asked, and workers it hands the task to, may take the sensitive actions they spell out. Spending money always needs Chris's fresh go-ahead, and anything intake didn't cover goes to Chris through Jarvis. Passing approval from T3 to Jarvis still follows 0015.
+Accepted 2026-11-12. Amended 2026-11-13 by [0016](0016-no-human-in-the-loop.md): for a task with intake answers, the agent that asked, and workers it hands the task to, may take the sensitive actions they spell out. Spending money always needs Chris's fresh go-ahead, and anything intake didn't cover goes to Chris through Jarvis. Passing approval from T3 to Jarvis still follows 0015. Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)), work that needs that approval stays whole on T3's own ledger, while other work lives in the sidecar.
 
 ## Decision
 

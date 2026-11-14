@@ -45,7 +45,16 @@ path with a genuine inbox run, its registered subscription id, event name, and
 thread filter. Posted-message forwarding is outside this round; the inbox must not
 switch to post-only acknowledgements.
 
-Acceptance requires a live check after the coordinated round-three update:
-Jarvis pins its existing inbox, launches a scratch run with notify, and reports
-the source run id after the relay message wakes it. Unit tests and webhook ACKs
-do not establish that acceptance.
+Acceptance was first set as a live check after the coordinated round-three
+update: Jarvis pins its existing inbox, launches a scratch run with notify, and
+reports the source run id after the relay message wakes it. Unit tests and
+webhook ACKs do not establish acceptance. On 2026-11-14 Chris chose a verified real
+receipt in place of the scratch run (amendment below). That receipt proves the
+relay half only, so acceptance stays open until Chris confirms it or a Jarvis
+wake is shown.
+
+## Amendment, 2026-11-14: real receipt accepted
+
+Chris chose "Accept real receipt" on 2026-11-14 (audit thread 7e56b504, item 7371). A verified real relay replaces the scripted scratch check, and the scratch run is dropped. The receipt is a 2026-11-13 source run that completed, the server-written relay message it produced in the pinned Jarvis inbox, and the inbox run that message started, with the matching event name, source run id and ledger key. Its exact run and message ids are recorded in this ADR in the private connector repo, which is the source of truth for these docs.
+
+**What this proves, and what it doesn't.** The chain proves the relay half: a genuine source run, a binding to the pinned inbox, a stored relay message, and a genuine inbox run started by it. Run 250's own reply was the inbox agent's "Queued for Jarvis" acknowledgement. The chain has no Jarvis-side receipt (Jarvis waking on that run's `thread.run.result` and reporting the source run). Chris was asked about a relay that "woke Jarvis end to end". A later normal-mode wake test on 2026-11-14 got no Jarvis reply (recorded on the work ledger), so the wake leg is unproven. This ADR's acceptance stays open, on the work ledger until Chris confirms he accepts the relay half alone or the wake path is fixed and shown.
