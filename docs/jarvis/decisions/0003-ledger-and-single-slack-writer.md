@@ -1,6 +1,6 @@
 # The ledger owns shared work state
 
-Accepted 2026-11-12.
+Accepted 2026-11-12. Since 2026-11-14 the ledger is the dot-t3code-mcp sidecar, not the fork's ([0020](0020-ledger-of-record-is-the-sidecar.md)).
 
 ## Decision
 

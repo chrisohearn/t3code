@@ -49,3 +49,9 @@ Acceptance requires a live check after the coordinated round-three update:
 Jarvis pins its existing inbox, launches a scratch run with notify, and reports
 the source run id after the relay message wakes it. Unit tests and webhook ACKs
 do not establish that acceptance.
+
+## Amendment, 2026-11-14: real receipt accepted
+
+Chris chose "Accept real receipt" on 2026-11-14 (audit thread 7e56b504, item 7371). A verified real relay-to-wake receipt replaces the scripted scratch check, and the scratch run is dropped. The receipt is a 2026-11-13 source run that completed, the server-written relay message it produced in the pinned Jarvis inbox, and the inbox run that message started, with the matching event name, source run id and ledger key. Its exact run and message ids are recorded in this ADR in the private connector repo, which is the source of truth for these docs.
+
+It is a genuine run, relayed through the pinned inbox and started by the stored relay message. That is what the scripted check was meant to show. The audit owner verified the chain independently before Chris accepted it.

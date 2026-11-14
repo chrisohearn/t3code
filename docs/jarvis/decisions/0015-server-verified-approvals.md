@@ -2,6 +2,8 @@
 
 Accepted 2026-11-12. [0016](0016-no-human-in-the-loop.md) adds how intake answers authorize a task; this mechanism still carries every approval from T3 to Jarvis and every money go-ahead.
 
+**Superseded for new work on 2026-11-14 by [0020](0020-ledger-of-record-is-the-sidecar.md).** The sidecar ledger has no verified approvals: it refuses `approval` and the `approved` filter. Approvals recorded on the fork ledger before the switch stay readable there. Money still needs Chris's own fresh go-ahead.
+
 ## Decision
 
 A ledger row you own with `approval.approvedBy == "user"` is Chris's approval, used once, for exactly what its quote states.
