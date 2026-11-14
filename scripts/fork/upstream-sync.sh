@@ -205,12 +205,26 @@ artifacts=$(scripts/fork/build-release.sh "$version" 2>"$logs/build.log" | tail 
 tmp_cli=$(mktemp -d -p "$logs")
 tar -xzf "$artifacts/t3-$version-linux-x64.tar.gz" -C "$tmp_cli"
 cli=$(find "$tmp_cli" -type f -name t3 -perm -u+x | head -1)
+# One status from the preflight's JSON line (the log also holds stderr): `.` or `codexShadowHomes`.
+preflight_status() {
+  python3 -c 'import json, sys
+lines = [line for line in open(sys.argv[1]) if line.startswith("{")]
+try:
+    result = json.loads(lines[-1])
+except (IndexError, ValueError):
+    sys.exit()
+section = result if sys.argv[2] == "." else (result.get(sys.argv[2]) or {})
+print(section.get("status", ""))' "$1" "$2"
+}
 for protocol in 3 4; do
   "$cli" __service-preflight --database-path "$LIVE_DB" --launcher-protocol "$protocol" \
     >"$logs/preflight-$protocol.json" 2>&1 || true
-  grep -q '"status":"ready"' "$logs/preflight-$protocol.json" ||
+  [[ $(preflight_status "$logs/preflight-$protocol.json" .) == ready ]] ||
     fail "service preflight on the live database (launcher protocol $protocol)" "preflight-$protocol.json"
 done
+# Codex shadow homes the new build would refuse to set up; `auto-settle` ones it moves aside itself.
+[[ $(preflight_status "$logs/preflight-4.json" codexShadowHomes) == ready ]] ||
+  fail "Codex shadow home preflight (an instance's shadow conflicts with its shared home)" preflight-4.json
 
 if [[ -n "$dry_run" ]]; then
   keep_worktree=1
