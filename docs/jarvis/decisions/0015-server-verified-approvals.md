@@ -2,7 +2,7 @@
 
 Accepted 2026-11-12. [0016](0016-no-human-in-the-loop.md) adds how intake answers authorize a task; this mechanism still carries every approval from T3 to Jarvis and every money go-ahead.
 
-**Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)):** work state lives in the dot-t3code-mcp sidecar, which has no verified approvals. This mechanism stays in force on T3's own ledger, and recording an `approval` there is the one write still allowed on it. Use the same key as the sidecar row.
+**Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)):** work state lives in the dot-t3code-mcp sidecar, which has no verified approvals. This mechanism stays in force on T3's own ledger. Recording an `approval` there, and retiring it with `approval: null` right after acting, are the only writes still allowed on it. Use the same key as the sidecar row. Marking the sidecar row done does not retire the approval.
 
 ## Decision
 
