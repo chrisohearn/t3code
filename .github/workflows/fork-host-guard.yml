@@ -5,16 +5,29 @@ on:
   pull_request:
     paths:
       - "scripts/fork/host/t3-update-guard/**"
+      - "scripts/fork/upstream-*.sh"
+      - "scripts/fork/test-upstream-stable-tag.sh"
       - ".github/workflows/fork-host-guard.yml"
   push:
     branches: [integration/mcp-events-20261109]
     paths:
       - "scripts/fork/host/t3-update-guard/**"
+      - "scripts/fork/upstream-*.sh"
+      - "scripts/fork/test-upstream-stable-tag.sh"
 
 permissions:
   contents: read
 
 jobs:
+  stable-tag-tests:
+    name: Upstream stable tag tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run test-upstream-stable-tag.sh
+        run: bash scripts/fork/test-upstream-stable-tag.sh
+
   guard-tests:
     name: Update guard tests
     runs-on: ubuntu-24.04
