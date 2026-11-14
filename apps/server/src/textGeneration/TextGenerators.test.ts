@@ -63,7 +63,11 @@ it.effect.each([
       expect(new Headers(init?.headers).get(api.auth[0])).toBe(api.auth[1]);
       const body = JSON.parse(String(init?.body));
       expect(body.model).toBe("some/model");
-      expect(body.messages).toEqual([{ role: "user", content: "Name this thread." }]);
+      expect(body.messages).toEqual([
+        ...(api.kind === "openaiCompatible" ? [{ role: "system", content: "Fixed policy" }] : []),
+        { role: "user", content: "Name this thread." },
+      ]);
+      if (api.kind === "anthropic") expect(body.system).toBe("Fixed policy");
       return Response.json(api.reply);
     });
     const generators = yield* TextGenerators.TextGenerators.pipe(
@@ -71,7 +75,7 @@ it.effect.each([
     );
     const run = yield* generators.runner(ID);
     expect(run).toBeDefined();
-    const result = yield* run!(request).pipe(
+    const result = yield* run!({ ...request, systemPrompt: "Fixed policy" }).pipe(
       Effect.provideService(FetchHttpClient.Fetch, upstream),
     );
     expect(result).toEqual({ title: "Fix login" });

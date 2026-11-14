@@ -198,7 +198,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           reason: "exit",
           exitCode,
         });
-        return [];
+        return null;
       }
       const servers = yield* decodeCodexMcpServers(stdout).pipe(
         Effect.tapError(() =>
@@ -216,17 +216,18 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         onNone: () =>
           Effect.logWarning("codex mcp list failed; text generation keeps its MCP servers", {
             reason: "timeout",
-          }).pipe(Effect.as<ReadonlyArray<string>>([])),
+          }).pipe(Effect.as(null)),
         onSome: (names) => Effect.succeed(names),
       }),
     ),
-    Effect.orElseSucceed((): ReadonlyArray<string> => []),
+    Effect.orElseSucceed(() => null),
   );
 
   const runCodexJson = Effect.fn("runCodexJson")(function* <S extends Schema.Top>({
     operation,
     cwd,
     prompt,
+    systemPrompt,
     outputSchema: outputSchemaJson,
     modelSelection,
     attachments,
@@ -242,6 +243,11 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       toJsonSchemaObject(outputSchemaJson),
     );
     const schemaPath = yield* writeTempFile(operation, "codex-schema", schemaJson);
+    const systemConfig =
+      systemPrompt === undefined
+        ? undefined
+        : yield* encodeJsonForOperation(operation, systemPrompt);
+    const workingDirectory = operation === "reviewApproval" ? path.dirname(schemaPath) : cwd;
     const outputPath = yield* writeTempFile(operation, "codex-output", "").pipe(
       Effect.onError(() => removeTempFileDir(schemaPath)),
     );
@@ -269,14 +275,23 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         )?.slug ??
         listed.find((candidate) => codexModelFamily(candidate.slug) === requestedFamily)?.slug;
       const model =
-        matchedModel ??
-        listed.find((candidate) => candidate.isDefault)?.slug ??
-        listed.find((candidate) => !candidate.isLegacy)?.slug ??
-        listed[0]?.slug ??
-        requestedModel;
+        operation === "reviewApproval"
+          ? requestedModel
+          : (matchedModel ??
+            listed.find((candidate) => candidate.isDefault)?.slug ??
+            listed.find((candidate) => !candidate.isLegacy)?.slug ??
+            listed[0]?.slug ??
+            requestedModel);
       // The selection's options were chosen for the requested model and may not fit a fallback.
       const fellBack = matchedModel === undefined && model !== requestedModel;
       const launchArgs = resolveCodexLaunchArgs(effectiveConfig.launchArgs, effectiveEnvironment);
+      if (operation === "reviewApproval" && !resolved && launchArgs.trim()) {
+        return yield* new TextGenerationError({
+          operation,
+          detail:
+            "Reviewer cannot inherit custom Codex launch settings. Use a managed provider instance or a standard sign-in.",
+        });
+      }
       const reasoningEffort =
         (fellBack
           ? undefined
@@ -287,6 +302,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       const binary = effectiveConfig.binaryPath || "codex";
       const env = {
         ...effectiveEnvironment,
+        HOME: effectiveEnvironment.HOME,
         ...(effectiveConfig.homePath
           ? {
               CODEX_HOME: expandHomePath(
@@ -296,12 +312,48 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
             }
           : {}),
       };
-      const enabledMcpServers = yield* listEnabledMcpServers({
+      if (operation === "reviewApproval") {
+        const sourceHome = env.CODEX_HOME ?? path.join(yield* HostProcess.HomeDirectory, ".codex");
+        const isolatedHome = yield* fileSystem
+          .makeTempDirectoryScoped({ prefix: "t3code-codex-review-home-" })
+          .pipe(
+            Effect.mapError((cause) =>
+              normalizeCliError("codex", operation, cause, "Cannot isolate reviewer home"),
+            ),
+          );
+        yield* Effect.gen(function* () {
+          yield* fileSystem.chmod(isolatedHome, 0o700);
+          const authPath = path.join(sourceHome, "auth.json");
+          if (!resolved && (yield* fileSystem.exists(authPath))) {
+            yield* fileSystem.copyFile(authPath, path.join(isolatedHome, "auth.json"));
+            yield* fileSystem.chmod(path.join(isolatedHome, "auth.json"), 0o600);
+          }
+        }).pipe(
+          Effect.mapError((cause) =>
+            normalizeCliError(
+              "codex",
+              operation,
+              cause,
+              "Cannot prepare isolated reviewer sign-in",
+            ),
+          ),
+        );
+        env.CODEX_HOME = isolatedHome;
+        env.HOME = isolatedHome;
+      }
+      const mcpServers = yield* listEnabledMcpServers({
         binary,
-        cwd,
+        cwd: workingDirectory,
         env,
         launchArgs: codexMcpListLaunchArgs(launchArgs),
       });
+      if (mcpServers === null && operation === "reviewApproval") {
+        return yield* new TextGenerationError({
+          operation,
+          detail: "Cannot isolate reviewer MCP tools.",
+        });
+      }
+      const enabledMcpServers = mcpServers ?? [];
       const mcpServersOff = codexMcpServersOff(enabledMcpServers);
       const execLaunchArgs = codexExecLaunchArgs(launchArgs);
       // A launch-arg mcp_servers={...} table replaces ours and can re-enable dotted names.
@@ -315,6 +367,23 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           ...execLaunchArgs,
           // A user's MCP server could act on the text-generation prompt.
           ...CODEX_NO_PLUGIN_ARGS,
+          ...(systemConfig ? ["--config", `developer_instructions=${systemConfig}`] : []),
+          ...(operation === "reviewApproval"
+            ? [
+                "--config",
+                "features.shell_tool=false",
+                "--config",
+                'approval_policy="never"',
+                "--config",
+                'approvals_reviewer="user"',
+                "--config",
+                'web_search="disabled"',
+                "--config",
+                "project_doc_max_bytes=0",
+                "--config",
+                "project_doc_fallback_filenames=[]",
+              ]
+            : []),
           ...(mcpServersOff && launchArgsSetMcpTable ? ["--config", mcpServersOff] : []),
           // After launch args, so a launch arg's enabled=true cannot turn a server back on.
           ...codexMcpServerOffFlags(enabledMcpServers),
@@ -338,7 +407,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       );
       const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
         env,
-        cwd,
+        cwd: workingDirectory,
         shell: spawnCommand.shell,
         stdin: {
           stream: Stream.encodeText(Stream.make(prompt)),

@@ -24,8 +24,10 @@ import { advertisedModel, requireAdvertisedModel } from "../../providerModels.ts
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as PendingApproval from "../../PendingApprovalMcpService.ts";
+import * as AutoReviewConfig from "../../../orchestration-v2/ApprovalAutoReviewConfig.ts";
 import {
   dispatchFailure,
+  assertFullAccess,
   newCommandId,
   readCaller,
   readThread,
@@ -169,6 +171,7 @@ const configureAcknowledgeOnly = Effect.fn("mcp.configureAcknowledgeOnly")(funct
     modelSelection: thread.modelSelection,
     runtimeMode: thread.runtimeMode,
     interactionMode: thread.interactionMode,
+    autoReview: yield* AutoReviewConfig.read(thread.id).pipe(Effect.mapError(unavailable)),
     acknowledgeOnly,
   };
 });
@@ -293,6 +296,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     (input) =>
       input.modelSelection === undefined &&
       input.runtimeMode === undefined &&
+      input.autoReview === undefined &&
       input.applyAt === undefined &&
       input.acknowledgeOnly === undefined &&
       input.standingRole === undefined,
@@ -303,6 +307,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           projection: { thread },
         } = yield* readThread(input.threadId);
         return {
+          autoReview: yield* AutoReviewConfig.read(thread.id).pipe(Effect.mapError(unavailable)),
           ...configuration(thread, yield* (yield* ThreadRoles.ThreadRoles).get(thread.id)),
           acknowledgeOnly: yield* threads
             .acknowledgeOnly(thread.id)
@@ -316,6 +321,28 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           threads,
           projection: { thread },
         } = yield* readThread(input.threadId);
+        if (input.autoReview !== undefined) {
+          yield* assertFullAccess(yield* readCaller(), "configure approval auto-review");
+          if (
+            input.modelSelection !== undefined ||
+            input.runtimeMode !== undefined ||
+            input.applyAt !== undefined ||
+            input.acknowledgeOnly !== undefined ||
+            input.standingRole !== undefined
+          ) {
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "Set autoReview separately from other thread configuration.",
+            });
+          }
+          const autoReview = yield* AutoReviewConfig.write(thread.id, input.autoReview).pipe(
+            Effect.mapError(unavailable),
+          );
+          return {
+            ...configuration(thread, yield* (yield* ThreadRoles.ThreadRoles).get(thread.id)),
+            autoReview,
+          };
+        }
         if (input.acknowledgeOnly !== undefined) {
           return yield* configureAcknowledgeOnly(threads, thread, input);
         }
@@ -355,7 +382,10 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
             })
             .pipe(withMcpCommandActor, Effect.mapError(dispatchFailure));
           yield* roles.set(thread.id, input.standingRole, McpInvocationContext.actorLabel(scope));
-          return configuration(thread, yield* roles.get(thread.id));
+          return {
+            ...configuration(thread, yield* roles.get(thread.id)),
+            autoReview: yield* AutoReviewConfig.read(thread.id).pipe(Effect.mapError(unavailable)),
+          };
         }
         if (input.runtimeMode !== undefined) {
           if (input.modelSelection !== undefined) {

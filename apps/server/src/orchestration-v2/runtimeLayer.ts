@@ -2,6 +2,8 @@ import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as SnoozeDeferredDelivery from "./SnoozeDeferredDelivery.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
+import * as ApprovalAutoReview from "./ApprovalAutoReview.ts";
+import * as TextGenerators from "../textGeneration/TextGenerators.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -389,6 +391,11 @@ export const layer = Layer.mergeAll(
 );
 
 export const layerProduction = Layer.mergeAll(
+  ApprovalAutoReview.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(layerThreadManagementProvided, TextGenerators.layer, layerEventSink),
+    ),
+  ),
   WorktreeBranchSync.layer.pipe(
     Layer.provide(Layer.merge(layerThreadManagementProvided, ProjectionStore.layer)),
   ),

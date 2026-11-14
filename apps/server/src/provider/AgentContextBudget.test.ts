@@ -17,6 +17,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { McpServer, McpSchema } from "effect/ai";
 import * as JarvisPlaybook from "../mcp/JarvisPlaybook.ts";
+import * as ApprovalAutoReviewStatus from "../orchestration-v2/ApprovalAutoReviewStatus.ts";
 
 import { AssetSigner } from "../assets/AssetSigner.ts";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
@@ -61,6 +62,7 @@ import budget from "./agentContextBudget.json" with { type: "json" };
 
 // Registration only stores tool definitions, so the handlers' services are never called.
 const toolHandlerServices = Layer.mergeAll(
+  ApprovalAutoReviewStatus.layer,
   Layer.mock(McpEvents.McpEvents)({}),
   Layer.mock(McpBridgeMetrics.McpBridgeMetrics)({}),
   Layer.mock(McpClientThreads.McpClientThreads)({}),

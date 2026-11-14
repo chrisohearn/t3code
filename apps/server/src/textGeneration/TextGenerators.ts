@@ -91,7 +91,12 @@ export const make = Effect.gen(function* () {
       const label = generatorLabel(config);
       return connect(config).pipe(
         Effect.flatMap((connection) =>
-          driver.generate(connection, request.modelSelection.model, request.prompt),
+          driver.generate(
+            connection,
+            request.modelSelection.model,
+            request.prompt,
+            request.systemPrompt,
+          ),
         ),
         Effect.provideService(HttpClient.HttpClient, http),
         Effect.mapError(

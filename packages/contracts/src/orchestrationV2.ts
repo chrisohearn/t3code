@@ -1349,6 +1349,9 @@ export function latestProviderTurnForAttempt<
 }
 
 export const OrchestrationV2McpApprovalAnswer = Schema.Struct({
+  reviewer: Schema.optional(
+    Schema.Struct({ modelSelection: ModelSelection, reason: Schema.String }),
+  ),
   sessionId: Schema.String,
   clientLabel: Schema.String,
   originEnvironmentId: Schema.optional(EnvironmentId),

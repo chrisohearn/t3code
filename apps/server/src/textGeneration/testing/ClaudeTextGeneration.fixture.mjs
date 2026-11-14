@@ -2,6 +2,22 @@ import * as NodeFS from "node:fs";
 
 const argv = process.argv.slice(2);
 const args = argv.join(" ");
+if (process.env.T3_FAKE_CLAUDE_ISOLATED_REVIEW === "1") {
+  if (!process.env.CLAUDE_CONFIG_DIR?.includes("t3code-claude-review-home-"))
+    throw new Error("reviewer inherited its home");
+  for (const name of ["CLAUDE.md", "settings.json"]) {
+    if (NodeFS.existsSync(`${process.env.CLAUDE_CONFIG_DIR}/${name}`))
+      throw new Error("reviewer inherited instruction files");
+  }
+  if (
+    NodeFS.readFileSync(`${process.env.CLAUDE_CONFIG_DIR}/.credentials.json`, "utf8") !==
+    "synthetic-auth"
+  )
+    throw new Error("reviewer changed sign-in source");
+  const sourcesIndex = argv.indexOf("--setting-sources");
+  if (sourcesIndex < 0 || argv[sourcesIndex + 1] !== "")
+    throw new Error("reviewer loads user settings");
+}
 
 function fail(message, code) {
   process.stderr.write(message + "\n");

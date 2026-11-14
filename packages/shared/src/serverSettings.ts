@@ -606,6 +606,9 @@ export function applyServerSettingsPatch(
     ...(patch.fallbackModelSelection !== undefined
       ? { fallbackModelSelection: patch.fallbackModelSelection }
       : {}),
+    ...(patch.approvalAutoReview !== undefined
+      ? { approvalAutoReview: patch.approvalAutoReview }
+      : {}),
     ...(patch.secondaryFallbackModelSelection !== undefined
       ? { secondaryFallbackModelSelection: patch.secondaryFallbackModelSelection }
       : {}),

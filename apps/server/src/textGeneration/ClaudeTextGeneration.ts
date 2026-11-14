@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -31,6 +32,7 @@ import {
 import {
   hasClaudeManagedMcpConfig,
   makeClaudeEnvironment,
+  resolveClaudeHomePath,
 } from "../provider/Drivers/ClaudeHome.ts";
 
 const CLAUDE_TIMEOUT_MS = 180_000;
@@ -140,6 +142,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     operation,
     cwd,
     prompt,
+    systemPrompt,
     outputSchema: outputSchemaJson,
     modelSelection,
     investigate,
@@ -201,7 +204,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       noSessionPersistence: boolean,
     ) {
       const workingDirectory =
-        operation === "generateThreadTitle"
+        operation === "generateThreadTitle" || operation === "reviewApproval"
           ? yield* fileSystem
               .makeTempDirectoryScoped({ prefix: "t3code-claude-title-" })
               .pipe(
@@ -211,10 +214,48 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
               )
           : cwd;
       const managedMcpConfig = yield* hasClaudeManagedMcpConfig();
+      if (operation === "reviewApproval" && managedMcpConfig) {
+        return yield* new TextGenerationError({
+          operation,
+          detail: "Cannot isolate reviewer from managed MCP tools.",
+        });
+      }
+      let reviewerEnvironment = claudeEnvironment;
+      if (operation === "reviewApproval") {
+        const path = yield* Path.Path;
+        const sourceHome = yield* resolveClaudeHomePath(claudeSettings, claudeEnvironment);
+        const isolatedHome = yield* fileSystem
+          .makeTempDirectoryScoped({ prefix: "t3code-claude-review-home-" })
+          .pipe(
+            Effect.mapError((cause) =>
+              normalizeCliError("claude", operation, cause, "Cannot isolate reviewer home"),
+            ),
+          );
+        yield* Effect.gen(function* () {
+          yield* fileSystem.chmod(isolatedHome, 0o700);
+          const authPath = path.join(sourceHome, ".credentials.json");
+          if (yield* fileSystem.exists(authPath)) {
+            yield* fileSystem.copyFile(authPath, path.join(isolatedHome, ".credentials.json"));
+            yield* fileSystem.chmod(path.join(isolatedHome, ".credentials.json"), 0o600);
+          }
+        }).pipe(
+          Effect.mapError((cause) =>
+            normalizeCliError(
+              "claude",
+              operation,
+              cause,
+              "Cannot prepare isolated reviewer sign-in",
+            ),
+          ),
+        );
+        reviewerEnvironment = { ...claudeEnvironment, CLAUDE_CONFIG_DIR: isolatedHome };
+      }
       const spawnCommand = yield* resolveSpawnCommand(
         claudeSettings.binaryPath || "claude",
         [
           "-p",
+          ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
+          ...(operation === "reviewApproval" ? ["--setting-sources", ""] : []),
           "--output-format",
           "json",
           "--json-schema",
@@ -241,10 +282,10 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
           "--permission-mode",
           "dontAsk",
         ],
-        { env: claudeEnvironment },
+        { env: reviewerEnvironment },
       );
       const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-        env: claudeEnvironment,
+        env: reviewerEnvironment,
         cwd: workingDirectory,
         shell: spawnCommand.shell,
         stdin: {

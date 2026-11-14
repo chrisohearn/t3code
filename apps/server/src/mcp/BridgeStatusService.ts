@@ -17,8 +17,10 @@ import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import * as McpEvents from "./McpEvents.ts";
 import * as Metrics from "./McpBridgeMetrics.ts";
+import * as AutoReview from "../orchestration-v2/ApprovalAutoReviewStatus.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 export const BridgeStatusResult = Schema.Struct({
+  autoReview: AutoReview.Snapshot,
   serviceStartedAt: Schema.String,
   tunnel: Schema.NullOr(EnvironmentConnectReachability),
   daysUntilSessionExpires: Schema.Number,
@@ -75,6 +77,7 @@ export const layer = Layer.effect(
     const events = yield* McpEvents.McpEvents;
     const metrics = yield* Metrics.McpBridgeMetrics;
     const forwarding = yield* PeerForwarding.PeerForwarding;
+    const autoReview = yield* AutoReview.ApprovalAutoReviewStatus;
     const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
     return BridgeStatusService.of({
       status: Effect.fn("BridgeStatusService.status")(function* () {
@@ -123,6 +126,7 @@ export const layer = Layer.effect(
         );
         return {
           ...status,
+          autoReview: yield* autoReview.read,
           linkedEnvironments,
           missedScheduledRuns,
           toolCalls: yield* metrics.read(scope.client!.sessionId),

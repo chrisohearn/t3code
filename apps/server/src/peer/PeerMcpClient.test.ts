@@ -2,8 +2,10 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  ModelSelection,
   OrchestrationV2LinkedSender,
   OrchestratorMcpFailure,
+  RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -23,6 +25,7 @@ import { HttpClient, HttpClientResponse } from "effect/http";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../mcp/McpToolAccess.ts";
+import { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 import * as PeerMcpClient from "./PeerMcpClient.ts";
 import { descriptorOf, layerLinkingEnvironment, linkTo, servePeer } from "./PeerLinks.testkit.ts";
@@ -101,6 +104,60 @@ const senderToolkit = Toolkit.make(
     success: Schema.Struct({ senderThread: Schema.NullOr(OrchestrationV2LinkedSender) }),
     dependencies: [McpInvocationContext.McpInvocationContext],
   }),
+);
+
+it.effect("accepts older-peer thread configuration responses without autoReview", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const legacyConfiguration = {
+        threadId: ThreadId.make("thread:older-peer"),
+        modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+      };
+      const legacyToolkit = Toolkit.make(
+        Tool.make("t3_thread_configure", {
+          parameters: Schema.Struct({
+            threadId: ThreadId,
+            modelSelection: Schema.optional(ModelSelection),
+            runtimeMode: Schema.optional(RuntimeMode),
+          }),
+          success: Schema.Unknown,
+        }),
+      );
+      const handlers = McpToolAccess.toLayer(legacyToolkit, {
+        t3_thread_configure: McpToolAccess.reads((input) =>
+          Effect.succeed({ ...legacyConfiguration, ...input }),
+        ),
+      });
+      const box = descriptorOf("environment-older", "Older peer");
+      const peer = yield* servePeer(
+        box,
+        McpHttpServer.toolkitRegistration(legacyToolkit, handlers),
+      );
+      const context = yield* Layer.build(
+        layerLinkingEnvironment(descriptorOf("environment-current", "Current peer")),
+      );
+      const links = Context.get(context, PeerLinks.PeerLinks);
+      const client = Context.get(context, PeerMcpClient.PeerMcpClient);
+      yield* linkTo(links, peer);
+      for (const change of [
+        {},
+        { modelSelection: { instanceId: "codex", model: "gpt-5.5" } },
+        { runtimeMode: "full-access" },
+      ]) {
+        expect(
+          yield* client.call({
+            environmentId: box.environmentId,
+            tool: "t3_thread_configure",
+            arguments: { threadId: legacyConfiguration.threadId, ...change },
+            limits: { runtimeMode: "full-access", interactionMode: "default" },
+            success: ThreadToolkit.tools.t3_thread_configure.successSchema,
+          }),
+        ).toEqual({ ...legacyConfiguration, ...change });
+      }
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect("tells the peer which thread a call is made for", () =>

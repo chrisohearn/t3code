@@ -15,7 +15,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Invocation from "./McpInvocationContext.ts";
-import { McpApprovalAnswerContext } from "./McpApprovalAnswerContext.ts";
+import { ApprovalReviewEscalation, McpApprovalAnswerContext } from "./McpApprovalAnswerContext.ts";
 import {
   assertFullAccess,
   dispatchFailure,
@@ -34,7 +34,11 @@ const ApprovalRefusal = Schema.Struct({
   attemptedDecision: OrchestrationV2McpApprovalAnswer.fields.decision,
   reason: Schema.String,
 });
-const ApprovalRecord = Schema.Union([OrchestrationV2McpApprovalAnswer, ApprovalRefusal]);
+const ApprovalRecord = Schema.Union([
+  OrchestrationV2McpApprovalAnswer,
+  ApprovalRefusal,
+  ApprovalReviewEscalation,
+]);
 export const ApprovalLogResult = Schema.Struct({
   records: Schema.Array(ApprovalRecord),
   nextCursor: Schema.NullOr(Schema.Number),

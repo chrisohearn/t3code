@@ -115,6 +115,14 @@ export interface TranscriptionPostProcessingResult {
 }
 
 export interface ProviderTextGeneration {
+  readonly reviewApproval?: (input: {
+    cwd: string;
+    evidence: string;
+    modelSelection: ModelSelection;
+  }) => Effect.Effect<
+    { decision: "approve" | "decline" | "escalate"; reason: string },
+    TextGenerationError
+  >;
   readonly generateTranscriptionPostProcessing: (
     input: TranscriptionPostProcessingInput,
   ) => Effect.Effect<TranscriptionPostProcessingResult, TextGenerationError>;
