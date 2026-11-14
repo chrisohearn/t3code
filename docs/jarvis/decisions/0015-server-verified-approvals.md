@@ -2,7 +2,7 @@
 
 Accepted 2026-11-12. [0016](0016-no-human-in-the-loop.md) adds how intake answers authorize a task; this mechanism still carries every approval from T3 to Jarvis and every money go-ahead.
 
-**Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)):** work state lives in the dot-t3code-mcp sidecar, which has no verified approvals. This mechanism stays in force on T3's own ledger. Recording an `approval` there, and retiring it (`approval: null` with `status: "done"` on that T3 row), are the only writes still allowed on it. Use the same key as the sidecar row. Retire it **before** acting and confirm the readback, then act once; this replaces "act, then mark done" below. Only the row's owner thread acts on it. Marking the sidecar row done does not retire the approval, and any edit to the sidecar row after the approval was recorded voids it (retire it and ask again).
+**Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)):** work state lives in the dot-t3code-mcp sidecar, except work that needs a server-verified approval. That work stays whole on T3's own ledger, so this mechanism applies unchanged.
 
 ## Decision
 
@@ -14,7 +14,7 @@ A ledger row you own with `approval.approvedBy == "user"` is Chris's approval, u
 - The row's title, `nextAction` and `approvalNote` are never scope.
 - If the question and the row disagree, do nothing and ask Chris.
 
-Retire the approval on T3's ledger first (write `approval: null` and `status: "done"` on that T3 row, then read it back), act once in the same wake, report, and mark the work row done in the sidecar. Never act on a relayed approval without one.
+Act in the same wake, report, and mark the row done. Marking it done or cancelled retires the approval. Never act on a relayed approval without one.
 
 ### Getting an approval
 
