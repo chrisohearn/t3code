@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Daily upstream sync for the fork: merges pingdotgg/t3code main into the integration branch,
+# Upstream sync for the fork: merges the newest pingdotgg/t3code stable tag newer than the
+# integration branch's upstream base (UPSTREAM_TRACK=nightly: upstream main) into the integration branch,
 # checks the result, and publishes a fork preview release when everything passes. Publishing is
 # deploying: the host's update guard installs the newest fork release when no threads run.
 #
@@ -15,6 +16,7 @@ set -euo pipefail
 FORK=${T3_FORK_REPO:-chrisohearn/t3code}
 BRANCH=${T3_FORK_BRANCH:-integration/mcp-events-20261109}
 UPSTREAM_URL=https://github.com/pingdotgg/t3code.git
+UPSTREAM_TRACK=${UPSTREAM_TRACK:-stable}
 SOURCE=${T3_FORK_SOURCE:-$HOME/.t3/sources/t3code-ownership-personal-fork-20261110}
 WORKTREES=${T3_FORK_WORKTREES:-$HOME/.t3/worktrees/t3code-ownership-personal-fork-20261110}
 LIVE_DB=${T3_LIVE_DB:-$HOME/.t3/userdata/statev2.sqlite}
@@ -24,6 +26,7 @@ for tool in git gh docker python3 curl flock; do
   command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 2; }
 done
 log() { printf '[upstream-sync] %s\n' "$*" >&2; }
+[[ "$UPSTREAM_TRACK" == stable || "$UPSTREAM_TRACK" == nightly ]] || { log "UPSTREAM_TRACK must be stable or nightly"; exit 2; }
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/t3-fork-release
 mkdir -p "$cache/logs"
 exec 9>"$cache/upstream-sync.lock"
@@ -32,10 +35,41 @@ flock -n 9 || { log "another sync is running"; exit 0; }
 git -C "$SOURCE" remote get-url upstream >/dev/null 2>&1 ||
   git -C "$SOURCE" remote add upstream "$UPSTREAM_URL"
 git -C "$SOURCE" fetch -q origin
+# helper-load begin (the wrapper runs a copy of this script, so a sibling file may be missing; tested)
+helper=$(dirname "${BASH_SOURCE[0]}")/upstream-stable-tag.sh
+helper_tmp=""
+if [[ ! -f "$helper" ]]; then
+  helper=$(mktemp "$cache/upstream-stable-tag.XXXXXX.sh")
+  helper_tmp=$helper
+  git -C "$SOURCE" show "origin/$BRANCH:scripts/fork/upstream-stable-tag.sh" >"$helper" 2>/dev/null ||
+    { log "cannot load upstream-stable-tag.sh: no sibling file and not on origin/$BRANCH"; exit 2; }
+fi
+source "$helper" || { log "cannot load $helper"; exit 2; }
+[[ -z "$helper_tmp" ]] || rm -f "$helper_tmp"
+# helper-load end
 git -C "$SOURCE" fetch -q --no-tags upstream main
+# upstream_sha is the commit the sync targets; upstream_name labels it in logs and PRs.
 upstream_sha=$(git -C "$SOURCE" rev-parse upstream/main)
+upstream_name="upstream main (${upstream_sha:0:10})"
 release_only=0
-if git -C "$SOURCE" merge-base --is-ancestor "$upstream_sha" "origin/$BRANCH"; then
+skip_reason=""
+if [[ "$UPSTREAM_TRACK" == stable ]]; then
+  stable_tag=$(upstream_stable_tag)
+  if [[ -z "$stable_tag" ]]; then
+    upstream_sha=""
+    skip_reason="there is no stable upstream tag"
+  else
+    git -C "$SOURCE" fetch -q --no-tags upstream "refs/tags/$stable_tag"
+    upstream_sha=$(git -C "$SOURCE" rev-parse "FETCH_HEAD^{commit}")
+    upstream_name="upstream $stable_tag (${upstream_sha:0:10})"
+    read -r decision base <<<"$(stable_decision "$SOURCE" "origin/$BRANCH" "$upstream_sha" upstream/main)"
+    [[ "$decision" == merge ]] || skip_reason="integration already contains $upstream_name"
+    [[ "$decision" != wait ]] || skip_reason="waiting for a stable tag that contains ${base:0:10}"
+  fi
+elif git -C "$SOURCE" merge-base --is-ancestor "$upstream_sha" "origin/$BRANCH"; then
+  skip_reason="integration already contains $upstream_name"
+fi
+if [[ -n "$skip_reason" ]]; then
   latest_tag=$(gh api "repos/$FORK/releases?per_page=100" --jq '
     .[] | select(.draft | not)
     | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-preview\\.[0-9]{8}\\.[0-9]+$"))
@@ -47,19 +81,21 @@ if git -C "$SOURCE" merge-base --is-ancestor "$upstream_sha" "origin/$BRANCH"; t
     git -C "$SOURCE" fetch -q origin "refs/tags/$latest_tag:refs/tags/$latest_tag"
     if [[ "$(git -C "$SOURCE" rev-parse "$latest_tag^{tree}")" == \
           "$(git -C "$SOURCE" rev-parse "origin/$BRANCH^{tree}")" ]]; then
-      log "integration already contains upstream ${upstream_sha:0:10} and is published"
+      log "$skip_reason; integration is published"
       exit 0
     fi
   fi
   release_only=1
-  log "integration contains upstream but is unpublished; retrying release"
+  log "$skip_reason; nothing to merge, checking for an unpublished integration tree"
 fi
-behind=$(git -C "$SOURCE" rev-list --count "origin/$BRANCH..$upstream_sha")
+behind=0
+[[ -z "$upstream_sha" ]] || behind=$(git -C "$SOURCE" rev-list --count "origin/$BRANCH..$upstream_sha")
 
 # An open sync PR (one a failed run opened, or an agent's conflict fix) is re-checked and, when
 # it passes, merged and released. Otherwise start a new sync branch from the integration branch.
 open_pr=""
-if [[ "$release_only" == 0 ]]; then
+# With no stable tag (upstream_sha empty) an open sync PR is still looked up, to be refused below.
+if [[ "$release_only" == 0 || -z "$upstream_sha" ]]; then
   open_pr=$(gh pr list -R "$FORK" --base "$BRANCH" --state open --json number,headRefName \
     --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))][0] // empty | "\(.number) \(.headRefName)"')
 fi
@@ -69,8 +105,23 @@ if [[ -n "$open_pr" ]]; then
   read -r pr_number sync_branch <<<"$open_pr"
   git -C "$SOURCE" fetch -q origin "$sync_branch"
   git -C "$SOURCE" worktree add -q -B "$sync_branch" "$wt" "origin/$sync_branch"
+  # open-pr-guard begin (stable mode never publishes upstream beyond the selected tag; tested)
+  if [[ "$UPSTREAM_TRACK" == stable ]]; then
+    pr_upstream=$(git -C "$wt" merge-base HEAD upstream/main)
+    if [[ -z "$stable_tag" ]] || ! git -C "$wt" merge-base --is-ancestor "$pr_upstream" "$upstream_sha"; then
+      refusal="open sync PR #$pr_number carries upstream beyond ${stable_tag:-any stable tag}; close it or rerun with UPSTREAM_TRACK=nightly"
+      log "$refusal"
+      [[ -n "$dry_run" ]] || gh pr comment "$pr_number" -R "$FORK" --body "$refusal" >/dev/null
+      git -C "$SOURCE" worktree remove --force "$wt" 2>/dev/null || true
+      exit 4
+    fi
+  fi
+  # open-pr-guard end
   # Finish this candidate before incorporating newer upstream commits and resetting its CI.
-  upstream_sha=$(git -C "$wt" merge-base HEAD upstream/main)
+  target_sha=$upstream_sha
+  upstream_sha=$(git -C "$wt" merge-base HEAD "$target_sha")
+  # The candidate may hold an older upstream commit than the newest target; name it by commit then.
+  [[ "$upstream_sha" == "$target_sha" ]] || upstream_name="upstream commit (${upstream_sha:0:10})"
   behind=$(git -C "$SOURCE" rev-list --count "origin/$BRANCH..$upstream_sha")
   log "re-checking open sync PR #$pr_number ($sync_branch)"
 else
@@ -82,7 +133,12 @@ cleanup() { [[ -n "${keep_worktree:-}" ]] || git -C "$SOURCE" worktree remove --
 trap cleanup EXIT
 cd "$wt"
 logs=$(mktemp -d -p "$cache/logs" "$stamp-XXXX")
-log "merging upstream ${upstream_sha:0:10} ($behind commits) on $sync_branch; logs in $logs"
+if [[ "$release_only" == 1 ]]; then
+  upstream_name="nothing (release-only retry)"
+  log "release-only: $skip_reason; not merging upstream; logs in $logs"
+else
+  log "merging $upstream_name ($behind commits) on $sync_branch; logs in $logs"
+fi
 
 # Keep the PR mergeable when the integration branch moved since it was opened.
 if [[ -n "$pr_number" ]] && ! git merge-base --is-ancestor "origin/$BRANCH" HEAD; then
@@ -95,10 +151,13 @@ if [[ -n "$pr_number" ]] && ! git merge-base --is-ancestor "origin/$BRANCH" HEAD
 fi
 
 budget=apps/server/src/provider/agentContextBudget.json
-if git merge-base --is-ancestor "$upstream_sha" HEAD; then
-  log "branch already contains upstream ${upstream_sha:0:10}"
+# merge-step begin (release-only never merges upstream; tested)
+if [[ "$release_only" == 1 ]]; then
+  log "release-only: skipping the upstream merge"
+elif git merge-base --is-ancestor "$upstream_sha" HEAD; then
+  log "branch already contains $upstream_name"
 elif ! git -c merge.conflictstyle=zdiff3 merge -q --no-edit \
-  -m "Merge upstream main (${upstream_sha:0:10}) into $BRANCH" "$upstream_sha" >"$logs/merge.log" 2>&1; then
+  -m "Merge $upstream_name into $BRANCH" "$upstream_sha" >"$logs/merge.log" 2>&1; then
   # The context budget is measured output; take upstream's and re-measure below.
   if git diff --name-only --diff-filter=U | grep -qx "$budget"; then
     git checkout --theirs -- "$budget" && git add "$budget"
@@ -106,9 +165,9 @@ elif ! git -c merge.conflictstyle=zdiff3 merge -q --no-edit \
   conflicts=$(git diff --name-only --diff-filter=U)
   if [[ -n "$conflicts" ]]; then
     git merge --abort
-    title="Upstream sync conflict: upstream ${upstream_sha:0:10}"
-    body=$(printf 'The daily upstream sync could not merge `pingdotgg/t3code` main (%s, %s commits) into `%s`.\n\nConflicting files:\n%s\n\nResolve it in a worktree from fresh `origin/%s`, following FORK.md (fork migrations stay in `ForkMigrations/`), then open a PR into `%s` from a `sync/upstream-*` branch. The next sync run checks, merges and releases it.\n' \
-      "$upstream_sha" "$behind" "$BRANCH" "$(printf -- '- `%s`\n' $conflicts)" "$BRANCH" "$BRANCH")
+    title="Upstream sync conflict: $upstream_name"
+    body=$(printf 'The upstream sync could not merge `pingdotgg/t3code` %s (%s, %s commits) into `%s`.\n\nConflicting files:\n%s\n\nResolve it in a worktree from fresh `origin/%s`, following FORK.md (fork migrations stay in `ForkMigrations/`), then open a PR into `%s` from a `sync/upstream-*` branch. The next sync run checks, merges and releases it.\n' \
+      "$upstream_name" "$upstream_sha" "$behind" "$BRANCH" "$(printf -- '- `%s`\n' $conflicts)" "$BRANCH" "$BRANCH")
     gh label create upstream-sync -R "$FORK" --color FBCA04 --description "Daily upstream sync" 2>/dev/null || true
     existing=$(gh issue list -R "$FORK" --label upstream-sync --state open --json number --jq '.[0].number // empty')
     if [[ -n "$dry_run" ]]; then
@@ -128,6 +187,7 @@ elif ! git -c merge.conflictstyle=zdiff3 merge -q --no-edit \
   fi
   git commit -q --no-edit
 fi
+# merge-step end
 
 fail() {
   local reason=$1
@@ -135,13 +195,13 @@ fail() {
   if [[ -n "$dry_run" ]]; then keep_worktree=1; log "dry run: worktree kept at $wt"; exit 4; fi
   git push -q -u origin "$sync_branch"
   local body
-  body=$(printf 'Daily upstream sync: merges `pingdotgg/t3code` main (%s, %s commits) into `%s`.\n\n**Not released: %s.**\n\nLast lines of the failing step:\n\n```\n%s\n```\n\nFix it on this branch; the next sync run re-checks, merges and releases it.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' \
-    "$upstream_sha" "$behind" "$BRANCH" "$reason" "$(tail -40 "$logs/$2" 2>/dev/null)")
+  body=$(printf 'Upstream sync: merges `pingdotgg/t3code` %s (%s, %s commits) into `%s`.\n\n**Not released: %s.**\n\nLast lines of the failing step:\n\n```\n%s\n```\n\nFix it on this branch; the next sync run re-checks, merges and releases it.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' \
+    "$upstream_name" "$upstream_sha" "$behind" "$BRANCH" "$reason" "$(tail -40 "$logs/$2" 2>/dev/null)")
   if [[ -n "$pr_number" ]]; then
     gh pr comment "$pr_number" -R "$FORK" --body "$body" >/dev/null
   else
     gh pr create -R "$FORK" --base "$BRANCH" --head "$sync_branch" \
-      --title "Merge upstream main (${upstream_sha:0:10}) — needs attention" --body "$body"
+      --title "Merge $upstream_name — needs attention" --body "$body"
   fi
   exit 4
 }
@@ -241,14 +301,14 @@ if [[ "$release_only" == 1 ]]; then
 fi
 
 git push -q -u origin "$sync_branch"
-summary=$(printf 'Daily upstream sync: merges `pingdotgg/t3code` main (%s, %s commits) into `%s`.\n\nFormat, lint, typecheck, server tests, the container release build with its smoke test, and the service preflight against the live database passed. Prepared release candidate `v%s`; publication follows a successful merge.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' \
-  "$upstream_sha" "$behind" "$BRANCH" "$version")
+summary=$(printf 'Upstream sync: merges `pingdotgg/t3code` %s (%s, %s commits) into `%s`.\n\nFormat, lint, typecheck, server tests, the container release build with its smoke test, and the service preflight against the live database passed. Prepared release candidate `v%s`; publication follows a successful merge.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n' \
+  "$upstream_name" "$upstream_sha" "$behind" "$BRANCH" "$version")
 if [[ -n "$pr_number" ]]; then
   pr_url=$(gh pr view "$pr_number" -R "$FORK" --json url --jq .url)
   gh pr comment "$pr_number" -R "$FORK" --body "$summary" >/dev/null
 else
   pr_url=$(gh pr create -R "$FORK" --base "$BRANCH" --head "$sync_branch" \
-    --title "Merge upstream main (${upstream_sha:0:10})" --body "$summary")
+    --title "Merge $upstream_name" --body "$summary")
 fi
 # Observe once, then let the next scheduled run resume this PR; never merge while CI is pending.
 checks=$(gh pr checks "$pr_url" -R "$FORK" --json name,bucket) || {
@@ -266,5 +326,5 @@ merge_commit=$(gh api --method PUT "repos/$FORK/pulls/${pr_url##*/}/merge" \
 }
 git -C "$SOURCE" fetch -q origin
 scripts/fork/publish-release.sh "$version" "$artifacts" "$merge_commit" \
-  "Upstream sync: pingdotgg/t3code main ${upstream_sha:0:10} merged into $BRANCH ($pr_url)."
+  "Upstream sync: pingdotgg/t3code $upstream_name merged into $BRANCH ($pr_url)."
 log "released v$version from $merge_commit"
