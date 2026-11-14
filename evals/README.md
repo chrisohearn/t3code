@@ -23,6 +23,10 @@ Each eval's README lists its models, flags, and cost. Start with one case and on
 
 Evals call paid models, so CI does not run them. CI typechecks this package and runs the graders' unit tests.
 
+Evals that send model calls through the `vibeproxy` provider (mcp-tool-use with Codex models, and test-signal) read it from `config.toml` in `$CODEX_HOME`, or in `~/.codex` when that is unset. Without it they stop at startup and print what is missing.
+
+On the chrisohearn/t3code fork, paid eval runs are not part of the gate for model-facing text. See [FORK.md](../FORK.md#evals).
+
 ## The shape of an eval
 
 Every eval follows the same shape, so a new one is easy to write and an old one is easy to run.
