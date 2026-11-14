@@ -1,6 +1,5 @@
 import * as JarvisPlaybook from "./JarvisPlaybook.ts";
 import * as BridgeStatusService from "./BridgeStatusService.ts";
-import * as ApprovalAutoReviewStatus from "../orchestration-v2/ApprovalAutoReviewStatus.ts";
 import { BridgeToolkit } from "./toolkits/bridge/tools.ts";
 import * as BridgeHandlers from "./toolkits/bridge/handlers.ts";
 import * as McpRequestLog from "../persistence/McpRequestLog.ts";
@@ -1503,7 +1502,7 @@ export const layerTools = Layer.mergeAll(
     content: JarvisPlaybook.read(),
   }).pipe(Layer.provide(provideRegistrationServices<FileSystem.FileSystem | Path.Path>().layer)),
   toolkitRegistration(BridgeToolkit, BridgeHandlers.layer).pipe(
-    Layer.provide(BridgeStatusService.layer.pipe(Layer.provide(ApprovalAutoReviewStatus.layer))),
+    Layer.provide(BridgeStatusService.layer),
   ),
   layerLedgerToolkit,
   layerPresetToolkit,

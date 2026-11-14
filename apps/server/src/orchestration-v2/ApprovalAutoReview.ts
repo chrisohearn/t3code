@@ -327,4 +327,4 @@ export const layer = Layer.effectDiscard(
       }),
     );
   }),
-).pipe(Layer.provide(Status.layer));
+).pipe(Layer.provideMerge(Status.layer));

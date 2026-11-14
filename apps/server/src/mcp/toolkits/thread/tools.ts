@@ -208,10 +208,12 @@ const ApprovalLogTool = Tool.make("t3_approval_log", {
   .annotate(Tool.Destructive, false);
 
 const threadConfiguration = Schema.Struct({
-  autoReview: Schema.Struct({
-    override: AutoReviewOverride,
-    effective: Schema.NullOr(ModelSelection),
-  }),
+  autoReview: Schema.optional(
+    Schema.Struct({
+      override: AutoReviewOverride,
+      effective: Schema.NullOr(ModelSelection),
+    }),
+  ),
   threadId: ThreadId,
   modelSelection: ModelSelection,
   scheduledModelSelection: Schema.optional(
