@@ -34,6 +34,16 @@ check remains required.
 
 Upstream's `ci.yml` runs on pull requests and on pushes to `main`, and this fork never pushes to `main`, so a merge into the integration branch was never re-verified. `.github/workflows/fork-integration-ci.yml` runs every `ci.yml` job on each push to `integration/mcp-events-20261109`. It is generated: `scripts/fork/sync-integration-ci.sh` copies `ci.yml`'s jobs under a new trigger, which keeps `ci.yml` untouched. After an upstream merge that changes `ci.yml`, run the script and commit the result. The workflow's first job warns when the copy is stale.
 
+## Evals
+
+[evals/README.md](evals/README.md) asks for paid model runs when a change touches agent instructions, MCP tool descriptions or schemas. On this fork those runs are not part of the gate (the owner's decision, 2026-11-14). For such a change, the gate is:
+
+- hosted CI, including the eval package's typecheck and grader tests;
+- the `Agent context budget` check, which fails when the measured agent context grows;
+- the review of record on the PR.
+
+Run paid evals only with the owner's fresh go-ahead for that run. No eval model provider is set up on the fork's host, so the proxy-backed evals stop at startup with a message saying so.
+
 ## Upstream sync and releases
 
 Stable-tag tracking (Chris's decision, 2026-11-13): `UPSTREAM_TRACK` selects the upstream target. The default, `stable`, targets the newest upstream release that is neither a prerelease nor a draft and is named `vX.Y.Z` (`scripts/fork/upstream-stable-tag.sh` prints it, sorted by version). `UPSTREAM_TRACK=nightly` targets upstream `main`, for an explicit manual run only. The sync never merges upstream `main` otherwise. In stable mode the script fetches the tag and uses its commit wherever `main` was used, and PR titles, bodies and logs name the tag:
