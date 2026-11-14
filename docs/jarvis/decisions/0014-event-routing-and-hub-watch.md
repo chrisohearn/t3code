@@ -48,9 +48,10 @@ switch to post-only acknowledgements.
 Acceptance was first set as a live check after the coordinated round-three
 update: Jarvis pins its existing inbox, launches a scratch run with notify, and
 reports the source run id after the relay message wakes it. Unit tests and
-webhook ACKs do not establish acceptance. On 2026-11-14 Chris replaced that
-scratch check with a verified real receipt (amendment below), so the scratch
-run is not needed.
+webhook ACKs do not establish acceptance. On 2026-11-14 Chris chose a verified real
+receipt in place of the scratch run (amendment below). That receipt proves the
+relay half only, so acceptance stays open until Chris confirms it or a Jarvis
+wake is shown.
 
 ## Amendment, 2026-11-14: real receipt accepted
 
