@@ -30,7 +30,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Compare with ci.yml
-        run: scripts/fork/sync-integration-ci.sh --check || echo "::warning::fork-integration-ci.yml is stale against ci.yml. Run scripts/fork/sync-integration-ci.sh."
+        run: scripts/fork/sync-integration-ci.sh --check || echo "::warning::fork-post-merge-ci.yml is stale against ci.yml. Run scripts/fork/sync-integration-ci.sh."
 
   # Skips jobs a pull request cannot affect: a web change does not run the
   # server shards, a server change does not run the mobile tests, and the macOS
