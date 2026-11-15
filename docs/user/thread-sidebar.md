@@ -274,8 +274,8 @@ cooldown for the next prompt, including a queued prompt. Restarting the server
 clears learned cooldowns; none of these actions changes the configured fallbacks.
 
 Press **Resume** in an empty composer to continue a limited or interrupted turn
-manually. Do this when the provider reports no reset time, because nothing
-continues the turn on its own.
+manually when the provider supports native continuation, or send a message to continue.
+Do this when the provider reports no reset time, because nothing continues the turn on its own.
 Queued messages stay saved while the limit blocks the thread. They run after
 the continuation finishes. If the queue was held by a restart, resume it then.
 

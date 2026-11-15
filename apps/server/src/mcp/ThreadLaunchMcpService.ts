@@ -255,8 +255,28 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         const provider = providers.find((candidate) => candidate.instanceId === instanceId);
         if (provider !== undefined) yield* requireAdvertisedModel(provider, model);
       }
+      const projectSettings =
+        project === undefined
+          ? undefined
+          : yield* ServerSettings.ServerSettingsService.pipe(
+              Effect.flatMap((settings) => settings.getSettings),
+              Effect.mapError(unavailable),
+              Effect.map(
+                (settings) => resolveProjectSettings(settings, projectId, project).settings,
+              ),
+            );
+      // An omitted startFromOrigin follows the new-worktree setting, as the composer and
+      // t3_worktree_handoff do. Otherwise a stale local branch silently becomes the base.
+      const strategy =
+        projectSettings !== undefined &&
+        workspaceStrategy?.type === "worktree" &&
+        workspaceStrategy.startFromOrigin === undefined
+          ? {
+              ...workspaceStrategy,
+              startFromOrigin: projectSettings.newWorktreesStartFromOrigin,
+            }
+          : workspaceStrategy;
       // Reject unresolved base refs and blocked branch names before accepting a launch; worktree provisioning happens later.
-      const strategy = workspaceStrategy;
       if (!replaying && strategy?.type === "worktree")
         yield* ThreadLaunch.ThreadLaunchService.pipe(
           Effect.flatMap((launches) =>
@@ -273,16 +293,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       // A caller outside a thread has nothing to inherit, so it starts with the
       // project's effective defaults, as the composer does. Its mode stays
       // within the ceiling it was approved with.
-      const projectDefaults =
-        caller === undefined && project !== undefined
-          ? yield* ServerSettings.ServerSettingsService.pipe(
-              Effect.flatMap((settings) => settings.getSettings),
-              Effect.mapError(unavailable),
-              Effect.map(
-                (settings) => resolveProjectSettings(settings, projectId, project).settings,
-              ),
-            )
-          : undefined;
+      const projectDefaults = caller === undefined ? projectSettings : undefined;
       const modelSelection =
         requestedModel ??
         launchedModel ??
@@ -343,7 +354,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         modelSelection,
         runtimeMode: startedRuntimeMode,
         interactionMode,
-        workspaceStrategy: workspaceStrategy ?? { type: "root" },
+        workspaceStrategy: strategy ?? { type: "root" },
         ...(input.message === undefined && attachments.length === 0
           ? {}
           : {

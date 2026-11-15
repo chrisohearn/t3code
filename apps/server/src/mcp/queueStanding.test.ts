@@ -34,7 +34,8 @@ describe("queueStanding", () => {
     });
   });
 
-  it("puts automatic task completions ahead and reports a held queue without an active run", () => {
+  // Completions and messages interleave by request time, so the earlier completion goes first.
+  it("puts an earlier automatic task completion ahead and reports a held queue without an active run", () => {
     const runs = [
       {
         id: "run:mine",
@@ -43,6 +44,7 @@ describe("queueStanding", () => {
         queueHeld: true,
         status: "queued",
         userMessageId: "m:mine",
+        requestedAt: at("2026-11-12T10:05:00Z"),
       },
       {
         id: "run:completion",
@@ -51,6 +53,7 @@ describe("queueStanding", () => {
         queueHeld: true,
         status: "queued",
         userMessageId: "m:completion",
+        requestedAt: at("2026-11-12T10:04:00Z"),
       },
     ];
     const messages = [

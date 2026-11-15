@@ -2259,6 +2259,7 @@ it.effect(
             Layer.mock(ThreadManagement.ThreadManagementService)({
               listProjectThreads: () => Effect.succeed([unsettled, settled]),
               getPendingRuntimeRequestCounts: () => Effect.succeed({ [unsettled.id]: 2 }),
+              getShellSnapshot: () => Effect.succeed({ threads: [unsettled, settled] } as never),
             }),
           ),
           Layer.provide(ServerSettings.layerTest()),
