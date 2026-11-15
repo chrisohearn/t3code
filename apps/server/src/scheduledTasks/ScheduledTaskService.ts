@@ -1773,9 +1773,11 @@ export const layer = Layer.effect(
               return { token, secret, secretChanged };
             })
           : { token: null, secret: null, secretChanged: true };
+      // A folder that is not a Git repository, Scratch included, cannot hold a worktree.
       const workspaceStrategy: ScheduledTask["workspaceStrategy"] =
         input.workspaceStrategy.type === "worktree" &&
-        (yield* managedFolders.isScratchProject(projectId))
+        ((yield* managedFolders.isScratchProject(projectId)) ||
+          (yield* threadLaunch.isNonGitProject(projectId)))
           ? { type: "root" }
           : input.workspaceStrategy;
       const scheduleUnchanged =

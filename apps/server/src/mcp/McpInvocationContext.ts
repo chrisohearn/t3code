@@ -155,6 +155,11 @@ export interface McpInvocationScope {
   readonly linkedEnvironments?: boolean;
   /** Short digest of the request's `Mcp-Session-Id`: one agent's connection, kept for the request log. */
   readonly connection?: string;
+  /**
+   * The origin this `/mcp` request reached, e.g. a T3 Connect tunnel. Hosted clients cannot
+   * see the URL they were configured with, so links they must fetch carry it. Unset in-process.
+   */
+  readonly origin?: string | undefined;
 }
 
 export const messageSenderFor = (scope: McpInvocationScope) => {
