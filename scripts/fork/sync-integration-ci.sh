@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates .github/workflows/fork-integration-ci.yml: upstream's ci.yml (every job unchanged) triggered by
+# Regenerates .github/workflows/fork-post-merge-ci.yml: upstream's ci.yml (every job unchanged) triggered by
 # pushes to the fork's integration branch instead of main. ci.yml stays untouched, so upstream merges stay cheap.
 #
 #   scripts/fork/sync-integration-ci.sh           rewrite the generated workflow
@@ -10,7 +10,7 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 src=.github/workflows/ci.yml
-out=.github/workflows/fork-integration-ci.yml
+out=.github/workflows/fork-post-merge-ci.yml
 branch=integration/mcp-events-20261109
 
 generate() {
@@ -49,7 +49,7 @@ HEADER
           sparse-checkout-cone-mode: false
 
       - name: Compare with ci.yml
-        run: scripts/fork/sync-integration-ci.sh --check || echo "::warning::fork-integration-ci.yml is stale against ci.yml. Run scripts/fork/sync-integration-ci.sh."
+        run: scripts/fork/sync-integration-ci.sh --check || echo "::warning::fork-post-merge-ci.yml is stale against ci.yml. Run scripts/fork/sync-integration-ci.sh."
 
 DRIFT
   sed -n '/^jobs:$/,$p' "$src" | tail -n +2

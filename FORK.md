@@ -32,7 +32,7 @@ check remains required.
 
 ## Post-merge CI
 
-Upstream's `ci.yml` runs on pull requests and on pushes to `main`, and this fork never pushes to `main`, so a merge into the integration branch was never re-verified. `.github/workflows/fork-integration-ci.yml` runs every `ci.yml` job on each push to `integration/mcp-events-20261109`. It is generated: `scripts/fork/sync-integration-ci.sh` copies `ci.yml`'s jobs under a new trigger, which keeps `ci.yml` untouched. After an upstream merge that changes `ci.yml`, run the script and commit the result. The workflow's first job warns when the copy is stale.
+Upstream's `ci.yml` runs on pull requests and on pushes to `main`, and this fork never pushes to `main`, so a merge into the integration branch was never re-verified. `.github/workflows/fork-post-merge-ci.yml` runs every `ci.yml` job on each push to `integration/mcp-events-20261109`. It is generated: `scripts/fork/sync-integration-ci.sh` copies `ci.yml`'s jobs under a new trigger, which keeps `ci.yml` untouched. After an upstream merge that changes `ci.yml`, run the script and commit the result. The workflow's first job warns when the copy is stale.
 
 ## Evals
 
