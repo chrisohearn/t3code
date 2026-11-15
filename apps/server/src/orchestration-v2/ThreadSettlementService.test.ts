@@ -864,7 +864,9 @@ describe("ThreadSettlementServiceV2 worker", () => {
           yield* Queue.take(fixture.snapshotReads);
           yield* service.drain;
           assert.deepEqual(yield* Ref.get(fixture.commands), []);
-          assert.lengthOf(yield* Ref.get(fixture.branchCalls), 4);
+          // A failed branch lookup waits until it is due again, so each branch
+          // is looked up once here.
+          assert.lengthOf(yield* Ref.get(fixture.branchCalls), 2);
           assert.lengthOf(logs, 1);
         }).pipe(
           Effect.provide(

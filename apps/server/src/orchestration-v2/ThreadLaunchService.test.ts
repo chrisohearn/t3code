@@ -2200,6 +2200,8 @@ it.effect(
       const allowSetup = yield* Deferred.make<void>();
       const fetched: Array<string> = [];
       const harness = makeHarness({
+        // Fork: provisioning re-checks the base first; a local `main` keeps that check off the fetch path.
+        hasCommit: ({ refName }) => Effect.succeed(refName === "main"),
         fetchWorktreeBaseCommit: ({ refName }) =>
           Effect.sync(() => {
             fetched.push(refName);
