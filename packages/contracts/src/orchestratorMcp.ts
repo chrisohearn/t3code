@@ -26,7 +26,13 @@ import {
   ScheduledTaskSchedule,
   ScheduledTaskUpsertSchedule,
 } from "./scheduledTask.ts";
-import { ProviderInteractionMode, ProviderRequestKind, RuntimeMode } from "./providerPolicy.ts";
+import {
+  ProviderInteractionMode,
+  ProviderRequestKind,
+  RuntimeMode,
+  UserInputAnsweredBy,
+  UserInputAnsweringClient,
+} from "./providerPolicy.ts";
 import { PullRequestState } from "./pullRequest.ts";
 import {
   ThreadLinkedPullRequest,
@@ -551,6 +557,10 @@ export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
   creationSource: Schema.NullOr(OrchestrationV2CreationSource),
   senderThreadId: Schema.optional(ThreadId),
   senderClient: Schema.optional(OrchestrationV2SenderClient),
+  // Question dialogs only: the server's record of who answered. Absent while pending and on
+  // answers recorded before the server stamped it.
+  answeredBy: Schema.optional(UserInputAnsweredBy),
+  answeringClient: Schema.optional(UserInputAnsweringClient),
   type: Schema.String,
   status: OrchestrationV2TurnItemStatus,
   title: Schema.NullOr(Schema.String),

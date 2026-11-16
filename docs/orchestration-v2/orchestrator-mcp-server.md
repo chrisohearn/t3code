@@ -428,6 +428,14 @@ and `creationSource: "mcp"`; provider output uses `creationSource: "provider"`.
 Actor and ingress are separate so agent-authored user-role messages remain
 distinguishable from human-authored messages.
 
+A question dialog (`user_input_request`) is not a message, so its `createdBy`
+and `creationSource` are null. Once answered, the item carries `answeredBy`,
+the server's record of who answered: `owner_client` (the owner's signed-in app),
+`mcp_client` (an outside MCP sign-in) or `agent`. An owner answer also carries
+`answeringClient`, the short session id and label of the app it came from.
+Both are absent while the dialog is pending and on answers recorded before the
+server stamped them.
+
 Agents mention another thread by the `link` its result carries,
 `<t3-thread://v2/<environmentId>/<threadId>>`, so they never format an id or
 write a title, which goes stale when the user renames the thread. The
