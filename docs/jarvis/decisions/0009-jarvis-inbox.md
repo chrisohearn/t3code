@@ -6,7 +6,7 @@ Accepted 2026-11-12. Acknowledge-only mode added 2026-11-13.
 
 T3 agents send requests to Jarvis's T3 inbox thread. An event wakes Jarvis, which reads the request and answers in the requesting thread.
 
-The inbox acknowledges each message with a run of its own; that run's result event is the wake signal (0012, 0014). Acknowledge-only mode lets the server write that acknowledgement instead of a model. The coordinator turns it on for the inbox after deploy, once it has verified that Jarvis still wakes.
+The inbox acknowledges each message with a run of its own; that run's result event is the wake signal ([0012, inbox subscriptions and the heartbeat](0012-inbox-subscriptions-and-the-heartbeat.md); [0014](0014-event-routing-and-hub-watch.md)). Acknowledge-only mode lets the server write that acknowledgement instead of a model. The coordinator turns it on for the inbox after deploy, once it has verified that Jarvis still wakes.
 
 ## Acknowledge-only mode
 

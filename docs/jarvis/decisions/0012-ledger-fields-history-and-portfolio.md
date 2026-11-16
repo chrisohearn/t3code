@@ -1,6 +1,6 @@
 # Ledger fields, history and portfolio
 
-Accepted 2026-11-12. Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)) the ledger is the dot-t3code-mcp sidecar: wait reasons and history carry over, while run metadata and `portfolio_status` apply only to rows on T3's ledger: pre-switch rows, plus the post-switch work that needs a server-verified approval, which stays whole there. Sidecar rows are outside them. Sender provenance does not carry over: sidecar history records `changedBy` from a caller label (`X-Caller` or `DOT_T3CODE_MCP_CALLER`), which is not authenticated, and `changedByClient` is `null` for every post-switch entry. Treat post-switch `changedBy` as a hint, not verified attribution.
+Accepted 2026-11-12. Since 2026-11-14 ([0020](0020-ledger-of-record-is-the-sidecar.md)) the ledger is the dot-t3code-mcp sidecar: wait reasons and history carry over, while run metadata and `portfolio_status` apply only to rows on T3's ledger: pre-switch rows, plus the post-switch work that needs a server-verified approval, which stays whole there. Sidecar rows are outside them. Sender provenance does not carry over to the sidecar: its history records `changedBy` from a caller label (`X-Caller`, or `DOT_T3CODE_MCP_CALLER` with the T3 thread id appended over stdio), which is not authenticated, and `changedByClient` is `null` for every sidecar entry. Treat sidecar `changedBy` as a hint, not verified attribution. Rows that stay on T3's ledger after the switch, the approval-bearing work in 0020, still get T3's server-recorded senders.
 
 ## Decision
 
