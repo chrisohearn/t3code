@@ -1134,6 +1134,15 @@ function timelineItem(input: {
     creationSource: message?.creationSource ?? null,
     ...(message?.senderThreadId === undefined ? {} : { senderThreadId: message.senderThreadId }),
     ...(message?.senderClient === undefined ? {} : { senderClient: message.senderClient }),
+    ...(input.row.item.type === "user_input_request" &&
+    input.row.item.questionAnswer?.answeredBy !== undefined
+      ? {
+          answeredBy: input.row.item.questionAnswer.answeredBy,
+          ...(input.row.item.questionAnswer.answeringClient === undefined
+            ? {}
+            : { answeringClient: input.row.item.questionAnswer.answeringClient }),
+        }
+      : {}),
     ...(input.row.item.type === "user_message" && input.row.item.inputIntent === "post"
       ? { postOnly: true }
       : {}),
