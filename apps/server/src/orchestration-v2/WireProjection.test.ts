@@ -422,6 +422,57 @@ describe("orchestration V2 wire projection", () => {
     };
     expect(projectStoredEventForWire(detached)).toBe(detached);
   });
+
+  it("sends a post as a post-only turn start that upstream clients decode", () => {
+    // Upstream's literal set; its structs drop the unknown postOnly key.
+    const decodeUpstreamUserMessage = Schema.decodeUnknownSync(
+      Schema.Struct({
+        type: Schema.Literal("user_message"),
+        inputIntent: Schema.Literals([
+          "turn_start",
+          "queued_turn",
+          "steer",
+          "promoted_queued_to_steer",
+        ]),
+      }),
+    );
+    const { toolName: _toolName, input: _input, ...itemBase } = base;
+    // Posts stored before the postOnly marker carry only the intent.
+    const post = decodeTurnItem({
+      ...itemBase,
+      id: "post-1",
+      type: "user_message",
+      createdBy: "agent",
+      creationSource: "server",
+      messageId: "message-post-1",
+      inputIntent: "post",
+      text: "Posted",
+      attachments: [],
+    });
+    expect(() => decodeUpstreamUserMessage(post)).toThrow();
+
+    const event: OrchestrationV2DomainEvent = {
+      id: EventId.make("post-event"),
+      type: "turn-item.updated",
+      threadId: base.threadId,
+      occurredAt: base.updatedAt,
+      payload: post,
+    };
+    const live = projectDomainEventForWire(event);
+    for (const projected of [
+      projectTurnItemForWire(post),
+      projectTurnItemForDetail(post),
+      live.type === "turn-item.updated" ? live.payload : null,
+    ]) {
+      expect(projected).toMatchObject({ inputIntent: "turn_start", postOnly: true });
+      expect(decodeUpstreamUserMessage(projected).inputIntent).toBe("turn_start");
+      expect(decodeTurnItem(projected)).toMatchObject({ postOnly: true });
+    }
+    expect(post).toMatchObject({ inputIntent: "post" });
+
+    const turnStart = { ...post, inputIntent: "turn_start" as const };
+    expect(projectTurnItemForWire(turnStart)).toBe(turnStart);
+  });
 });
 
 describe("live body deduper", () => {
