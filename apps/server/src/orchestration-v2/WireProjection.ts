@@ -193,6 +193,11 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
         progress: truncateDetail(item.progress),
         result: item.result === null ? null : (truncateDetail(item.result) ?? null),
       };
+    case "user_message":
+      // "post" is fork-only; upstream clients reject a thread whose items carry it.
+      return item.inputIntent === "post"
+        ? { ...item, inputIntent: "turn_start", postOnly: true }
+        : item;
     case "dynamic_tool": {
       const { output: rawOutput, ...projected } = item;
       const output = compactDynamicToolOutput(rawOutput);
@@ -294,6 +299,7 @@ export function projectTurnItemForDetail(item: OrchestrationV2TurnItem): Orchest
           : {}),
       };
     case "handoff":
+    case "user_message":
       return projectTurnItemForWire(item);
     default:
       return item;

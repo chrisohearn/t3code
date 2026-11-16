@@ -25,7 +25,7 @@ import {
   selectRecentTimelineWindow,
   THREAD_HISTORY_PAGE_POLICY,
 } from "./threadHistoryPaging.ts";
-import { projectThreadProjectionForWire } from "./WireProjection.ts";
+import { projectThreadProjectionForWire, projectTurnItemForWire } from "./WireProjection.ts";
 
 const NOW = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
 const THREAD = ThreadId.make("thread-1");
@@ -342,6 +342,32 @@ describe("threadHistoryPaging", () => {
     expect([...older.items, ...first.items].map((row) => row.sourceItemId)).toEqual(
       items.map((row) => row.sourceItemId),
     );
+  });
+
+  it("leaves posts out of the 150-turn ceiling, as stored and as sent on the wire", () => {
+    const items = Array.from({ length: 161 }, (_, turn) => {
+      const post = makeTurnStart(turn * 2 + 1, "user");
+      return [
+        makeTurnStart(turn * 2, turn === 0 ? "user" : "agent"),
+        {
+          ...post,
+          item: { ...post.item, inputIntent: "post" },
+        } as OrchestrationV2ProjectedTurnItem,
+      ];
+    }).flat();
+    const policy = {
+      ...THREAD_HISTORY_PAGE_POLICY,
+      maxItems: 1_000,
+      maxTurnItems: 1_000,
+      maxEncodedBytes: 10_000_000,
+    };
+    const wire = items.map((row) => ({ ...row, item: projectTurnItemForWire(row.item) }));
+    for (const rows of [items, wire]) {
+      expect(
+        selectRecentTimelineWindow({ items: rows, snapshotSequence: 1, policy }).items[0]
+          ?.sourceItemId,
+      ).toBe("item-22");
+    }
   });
 
   it("counts runs that a notification started toward the 150-turn ceiling", () => {

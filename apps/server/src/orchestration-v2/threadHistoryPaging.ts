@@ -60,6 +60,7 @@ type HistoryRow = Pick<
     readonly id?: string;
     readonly messageId?: string;
     readonly inputIntent?: string;
+    readonly postOnly?: boolean | undefined;
     readonly createdBy?: string;
     readonly runId?: string | null;
     readonly status?: OrchestrationV2TurnItem["status"];
@@ -191,6 +192,7 @@ export function decodeThreadHistoryCursor(cursor: string): ThreadHistoryCursorPa
 function isThreadHistoryTurnStart(item: HistoryRow["item"]): boolean {
   return (
     item.type === "user_message" &&
+    item.postOnly !== true &&
     (item.inputIntent === "turn_start" || item.inputIntent === "queued_turn")
   );
 }
