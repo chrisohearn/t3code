@@ -220,6 +220,8 @@ export class ThreadLaunchService extends Context.Service<
       input: Pick<ThreadLaunchInput, "projectId" | "workspaceStrategy"> & {
         /** Skips the check when this launch was already accepted, so its retry replays. */
         readonly commandId?: CommandId;
+        /** Allows a saved origin base to disappear before scheduled or retried provisioning. */
+        readonly allowMissingOriginBase?: boolean;
       },
     ) => Effect.Effect<
       void,
@@ -406,20 +408,19 @@ const make = Effect.gen(function* () {
     const baseResolves =
       hasBaseCommit ||
       (yield* Effect.gen(function* () {
-        if (strategy.startFromOrigin === true) {
-          const remote = yield* git.resolveWorktreeBaseRemote({ cwd, refName: baseRef });
+        const remote =
+          strategy.startFromOrigin === true
+            ? yield* git.resolveWorktreeBaseRemote({ cwd, refName: baseRef })
+            : null;
+        if (remote !== null) {
           // The remote may have deleted the branch; ask it rather than trusting the name.
-          if (
-            remote !== null &&
-            (yield* git.fetchWorktreeBaseCommit({ cwd, refName: baseRef, remote })) !== null
-          )
+          if ((yield* git.fetchWorktreeBaseCommit({ cwd, refName: baseRef, remote })) !== null)
             return true;
         }
         // git worktree add accepts remote-tracking branches; let Git decide when any matching ref exists.
         if (yield* git.hasRefNamed({ cwd, refName: baseRef })) return true;
-        // A saved origin-based branch can disappear. Preparation resolves the remote default
-        // branch or the checked-out commit before creating the worktree.
-        if (strategy.startFromOrigin === true) return true;
+        // Only provisioning may replace a saved origin base that disappeared after acceptance.
+        if (input.allowMissingOriginBase && remote !== null) return true;
         return !(yield* git.hasCommit({ cwd, refName: "HEAD" }));
       }).pipe(Effect.orElseSucceed(() => true)));
     if (!baseResolves)
@@ -639,6 +640,7 @@ const make = Effect.gen(function* () {
         yield* checkWorktreeBase({
           projectId: input.projectId,
           workspaceStrategy: input.workspaceStrategy,
+          allowMissingOriginBase: true,
         }).pipe(
           // Provisioning flattens a temporary branch name that collides.
           Effect.catchTags({ ThreadLaunchBranchConflictError: () => Effect.void }),

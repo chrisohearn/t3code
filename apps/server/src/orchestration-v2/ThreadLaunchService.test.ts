@@ -1497,13 +1497,22 @@ it.effect("skips a stale tracking ref when the remote reports the base branch is
       const betaHead = (yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim();
       // The deleted remote branch leaves its tracking ref (and origin/HEAD) behind.
       yield* command(cwd, ["update-ref", "refs/remotes/origin/gone", staleHead]);
-      yield* command(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/beta"]);
+      yield* command(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]);
 
       yield* launchFromBase(
         harness({
-          git: { resolvePrimaryRemoteName: () => Effect.succeed("origin") },
+          // A completed fetch that found no branch, as when the branch was deleted.
+          fetchWorktreeBaseCommit: () => Effect.succeed(null),
+          git: {
+            resolvePrimaryRemoteName: () => Effect.succeed("origin"),
+            resolveWorktreeBaseRemote: ({ refName }) =>
+              Effect.succeed({
+                remoteName: "origin",
+                branchName: refName.replace(/^origin\//, ""),
+              }),
+          },
         }),
-        "gone",
+        "main",
       );
       assert.equal((yield* command(worktreePath, ["rev-parse", "HEAD"])).stdout.trim(), betaHead);
     }),
@@ -3194,7 +3203,7 @@ it.effect.each([
           command: `command:launch:clear-base-${testCase.repositoryRoot === null ? "none" : "ref"}`,
           thread: `thread:launch:clear-base-${testCase.repositoryRoot === null ? "none" : "ref"}`,
           message: "First message",
-          workspace: { type: "worktree", baseRef: "main", startFromOrigin: false },
+          workspace: { type: "worktree", baseRef: "main", startFromOrigin: true },
         }),
       );
       const projection = yield* preparationSettled(launched.threadId);
@@ -3281,7 +3290,7 @@ it.effect.each([
 it.effect.each([
   { name: "has no origin to come from", baseRef: "t3/renamed", origin: false },
   { name: "was deleted on its remote", baseRef: "origin/development", origin: true },
-])("allows a missing base ref $name when HEAD can be used", (testCase) =>
+])("refuses a new worktree whose origin base $name", (testCase) =>
   Effect.gen(function* () {
     const harness = makeHarness({
       hasCommit: ({ refName }) => Effect.succeed(refName === "HEAD"),
@@ -3293,13 +3302,20 @@ it.effect.each([
       },
     });
     const launches = yield* ThreadLaunch.ThreadLaunchService.pipe(Effect.provide(harness.layer));
-    yield* launches.checkWorktreeBase({
+    const error = yield* launches
+      .checkWorktreeBase({
+        projectId,
+        workspaceStrategy: {
+          type: "worktree",
+          baseRef: testCase.baseRef,
+          startFromOrigin: true,
+        },
+      })
+      .pipe(Effect.flip);
+    assert.deepInclude(error, {
+      _tag: "ThreadLaunchBaseRefError",
       projectId,
-      workspaceStrategy: {
-        type: "worktree",
-        baseRef: testCase.baseRef,
-        startFromOrigin: true,
-      },
+      baseRef: testCase.baseRef,
     });
   }),
 );

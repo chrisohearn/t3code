@@ -1303,7 +1303,7 @@ export const layer = Layer.effect(
         const completedAt = yield* localNow;
         // An accepted run keeps the previous run's status until its own outcome is known.
         const lastRunStatus = runSucceeded ? previousRun.status : ("failed" as const);
-        const lastRunError = runSucceeded ? null : dispatchErrorMessage(result.cause);
+        const lastRunError = runSucceeded ? previousRun.error : dispatchErrorMessage(result.cause);
         const threadId = runSucceeded ? result.value : null;
         // One transaction, so an edit cannot land between reading the schedule and
         // writing the next run computed from it. The origin is read first: it reads

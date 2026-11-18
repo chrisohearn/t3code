@@ -8,7 +8,6 @@ import {
   CommandId,
   ProjectId,
   ProviderInstanceId,
-  type ScheduledTask,
   ScheduledTaskError,
   ScheduledTaskId,
   type ScheduledTaskUpsertInput,
@@ -28,7 +27,6 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
-import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
@@ -665,28 +663,38 @@ it.effect("a run still going when the next one starts cannot overwrite the newer
         interactionMode: "default",
       });
       yield* service.runNow({ id: task.id });
-      yield* TestClock.adjust("1 minute");
-      const second = yield* service.runNow({ id: task.id });
-      const states = yield* Queue.unbounded<ScheduledTask | undefined>();
-      yield* service.subscribeList().pipe(
-        Stream.runForEach(({ tasks }) =>
-          Queue.offer(
-            states,
-            tasks.find((candidate) => candidate.id === task.id),
-          ),
+      const firstFailure = yield* service.subscribeList().pipe(
+        Stream.map(({ tasks }) => tasks.find((candidate) => candidate.id === task.id)),
+        Stream.filter(
+          (current) =>
+            current?.lastRunStatus === "failed" && current.runInProgressSince === undefined,
         ),
+        Stream.runHead,
         Effect.forkChild,
       );
-      yield* Queue.take(states);
       yield* Deferred.succeed(endFirst, undefined);
-      // The first run's follower notifies when it ends; the second run is still the pending one.
-      const afterFirst = yield* Queue.take(states);
+      const afterFirst = Option.getOrUndefined(yield* Fiber.join(firstFailure));
       assert.deepEqual(
-        { status: afterFirst?.lastRunStatus, since: afterFirst?.runInProgressSince },
-        { status: "never", since: second.task.lastRunAt },
+        { status: afterFirst?.lastRunStatus, error: afterFirst?.lastRunError },
+        { status: "failed", error: "The run failed." },
+      );
+      yield* TestClock.adjust("1 minute");
+      const second = yield* service.runNow({ id: task.id });
+      assert.deepEqual(
+        { status: second.task.lastRunStatus, error: second.task.lastRunError },
+        { status: "failed", error: "The run failed." },
+      );
+      const secondSuccess = yield* service.subscribeList().pipe(
+        Stream.map(({ tasks }) => tasks.find((candidate) => candidate.id === task.id)),
+        Stream.filter(
+          (current) =>
+            current?.lastRunStatus === "succeeded" && current.runInProgressSince === undefined,
+        ),
+        Stream.runHead,
+        Effect.forkChild,
       );
       yield* Deferred.succeed(endSecond, undefined);
-      const afterSecond = yield* Queue.take(states);
+      const afterSecond = Option.getOrUndefined(yield* Fiber.join(secondSuccess));
       assert.deepEqual(
         {
           status: afterSecond?.lastRunStatus,
