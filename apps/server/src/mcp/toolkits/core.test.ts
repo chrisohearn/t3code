@@ -1405,6 +1405,7 @@ it.effect("search names the calling thread, so an agent can tell its own match a
     Effect.provide(
       McpHttpServer.layerThreadToolkit.pipe(
         Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(Sqlite.layerMemory),
         Layer.provide(NodeCrypto.layer),
         Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
         Layer.provide(
@@ -1963,12 +1964,15 @@ it.effect("run_scheduled_task_now reports why a started run failed to dispatch",
     Effect.provide(
       McpHttpServer.layerThreadToolkit.pipe(
         Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(Sqlite.layerMemory),
         Layer.provide(NodeCrypto.layer),
         Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
         Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
         Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
         Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
         Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+        Layer.provide(Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({})),
         Layer.provide(
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({
             list: () =>

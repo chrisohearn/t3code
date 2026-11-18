@@ -6428,13 +6428,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
     // Track inherited history through live and deleted intermediate run forks. Snapshot exclusions
     // keep fork-only migration state from making excluded runs retain their files.
-    const liveForkSources = (threadId: ThreadId) => sql`
+    const liveForkSources = (threadId: ThreadId, excludedForkThreadId: ThreadId = threadId) => sql`
       WITH RECURSIVE live_sources(thread_id, run_ordinal, fork_thread_id) AS (
         SELECT run.thread_id, run.ordinal, fork.thread_id
         FROM orchestration_v2_projection_threads AS fork
         JOIN orchestration_v2_projection_runs AS run
           ON run.run_id = json_extract(fork.payload_json, '$.forkedFrom.runId')
-        WHERE fork.deleted_at IS NULL AND fork.thread_id <> ${threadId}
+        WHERE fork.deleted_at IS NULL
+          AND fork.thread_id <> ${threadId}
+          AND fork.thread_id <> ${excludedForkThreadId}
           AND json_extract(fork.payload_json, '$.forkedFrom.type') = 'run'
           AND json_extract(fork.payload_json, '$.lineage.sideChat') IS NOT 1
         UNION
@@ -6475,12 +6477,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       from: number,
       through: number,
       includeShownByLiveFork = false,
+      excludedForkThreadId?: ThreadId,
     ) {
       const exceptShown = (alias: string) =>
         includeShownByLiveFork ? sql`` : sql`AND NOT ${shownByLiveFork(alias)}`;
       const [messages, renders, answerFiles] = yield* Effect.all([
         sql<{ id: string }>`
-          ${liveForkSources(threadId)}
+          ${liveForkSources(threadId, excludedForkThreadId)}
           SELECT DISTINCT json_extract(attachment.value, '$.id') AS id
           FROM orchestration_v2_projection_messages AS message,
             json_each(message.payload_json, '$.attachments') AS attachment
@@ -6489,7 +6492,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ${exceptShown("message")}
         `,
         sql<{ payload_json: string }>`
-          ${liveForkSources(threadId)}
+          ${liveForkSources(threadId, excludedForkThreadId)}
           SELECT item.payload_json
           FROM orchestration_v2_projection_turn_items AS item
           WHERE item.thread_id = ${threadId}
@@ -6501,7 +6504,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ${exceptShown("item")}
         `,
         sql<{ id: string }>`
-          ${liveForkSources(threadId)}
+          ${liveForkSources(threadId, excludedForkThreadId)}
           SELECT DISTINCT json_extract(attachment.value, '$.id') AS id
           FROM orchestration_v2_projection_turn_items AS item,
             json_each(item.payload_json, '$.questionAnswer.attachmentsByQuestionId') AS question,
@@ -6533,11 +6536,24 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       from: number,
       through: number,
       includeShownByLiveFork = false,
+      excludedForkThreadId?: ThreadId,
     ) {
-      const candidates = yield* runAttachmentIds(threadId, from, through, includeShownByLiveFork);
+      const candidates = yield* runAttachmentIds(
+        threadId,
+        from,
+        through,
+        includeShownByLiveFork,
+        excludedForkThreadId,
+      );
       if (from <= -1 || candidates.length === 0) return candidates;
       const retained = new Set(
-        yield* runAttachmentIds(threadId, -1, from - 1, includeShownByLiveFork),
+        yield* runAttachmentIds(
+          threadId,
+          -1,
+          from - 1,
+          includeShownByLiveFork,
+          excludedForkThreadId,
+        ),
       );
       return candidates.filter((id) => !retained.has(id));
     });
@@ -6575,7 +6591,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         );
         const releasedSources = yield* Effect.forEach(
           options?.includeShownByLiveFork === true ? [] : deletedSources,
-          ({ thread_id: source }) => unshownRunAttachmentIds(source, -1, Number.MAX_SAFE_INTEGER),
+          ({ thread_id: source }) =>
+            unshownRunAttachmentIds(source, -1, Number.MAX_SAFE_INTEGER, false, threadId),
         );
         const guestFiles = yield* sql<{ id: string }>`
           SELECT DISTINCT json_extract(attachment.value, '$.id') AS id

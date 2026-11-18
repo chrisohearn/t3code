@@ -122,7 +122,7 @@ it.effect("filters image searches before applying the result limit", () =>
       expect(resultWithDirectoryKind.entries).toEqual([{ kind: "file", path: "public/icon.svg" }]);
       expect(fileSearch).toHaveBeenCalledTimes(2);
       expect(fileSearch).toHaveBeenCalledWith(expect.stringContaining("**/*.{"), {
-        pageSize: 25_002,
+        pageSize: 201,
       });
     }),
   ).pipe(Effect.provide(testLayer)),
@@ -433,13 +433,11 @@ it.live("answers content searches with git grep while a slow content index build
       ...finder,
       waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
     } as unknown as FileFinder;
-    vi.spyOn(FileFinder, "create")
-      .mockReturnValueOnce({ ok: true, value: finder })
-      .mockReturnValueOnce({ ok: true, value: noPcreFinder })
-      .mockReturnValueOnce({ ok: true, value: noPcreFinder })
-      .mockReturnValueOnce({ ok: true, value: noPcreFinder });
+    const finders = [finder, noPcreFinder, noPcreFinder, noPcreFinder];
+    let finderIndex = 0;
+    const withNextFinder = () => withInProcessFinder(finders[finderIndex++] ?? noPcreFinder);
 
-    const searchIndex = yield* WorkspaceSearchIndex.make(cwd, "content");
+    const searchIndex = yield* WorkspaceSearchIndex.make(cwd, "content").pipe(withNextFinder());
     const search = (input: Partial<Parameters<typeof searchIndex.searchContents>[0]>) =>
       searchIndex.searchContents({
         query: "needle",
@@ -523,6 +521,7 @@ it.live("answers content searches with git grep while a slow content index build
                 : vcsProcess.run(input),
           }),
         ),
+        withNextFinder(),
       );
     const regexInput = {
       query: "ne+dles?",

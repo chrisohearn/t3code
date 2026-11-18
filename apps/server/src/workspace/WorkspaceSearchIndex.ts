@@ -654,7 +654,7 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
   const isContentIndexReady = Effect.fn("WorkspaceSearchIndex.isContentIndexReady")(function* () {
     if (!contentIndexPending) return true;
     const progress = yield* Effect.promise(() =>
-      finder.getScanProgressAsync().catch(() => undefined),
+      finder.call("getScanProgressAsync").catch(() => undefined),
     );
     if (progress?.ok && !progress.value.isScanning && progress.value.isWarmupComplete) {
       contentIndexPending = false;

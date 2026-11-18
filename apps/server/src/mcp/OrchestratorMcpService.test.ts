@@ -2585,8 +2585,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           unmatched.message,
           "Model opus-5.5 is not advertised by provider codex. Advertised models: " +
             "claude-opus-5-1, claude-opus-5-2, claude-opus-5-3, claude-opus-5-4, claude-opus-5-5, " +
-            "claude-opus-5-6, claude-opus-5-7, claude-opus-5-8 and 2 more; " +
-            "orchestrator_capabilities with search finds them.",
+            "claude-opus-5-6, claude-opus-5-7, claude-opus-5-8, claude-opus-5-9, claude-opus-4-1.",
         );
 
         const updateRequired = yield* refuse("claude-fable-5-2");
@@ -4328,6 +4327,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               yield* Ref.make<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>([]),
               existing,
               inputs,
+              workspaceRoot,
               { project: null, environment: environmentDefault },
             ),
           ),

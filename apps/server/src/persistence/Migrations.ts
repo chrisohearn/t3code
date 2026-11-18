@@ -301,11 +301,12 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
 }: RunMigrationsOptions = {}) {
   // The desktop waits past its readiness budget until the finished line follows this one.
   const hasPending = yield* hasPendingMigrations();
+  const forkMigrationsPending = yield* hasPendingForkMigrations(migrationManifest);
   if (hasPending) yield* Effect.log(DATABASE_MIGRATIONS_STARTED_MESSAGE);
   const includesV2 =
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
   const previewMigrations = includesV2 && hasPending ? yield* reconcileV2PreviewMigration() : [];
-  const repairedForkMigrations = (yield* hasPendingForkMigrations(migrationManifest))
+  const repairedForkMigrations = forkMigrationsPending
     ? yield* repairForkMigrationHistory(migrationManifest)
     : [];
   if (includesV2) {
@@ -342,7 +343,7 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
   }
   // Fork: fork migrations run after every upstream migration, so only on a full run.
   const executedForkMigrations =
-    toMigrationInclusive === undefined ? yield* runForkMigrations() : [];
+    toMigrationInclusive === undefined && forkMigrationsPending ? yield* runForkMigrations() : [];
   const hasForkChanges = repairedForkMigrations.length > 0 || executedForkMigrations.length > 0;
   if (hasForkChanges) {
     yield* Effect.log("Fork migrations ran successfully").pipe(

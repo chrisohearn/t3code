@@ -703,6 +703,7 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const eventSink = yield* EventSink.EventSinkV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
         const config = yield* ServerConfig.ServerConfig;
         const fileSystem = yield* FileSystem.FileSystem;
@@ -831,6 +832,11 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
           text: "Send queued work without files",
           attachments: [],
         });
+        assert.include(
+          yield* projections.getThreadAttachmentIds(threadId, { includeShownByLiveFork: true }),
+          shared.id,
+          "the queued edit must see the attachment still present in earlier history",
+        );
         yield* worker.drain();
 
         assert.isFalse(yield* fileSystem.exists(filePath(dropped)));
@@ -853,15 +859,21 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
             createdBy: "user",
             creationSource: "web",
           });
-          for (const id of [threadId, laterForkId]) {
-            yield* orchestrator.dispatch({
-              type: "thread.delete",
-              commandId: CommandId.make(`${key}:delete:${id}`),
-              threadId: id,
-            });
-            yield* worker.drain();
-            assert.equal(yield* fileSystem.readFileString(filePath(shared)), "bytes");
-          }
+          yield* orchestrator.dispatch({
+            type: "thread.delete",
+            commandId: CommandId.make(`${key}:delete:${threadId}`),
+            threadId,
+          });
+          yield* worker.drain();
+          assert.equal(yield* fileSystem.readFileString(filePath(shared)), "bytes");
+
+          yield* orchestrator.dispatch({
+            type: "thread.delete",
+            commandId: CommandId.make(`${key}:delete:${laterForkId}`),
+            threadId: laterForkId,
+          });
+          yield* worker.drain();
+          assert.isFalse(yield* fileSystem.exists(filePath(shared)));
           yield* orchestrator.dispatch({
             type: "thread.delete",
             commandId: CommandId.make(`${key}:delete-first-fork`),
@@ -1196,7 +1208,11 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
       const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const config = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const pagePath = (attachmentId: string) =>
+        path.join(config.attachmentsDir, `${attachmentId}.html`);
       const projectId = ProjectId.make("html-fork-project");
       const sourceThreadId = ThreadId.make("html-fork-source");
       const forkThreadId = ThreadId.make("html-fork-target");
@@ -1252,6 +1268,10 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
         key: "later",
         ordinal: 2,
       });
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      for (const page of [inherited, forkPage, firstRun, later]) {
+        yield* fileSystem.writeFileString(pagePath(page.attachmentId), "<p>Page</p>");
+      }
       const deleteThread = (threadId: ThreadId) =>
         orchestrator.dispatch({
           type: "thread.delete",
@@ -1261,7 +1281,7 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
       const pagesOnDisk = Effect.gen(function* () {
         yield* worker.drain();
         return yield* Effect.forEach([inherited, forkPage, later], (page) =>
-          fileSystem.exists(page.pagePath),
+          fileSystem.exists(pagePath(page.attachmentId)),
         );
       });
       yield* deleteThread(forkThreadId);
@@ -3599,11 +3619,6 @@ const writeHtmlRenderRun = Effect.fn("test.writeHtmlRenderRun")(function* (input
   const runId = RunId.make(`html-fork-run:${input.key}`);
   const messageId = MessageId.make(`html-fork-message:${input.key}`);
   const attachmentId = createAttachmentId(input.threadId, "html")!;
-  const fileSystem = yield* FileSystem.FileSystem;
-  const { attachmentsDir } = yield* ServerConfig.ServerConfig;
-  const pagePath = (yield* Path.Path).join(attachmentsDir, `${attachmentId}.html`);
-  yield* fileSystem.makeDirectory(attachmentsDir, { recursive: true });
-  yield* fileSystem.writeFileString(pagePath, "<p>Page</p>");
   yield* eventSink.write({
     events: [
       {
@@ -3685,7 +3700,7 @@ const writeHtmlRenderRun = Effect.fn("test.writeHtmlRenderRun")(function* (input
       },
     ],
   });
-  return { runId, pagePath };
+  return { runId, attachmentId };
 });
 
 it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {

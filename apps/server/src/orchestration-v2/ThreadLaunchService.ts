@@ -417,6 +417,9 @@ const make = Effect.gen(function* () {
         }
         // git worktree add accepts remote-tracking branches; let Git decide when any matching ref exists.
         if (yield* git.hasRefNamed({ cwd, refName: baseRef })) return true;
+        // A saved origin-based branch can disappear. Preparation resolves the remote default
+        // branch or the checked-out commit before creating the worktree.
+        if (strategy.startFromOrigin === true) return true;
         return !(yield* git.hasCommit({ cwd, refName: "HEAD" }));
       }).pipe(Effect.orElseSucceed(() => true)));
     if (!baseResolves)
