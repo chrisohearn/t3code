@@ -108,6 +108,8 @@ export const ProviderAdapterV2Event = Schema.Union([
     driver: ProviderDriverKind,
     threadId: Schema.optional(ThreadId),
     providerTurn: OrchestrationV2ProviderTurn,
+    /** Questions the adapter keeps open after this turn ends; the rest of the turn's are dismissed. */
+    retainedRuntimeRequestIds: Schema.optional(Schema.Array(RuntimeRequestId)),
   }),
   Schema.Struct({
     type: Schema.Literal("node.updated"),
@@ -187,6 +189,7 @@ export const ProviderAdapterV2Event = Schema.Union([
     threadDisposition: Schema.Literals(["reusable", "broken"]),
     /** Positive evidence only: the adapter saw no output, tool call or file change in this turn. */
     noWorkObserved: Schema.optional(Schema.Literal(true)),
+    retainedRuntimeRequestIds: Schema.optional(Schema.Array(RuntimeRequestId)),
   }),
   Schema.Struct({
     type: Schema.Literal("turn.terminal"),
@@ -206,6 +209,7 @@ export const ProviderAdapterV2Event = Schema.Union([
     noWorkObserved: Schema.optional(Schema.Literal(true)),
     /** Set only when the adapter recognized an account-side cause, never inferred from the class. */
     accountFailure: Schema.optional(OrchestrationV2ProviderFailoverReason),
+    retainedRuntimeRequestIds: Schema.optional(Schema.Array(RuntimeRequestId)),
   }),
 ]);
 export type ProviderAdapterV2Event = typeof ProviderAdapterV2Event.Type;
@@ -457,6 +461,8 @@ export class ProviderAdapterEventStreamError extends Schema.TaggedError<Provider
     providerSessionId: ProviderSessionId,
     /** Set when T3 closed the session because this thread detached from it, not the provider. */
     detachedThreadId: Schema.optional(ThreadId),
+    /** Set when T3 raised this itself; unset when the adapter reported its runtime failing. */
+    raisedByT3: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -756,6 +762,11 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly applyModelSelection?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly modelSelection: ModelSelection;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /** Renames the provider's native session while its process is running; otherwise the next turn does. */
+  readonly applyThreadTitle?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly title: string;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly stopTask?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;

@@ -55,7 +55,7 @@ process.once("message", (options) => {
   process.on("message", async ({ id, method, args }) => {
     try {
       if (method === "watch") {
-        const watched = finder.watch((events) => process.send({ events }));
+        const watched = await finder.watchAsync((events) => process.send({ events }));
         if (watched.ok) unwatch = watched.value;
         process.send({ id, value: watched.ok ? { ok: true } : watched });
       } else if (method === "unwatch") {

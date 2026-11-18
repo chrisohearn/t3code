@@ -1,0 +1,1 @@
+../../../.agents/skills/test-t3-mobile/SKILL.md
