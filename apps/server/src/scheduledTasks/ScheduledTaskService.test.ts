@@ -8,6 +8,7 @@ import {
   CommandId,
   ProjectId,
   ProviderInstanceId,
+  type ScheduledTask,
   ScheduledTaskError,
   ScheduledTaskId,
   type ScheduledTaskUpsertInput,
@@ -27,6 +28,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
@@ -607,7 +609,7 @@ it.effect.each([
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
-it.effect("a run still going when the next one starts cannot overwrite the newer run", () =>
+it.effect("a prior run's error remains visible while the next run is pending", () =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("project:test");
     const sent = yield* Ref.make<ReadonlyArray<string>>([]);
@@ -695,6 +697,96 @@ it.effect("a run still going when the next one starts cannot overwrite the newer
       );
       yield* Deferred.succeed(endSecond, undefined);
       const afterSecond = Option.getOrUndefined(yield* Fiber.join(secondSuccess));
+      assert.deepEqual(
+        {
+          status: afterSecond?.lastRunStatus,
+          error: afterSecond?.lastRunError,
+          since: afterSecond?.runInProgressSince,
+        },
+        { status: "succeeded", error: null, since: undefined },
+      );
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect("a run still going when the next one starts cannot overwrite the newer run", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:test");
+    const sent = yield* Ref.make<ReadonlyArray<string>>([]);
+    const endFirst = yield* Deferred.make<void>();
+    const endSecond = yield* Deferred.make<void>();
+    const layer = followerLayer(
+      Layer.mock(ThreadManagementService.ThreadManagementService)({
+        sendToThread: (input) =>
+          Ref.update(sent, (all) => [...all, input.messageId]).pipe(Effect.as({} as never)),
+        getThreadShell: () => Effect.succeed(threadShell(projectId)),
+        getProjectThreadRecords: () =>
+          Effect.map(
+            Ref.get(sent),
+            (messages) =>
+              ({
+                runs: messages.map((userMessageId, index) => ({
+                  id: `run:${index}`,
+                  status: "running",
+                  rootNodeId: "node:root",
+                  userMessageId,
+                })),
+                messages: messages.map((id, index) => ({ id, runId: `run:${index}` })),
+                turnItems: [],
+              }) as never,
+          ),
+        waitForThread: (input) =>
+          Deferred.await(input.runId === "run:0" ? endFirst : endSecond).pipe(
+            Effect.as({
+              threadId: input.threadId,
+              run: {
+                id: input.runId,
+                status: input.runId === "run:0" ? "failed" : "completed",
+                rootNodeId: "node:root",
+              },
+              timedOut: false,
+            } as never),
+          ),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const { task } = yield* service.upsert({
+        id: ScheduledTaskId.make("task:overlap"),
+        title: "Hourly sync",
+        prompt: "Sync upstream",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60 * 60_000 },
+        projectId,
+        threadId: ThreadId.make("thread:overlap"),
+        workspaceStrategy: { type: "root" },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      });
+      yield* service.runNow({ id: task.id });
+      yield* TestClock.adjust("1 minute");
+      const second = yield* service.runNow({ id: task.id });
+      const states = yield* Queue.unbounded<ScheduledTask | undefined>();
+      yield* service.subscribeList().pipe(
+        Stream.runForEach(({ tasks }) =>
+          Queue.offer(
+            states,
+            tasks.find((candidate) => candidate.id === task.id),
+          ),
+        ),
+        Effect.forkChild,
+      );
+      yield* Queue.take(states);
+      yield* Deferred.succeed(endFirst, undefined);
+      // The first run's follower notifies when it ends; the second run is still the pending one.
+      const afterFirst = yield* Queue.take(states);
+      assert.deepEqual(
+        { status: afterFirst?.lastRunStatus, since: afterFirst?.runInProgressSince },
+        { status: "never", since: second.task.lastRunAt },
+      );
+      yield* Deferred.succeed(endSecond, undefined);
+      const afterSecond = yield* Queue.take(states);
       assert.deepEqual(
         {
           status: afterSecond?.lastRunStatus,
