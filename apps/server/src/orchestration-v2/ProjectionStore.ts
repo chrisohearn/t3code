@@ -6476,23 +6476,25 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       threadId: ThreadId,
       from: number,
       through: number,
-      includeShownByLiveFork = false,
+      forkVisibility: "all" | "shown",
       excludedForkThreadId?: ThreadId,
     ) {
-      const exceptShown = (alias: string) =>
-        includeShownByLiveFork ? sql`` : sql`AND NOT ${shownByLiveFork(alias)}`;
+      const forkSources =
+        forkVisibility === "all" ? sql`` : liveForkSources(threadId, excludedForkThreadId);
+      const forkFilter = (alias: string) =>
+        forkVisibility === "shown" ? sql`AND ${shownByLiveFork(alias)}` : sql``;
       const [messages, renders, answerFiles] = yield* Effect.all([
         sql<{ id: string }>`
-          ${liveForkSources(threadId, excludedForkThreadId)}
+          ${forkSources}
           SELECT DISTINCT json_extract(attachment.value, '$.id') AS id
           FROM orchestration_v2_projection_messages AS message,
             json_each(message.payload_json, '$.attachments') AS attachment
           WHERE message.thread_id = ${threadId}
             AND ${runOrdinalBetween("message.run_id", from, through)}
-            ${exceptShown("message")}
+            ${forkFilter("message")}
         `,
         sql<{ payload_json: string }>`
-          ${liveForkSources(threadId, excludedForkThreadId)}
+          ${forkSources}
           SELECT item.payload_json
           FROM orchestration_v2_projection_turn_items AS item
           WHERE item.thread_id = ${threadId}
@@ -6501,10 +6503,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               OR item.payload_json LIKE ${`%${MCP_APP_OUTPUT_KEY}%`}
               OR item.payload_json LIKE '%preview_recording_stop%')
             AND ${runOrdinalBetween("item.run_id", from, through)}
-            ${exceptShown("item")}
+            ${forkFilter("item")}
         `,
         sql<{ id: string }>`
-          ${liveForkSources(threadId, excludedForkThreadId)}
+          ${forkSources}
           SELECT DISTINCT json_extract(attachment.value, '$.id') AS id
           FROM orchestration_v2_projection_turn_items AS item,
             json_each(item.payload_json, '$.questionAnswer.attachmentsByQuestionId') AS question,
@@ -6512,7 +6514,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           WHERE item.thread_id = ${threadId}
             AND item.type = 'user_input_request'
             AND ${runOrdinalBetween("item.run_id", from, through)}
-            ${exceptShown("item")}
+            ${forkFilter("item")}
         `,
       ]);
       return [
@@ -6542,16 +6544,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         threadId,
         from,
         through,
-        includeShownByLiveFork,
+        "all",
         excludedForkThreadId,
       );
-      if (from <= -1 || candidates.length === 0) return candidates;
+      if (includeShownByLiveFork || candidates.length === 0) return candidates;
       const retained = new Set(
         yield* runAttachmentIds(
           threadId,
           -1,
-          from - 1,
-          includeShownByLiveFork,
+          Number.MAX_SAFE_INTEGER,
+          "shown",
           excludedForkThreadId,
         ),
       );

@@ -873,7 +873,7 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
             threadId: laterForkId,
           });
           yield* worker.drain();
-          assert.isFalse(yield* fileSystem.exists(filePath(shared)));
+          assert.equal(yield* fileSystem.readFileString(filePath(shared)), "bytes");
           yield* orchestrator.dispatch({
             type: "thread.delete",
             commandId: CommandId.make(`${key}:delete-first-fork`),
