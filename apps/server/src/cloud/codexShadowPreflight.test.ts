@@ -5,6 +5,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { unmanagedProviders } from "../policy/managedProviders.ts";
 import { unmanagedSettings } from "../policy/managedSettings.ts";
 import { inspectConfiguredCodexShadowHomes } from "./codexShadowPreflight.ts";
@@ -252,6 +253,161 @@ it.layer(NodeServices.layer)("inspectConfiguredCodexShadowHomes", (it) => {
 
         expect(report.status).toBe("not-ready");
         expect(report.instances.map((instance) => instance.status)).toEqual(["unknown"]);
+      }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "uses CODEX_HOME when the shadow path is configured without homePath",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const stateDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-state-" });
+          const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-home-" });
+          const sharedHome = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3code-codex-shared-",
+          });
+          const shadowHome = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3code-codex-shadow-",
+          });
+          yield* fileSystem.writeFileString(path.join(sharedHome, "config.toml"), "shared");
+          yield* fileSystem.writeFileString(path.join(shadowHome, "config.toml"), "local");
+          yield* fileSystem.writeFileString(
+            path.join(stateDir, "settings.json"),
+            JSON.stringify({
+              providerInstances: {
+                codex_work: {
+                  driver: "codex",
+                  config: { shadowHomePath: shadowHome },
+                  environment: [{ name: "CODEX_HOME", value: sharedHome }],
+                },
+              },
+            }),
+          );
+
+          const report = yield* inspectConfiguredCodexShadowHomes(stateDir).pipe(
+            Effect.provideService(HostProcess.HomeDirectory, home),
+          );
+
+          expect(report.status).toBe("not-ready");
+          expect(report.instances).toEqual([
+            {
+              instanceId: "codex_work",
+              shadowHomePath: shadowHome,
+              status: "not-ready",
+              conflicts: [
+                {
+                  entryName: "config.toml",
+                  path: path.join(shadowHome, "config.toml"),
+                  autoSettle: false,
+                },
+              ],
+            },
+          ]);
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "uses CODEX_HOME when homePath contains only whitespace",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const stateDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-state-" });
+          const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-home-" });
+          const sharedHome = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3code-codex-shared-",
+          });
+          const shadowHome = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3code-codex-shadow-",
+          });
+          yield* fileSystem.writeFileString(path.join(sharedHome, "config.toml"), "shared");
+          yield* fileSystem.writeFileString(path.join(shadowHome, "config.toml"), "local");
+          yield* fileSystem.writeFileString(
+            path.join(stateDir, "settings.json"),
+            JSON.stringify({
+              providerInstances: {
+                codex_work: {
+                  driver: "codex",
+                  config: { homePath: "   ", shadowHomePath: shadowHome },
+                  environment: [{ name: "CODEX_HOME", value: sharedHome }],
+                },
+              },
+            }),
+          );
+
+          const report = yield* inspectConfiguredCodexShadowHomes(stateDir).pipe(
+            Effect.provideService(HostProcess.HomeDirectory, home),
+          );
+
+          expect(report.status).toBe("not-ready");
+          expect(report.instances[0]).toMatchObject({
+            instanceId: "codex_work",
+            shadowHomePath: shadowHome,
+            status: "not-ready",
+            conflicts: [
+              {
+                entryName: "config.toml",
+                path: path.join(shadowHome, "config.toml"),
+                autoSettle: false,
+              },
+            ],
+          });
+        }),
+    );
+
+    it.effect.skipIf(
+      !symlinksSupported ||
+        HostProcess.Platform.defaultValue() === "win32" ||
+        HostProcess.Username.defaultValue() === "root",
+    )("marks a shared memories_v2 link not-ready when its shadow directory is read-only", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const stateDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-state-" });
+        const sharedHome = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3code-codex-shared-",
+        });
+        const shadowHome = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3code-codex-shadow-",
+        });
+        const sharedMemories = path.join(sharedHome, "memories_v2");
+        const shadowMemories = path.join(shadowHome, "memories_v2");
+        yield* fileSystem.makeDirectory(sharedMemories);
+        yield* fileSystem.symlink(sharedMemories, shadowMemories);
+        yield* fileSystem.writeFileString(
+          path.join(stateDir, "settings.json"),
+          JSON.stringify({
+            providerInstances: {
+              codex_work: {
+                driver: "codex",
+                config: { homePath: sharedHome, shadowHomePath: shadowHome },
+              },
+            },
+          }),
+        );
+        yield* fileSystem.chmod(shadowHome, 0o555);
+
+        const report = yield* inspectConfiguredCodexShadowHomes(stateDir).pipe(
+          Effect.ensuring(fileSystem.chmod(shadowHome, 0o755).pipe(Effect.orDie)),
+        );
+
+        expect(report.status).toBe("not-ready");
+        expect(report.instances).toEqual([
+          {
+            instanceId: "codex_work",
+            shadowHomePath: shadowHome,
+            status: "not-ready",
+            conflicts: [
+              {
+                entryName: "memories_v2",
+                path: shadowMemories,
+                autoSettle: false,
+              },
+            ],
+          },
+        ]);
+        expect(yield* fileSystem.readLink(shadowMemories)).toBe(sharedMemories);
       }),
     );
 

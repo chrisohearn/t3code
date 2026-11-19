@@ -459,11 +459,19 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
 
           yield* fileSystem.makeDirectory(path.join(sharedHome, "log"));
           yield* fileSystem.makeDirectory(path.join(sharedHome, "memories"));
+          yield* fileSystem.makeDirectory(path.join(sharedHome, "memories_v2"));
           yield* fileSystem.makeDirectory(path.join(sharedHome, "tmp"));
           yield* writeTextFile(path.join(sharedHome, "config.toml"), 'model = "gpt-5-codex"\n');
           yield* writeTextFile(path.join(shadowHome, "auth.json"), '{"shadow":true}\n');
           yield* fileSystem.makeDirectory(path.join(shadowHome, "log"), { recursive: true });
           yield* fileSystem.makeDirectory(path.join(shadowHome, "memories"), { recursive: true });
+          yield* fileSystem.makeDirectory(path.join(shadowHome, "memories_v2"), {
+            recursive: true,
+          });
+          yield* writeTextFile(
+            path.join(shadowHome, "memories_v2", "memory_summary.md"),
+            "shadow memory",
+          );
           yield* fileSystem.makeDirectory(path.join(shadowHome, "tmp"), { recursive: true });
 
           const layout = yield* resolveCodexHomeLayout(
@@ -482,14 +490,65 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           const memoriesLinkResult = yield* fileSystem
             .readLink(path.join(shadowHome, "memories"))
             .pipe(Effect.result);
+          const memoriesV2LinkResult = yield* fileSystem
+            .readLink(path.join(shadowHome, "memories_v2"))
+            .pipe(Effect.result);
           const tmpLinkResult = yield* fileSystem
             .readLink(path.join(shadowHome, "tmp"))
             .pipe(Effect.result);
+          const memoriesV2Content = yield* fileSystem.readFileString(
+            path.join(shadowHome, "memories_v2", "memory_summary.md"),
+          );
 
           expect(configTarget).toBe(path.join(sharedHome, "config.toml"));
           expect(logLinkResult._tag).toBe("Failure");
           expect(memoriesLinkResult._tag).toBe("Failure");
+          expect(memoriesV2LinkResult._tag).toBe("Failure");
+          expect(memoriesV2Content).toBe("shadow memory");
           expect(tmpLinkResult._tag).toBe("Failure");
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "unlinks legacy memories_v2 links to the shared home without changing shared memory",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          const sharedMemoriesV2 = path.join(sharedHome, "memories_v2");
+          const shadowMemoriesV2 = path.join(shadowHome, "memories_v2");
+          const sharedSummary = path.join(sharedMemoriesV2, "memory_summary.md");
+
+          yield* fileSystem.makeDirectory(sharedMemoriesV2, { recursive: true });
+          yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
+          yield* writeTextFile(sharedSummary, "shared memory");
+          yield* fileSystem.symlink(sharedMemoriesV2, shadowMemoriesV2);
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({
+              homePath: sharedHome,
+              shadowHomePath: shadowHome,
+            }),
+          );
+
+          const conflicts = yield* inspectCodexShadowHome(layout, noSqliteHome);
+          expect(conflicts).toContainEqual({
+            entryName: "memories_v2",
+            path: shadowMemoriesV2,
+            sqliteFiles: undefined,
+            autoSettle: true,
+          });
+          expect(yield* fileSystem.readLink(shadowMemoriesV2)).toBe(sharedMemoriesV2);
+
+          yield* materializeCodexShadowHome(layout, noSqliteHome);
+
+          expect((yield* fileSystem.readLink(shadowMemoriesV2).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          expect(yield* fileSystem.readFileString(sharedSummary)).toBe("shared memory");
         }),
     );
 
@@ -547,6 +606,33 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           expect(error.message).toBe(
             `Cannot create Codex shadow home entry 'config.toml' because '${path.join(shadowHome, "config.toml")}' already exists and is not a symlink.`,
           );
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "leaves legacy shared memories_v2 links in place when another conflict refuses setup",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          const sharedMemories = path.join(sharedHome, "memories_v2");
+          const shadowMemories = path.join(shadowHome, "memories_v2");
+          yield* writeTextFile(path.join(sharedHome, "config.toml"), 'model = "shared"\n');
+          yield* writeTextFile(path.join(shadowHome, "config.toml"), 'model = "local"\n');
+          yield* fileSystem.makeDirectory(sharedMemories, { recursive: true });
+          yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
+          yield* fileSystem.symlink(sharedMemories, shadowMemories);
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          const error = yield* materializeCodexShadowHome(layout, noSqliteHome).pipe(Effect.flip);
+
+          expect(error).toBeInstanceOf(CodexShadowHomeEntryConflictError);
+          expect(yield* fileSystem.readLink(shadowMemories)).toBe(sharedMemories);
         }),
     );
 

@@ -36,7 +36,7 @@ const KNOWN_SHARED_DIRECTORIES = [
 // auth.lock guards the shadow home's private auth.json.
 const PRIVATE_ENTRY_NAMES = new Set(["auth.json", "auth.lock", "models_cache.json"]);
 // Finder maintains metadata separately for each directory, including shadow homes.
-const SHADOW_LOCAL_ENTRY_NAMES = new Set(["log", "memories", "tmp", ".DS_Store"]);
+const SHADOW_LOCAL_ENTRY_NAMES = new Set(["log", "memories", "memories_v2", "tmp", ".DS_Store"]);
 // Shadow homes may create local runtime locks first; replace them with shared links because they guard shared state.
 const REPLACEABLE_SHARED_RUNTIME_ENTRIES = new Set([
   "mcp-oauth-locks",
@@ -548,6 +548,55 @@ const backupParentAccepts = Effect.fnUntraced(function* (
   );
 });
 
+const sharedMemoriesV2LinkPath = Effect.fn("CodexHomeLayout.sharedMemoriesV2LinkPath")(
+  function* (input: {
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly sharedHomePath: string;
+    readonly effectiveHomePath: string;
+  }): Effect.fn.Return<string | undefined, CodexShadowHomeError, Path.Path> {
+    const path = yield* Path.Path;
+    const entryName = "memories_v2";
+    const linkPath = path.join(input.effectiveHomePath, entryName);
+    const state = yield* readLinkState({
+      ...input,
+      entryName,
+      linkPath,
+    });
+    if (state._tag !== "Symlink") return undefined;
+
+    const resolvedTarget = path.resolve(path.dirname(linkPath), state.target);
+    const sharedTarget = path.join(input.sharedHomePath, entryName);
+    return resolvedTarget === sharedTarget ||
+      (yield* sameDirectory(input.fileSystem, path, resolvedTarget, sharedTarget))
+      ? linkPath
+      : undefined;
+  },
+);
+
+const removeSharedMemoriesV2Link = Effect.fn("CodexHomeLayout.removeSharedMemoriesV2Link")(
+  function* (input: {
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly sharedHomePath: string;
+    readonly effectiveHomePath: string;
+  }): Effect.fn.Return<void, CodexShadowHomeError, Path.Path> {
+    const linkPath = yield* sharedMemoriesV2LinkPath(input);
+    if (linkPath === undefined) return;
+    yield* input.fileSystem.remove(linkPath).pipe(
+      Effect.catchTags({
+        PlatformError: (cause) =>
+          new CodexShadowHomeFileSystemError({
+            sharedHomePath: input.sharedHomePath,
+            effectiveHomePath: input.effectiveHomePath,
+            operation: "remove",
+            path: linkPath,
+            entryName: "memories_v2",
+            cause,
+          }),
+      }),
+    );
+  },
+);
+
 /** Read-only: what materializing this shadow home would have to move aside or refuse. */
 export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(function* (
   layout: CodexHomeLayout,
@@ -602,6 +651,21 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
       path: authPath,
       sqliteFiles: undefined,
       autoSettle: false,
+    });
+  }
+  const sharedMemoriesV2Link = yield* sharedMemoriesV2LinkPath(context);
+  if (sharedMemoriesV2Link !== undefined) {
+    const shadowDirectoryWritable = yield* fileSystem
+      .access(effectiveHomePath, { writable: true })
+      .pipe(
+        Effect.as(true),
+        Effect.orElseSucceed(() => false),
+      );
+    conflicts.push({
+      entryName: "memories_v2",
+      path: sharedMemoriesV2Link,
+      sqliteFiles: undefined,
+      autoSettle: shadowDirectoryWritable,
     });
   }
   for (const entryName of shadowLinkEntryNames(sharedEntryNames)) {
@@ -798,20 +862,6 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
   );
   const entries = shadowLinkEntryNames(sharedEntryNames);
 
-  yield* Effect.forEach(
-    PRIVATE_ENTRY_NAMES,
-    (entryName) =>
-      entryName === "auth.json"
-        ? Effect.void
-        : removePrivateSymlink({
-            fileSystem,
-            sharedHomePath: layout.sharedHomePath,
-            effectiveHomePath,
-            entryName,
-          }),
-    { discard: true },
-  );
-
   const conflicts = yield* inspectCodexShadowHome(layout, options);
   const platform = yield* HostProcess.Platform;
   const backupDirectory = backupDirectoryFor(
@@ -819,7 +869,7 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
     effectiveHomePath,
     yield* Clock.currentTimeMillis,
   );
-  // Refuse before moving anything, so a failed setup leaves the shadow as it found it.
+  // Refuse before moving databases or unlinking entries.
   const blocker = conflicts.find((conflict) => !conflict.autoSettle);
   if (blocker !== undefined && blocker.sqliteFiles === undefined) {
     return yield* blocker.entryName === "auth.json"
@@ -871,6 +921,28 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
       { files, backup: backupDirectory },
     );
   }
+
+  yield* Effect.forEach(
+    PRIVATE_ENTRY_NAMES,
+    (entryName) =>
+      entryName === "auth.json"
+        ? Effect.void
+        : removePrivateSymlink({
+            fileSystem,
+            sharedHomePath: layout.sharedHomePath,
+            effectiveHomePath,
+            entryName,
+          }),
+    { discard: true },
+  );
+
+  // Older releases linked this shared directory into every shadow. Remove only the link; the
+  // shared target and any real, instance-local memories_v2 directory remain untouched.
+  yield* removeSharedMemoriesV2Link({
+    fileSystem,
+    sharedHomePath: layout.sharedHomePath,
+    effectiveHomePath,
+  });
 
   yield* settleShadowSqliteSidecars({
     fileSystem,

@@ -9,9 +9,9 @@
 # down twice on 2026-11-11.
 #
 # How:
-#   launch    systemd ExecStart (drop-in). Starts the active build only if it is a verified
-#             release from a trusted repo; otherwise restores the newest build that has run
-#             here and starts that.
+#   launch    systemd ExecStart (drop-in). Starts a verified active build when its database and
+#             Codex shadow homes are ready. A positive shadow conflict may select a known-ready
+#             build; unknown shadow status keeps the active database-compatible build running.
 #   prove     Run ~90 s after each start. Records the active build as healthy once it serves.
 #   rollback  systemd OnFailure. If a build that never proved healthy crash-loops, go back to
 #             the newest healthy build and start it.
@@ -341,16 +341,23 @@ trust() {
   log "trusted $v"
 }
 
-# Whether build $1 says it can run on the current database. A release can migrate the
-# database one way (e.g. the fork's migration-namespace repair), after which older builds
-# refuse it; never fall back to one of those. Unknown answers count as yes.
-can_open() {
-  local v="$1" proto out status
+# Run build $1's launcher preflight against the current database.
+service_preflight() {
+  local v="$1" proto
   proto=$(jq -r '.protocol // 3' "$GUARD_STATE/healthy/$v.json" 2>/dev/null)
   [[ "$proto" =~ ^[0-9]+$ ]] || proto=$(jq -r '.protocol // 3' "$STATE_FILE" 2>/dev/null)
   [[ "$proto" =~ ^[0-9]+$ ]] || proto=3
-  out=$(timeout 120 "$(binary_of "$v")" __service-preflight --database-path "$DB" \
-    --launcher-protocol "$proto" 2>/dev/null | tail -n1)
+  timeout 120 "$(binary_of "$v")" __service-preflight --database-path "$DB" \
+    --launcher-protocol "$proto" 2>/dev/null | tail -n1
+}
+
+# Whether build $1 says it can run on the current database. A release can migrate the
+# database one way (e.g. the fork's migration-namespace repair), after which older builds
+# refuse it; never fall back to one of those. Unknown answers count as yes. Shadow-home
+# readiness is deliberately not part of database compatibility: restoring a snapshot because
+# of a shadow-only failure would discard database writes without fixing the shadow.
+preflight_allows_database() {
+  local v="$1" out="$2" status
   status=$(jq -r '.status // empty' <<<"$out" 2>/dev/null)
   # The guard runs each build's own launcher, so a launcher-protocol refusal does not apply.
   if [[ "$status" == "blocked" ]] && ! jq -re '.reason | startswith("The installed service launcher speaks protocol")' <<<"$out" >/dev/null 2>&1; then
@@ -360,10 +367,60 @@ can_open() {
   return 0
 }
 
-# Newest version that has served here, is installed, trusted, not excluded, and can open the
-# current database.
-newest_healthy_except() {
+# Only a positive shadow-home report makes a build a preferred startup candidate. Return 1 for a
+# positive shadow conflict, 2 for a database incompatibility, and 3 when shadow readiness is
+# unknown. A missing or unknown report is not proof that an older build is safer.
+can_start() {
+  local v="$1" out
+  out=$(service_preflight "$v")
+  preflight_allows_database "$v" "$out" || return 2
+  if jq -e '
+    .codexShadowHomes.status == "ready" and
+    all(.codexShadowHomes.instances[]?; .status == "ready" or .status == "auto-settle")
+  ' <<<"$out" >/dev/null 2>&1; then
+    return 0
+  fi
+  if jq -e '
+    any(.codexShadowHomes.instances[]?; .status == "not-ready")
+  ' <<<"$out" >/dev/null 2>&1; then
+    log "preflight: $v has a positively unready Codex shadow home"
+    return 1
+  fi
+  log "preflight: $v shadow homes are unknown"
+  return 3
+}
+
+# Whether build $1 says it can run on the current database.
+can_open() {
+  local v="$1" out
+  out=$(service_preflight "$v")
+  preflight_allows_database "$v" "$out"
+}
+
+# Newest healthy, installed, trusted version with positively ready shadow homes.
+newest_healthy_shadow_ready_except() {
   local skip="$1" f v
+  for v in $(for f in "$GUARD_STATE"/healthy/*.json; do
+    [[ -e "$f" ]] && basename "$f" .json
+  done | sort -rV); do
+    [[ "$v" == "$skip" ]] && continue
+    is_bad "$v" && continue
+    is_trusted "$v" || continue
+    can_start "$v" || continue
+    printf '%s\n' "$v"
+    return 0
+  done
+}
+
+# Prefer positively ready shadow homes, then keep service availability on any build that can
+# open the current database. A shadow conflict only disables that Codex instance in the server.
+newest_healthy_except() {
+  local skip="$1" preferred f v
+  preferred=$(newest_healthy_shadow_ready_except "$skip")
+  if [[ -n "$preferred" ]]; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
   for v in $(for f in "$GUARD_STATE"/healthy/*.json; do
     [[ -e "$f" ]] && basename "$f" .json
   done | sort -rV); do
@@ -396,7 +453,7 @@ exec_launcher() {
 }
 
 cmd_launch() {
-  local v fallback
+  local v fallback start_status
   v=$(active_version)
   if [[ -z "$v" ]]; then
     log "launch: no active version recorded"
@@ -406,10 +463,29 @@ cmd_launch() {
   fi
 
   if installed "$v" && ! is_bad "$v" && { is_trusted "$v" || trust "$v"; }; then
-    can_open "$v" && exec_launcher "$v"
+    if can_start "$v"; then
+      exec_launcher "$v"
+    else
+      start_status=$?
+    fi
+    if [[ "$start_status" == 1 ]]; then
+      # A positive shadow conflict can justify switching to a known-ready build.
+      fallback=$(newest_healthy_shadow_ready_except "$v")
+      if [[ -n "$fallback" ]] && write_state_for "$fallback"; then
+        notify "$v shadow preflight was not ready. Started known-ready build $fallback instead."
+        exec_launcher "$fallback"
+      fi
+      log "launch: keeping database-compatible $v; no healthier shadow-ready build is known"
+      exec_launcher "$v"
+    fi
+    if [[ "$start_status" == 3 ]]; then
+      log "launch: keeping database-compatible $v; shadow readiness is unknown"
+      exec_launcher "$v"
+    fi
+    # A database-incompatible build may use any verified, compatible fallback.
     fallback=$(newest_healthy_except "$v")
     if [[ -n "$fallback" ]] && write_state_for "$fallback"; then
-      notify "$v refused this database at preflight. Started $fallback instead."
+      notify "$v cannot open the current database. Started compatible build $fallback instead."
       exec_launcher "$fallback"
     fi
     exec_launcher "$v"
@@ -944,7 +1020,7 @@ cmd_update() {
     return
   fi
   if [[ -z "$target" && -e "$GUARD_STATE/rejected/$latest" ]]; then
-    log "update: $latest was rejected by the late canary; skipping (run t3-service-update $latest to retry)"
+    log "update: $latest was rejected on this host; skipping (run t3-service-update $latest to retry)"
     return 0
   fi
   if is_bad "$latest" && [[ -z "$target" ]]; then
@@ -1097,6 +1173,29 @@ cmd_update() {
       return 0
     fi
   done
+  # A positive shadow conflict can intentionally redirect launch to a known-ready build. That
+  # keeps the service available, but does not mean the new release itself is broken.
+  local selected latest_start_status
+  selected=$(active_version)
+  up=$(service_uptime) || up=0
+  if [[ "$selected" != "$latest" && -n "$selected" ]] && (( up >= 60 )) &&
+    [[ "$(service_version)" == "$selected" ]] && is_trusted "$selected" &&
+    is_healthy "$selected" && can_open "$selected"; then
+    if can_start "$latest"; then
+      latest_start_status=0
+    else
+      latest_start_status=$?
+    fi
+    if [[ "$latest_start_status" == 1 ]]; then
+      mkdir -p "$GUARD_STATE/rejected"
+      date -Is >"$GUARD_STATE/rejected/$latest"
+      log "update: $latest has a positive shadow conflict; database-compatible $selected is serving"
+      outage_end "$selected"
+      notify "T3 update $latest was not selected because its Codex shadow preflight is not-ready. $selected remains serving; fix the shadow conflict and retry with t3-service-update $latest."
+      report "$latest was not selected because its Codex shadow preflight is not-ready; $selected remains serving. Fix the shadow conflict, then retry with t3-service-update $latest."
+      return 1
+    fi
+  fi
   date -Is >"$GUARD_STATE/bad/$latest"
   # Reported once the rollback has decided (below), so the report never delays a stop or restart.
   local outcome
