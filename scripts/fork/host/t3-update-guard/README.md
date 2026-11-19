@@ -22,6 +22,8 @@ Installing the guard does not restart the T3 service.
 
 ## When updates happen
 
+- **Launch selection:** the guard prefers a build with a positive Codex shadow readiness report. It switches away from the active build only when that build positively reports a shadow conflict and another verified build reports ready. Missing or unknown shadow status keeps the active build when it can open the database. If an update launch is redirected to a compatible build because of a positive shadow conflict, the release is marked rejected on this host, not bad globally; fix the shadow conflict and retry with `t3-service-update <version>`.
+
 - **Idle server:** the guard updates once no thread has run for 15 min.
 - **Busy server:** threads nearly always run, so after 30 min of waiting (`MAX_DEFER_SECONDS`) the update is forced.
 - **Before a forced restart:** the guard waits up to 20 more minutes (`FORCE_GRACE_SECONDS`) while an approval or question is pending, or a tool call is still running. A restart cancels pending approvals, and a tool call cut off part-way can be repeated by its continuation. It checks again just before stopping.

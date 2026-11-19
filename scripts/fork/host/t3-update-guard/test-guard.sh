@@ -19,22 +19,33 @@ chmod +x "$root/fake-preflight"
 binary_of() { echo "$root/fake-preflight"; }
 export PREFLIGHT_OUTPUT='{"status":"ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"not-ready"}]}}'
 can_open 1 || fail 'shadow readiness made a database-compatible build look incompatible'
-can_start 1 && fail 'startup selected a build with a known-unready Codex shadow home'
+if can_start 1; then fail 'startup selected a build with a known-unready Codex shadow home'; else
+  [[ "$?" == 1 ]] || fail 'known shadow conflict did not return its distinct status'
+fi
 export PREFLIGHT_OUTPUT='{"status":"ready","codexShadowHomes":{"status":"ready","instances":[]}}'
 can_open 1 || fail 'database compatibility rejected a build with ready Codex shadow homes'
 can_start 1 || fail 'startup rejected a build with ready Codex shadow homes'
 export PREFLIGHT_OUTPUT='{"status":"not-ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"unknown"}]}}'
 can_open 1 || fail 'an unknown secret-backed shadow made a database-compatible build unusable'
-can_start 1 && fail 'an unknown secret-backed shadow was treated as positively ready'
+if can_start 1; then fail 'an unknown secret-backed shadow was treated as positively ready'; else
+  [[ "$?" == 3 ]] || fail 'unknown shadow readiness did not return its distinct status'
+fi
 export PREFLIGHT_OUTPUT='{"status":"ready"}'
 can_open 1 || fail 'legacy preflight without shadow status made a database-compatible build unusable'
-can_start 1 && fail 'legacy preflight without shadow status was treated as positively ready'
+if can_start 1; then fail 'legacy preflight without shadow status was treated as positively ready'; else
+  [[ "$?" == 3 ]] || fail 'legacy shadow readiness did not return its distinct status'
+fi
+export PREFLIGHT_OUTPUT='{"status":"blocked","reason":"migration unavailable"}'
+if can_start 1; then fail 'database-incompatible build was selected'; else
+  [[ "$?" == 2 ]] || fail 'database incompatibility did not return its distinct status'
+fi
 eval "$real_binary_of"
 unset PREFLIGHT_OUTPUT
-pass 'database compatibility ignores shadow state while preferred startup requires positive shadow readiness'
+pass 'database compatibility, positive shadow conflicts, and unknown shadow status stay distinct'
 
 # Exercise the service-launch and crash-loop paths, including an older build that has no
 # shadow preflight report. Shadow readiness is a preference; database compatibility keeps T3 up.
+# A known-unready active build stays up when the only older build has no shadow report.
 (
   exec 9>&-
   export T3_GUARD_DRY_RUN=1
@@ -60,6 +71,52 @@ EOF
   [[ "$out" == *"/versions/2/t3"* ]] || exit 1
 ) || fail 'launch downgraded a database-compatible build to a legacy build without shadow status'
 pass 'launch keeps a database-compatible active build when a legacy fallback has no shadow report'
+
+# An unknown active shadow report does not justify downgrading to an older ready build.
+(
+  exec 9>&-
+  export T3_GUARD_DRY_RUN=1
+  mkdir -p "$GUARD_STATE/healthy" "$root/versions/1" "$root/versions/2"
+  printf '{"protocol":4}\n' >"$GUARD_STATE/healthy/1.json"
+  cat >"$root/versions/1/t3" <<'EOF'
+#!/bin/bash
+echo '{"status":"ready","codexShadowHomes":{"status":"ready","instances":[]}}'
+EOF
+  cat >"$root/versions/2/t3" <<'EOF'
+#!/bin/bash
+echo '{"status":"ready"}'
+EOF
+  chmod +x "$root/versions/1/t3" "$root/versions/2/t3"
+  binary_of() { echo "$root/versions/$1/t3"; }
+  installed() { return 0; }; is_trusted() { return 0; }; is_bad() { return 1; }
+  active_version() { echo 2; }
+  out=$(cmd_launch 2>/dev/null)
+  [[ "$out" == *"/versions/2/t3"* ]] || exit 1
+) || fail 'launch downgraded an active build when its shadow preflight was unknown'
+pass 'launch keeps the database-compatible active build when shadow readiness is unknown'
+
+# A positive shadow conflict can select an older build whose shadow homes are known ready.
+(
+  exec 9>&-
+  export T3_GUARD_DRY_RUN=1
+  mkdir -p "$GUARD_STATE/healthy" "$root/versions/1" "$root/versions/2"
+  printf '{"protocol":4}\n' >"$GUARD_STATE/healthy/1.json"
+  cat >"$root/versions/1/t3" <<'EOF'
+#!/bin/bash
+echo '{"status":"ready","codexShadowHomes":{"status":"ready","instances":[]}}'
+EOF
+  cat >"$root/versions/2/t3" <<'EOF'
+#!/bin/bash
+echo '{"status":"ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"not-ready"}]}}'
+EOF
+  chmod +x "$root/versions/1/t3" "$root/versions/2/t3"
+  binary_of() { echo "$root/versions/$1/t3"; }
+  installed() { return 0; }; is_trusted() { return 0; }; is_bad() { return 1; }
+  active_version() { echo 2; }
+  out=$(cmd_launch 2>/dev/null)
+  [[ "$out" == *"/versions/1/t3"* ]] || exit 1
+) || fail 'launch did not switch from a positively unready build to a known-ready fallback'
+pass 'launch switches to an older build only after a positive shadow conflict'
 
 (
   exec 9>&-
@@ -387,6 +444,72 @@ HEALTH_WAIT_SECONDS=0 cmd_update >/dev/null 2>&1 && fail 'shadow-only startup fa
 [[ ! -e "$root/shadow-restore" ]] || fail 'shadow-only startup failure restored the pre-update database'
 [[ "$(cat "$root/shadow-rollback-restart")" == 1 ]] || fail 'database-compatible old build was not restarted'
 pass 'shadow-only rollback failure restarts the database-compatible build without restoring its snapshot'
+
+# A positive shadow redirect keeps the previous build serving without marking the release bad.
+# Earlier cmd_update cases keep their service-change lock on fd 9 until the test process closes it.
+exec 9>&-
+(
+  source "$root/functions"
+  sim_active_version=1
+  manager_ready() { return 0; }
+  latest_release() { echo 2; }
+  active_runs() { echo 0; }
+  quiet_seconds() { echo 99999; }
+  active_version() { echo "$sim_active_version"; }
+  write_state_for() { sim_active_version="$1"; }
+  is_trusted() { return 0; }
+  is_healthy() { [[ "$1" == 1 ]]; }
+  is_bad() { return 1; }
+  release_binary_sha() { echo 1234; }
+  record_pre_restart() { :; }
+  kernel_hang_signs() { return 1; }
+  systemctl() { echo active; }
+  service_version() { echo "$sim_active_version"; }
+  service_uptime() { echo 100; }
+  installed() { return 0; }
+  wait_inactive() { return 0; }
+  outage_begin() { :; }
+  snapshot_db() { echo "$root/snap"; }
+  binary_of() { echo "$root/versions/$1/t3"; }
+  svc() {
+    echo "$*" >>"$root/redirect-svc"
+    [[ "$1" != restart ]] || sim_active_version=1
+    return 0
+  }
+  notify() { echo "$*" >>"$root/redirect-notify"; }
+  report() { echo "$*" >>"$root/redirect-report"; }
+  mkdir -p "$root/versions/1" "$root/versions/2"
+  cat >"$root/versions/1/t3" <<'EOF'
+#!/bin/bash
+case "${1:-}" in
+  __service-preflight) echo '{"status":"ready","codexShadowHomes":{"status":"ready","instances":[]}}' ;;
+  update) exit 0 ;;
+esac
+EOF
+  cat >"$root/versions/2/t3" <<'EOF'
+#!/bin/bash
+case "${1:-}" in
+  __service-preflight) echo '{"status":"ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"not-ready"}]}}' ;;
+  update) exit 0 ;;
+esac
+EOF
+  chmod +x "$root/versions/1/t3" "$root/versions/2/t3"
+  rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2" "$GUARD_STATE/rejected/2" "$root/redirect-svc"
+  if HEALTH_WAIT_SECONDS=0 cmd_update >"$root/redirect-output" 2>&1; then
+    fail 'shadow redirect reported the new release as serving'
+  fi
+  exec 9>&-
+  [[ -e "$GUARD_STATE/rejected/2" ]] || fail 'shadow redirect was not rejected on this host'
+  [[ ! -e "$GUARD_STATE/bad/2" ]] || fail 'shadow redirect marked the release globally bad'
+  [[ "$(grep -c '^stop --no-block t3code.service$' "$root/redirect-svc")" == 1 ]] ||
+    fail 'guard stopped the already-serving fallback again'
+  [[ "$(grep -c '^restart t3code.service$' "$root/redirect-svc")" == 1 ]] ||
+    fail 'guard restarted the already-serving fallback again'
+  grep -q 'Codex shadow preflight is not-ready' "$root/redirect-report" ||
+    fail 'shadow redirect was not reported with its cause'
+) || fail 'shadow redirect was mishandled by cmd_update'
+pass 'shadow redirect is host-rejected and reported without marking the release bad or restarting the fallback'
+
 eval "$real_manager_ready"; eval "$real_release_binary_sha"; eval "$real_write_state_for"; eval "$real_installed"
 eval "$real_is_healthy"; eval "$real_active_runs"; eval "$real_quiet_seconds"; eval "$real_record_pre_restart"
 eval "$real_systemctl"; eval "$real_svc"; eval "$real_snapshot_db"; eval "$real_outage_begin"
@@ -394,6 +517,7 @@ eval "$real_restore_db"; eval "$real_restart_on"; eval "$real_notify"; eval "$re
 eval "$real_wait_for_continuations"; eval "$real_recovery_summary"; eval "$real_last_fatal"
 eval "$real_binary_for_shadow_rollback"
 rm -f "$root/shadow-rollback-svc" "$root/shadow-rollback-cli" "$AUTO_HOLD" "$GUARD_STATE/bad/2"
+rm -f "$GUARD_STATE/rejected/2"
 active_version() { echo 1; }; latest_release() { echo 1; }; service_version() { echo 1; }
 
 # A deploy onto an idle server is checked again on later ticks; a late break holds and reports.

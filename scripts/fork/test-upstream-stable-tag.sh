@@ -112,4 +112,60 @@ check "open PR within the tag continues" "$(run_guard "$D" "$E" v1)" "rc=0 comme
 check "open PR beyond the tag: exit 4, comment, worktree removed" "$(run_guard "$E" "$D" v1)" "rc=4 comments=1 worktree=removed"
 check "open PR beyond the tag, dry run: no comment" "$(run_guard "$E" "$D" v1 1)" "rc=4 comments=0 worktree=removed"
 check "open PR with no stable tag is refused" "$(run_guard "$D" "" "")" "rc=4 comments=1 worktree=removed"
+
+# Every publication path carries the local memories_v2 compatibility note.
+release_repo="$tmp/release-repo"
+release_remote="$tmp/release-origin.git"
+git init -q --bare -b integration "$release_remote"
+git init -q -b integration "$release_repo"
+git -C "$release_repo" config user.name t
+git -C "$release_repo" config user.email t@t
+printf 'release tree\n' >"$release_repo/tree.txt"
+git -C "$release_repo" add tree.txt
+git -C "$release_repo" commit -q -m release
+git -C "$release_repo" remote add origin "$release_remote"
+git -C "$release_repo" push -q -u origin integration
+git -C "$release_repo" fetch -q origin
+release_commit=$(git -C "$release_repo" rev-parse HEAD)
+release_version=0.1.10-preview.20261119.2
+release_artifacts="$tmp/release/artifacts"
+mkdir -p "$release_artifacts" "$tmp/release-bin"
+printf 'build %s\n' "$release_commit" >"$tmp/release/build.txt"
+printf 'archive\n' >"$release_artifacts/t3-$release_version-linux-x64.tar.gz"
+(cd "$release_artifacts" && sha256sum "t3-$release_version-linux-x64.tar.gz" >SHA256SUMS)
+cat >"$tmp/release-bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == release && "${2:-}" == create ]]; then
+  shift 2
+  while (($#)); do
+    if [[ "$1" == --notes ]]; then
+      shift
+      printf '%s' "$1" >"$GH_NOTES"
+      exit 0
+    fi
+    shift
+  done
+  exit 1
+fi
+if [[ "${1:-}" == release && "${2:-}" == view ]]; then
+  echo '{"isPrerelease":true,"assets":[]}'
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$tmp/release-bin/gh"
+(
+  cd "$release_repo"
+  GH_NOTES="$tmp/release-notes" T3_FORK_REPO=test/fork T3_FORK_BRANCH=integration \
+    PATH="$tmp/release-bin:$PATH" bash "$here/publish-release.sh" "$release_version" \
+      "$release_artifacts" "$release_commit" 'Upstream sync test note.'
+)
+if grep -Fq 'Upstream sync test note.' "$tmp/release-notes" &&
+  grep -Fq 'Codex shadow compatibility:' "$tmp/release-notes"; then
+  echo 'ok   published notes retain caller notes and explain Codex shadow compatibility'
+else
+  echo 'FAIL published notes omit the Codex shadow compatibility note'
+  fail=1
+fi
 exit $fail
