@@ -9,6 +9,23 @@ sed '/^case "${1:-}" in/,$d' "$original" > "$root/functions"
 source "$root/functions"
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; exit 1; }
+# A ready database is not enough for rollback if configured Codex shadows cannot start.
+real_binary_of=$(declare -f binary_of)
+cat >"$root/fake-preflight" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$PREFLIGHT_OUTPUT"
+EOF
+chmod +x "$root/fake-preflight"
+binary_of() { echo "$root/fake-preflight"; }
+export PREFLIGHT_OUTPUT='{"status":"ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"not-ready"}]}}'
+can_open 1 && fail 'rollback selected a build with an unready Codex shadow home'
+export PREFLIGHT_OUTPUT='{"status":"ready","codexShadowHomes":{"status":"ready","instances":[]}}'
+can_open 1 || fail 'rollback rejected a build with ready Codex shadow homes'
+export PREFLIGHT_OUTPUT='{"status":"ready"}'
+can_open 1 || fail 'legacy preflight without shadow status was rejected'
+eval "$real_binary_of"
+unset PREFLIGHT_OUTPUT
+pass 'rollback preflight rejects known Codex shadow conflicts while retaining legacy compatibility'
 # No real service calls, installs, or network calls below.
 manager_ready() { echo manager >> "$root/calls"; return 0; }
 active_version() { echo 1; }; is_trusted() { return 0; }; latest_release() { echo 1; }

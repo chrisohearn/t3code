@@ -345,7 +345,7 @@ trust() {
 # database one way (e.g. the fork's migration-namespace repair), after which older builds
 # refuse it; never fall back to one of those. Unknown answers count as yes.
 can_open() {
-  local v="$1" proto out status
+  local v="$1" proto out status shadow_status
   proto=$(jq -r '.protocol // 3' "$GUARD_STATE/healthy/$v.json" 2>/dev/null)
   [[ "$proto" =~ ^[0-9]+$ ]] || proto=$(jq -r '.protocol // 3' "$STATE_FILE" 2>/dev/null)
   [[ "$proto" =~ ^[0-9]+$ ]] || proto=3
@@ -355,6 +355,15 @@ can_open() {
   # The guard runs each build's own launcher, so a launcher-protocol refusal does not apply.
   if [[ "$status" == "blocked" ]] && ! jq -re '.reason | startswith("The installed service launcher speaks protocol")' <<<"$out" >/dev/null 2>&1; then
     log "preflight: $v cannot run on this database: $(jq -r '.reason // ""' <<<"$out" | cut -c1-240)"
+    return 1
+  fi
+  # A database-compatible build may still be unable to start Codex sessions when shadow homes
+  # contain entries it would replace. Older preflight output has no shadow status; keep treating
+  # that unknown answer as compatible for migration-era releases.
+  shadow_status=$(jq -r '.codexShadowHomes.status // empty' <<<"$out" 2>/dev/null)
+  if [[ "$shadow_status" == "not-ready" || "$shadow_status" == "unknown" ]] ||
+    jq -e 'any(.codexShadowHomes.instances[]?; .status == "not-ready" or .status == "unknown")' <<<"$out" >/dev/null 2>&1; then
+    log "preflight: $v cannot start Codex shadow homes: ${shadow_status:-not-ready}"
     return 1
   fi
   return 0

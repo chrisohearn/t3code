@@ -509,6 +509,49 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
         }),
     );
 
+    it.effect.skipIf(!symlinksSupported)(
+      "unlinks legacy memories_v2 links to the shared home without changing shared memory",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          const sharedMemoriesV2 = path.join(sharedHome, "memories_v2");
+          const shadowMemoriesV2 = path.join(shadowHome, "memories_v2");
+          const sharedSummary = path.join(sharedMemoriesV2, "memory_summary.md");
+
+          yield* fileSystem.makeDirectory(sharedMemoriesV2, { recursive: true });
+          yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
+          yield* writeTextFile(sharedSummary, "shared memory");
+          yield* fileSystem.symlink(sharedMemoriesV2, shadowMemoriesV2);
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({
+              homePath: sharedHome,
+              shadowHomePath: shadowHome,
+            }),
+          );
+
+          const conflicts = yield* inspectCodexShadowHome(layout, noSqliteHome);
+          expect(conflicts).toContainEqual({
+            entryName: "memories_v2",
+            path: shadowMemoriesV2,
+            sqliteFiles: undefined,
+            autoSettle: true,
+          });
+          expect(yield* fileSystem.readLink(shadowMemoriesV2)).toBe(sharedMemoriesV2);
+
+          yield* materializeCodexShadowHome(layout, noSqliteHome);
+
+          expect((yield* fileSystem.readLink(shadowMemoriesV2).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          expect(yield* fileSystem.readFileString(sharedSummary)).toBe("shared memory");
+        }),
+    );
+
     it.effect("rejects shadow homes that point at the shared home", () =>
       Effect.gen(function* () {
         const sharedHome = yield* makeTempDir("t3code-codex-shared-");
