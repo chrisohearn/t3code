@@ -5,6 +5,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, vi } from "@effect/vitest";
 import {
+  CommandId,
   ProjectId,
   ProviderInstanceId,
   type ScheduledTask,
@@ -34,6 +35,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import { OrchestratorDispatchError } from "../orchestration-v2/Orchestrator.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -607,6 +609,106 @@ it.effect.each([
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
+it.effect("a prior run's error remains visible while the next run is pending", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:test");
+    const sent = yield* Ref.make<ReadonlyArray<string>>([]);
+    const endFirst = yield* Deferred.make<void>();
+    const endSecond = yield* Deferred.make<void>();
+    const layer = followerLayer(
+      Layer.mock(ThreadManagementService.ThreadManagementService)({
+        sendToThread: (input) =>
+          Ref.update(sent, (all) => [...all, input.messageId]).pipe(Effect.as({} as never)),
+        getThreadShell: () => Effect.succeed(threadShell(projectId)),
+        getProjectThreadRecords: () =>
+          Effect.map(
+            Ref.get(sent),
+            (messages) =>
+              ({
+                runs: messages.map((userMessageId, index) => ({
+                  id: `run:${index}`,
+                  status: "running",
+                  rootNodeId: "node:root",
+                  userMessageId,
+                })),
+                messages: messages.map((id, index) => ({ id, runId: `run:${index}` })),
+                turnItems: [],
+              }) as never,
+          ),
+        waitForThread: (input) =>
+          Deferred.await(input.runId === "run:0" ? endFirst : endSecond).pipe(
+            Effect.as({
+              threadId: input.threadId,
+              run: {
+                id: input.runId,
+                status: input.runId === "run:0" ? "failed" : "completed",
+                rootNodeId: "node:root",
+              },
+              timedOut: false,
+            } as never),
+          ),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const { task } = yield* service.upsert({
+        id: ScheduledTaskId.make("task:overlap"),
+        title: "Hourly sync",
+        prompt: "Sync upstream",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60 * 60_000 },
+        projectId,
+        threadId: ThreadId.make("thread:overlap"),
+        workspaceStrategy: { type: "root" },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      });
+      yield* service.runNow({ id: task.id });
+      const firstFailure = yield* service.subscribeList().pipe(
+        Stream.map(({ tasks }) => tasks.find((candidate) => candidate.id === task.id)),
+        Stream.filter(
+          (current) =>
+            current?.lastRunStatus === "failed" && current.runInProgressSince === undefined,
+        ),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* Deferred.succeed(endFirst, undefined);
+      const afterFirst = Option.getOrUndefined(yield* Fiber.join(firstFailure));
+      assert.deepEqual(
+        { status: afterFirst?.lastRunStatus, error: afterFirst?.lastRunError },
+        { status: "failed", error: "The run failed." },
+      );
+      yield* TestClock.adjust("1 minute");
+      const second = yield* service.runNow({ id: task.id });
+      assert.deepEqual(
+        { status: second.task.lastRunStatus, error: second.task.lastRunError },
+        { status: "failed", error: "The run failed." },
+      );
+      const secondSuccess = yield* service.subscribeList().pipe(
+        Stream.map(({ tasks }) => tasks.find((candidate) => candidate.id === task.id)),
+        Stream.filter(
+          (current) =>
+            current?.lastRunStatus === "succeeded" && current.runInProgressSince === undefined,
+        ),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* Deferred.succeed(endSecond, undefined);
+      const afterSecond = Option.getOrUndefined(yield* Fiber.join(secondSuccess));
+      assert.deepEqual(
+        {
+          status: afterSecond?.lastRunStatus,
+          error: afterSecond?.lastRunError,
+          since: afterSecond?.runInProgressSince,
+        },
+        { status: "succeeded", error: null, since: undefined },
+      );
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
 it.effect("a run still going when the next one starts cannot overwrite the newer run", () =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("project:test");
@@ -1109,6 +1211,67 @@ it.effect("a first run binding after filing follows the thread's committed proje
       const stale = yield* tasks.upsert({ ...task, title: "Edited after source deletion" });
       assert.equal(stale.task.threadId, threadId);
       assert.equal(stale.task.projectId, target);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect("a refused dispatch records its refusal, and opaque causes stay generic", () =>
+  Effect.gen(function* () {
+    const refusal = "Thread thread:refused was stopped.";
+    const refused = (cause: unknown) =>
+      new OrchestratorDispatchError({
+        commandId: CommandId.make("command:refused"),
+        commandType: "message.dispatch",
+        cause,
+      });
+    const generic = refused(undefined).message;
+    const cases = [
+      [refusal, refusal],
+      ["   ", generic],
+      [new Error("private-nested-secret"), generic],
+    ] as const;
+    const failure = yield* Ref.make<unknown>(undefined);
+    const layer = ScheduledTaskService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ManagedPolicy.layerTest(),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: () => Effect.succeed(threadShell(ProjectId.make("project:test"))),
+            sendToThread: () =>
+              Ref.get(failure).pipe(Effect.flatMap((cause) => Effect.fail(refused(cause)))),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: "/projects",
+            isScratchProject: () => Effect.succeed(false),
+          }),
+          NodeCrypto.layer,
+          Layer.succeed(Scheduler.Scheduler, { register: () => Effect.void }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const { task } = yield* service.upsert({
+        id: ScheduledTaskId.make("task:refused"),
+        title: "Refused dispatch",
+        prompt: "Check progress",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 60_000 },
+        projectId: ProjectId.make("project:test"),
+        threadId: ThreadId.make("thread:refused"),
+        workspaceStrategy: { type: "root" },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      });
+      for (const [cause, expected] of cases) {
+        yield* Ref.set(failure, cause);
+        const result = yield* service.runNow({ id: task.id });
+        assert.equal(result.task.lastRunStatus, "failed");
+        assert.equal(result.task.lastRunError, expected);
+      }
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
