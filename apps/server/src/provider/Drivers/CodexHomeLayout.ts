@@ -862,28 +862,6 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
   );
   const entries = shadowLinkEntryNames(sharedEntryNames);
 
-  yield* Effect.forEach(
-    PRIVATE_ENTRY_NAMES,
-    (entryName) =>
-      entryName === "auth.json"
-        ? Effect.void
-        : removePrivateSymlink({
-            fileSystem,
-            sharedHomePath: layout.sharedHomePath,
-            effectiveHomePath,
-            entryName,
-          }),
-    { discard: true },
-  );
-
-  // Older releases linked this shared directory into every shadow. Remove only the link; the
-  // shared target and any real, instance-local memories_v2 directory remain untouched.
-  yield* removeSharedMemoriesV2Link({
-    fileSystem,
-    sharedHomePath: layout.sharedHomePath,
-    effectiveHomePath,
-  });
-
   const conflicts = yield* inspectCodexShadowHome(layout, options);
   const platform = yield* HostProcess.Platform;
   const backupDirectory = backupDirectoryFor(
@@ -891,7 +869,7 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
     effectiveHomePath,
     yield* Clock.currentTimeMillis,
   );
-  // Refuse before moving anything, so a failed setup leaves the shadow as it found it.
+  // Refuse before moving databases or unlinking entries.
   const blocker = conflicts.find((conflict) => !conflict.autoSettle);
   if (blocker !== undefined && blocker.sqliteFiles === undefined) {
     return yield* blocker.entryName === "auth.json"
@@ -943,6 +921,28 @@ const materializeCodexShadowHomeUnlocked = Effect.fn("materializeCodexShadowHome
       { files, backup: backupDirectory },
     );
   }
+
+  yield* Effect.forEach(
+    PRIVATE_ENTRY_NAMES,
+    (entryName) =>
+      entryName === "auth.json"
+        ? Effect.void
+        : removePrivateSymlink({
+            fileSystem,
+            sharedHomePath: layout.sharedHomePath,
+            effectiveHomePath,
+            entryName,
+          }),
+    { discard: true },
+  );
+
+  // Older releases linked this shared directory into every shadow. Remove only the link; the
+  // shared target and any real, instance-local memories_v2 directory remain untouched.
+  yield* removeSharedMemoriesV2Link({
+    fileSystem,
+    sharedHomePath: layout.sharedHomePath,
+    effectiveHomePath,
+  });
 
   yield* settleShadowSqliteSidecars({
     fileSystem,

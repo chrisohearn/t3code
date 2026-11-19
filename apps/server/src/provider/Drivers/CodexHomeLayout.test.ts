@@ -609,6 +609,33 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
         }),
     );
 
+    it.effect.skipIf(!symlinksSupported)(
+      "leaves legacy shared memories_v2 links in place when another conflict refuses setup",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          const sharedMemories = path.join(sharedHome, "memories_v2");
+          const shadowMemories = path.join(shadowHome, "memories_v2");
+          yield* writeTextFile(path.join(sharedHome, "config.toml"), 'model = "shared"\n');
+          yield* writeTextFile(path.join(shadowHome, "config.toml"), 'model = "local"\n');
+          yield* fileSystem.makeDirectory(sharedMemories, { recursive: true });
+          yield* fileSystem.makeDirectory(shadowHome, { recursive: true });
+          yield* fileSystem.symlink(sharedMemories, shadowMemories);
+
+          const layout = yield* resolveCodexHomeLayout(
+            decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+          );
+          const error = yield* materializeCodexShadowHome(layout, noSqliteHome).pipe(Effect.flip);
+
+          expect(error).toBeInstanceOf(CodexShadowHomeEntryConflictError);
+          expect(yield* fileSystem.readLink(shadowMemories)).toBe(sharedMemories);
+        }),
+    );
+
     // Codex wrote memories_v2_1.sqlite into the shadow before CODEX_SQLITE_HOME, and the
     // shared home gained its own copy later; the next setup failed every session.
     const ownDatabaseFiles = [

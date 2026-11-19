@@ -24,12 +24,68 @@ export PREFLIGHT_OUTPUT='{"status":"ready","codexShadowHomes":{"status":"ready",
 can_open 1 || fail 'database compatibility rejected a build with ready Codex shadow homes'
 can_start 1 || fail 'startup rejected a build with ready Codex shadow homes'
 export PREFLIGHT_OUTPUT='{"status":"not-ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"unknown"}]}}'
-can_start 1 || fail 'an unknown secret-backed shadow caused a healthy build to be rejected'
+can_open 1 || fail 'an unknown secret-backed shadow made a database-compatible build unusable'
+can_start 1 && fail 'an unknown secret-backed shadow was treated as positively ready'
 export PREFLIGHT_OUTPUT='{"status":"ready"}'
-can_start 1 || fail 'legacy preflight without shadow status was rejected'
+can_open 1 || fail 'legacy preflight without shadow status made a database-compatible build unusable'
+can_start 1 && fail 'legacy preflight without shadow status was treated as positively ready'
 eval "$real_binary_of"
 unset PREFLIGHT_OUTPUT
-pass 'database compatibility ignores shadow state while startup rejects only known shadow conflicts'
+pass 'database compatibility ignores shadow state while preferred startup requires positive shadow readiness'
+
+# Exercise the service-launch and crash-loop paths, including an older build that has no
+# shadow preflight report. Shadow readiness is a preference; database compatibility keeps T3 up.
+(
+  exec 9>&-
+  export T3_GUARD_DRY_RUN=1
+  mkdir -p "$GUARD_STATE/healthy" "$root/versions/1" "$root/versions/2"
+  printf '{"protocol":4}\n' >"$GUARD_STATE/healthy/1.json"
+  for v in 1 2; do
+    cat >"$root/versions/$v/t3" <<EOF
+#!/bin/bash
+if [[ "$v" == 1 ]]; then
+  echo '{"status":"ready"}'
+else
+  echo '{"status":"ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"not-ready"}]}}'
+fi
+EOF
+    chmod +x "$root/versions/$v/t3"
+  done
+  binary_of() { echo "$root/versions/$1/t3"; }
+  installed() { return 0; }
+  is_trusted() { return 0; }
+  is_bad() { return 1; }
+  active_version() { echo 2; }
+  out=$(cmd_launch 2>/dev/null)
+  [[ "$out" == *"/versions/2/t3"* ]] || exit 1
+) || fail 'launch downgraded a database-compatible build to a legacy build without shadow status'
+pass 'launch keeps a database-compatible active build when a legacy fallback has no shadow report'
+
+(
+  exec 9>&-
+  export T3_GUARD_DRY_RUN=1
+  mkdir -p "$GUARD_STATE/healthy" "$GUARD_STATE/bad"
+  printf '{"protocol":4}\n' >"$GUARD_STATE/healthy/1.json"
+  binary_of() { echo "$root/versions/$1/t3"; }
+  printf '%s\n' '#!/bin/bash' 'echo '\''{"status":"ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"not-ready"}]}}'\''' >"$root/versions/1/t3"
+  chmod +x "$root/versions/1/t3"
+  is_healthy() { [[ -f "$GUARD_STATE/healthy/$1.json" ]]; }
+  is_bad() { [[ -f "$GUARD_STATE/bad/$1" ]]; }
+  is_trusted() { return 0; }
+  active_version() { echo 2; }
+  restart_on() { echo "$1" >"$root/rollback-fallback"; }
+  outage_begin() { :; }
+  notify() { :; }
+  report() { :; }
+  last_fatal() { :; }
+  rm -f "$GUARD_STATE/last-rollback" "$root/rollback-fallback"
+  cmd_rollback >/dev/null 2>&1
+  [[ "$(cat "$root/rollback-fallback")" == 1 ]]
+) || fail 'crash-loop rollback did not use a database-compatible fallback with a shadow conflict'
+pass 'crash-loop rollback preserves a database-compatible fallback when its Codex shadow is unready'
+
+rm -f "$GUARD_STATE/healthy/1.json" "$GUARD_STATE/bad/2" "$GUARD_STATE/last-rollback" "$root/rollback-fallback"
+
 # No real service calls, installs, or network calls below.
 manager_ready() { echo manager >> "$root/calls"; return 0; }
 active_version() { echo 1; }; is_trusted() { return 0; }; latest_release() { echo 1; }

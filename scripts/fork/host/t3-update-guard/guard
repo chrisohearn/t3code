@@ -367,16 +367,18 @@ preflight_allows_database() {
   return 0
 }
 
-# A known shadow conflict can rule a build out as a launch fallback. Unknown results remain
-# compatible here: secret-backed paths may resolve in the driver even though preflight cannot
-# inspect them, and downgrading a serving build on that uncertainty is unsafe.
+# Only a positive shadow-home report makes a build a preferred startup candidate. A missing or
+# unknown report is not proof that an older build is safer.
 can_start() {
   local v="$1" out shadow_status
   out=$(service_preflight "$v")
   preflight_allows_database "$v" "$out" || return 1
-  if jq -e 'any(.codexShadowHomes.instances[]?; .status == "not-ready")' <<<"$out" >/dev/null 2>&1; then
-    shadow_status=$(jq -r '.codexShadowHomes.status // "not-ready"' <<<"$out" 2>/dev/null)
-    log "preflight: $v cannot start Codex shadow homes: $shadow_status"
+  if ! jq -e '
+    .codexShadowHomes.status == "ready" and
+    all(.codexShadowHomes.instances[]?; .status == "ready" or .status == "auto-settle")
+  ' <<<"$out" >/dev/null 2>&1; then
+    shadow_status=$(jq -r '.codexShadowHomes.status // "unknown"' <<<"$out" 2>/dev/null)
+    log "preflight: $v shadow homes are not confirmed ready: $shadow_status"
     return 1
   fi
   return 0
@@ -389,9 +391,8 @@ can_open() {
   preflight_allows_database "$v" "$out"
 }
 
-# Newest version that has served here, is installed, trusted, not excluded, and can open the
-# current database.
-newest_healthy_except() {
+# Newest healthy, installed, trusted version with positively ready shadow homes.
+newest_healthy_shadow_ready_except() {
   local skip="$1" f v
   for v in $(for f in "$GUARD_STATE"/healthy/*.json; do
     [[ -e "$f" ]] && basename "$f" .json
@@ -400,6 +401,27 @@ newest_healthy_except() {
     is_bad "$v" && continue
     is_trusted "$v" || continue
     can_start "$v" || continue
+    printf '%s\n' "$v"
+    return 0
+  done
+}
+
+# Prefer positively ready shadow homes, then keep service availability on any build that can
+# open the current database. A shadow conflict only disables that Codex instance in the server.
+newest_healthy_except() {
+  local skip="$1" preferred f v
+  preferred=$(newest_healthy_shadow_ready_except "$skip")
+  if [[ -n "$preferred" ]]; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
+  for v in $(for f in "$GUARD_STATE"/healthy/*.json; do
+    [[ -e "$f" ]] && basename "$f" .json
+  done | sort -rV); do
+    [[ "$v" == "$skip" ]] && continue
+    is_bad "$v" && continue
+    is_trusted "$v" || continue
+    can_open "$v" || continue
     printf '%s\n' "$v"
     return 0
   done
@@ -436,9 +458,20 @@ cmd_launch() {
 
   if installed "$v" && ! is_bad "$v" && { is_trusted "$v" || trust "$v"; }; then
     can_start "$v" && exec_launcher "$v"
+    if can_open "$v"; then
+      # Switch only when another build positively passes shadow preflight. A legacy or
+      # indeterminate report is no evidence that downgrading will improve the Codex instance.
+      fallback=$(newest_healthy_shadow_ready_except "$v")
+      if [[ -n "$fallback" ]] && write_state_for "$fallback"; then
+        notify "$v shadow preflight was not ready. Started known-ready build $fallback instead."
+        exec_launcher "$fallback"
+      fi
+      log "launch: keeping database-compatible $v; no healthier shadow-ready build is known"
+      exec_launcher "$v"
+    fi
     fallback=$(newest_healthy_except "$v")
     if [[ -n "$fallback" ]] && write_state_for "$fallback"; then
-      notify "$v failed startup preflight. Started $fallback instead."
+      notify "$v cannot open the current database. Started compatible build $fallback instead."
       exec_launcher "$fallback"
     fi
     exec_launcher "$v"

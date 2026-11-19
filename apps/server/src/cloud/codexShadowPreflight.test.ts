@@ -307,6 +307,55 @@ it.layer(NodeServices.layer)("inspectConfiguredCodexShadowHomes", (it) => {
         }),
     );
 
+    it.effect.skipIf(!symlinksSupported)(
+      "uses CODEX_HOME when homePath contains only whitespace",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const stateDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-state-" });
+          const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-home-" });
+          const sharedHome = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3code-codex-shared-",
+          });
+          const shadowHome = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3code-codex-shadow-",
+          });
+          yield* fileSystem.writeFileString(path.join(sharedHome, "config.toml"), "shared");
+          yield* fileSystem.writeFileString(path.join(shadowHome, "config.toml"), "local");
+          yield* fileSystem.writeFileString(
+            path.join(stateDir, "settings.json"),
+            JSON.stringify({
+              providerInstances: {
+                codex_work: {
+                  driver: "codex",
+                  config: { homePath: "   ", shadowHomePath: shadowHome },
+                  environment: [{ name: "CODEX_HOME", value: sharedHome }],
+                },
+              },
+            }),
+          );
+
+          const report = yield* inspectConfiguredCodexShadowHomes(stateDir).pipe(
+            Effect.provideService(HostProcess.HomeDirectory, home),
+          );
+
+          expect(report.status).toBe("not-ready");
+          expect(report.instances[0]).toMatchObject({
+            instanceId: "codex_work",
+            shadowHomePath: shadowHome,
+            status: "not-ready",
+            conflicts: [
+              {
+                entryName: "config.toml",
+                path: path.join(shadowHome, "config.toml"),
+                autoSettle: false,
+              },
+            ],
+          });
+        }),
+    );
+
     it.effect.skipIf(
       !symlinksSupported ||
         HostProcess.Platform.defaultValue() === "win32" ||

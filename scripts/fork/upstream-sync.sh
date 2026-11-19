@@ -277,12 +277,14 @@ section = result if sys.argv[2] == "." else (result.get(sys.argv[2]) or {})
 print(section.get("status", ""))' "$1" "$2"
 }
 for protocol in 3 4; do
-  "$cli" __service-preflight --database-path "$LIVE_DB" --launcher-protocol "$protocol" \
+  env -u CODEX_HOME -u CODEX_SQLITE_HOME "$cli" __service-preflight \
+    --database-path "$LIVE_DB" --launcher-protocol "$protocol" \
     >"$logs/preflight-$protocol.json" 2>&1 || true
   [[ $(preflight_status "$logs/preflight-$protocol.json" .) == ready ]] ||
     fail "service preflight on the live database (launcher protocol $protocol)" "preflight-$protocol.json"
 done
-# Codex shadow homes the new build would refuse to set up; `auto-settle` ones it moves aside itself.
+# Caller-only Codex home variables are cleared so an agent shell cannot redirect the release gate.
+# `auto-settle` conflicts can be safely unlinked or moved aside by setup.
 [[ $(preflight_status "$logs/preflight-4.json" codexShadowHomes) == ready ]] ||
   fail "Codex shadow home preflight (an instance's shadow conflicts with its shared home)" preflight-4.json
 

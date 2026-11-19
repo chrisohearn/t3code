@@ -21,7 +21,7 @@ import { decodeSettingsFileContents } from "../serverSettings.ts";
 export interface CodexShadowHomeReport {
   readonly instanceId: string;
   readonly shadowHomePath: string;
-  /** `auto-settle`: setup will move the shadow's own databases aside; `not-ready`: setup will refuse. */
+  /** `auto-settle`: setup can remove a shared link or move the shadow's own databases aside. */
   readonly status: "ready" | "auto-settle" | "not-ready" | "unknown";
   readonly conflicts: ReadonlyArray<{
     readonly entryName: string;
@@ -129,7 +129,7 @@ export const inspectConfiguredCodexShadowHomes = Effect.fn("inspectConfiguredCod
               config,
             )
           : yield* resolveCodexHomeLayout(
-              !config.homePath && environment.CODEX_HOME?.trim()
+              !config.homePath?.trim() && environment.CODEX_HOME?.trim()
                 ? { ...config, homePath: environment.CODEX_HOME }
                 : config,
             );
