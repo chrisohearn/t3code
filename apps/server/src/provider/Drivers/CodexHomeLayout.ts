@@ -655,11 +655,17 @@ export const inspectCodexShadowHome = Effect.fn("inspectCodexShadowHome")(functi
   }
   const sharedMemoriesV2Link = yield* sharedMemoriesV2LinkPath(context);
   if (sharedMemoriesV2Link !== undefined) {
+    const shadowDirectoryWritable = yield* fileSystem
+      .access(effectiveHomePath, { writable: true })
+      .pipe(
+        Effect.as(true),
+        Effect.orElseSucceed(() => false),
+      );
     conflicts.push({
       entryName: "memories_v2",
       path: sharedMemoriesV2Link,
       sqliteFiles: undefined,
-      autoSettle: true,
+      autoSettle: shadowDirectoryWritable,
     });
   }
   for (const entryName of shadowLinkEntryNames(sharedEntryNames)) {

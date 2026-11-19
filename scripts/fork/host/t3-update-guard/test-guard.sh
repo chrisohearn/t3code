@@ -9,7 +9,7 @@ sed '/^case "${1:-}" in/,$d' "$original" > "$root/functions"
 source "$root/functions"
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; exit 1; }
-# A ready database is not enough for rollback if configured Codex shadows cannot start.
+# Database compatibility and Codex shadow readiness are separate rollback/startup checks.
 real_binary_of=$(declare -f binary_of)
 cat >"$root/fake-preflight" <<'EOF'
 #!/bin/bash
@@ -18,14 +18,18 @@ EOF
 chmod +x "$root/fake-preflight"
 binary_of() { echo "$root/fake-preflight"; }
 export PREFLIGHT_OUTPUT='{"status":"ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"not-ready"}]}}'
-can_open 1 && fail 'rollback selected a build with an unready Codex shadow home'
+can_open 1 || fail 'shadow readiness made a database-compatible build look incompatible'
+can_start 1 && fail 'startup selected a build with a known-unready Codex shadow home'
 export PREFLIGHT_OUTPUT='{"status":"ready","codexShadowHomes":{"status":"ready","instances":[]}}'
-can_open 1 || fail 'rollback rejected a build with ready Codex shadow homes'
+can_open 1 || fail 'database compatibility rejected a build with ready Codex shadow homes'
+can_start 1 || fail 'startup rejected a build with ready Codex shadow homes'
+export PREFLIGHT_OUTPUT='{"status":"not-ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"unknown"}]}}'
+can_start 1 || fail 'an unknown secret-backed shadow caused a healthy build to be rejected'
 export PREFLIGHT_OUTPUT='{"status":"ready"}'
-can_open 1 || fail 'legacy preflight without shadow status was rejected'
+can_start 1 || fail 'legacy preflight without shadow status was rejected'
 eval "$real_binary_of"
 unset PREFLIGHT_OUTPUT
-pass 'rollback preflight rejects known Codex shadow conflicts while retaining legacy compatibility'
+pass 'database compatibility ignores shadow state while startup rejects only known shadow conflicts'
 # No real service calls, installs, or network calls below.
 manager_ready() { echo manager >> "$root/calls"; return 0; }
 active_version() { echo 1; }; is_trusted() { return 0; }; latest_release() { echo 1; }
@@ -288,6 +292,53 @@ pass 'a build that serves but fails the canary is marked bad, rolled back and re
 unset -f provider_canary
 service_version() { echo 1; }; active_version() { echo 1; }
 rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2"
+
+# A shadow-only preflight failure on the old build must not restore the pre-update database.
+real_manager_ready=$(declare -f manager_ready); real_release_binary_sha=$(declare -f release_binary_sha)
+real_write_state_for=$(declare -f write_state_for); real_installed=$(declare -f installed)
+real_is_healthy=$(declare -f is_healthy); real_active_runs=$(declare -f active_runs)
+real_quiet_seconds=$(declare -f quiet_seconds); real_record_pre_restart=$(declare -f record_pre_restart)
+real_systemctl=$(declare -f systemctl); real_svc=$(declare -f svc); real_snapshot_db=$(declare -f snapshot_db)
+real_outage_begin=$(declare -f outage_begin); real_restore_db=$(declare -f restore_db)
+real_restart_on=$(declare -f restart_on); real_notify=$(declare -f notify); real_report=$(declare -f report)
+real_wait_for_continuations=$(declare -f wait_for_continuations)
+real_recovery_summary=$(declare -f recovery_summary); real_last_fatal=$(declare -f last_fatal)
+real_binary_for_shadow_rollback=$(declare -f binary_of)
+latest_release() { echo 2; }; active_runs() { echo 0; }; quiet_seconds() { echo 99999; }
+manager_ready() { return 0; }; active_version() { echo 1; }; is_trusted() { return 0; }
+is_healthy() { return 1; }; release_binary_sha() { echo 1234; }; record_pre_restart() { :; }
+kernel_hang_signs() { return 1; }; write_state_for() { :; }; systemctl() { echo active; }
+service_version() { echo ''; }; installed() { return 0; }; wait_inactive() { return 0; }
+outage_begin() { :; }; svc() { echo "$*" >> "$root/shadow-rollback-svc"; return 0; }
+snapshot_db() { echo "$root/snap"; }; restore_db() { echo restored > "$root/shadow-restore"; return 0; }
+binary_of() { echo "$root/shadow-rollback-cli"; }
+cat >"$root/shadow-rollback-cli" <<'EOF'
+#!/bin/bash
+case "${1:-}" in
+  __service-preflight)
+    echo '{"status":"ready","codexShadowHomes":{"status":"not-ready","instances":[{"status":"not-ready"}]}}'
+    ;;
+  update) exit 0 ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$root/shadow-rollback-cli"
+restart_on() { echo "$1" > "$root/shadow-rollback-restart"; return 0; }
+notify() { :; }; report() { :; }; wait_for_continuations() { :; }
+recovery_summary() { :; }; last_fatal() { :; }
+rm -f "$root/shadow-rollback-svc" "$root/shadow-restore" "$root/shadow-rollback-restart" "$AUTO_HOLD"
+HEALTH_WAIT_SECONDS=0 cmd_update >/dev/null 2>&1 && fail 'shadow-only startup failure reported as success'
+[[ ! -e "$root/shadow-restore" ]] || fail 'shadow-only startup failure restored the pre-update database'
+[[ "$(cat "$root/shadow-rollback-restart")" == 1 ]] || fail 'database-compatible old build was not restarted'
+pass 'shadow-only rollback failure restarts the database-compatible build without restoring its snapshot'
+eval "$real_manager_ready"; eval "$real_release_binary_sha"; eval "$real_write_state_for"; eval "$real_installed"
+eval "$real_is_healthy"; eval "$real_active_runs"; eval "$real_quiet_seconds"; eval "$real_record_pre_restart"
+eval "$real_systemctl"; eval "$real_svc"; eval "$real_snapshot_db"; eval "$real_outage_begin"
+eval "$real_restore_db"; eval "$real_restart_on"; eval "$real_notify"; eval "$real_report"
+eval "$real_wait_for_continuations"; eval "$real_recovery_summary"; eval "$real_last_fatal"
+eval "$real_binary_for_shadow_rollback"
+rm -f "$root/shadow-rollback-svc" "$root/shadow-rollback-cli" "$AUTO_HOLD" "$GUARD_STATE/bad/2"
+active_version() { echo 1; }; latest_release() { echo 1; }; service_version() { echo 1; }
 
 # A deploy onto an idle server is checked again on later ticks; a late break holds and reports.
 sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;"

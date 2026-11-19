@@ -341,32 +341,52 @@ trust() {
   log "trusted $v"
 }
 
-# Whether build $1 says it can run on the current database. A release can migrate the
-# database one way (e.g. the fork's migration-namespace repair), after which older builds
-# refuse it; never fall back to one of those. Unknown answers count as yes.
-can_open() {
-  local v="$1" proto out status shadow_status
+# Run build $1's launcher preflight against the current database.
+service_preflight() {
+  local v="$1" proto
   proto=$(jq -r '.protocol // 3' "$GUARD_STATE/healthy/$v.json" 2>/dev/null)
   [[ "$proto" =~ ^[0-9]+$ ]] || proto=$(jq -r '.protocol // 3' "$STATE_FILE" 2>/dev/null)
   [[ "$proto" =~ ^[0-9]+$ ]] || proto=3
-  out=$(timeout 120 "$(binary_of "$v")" __service-preflight --database-path "$DB" \
-    --launcher-protocol "$proto" 2>/dev/null | tail -n1)
+  timeout 120 "$(binary_of "$v")" __service-preflight --database-path "$DB" \
+    --launcher-protocol "$proto" 2>/dev/null | tail -n1
+}
+
+# Whether build $1 says it can run on the current database. A release can migrate the
+# database one way (e.g. the fork's migration-namespace repair), after which older builds
+# refuse it; never fall back to one of those. Unknown answers count as yes. Shadow-home
+# readiness is deliberately not part of database compatibility: restoring a snapshot because
+# of a shadow-only failure would discard database writes without fixing the shadow.
+preflight_allows_database() {
+  local v="$1" out="$2" status
   status=$(jq -r '.status // empty' <<<"$out" 2>/dev/null)
   # The guard runs each build's own launcher, so a launcher-protocol refusal does not apply.
   if [[ "$status" == "blocked" ]] && ! jq -re '.reason | startswith("The installed service launcher speaks protocol")' <<<"$out" >/dev/null 2>&1; then
     log "preflight: $v cannot run on this database: $(jq -r '.reason // ""' <<<"$out" | cut -c1-240)"
     return 1
   fi
-  # A database-compatible build may still be unable to start Codex sessions when shadow homes
-  # contain entries it would replace. Older preflight output has no shadow status; keep treating
-  # that unknown answer as compatible for migration-era releases.
-  shadow_status=$(jq -r '.codexShadowHomes.status // empty' <<<"$out" 2>/dev/null)
-  if [[ "$shadow_status" == "not-ready" || "$shadow_status" == "unknown" ]] ||
-    jq -e 'any(.codexShadowHomes.instances[]?; .status == "not-ready" or .status == "unknown")' <<<"$out" >/dev/null 2>&1; then
-    log "preflight: $v cannot start Codex shadow homes: ${shadow_status:-not-ready}"
+  return 0
+}
+
+# A known shadow conflict can rule a build out as a launch fallback. Unknown results remain
+# compatible here: secret-backed paths may resolve in the driver even though preflight cannot
+# inspect them, and downgrading a serving build on that uncertainty is unsafe.
+can_start() {
+  local v="$1" out shadow_status
+  out=$(service_preflight "$v")
+  preflight_allows_database "$v" "$out" || return 1
+  if jq -e 'any(.codexShadowHomes.instances[]?; .status == "not-ready")' <<<"$out" >/dev/null 2>&1; then
+    shadow_status=$(jq -r '.codexShadowHomes.status // "not-ready"' <<<"$out" 2>/dev/null)
+    log "preflight: $v cannot start Codex shadow homes: $shadow_status"
     return 1
   fi
   return 0
+}
+
+# Whether build $1 says it can run on the current database.
+can_open() {
+  local v="$1" out
+  out=$(service_preflight "$v")
+  preflight_allows_database "$v" "$out"
 }
 
 # Newest version that has served here, is installed, trusted, not excluded, and can open the
@@ -379,7 +399,7 @@ newest_healthy_except() {
     [[ "$v" == "$skip" ]] && continue
     is_bad "$v" && continue
     is_trusted "$v" || continue
-    can_open "$v" || continue
+    can_start "$v" || continue
     printf '%s\n' "$v"
     return 0
   done
@@ -415,10 +435,10 @@ cmd_launch() {
   fi
 
   if installed "$v" && ! is_bad "$v" && { is_trusted "$v" || trust "$v"; }; then
-    can_open "$v" && exec_launcher "$v"
+    can_start "$v" && exec_launcher "$v"
     fallback=$(newest_healthy_except "$v")
     if [[ -n "$fallback" ]] && write_state_for "$fallback"; then
-      notify "$v refused this database at preflight. Started $fallback instead."
+      notify "$v failed startup preflight. Started $fallback instead."
       exec_launcher "$fallback"
     fi
     exec_launcher "$v"

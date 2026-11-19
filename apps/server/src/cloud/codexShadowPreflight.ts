@@ -129,7 +129,7 @@ export const inspectConfiguredCodexShadowHomes = Effect.fn("inspectConfiguredCod
               config,
             )
           : yield* resolveCodexHomeLayout(
-              !config.homePath && !config.shadowHomePath && environment.CODEX_HOME?.trim()
+              !config.homePath && environment.CODEX_HOME?.trim()
                 ? { ...config, homePath: environment.CODEX_HOME }
                 : config,
             );
