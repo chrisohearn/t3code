@@ -459,11 +459,19 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
 
           yield* fileSystem.makeDirectory(path.join(sharedHome, "log"));
           yield* fileSystem.makeDirectory(path.join(sharedHome, "memories"));
+          yield* fileSystem.makeDirectory(path.join(sharedHome, "memories_v2"));
           yield* fileSystem.makeDirectory(path.join(sharedHome, "tmp"));
           yield* writeTextFile(path.join(sharedHome, "config.toml"), 'model = "gpt-5-codex"\n');
           yield* writeTextFile(path.join(shadowHome, "auth.json"), '{"shadow":true}\n');
           yield* fileSystem.makeDirectory(path.join(shadowHome, "log"), { recursive: true });
           yield* fileSystem.makeDirectory(path.join(shadowHome, "memories"), { recursive: true });
+          yield* fileSystem.makeDirectory(path.join(shadowHome, "memories_v2"), {
+            recursive: true,
+          });
+          yield* writeTextFile(
+            path.join(shadowHome, "memories_v2", "memory_summary.md"),
+            "shadow memory",
+          );
           yield* fileSystem.makeDirectory(path.join(shadowHome, "tmp"), { recursive: true });
 
           const layout = yield* resolveCodexHomeLayout(
@@ -482,13 +490,21 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           const memoriesLinkResult = yield* fileSystem
             .readLink(path.join(shadowHome, "memories"))
             .pipe(Effect.result);
+          const memoriesV2LinkResult = yield* fileSystem
+            .readLink(path.join(shadowHome, "memories_v2"))
+            .pipe(Effect.result);
           const tmpLinkResult = yield* fileSystem
             .readLink(path.join(shadowHome, "tmp"))
             .pipe(Effect.result);
+          const memoriesV2Content = yield* fileSystem.readFileString(
+            path.join(shadowHome, "memories_v2", "memory_summary.md"),
+          );
 
           expect(configTarget).toBe(path.join(sharedHome, "config.toml"));
           expect(logLinkResult._tag).toBe("Failure");
           expect(memoriesLinkResult._tag).toBe("Failure");
+          expect(memoriesV2LinkResult._tag).toBe("Failure");
+          expect(memoriesV2Content).toBe("shadow memory");
           expect(tmpLinkResult._tag).toBe("Failure");
         }),
     );
