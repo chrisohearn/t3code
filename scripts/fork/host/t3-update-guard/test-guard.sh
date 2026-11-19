@@ -468,7 +468,6 @@ exec 9>&-
   service_uptime() { echo 100; }
   installed() { return 0; }
   wait_inactive() { return 0; }
-  outage_begin() { :; }
   snapshot_db() { echo "$root/snap"; }
   binary_of() { echo "$root/versions/$1/t3"; }
   svc() {
@@ -477,7 +476,6 @@ exec 9>&-
     return 0
   }
   notify() { echo "$*" >>"$root/redirect-notify"; }
-  report() { echo "$*" >>"$root/redirect-report"; }
   mkdir -p "$root/versions/1" "$root/versions/2"
   cat >"$root/versions/1/t3" <<'EOF'
 #!/bin/bash
@@ -495,6 +493,7 @@ esac
 EOF
   chmod +x "$root/versions/1/t3" "$root/versions/2/t3"
   rm -f "$AUTO_HOLD" "$GUARD_STATE/bad/2" "$GUARD_STATE/rejected/2" "$root/redirect-svc"
+  rm -f "$OUTAGE" "$GUARD_STATE/outage-reported" "$GUARD_STATE/recoveries.log" "$REPORTS"
   if HEALTH_WAIT_SECONDS=0 cmd_update >"$root/redirect-output" 2>&1; then
     fail 'shadow redirect reported the new release as serving'
   fi
@@ -505,10 +504,14 @@ EOF
     fail 'guard stopped the already-serving fallback again'
   [[ "$(grep -c '^restart t3code.service$' "$root/redirect-svc")" == 1 ]] ||
     fail 'guard restarted the already-serving fallback again'
-  grep -q 'Codex shadow preflight is not-ready' "$root/redirect-report" ||
+  [[ ! -e "$OUTAGE" ]] || fail 'shadow redirect left the outage clock open'
+  [[ ! -e "$GUARD_STATE/outage-reported" ]] || fail 'shadow redirect left the outage report marker open'
+  grep -q 'Codex shadow preflight is not-ready' "$REPORTS" ||
     fail 'shadow redirect was not reported with its cause'
+  grep -q 'recovered on 1 after .* (update 1 -> 2)' "$GUARD_STATE/events.log" ||
+    fail 'shadow redirect did not record recovery on the serving fallback'
 ) || fail 'shadow redirect was mishandled by cmd_update'
-pass 'shadow redirect is host-rejected and reported without marking the release bad or restarting the fallback'
+pass 'shadow redirect closes the outage clock, is host-rejected, and keeps the fallback serving'
 
 eval "$real_manager_ready"; eval "$real_release_binary_sha"; eval "$real_write_state_for"; eval "$real_installed"
 eval "$real_is_healthy"; eval "$real_active_runs"; eval "$real_quiet_seconds"; eval "$real_record_pre_restart"

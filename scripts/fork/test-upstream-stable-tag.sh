@@ -121,9 +121,15 @@ git init -q -b integration "$release_repo"
 git -C "$release_repo" config user.name t
 git -C "$release_repo" config user.email t@t
 printf 'release tree\n' >"$release_repo/tree.txt"
-git -C "$release_repo" add tree.txt
-git -C "$release_repo" commit -q -m release
+mkdir -p "$release_repo/scripts/fork"
+printf 'older publisher\n' >"$release_repo/scripts/fork/publish-release.sh"
+git -C "$release_repo" add tree.txt scripts/fork/publish-release.sh
+git -C "$release_repo" commit -q -m previous-release
 git -C "$release_repo" remote add origin "$release_remote"
+git -C "$release_repo" tag v0.1.10-preview.20261119.1
+printf '%s\n' 'CODEX_SHADOW_COMPATIBILITY_RELEASE_NOTE_V1' >"$release_repo/scripts/fork/publish-release.sh"
+git -C "$release_repo" add scripts/fork/publish-release.sh
+git -C "$release_repo" commit -q -m add-shadow-compatibility-note
 git -C "$release_repo" push -q -u origin integration
 git -C "$release_repo" fetch -q origin
 release_commit=$(git -C "$release_repo" rev-parse HEAD)
@@ -163,9 +169,35 @@ chmod +x "$tmp/release-bin/gh"
 )
 if grep -Fq 'Upstream sync test note.' "$tmp/release-notes" &&
   grep -Fq 'Codex shadow compatibility:' "$tmp/release-notes"; then
-  echo 'ok   published notes retain caller notes and explain Codex shadow compatibility'
+  echo 'ok   first release includes the Codex shadow compatibility note'
 else
-  echo 'FAIL published notes omit the Codex shadow compatibility note'
+  echo 'FAIL first release omits the Codex shadow compatibility note'
+  fail=1
+fi
+
+git -C "$release_repo" tag v0.1.10-preview.20261119.2 "$release_commit"
+printf 'next release tree\n' >>"$release_repo/tree.txt"
+git -C "$release_repo" add tree.txt
+git -C "$release_repo" commit -q -m later-release
+git -C "$release_repo" push -q origin integration
+next_commit=$(git -C "$release_repo" rev-parse HEAD)
+next_version=0.1.10-preview.20261119.3
+next_artifacts="$tmp/release-next/artifacts"
+mkdir -p "$next_artifacts"
+printf 'build %s\n' "$next_commit" >"$tmp/release-next/build.txt"
+printf 'archive\n' >"$next_artifacts/t3-$next_version-linux-x64.tar.gz"
+(cd "$next_artifacts" && sha256sum "t3-$next_version-linux-x64.tar.gz" >SHA256SUMS)
+(
+  cd "$release_repo"
+  GH_NOTES="$tmp/next-release-notes" T3_FORK_REPO=test/fork T3_FORK_BRANCH=integration \
+    PATH="$tmp/release-bin:$PATH" bash "$here/publish-release.sh" "$next_version" \
+      "$next_artifacts" "$next_commit" 'Later upstream sync note.'
+)
+if grep -Fq 'Later upstream sync note.' "$tmp/next-release-notes" &&
+  ! grep -Fq 'Codex shadow compatibility:' "$tmp/next-release-notes"; then
+  echo 'ok   later release retires the Codex shadow compatibility note'
+else
+  echo 'FAIL later release repeated the Codex shadow compatibility note'
   fail=1
 fi
 exit $fail

@@ -1190,6 +1190,7 @@ cmd_update() {
       mkdir -p "$GUARD_STATE/rejected"
       date -Is >"$GUARD_STATE/rejected/$latest"
       log "update: $latest has a positive shadow conflict; database-compatible $selected is serving"
+      outage_end "$selected"
       notify "T3 update $latest was not selected because its Codex shadow preflight is not-ready. $selected remains serving; fix the shadow conflict and retry with t3-service-update $latest."
       report "$latest was not selected because its Codex shadow preflight is not-ready; $selected remains serving. Fix the shadow conflict, then retry with t3-service-update $latest."
       return 1
