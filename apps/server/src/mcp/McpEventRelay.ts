@@ -466,11 +466,23 @@ const make = Effect.gen(function* () {
         firstSequence: number | null;
       }>`SELECT MIN(sequence) AS "firstSequence" FROM orchestration_events
         WHERE application_event_version = 2 AND aggregate_kind = 'thread' AND stream_id = ${threadId}
-          AND event_type = 'run.updated' AND json_extract(payload_json, '$.id') = ${runId}`.pipe(
+          AND event_type IN ('run.created', 'run.updated') AND json_extract(payload_json, '$.id') = ${runId}`.pipe(
         Effect.mapError(storage),
       );
-      if (run !== undefined && start?.firstSequence == null)
-        return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+      if (run !== undefined && start?.firstSequence == null) {
+        if (Threads.isTerminalRunStatus(run.status))
+          return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+        const [oldest] = yield* sql<{ occurredAt: string }>`SELECT occurred_at AS "occurredAt"
+          FROM orchestration_events
+          WHERE aggregate_kind = 'project'
+            OR (application_event_version = 2 AND aggregate_kind = 'thread')
+          ORDER BY sequence LIMIT 1`.pipe(Effect.mapError(storage));
+        if (
+          oldest !== undefined &&
+          DateTime.isLessThan(run.requestedAt, DateTime.makeUnsafe(oldest.occurredAt))
+        )
+          return yield* new McpEventsError({ code: -32602, reason: "source_history_pruned" });
+      }
       const cursor = Math.min(
         prepared.cursor,
         start?.firstSequence == null ? prepared.cursor : Math.max(0, start.firstSequence - 1),
