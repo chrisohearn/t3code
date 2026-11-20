@@ -26,6 +26,7 @@ import {
   ProviderInstanceId,
   ProviderDriverKind,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2Run,
   RuntimeRequestId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -412,6 +413,253 @@ it.effect(
         ).toBe("access_denied");
       }),
     ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["idle", "busy"] as const)(
+  "binds an immediately notified queued send on a %s thread before its run event",
+  (state) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const threadId = ThreadId.make("queued-send-" + state);
+        const requestedAt = DateTime.makeUnsafe(2000);
+        const run: OrchestrationV2Run = {
+          id: RunId.make("queued-run-" + state),
+          threadId,
+          ordinal: state === "busy" ? 2 : 1,
+          providerInstanceId: ProviderInstanceId.make("replay"),
+          modelSelection: { instanceId: ProviderInstanceId.make("replay"), model: "fixture" },
+          providerThreadId: null,
+          userMessageId: MessageId.make("queued-message-" + state),
+          rootNodeId: null,
+          activeAttemptId: null,
+          status: "queued",
+          requestedAt,
+          startedAt: null,
+          completedAt: null,
+          checkpointId: null,
+          contextHandoffId: null,
+        };
+        const records = idleThreadProjection(liveThreadShell(threadId));
+        const preceding: OrchestrationV2Run = {
+          ...run,
+          id: RunId.make("preceding-run"),
+          ordinal: 1,
+          status: "running",
+          requestedAt: DateTime.makeUnsafe(1000),
+          startedAt: DateTime.makeUnsafe(1000),
+        };
+        f.projections.set(threadId, {
+          ...records,
+          runs: state === "busy" ? [preceding, run] : [run],
+        });
+        if (state === "busy") {
+          yield* f.store.appendAgentEvents({
+            events: [
+              {
+                id: EventId.make("preceding-run-started"),
+                threadId,
+                occurredAt: DateTime.makeUnsafe(1000),
+                type: "run.updated",
+                payload: preceding,
+              },
+            ],
+          });
+        }
+        yield* f.call(f.service.setInbox({ threadId: ThreadId.make("queued-send-inbox") }));
+        const notification = yield* f.call(
+          ThreadNotifications.prepare({}).pipe(
+            Effect.provideService(McpEvents.McpEvents, f.service),
+          ),
+        );
+        expect(
+          yield* f.call(
+            ThreadNotifications.finish(notification, threadId, run.id, "queued-send-request"),
+          ),
+        ).toMatchObject({ status: "bound" });
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        const [binding] = yield* sql<{ scan_cursor: number }>`
+          SELECT scan_cursor FROM mcp_event_relay_bindings
+        `;
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(0);
+        const [created] = yield* f.store.appendAgentEvents({
+          events: [
+            {
+              id: EventId.make("queued-run-created-" + state),
+              threadId,
+              occurredAt: requestedAt,
+              type: "run.created",
+              payload: run,
+            },
+            {
+              id: EventId.make("queued-run-started-" + state),
+              threadId,
+              occurredAt: DateTime.makeUnsafe(3000),
+              type: "run.updated",
+              payload: { ...run, status: "running", startedAt: DateTime.makeUnsafe(3000) },
+            },
+            {
+              id: EventId.make("queued-run-completed-" + state),
+              threadId,
+              occurredAt: DateTime.makeUnsafe(4000),
+              type: "run.updated",
+              payload: {
+                ...run,
+                status: "completed",
+                startedAt: DateTime.makeUnsafe(3000),
+                completedAt: DateTime.makeUnsafe(4000),
+              },
+            },
+          ],
+        });
+        expect(binding?.scan_cursor).toBe(created!.sequence - 1);
+        const lifecycle = yield* sql<{ sequence: number; event_type: string }>`
+          SELECT sequence, event_type FROM orchestration_events ORDER BY sequence
+        `;
+        expect(
+          lifecycle
+            .filter((event) => event.sequence > binding!.scan_cursor)
+            .map((event) => event.event_type),
+        ).toEqual(["run.created", "run.updated", "run.updated"]);
+        expect(
+          yield* f.call(
+            ThreadNotifications.finish(notification, threadId, run.id, "queued-send-request"),
+          ),
+        ).toMatchObject({ status: "bound" });
+        expect(yield* sql`SELECT id FROM mcp_event_relay_bindings`).toHaveLength(1);
+        yield* f.service.drain();
+        expect(f.inboxSends).toHaveLength(1);
+        expect(f.inboxSends[0]?.text).toContain('"runId":"' + run.id + '"');
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["empty", "newer", "same", "pruned"] as const)(
+  "distinguishes missing run events from evidence of pruned history (%s)",
+  (history) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const threadId = ThreadId.make("missing-run-history");
+        const runId = RunId.make("missing-run");
+        const [stored] = yield* f.outcome(threadId, runId);
+        const sourceEvent = stored!.event;
+        if (sourceEvent.type !== "run.updated") return yield* Effect.die("expected run update");
+        const requestedAt = DateTime.makeUnsafe(
+          history === "newer" ? 2000 : history === "same" ? 1234 : 1,
+        );
+        f.projections.set(threadId, {
+          ...idleThreadProjection(liveThreadShell(threadId)),
+          runs: [
+            {
+              ...sourceEvent.payload,
+              status: "queued",
+              requestedAt,
+              startedAt: null,
+              completedAt: null,
+            },
+          ],
+        });
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`DELETE FROM orchestration_events`;
+        if (history !== "empty") yield* f.append([ThreadId.make("retained-history")]);
+        yield* f.call(f.service.setInbox({ threadId: ThreadId.make("history-inbox") }));
+        const notification = yield* f.call(
+          ThreadNotifications.prepare({}).pipe(
+            Effect.provideService(McpEvents.McpEvents, f.service),
+          ),
+        );
+        expect(
+          yield* f.call(ThreadNotifications.finish(notification, threadId, runId)),
+        ).toMatchObject(
+          history === "pruned"
+            ? { status: "failed", reason: "source_history_pruned" }
+            : { status: "bound" },
+        );
+        expect(yield* sql`SELECT id FROM mcp_event_relay_bindings`).toHaveLength(
+          history === "pruned" ? 0 : 1,
+        );
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["completed", "failed", "cancelled", "interrupted", "rolled_back"] as const)(
+  "keeps a terminal run with genuinely pruned source history failed (%s)",
+  (status) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.grantWrite(f.principal);
+        const threadId = ThreadId.make("terminal-missing-history");
+        const runId = RunId.make("terminal-missing-run");
+        const [stored] = yield* f.outcome(threadId, runId);
+        const sourceEvent = stored!.event;
+        if (sourceEvent.type !== "run.updated") return yield* Effect.die("expected run update");
+        f.projections.set(threadId, {
+          ...idleThreadProjection(liveThreadShell(threadId)),
+          runs: [
+            {
+              ...sourceEvent.payload,
+              status,
+              requestedAt: DateTime.makeUnsafe(2000),
+              startedAt: DateTime.makeUnsafe(2000),
+              completedAt: DateTime.makeUnsafe(2001),
+            },
+          ],
+        });
+        const sql = Context.get(f.context, SqlClient.SqlClient);
+        yield* sql`DELETE FROM orchestration_events`;
+        yield* f.append([ThreadId.make("retained-terminal-history")]);
+        yield* f.call(f.service.setInbox({ threadId: ThreadId.make("terminal-history-inbox") }));
+        const notification = yield* f.call(
+          ThreadNotifications.prepare({}).pipe(
+            Effect.provideService(McpEvents.McpEvents, f.service),
+          ),
+        );
+        expect(
+          yield* f.call(ThreadNotifications.finish(notification, threadId, runId)),
+        ).toMatchObject({ status: "failed", reason: "source_history_pruned" });
+        expect(yield* sql`SELECT id FROM mcp_event_relay_bindings`).toEqual([]);
+      }),
+    ).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("rechecks relay authorization before binding a prepared notification", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.grantWrite(f.principal);
+      const threadId = ThreadId.make("revoked-send-source");
+      const runId = RunId.make("revoked-send-run");
+      const [stored] = yield* f.outcome(threadId, runId);
+      const sourceEvent = stored!.event;
+      if (sourceEvent.type !== "run.updated") return yield* Effect.die("expected run update");
+      f.projections.set(threadId, {
+        ...idleThreadProjection(liveThreadShell(threadId)),
+        runs: [
+          {
+            ...sourceEvent.payload,
+            status: "queued",
+            startedAt: null,
+            completedAt: null,
+          },
+        ],
+      });
+      yield* f.call(f.service.setInbox({ threadId: ThreadId.make("revoked-send-inbox") }));
+      const notification = yield* f.call(
+        ThreadNotifications.prepare({}).pipe(Effect.provideService(McpEvents.McpEvents, f.service)),
+      );
+      yield* f.sessions.revoke({ sessionId: f.principal, revokedAt: DateTime.makeUnsafe(2000) });
+      expect(
+        yield* f.call(ThreadNotifications.finish(notification, threadId, runId)),
+      ).toMatchObject({ status: "failed", reason: "access_denied" });
+      const sql = Context.get(f.context, SqlClient.SqlClient);
+      expect(yield* sql`SELECT id FROM mcp_event_relay_bindings`).toEqual([]);
+    }),
+  ).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
 it.effect("relays a failover run's result, not a blocker for the run that failed over to it", () =>
