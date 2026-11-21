@@ -369,7 +369,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       // An omitted startFromOrigin follows the new-worktree setting, as the composer and
       // t3_worktree_handoff do. Otherwise a stale local branch silently becomes the base.
       const requestedStrategy =
-        input.workspaceStrategy === undefined &&
+        workspaceStrategy === undefined &&
         caller === undefined &&
         project !== undefined &&
         projectSettings !== undefined &&

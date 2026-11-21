@@ -1,6 +1,7 @@
 import * as NetAddress from "effect/net/NetAddress";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, it } from "@effect/vitest";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
@@ -5614,7 +5615,9 @@ it.effect.each(["missing", "file"] as const)(
   (workspaceState) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
-      const root = yield* fileSystem.makeTempDirectoryScoped();
+      const root = yield* fileSystem.makeTempDirectoryScoped({
+        directory: HostProcess.Platform.defaultValue() === "linux" ? "/dev/shm" : "/tmp",
+      });
       const cwd = `${root}/workspace`;
       if (workspaceState === "file") yield* fileSystem.writeFileString(cwd, "not a directory");
       const state = yield* Ref.make(emptyState);
@@ -5648,7 +5651,7 @@ it.effect.each(["missing", "file"] as const)(
         assert.instanceOf(error, ProviderWorkspaceMissingError);
         assert.include(error.message, cwd);
         assert.include(error.message, "Restore the folder at this path before retrying.");
-        // The fixture lives in the system temp folder, which a reboot clears.
+        // This fixture lives under a system-cleared temporary directory.
         assert.include(error.message, "under a temporary folder");
         assert.equal((yield* Ref.get(state)).openCount, 0);
         assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));

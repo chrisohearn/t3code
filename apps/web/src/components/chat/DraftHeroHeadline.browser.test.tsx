@@ -27,11 +27,13 @@ import { render } from "../../../test/render";
 vi.mock(
   "../../../../../packages/client-runtime/src/connection/driver.ts",
   async (importOriginal) => {
-    const [actual, { fakeDriver }, Layer] = await Promise.all([
+    const [actual, { fakeDriver, installFakeEnvironment }, Layer] = await Promise.all([
       importOriginal<{ readonly ConnectionDriver: Context.Key<unknown, FakeDriver> }>(),
       import("../../../test/fakeEnvironment"),
       import("effect/Layer"),
     ]);
+    // Discovery can start before the test body installs its project fixtures.
+    installFakeEnvironment([]);
     return { ...actual, layer: Layer.succeed(actual.ConnectionDriver, fakeDriver) };
   },
 );

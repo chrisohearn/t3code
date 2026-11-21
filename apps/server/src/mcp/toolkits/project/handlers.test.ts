@@ -436,6 +436,40 @@ it.effect("a launch applies its preset, explicit fields win, and the role is sto
   }),
 );
 
+it.effect("a preset workspace strategy wins over the project worktree default", () =>
+  Effect.gen(function* () {
+    for (const workspaceStrategy of [
+      { type: "root" as const },
+      { type: "worktree" as const, baseRef: "origin/stable" },
+    ]) {
+      const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+      const harness = clientLaunchHarness({
+        runtimeModeCeiling: "full-access",
+        launched,
+        defaultThreadEnvMode: "worktree",
+        presets: { worker: { workspaceStrategy } },
+      });
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+            Layer.provide(harness.dependencies),
+          ),
+        ),
+      );
+      yield* toolkit
+        .handle("t3_thread_launch", {
+          title: "Work",
+          projectId: harness.projectId,
+          preset: "worker",
+          message: "Go",
+        })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(harness.dependencies));
+
+      expect(launched.at(-1)?.workspaceStrategy).toMatchObject(workspaceStrategy);
+    }
+  }),
+);
+
 it.effect("a failed launch keeps the role of a thread that exists and drops the rest", () =>
   Effect.gen(function* () {
     const launchFailing = Effect.fn("test.launchFailing")(function* (
