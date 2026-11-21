@@ -62,6 +62,7 @@ export class McpOAuthSessions extends Context.Service<
           readonly label: string;
           readonly access: AuthMcpClientAccess;
           readonly peerLink: boolean;
+          readonly expiresAt: DateTime.Utc;
         }
       | undefined,
       McpOAuthSessionStorageError
@@ -276,12 +277,21 @@ export const layer = Layer.effect(
               DateTime.makeUnsafe(row.expiresAt).epochMilliseconds <= now.epochMilliseconds
             )
               return undefined;
+            if (row.peerLink === 1) {
+              const renewedAccessExpiry = DateTime.add(now, { milliseconds: IDLE_MS });
+              // Peer links keep the bearer they received at pairing instead of a refresh token.
+              // Slide that access-token deadline with use, alongside the owning session's.
+              yield* sql`UPDATE mcp_oauth_tokens SET expires_at = ${renewedAccessExpiry.epochMilliseconds}
+              WHERE token_hash = ${tokenHash} AND kind = 'access'
+                AND expires_at < ${renewedAccessExpiry.epochMilliseconds}`;
+            }
             yield* touch(row.sessionId, now);
             return {
               sessionId: row.sessionId,
               label: row.label,
               access: row.access,
               peerLink: row.peerLink === 1,
+              expiresAt: DateTime.makeUnsafe(row.expiresAt),
             };
           }),
         );

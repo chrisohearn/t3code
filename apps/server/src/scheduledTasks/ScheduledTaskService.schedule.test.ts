@@ -199,6 +199,9 @@ it.effect("keeps one queued occurrence of a recurring task while its bound threa
       readonly messages: ReadonlyArray<OrchestrationV2ConversationMessage>;
     }>({ runs: [activeRun], messages: [] });
     const runDueWork = yield* Ref.make<Effect.Effect<void>>(Effect.void);
+    const sql = yield* SqlClient.SqlClient;
+    const outcomeDuringLookup = yield* Ref.make(false);
+    let nextRunAtAfterConcurrentCompletion: string | null = null;
     const layerDependencies = Layer.mergeAll(
       NodeCrypto.layer,
       ManagedPolicy.layerTest(),
@@ -245,7 +248,22 @@ it.effect("keeps one queued occurrence of a recurring task while its bound threa
               { runs: [...current.runs, run], messages: [...current.messages, message] },
             ];
           }),
-        getThreadRecords: () => Ref.get(thread).pipe(Effect.map((records) => records as never)),
+        getThreadRecords: (_id, fields) =>
+          Effect.gen(function* () {
+            if (
+              fields.some((field) => field === "messages") &&
+              (yield* Ref.get(outcomeDuringLookup))
+            ) {
+              yield* Ref.set(outcomeDuringLookup, false);
+              if (nextRunAtAfterConcurrentCompletion === null) {
+                throw new Error("The concurrent run did not have a next scheduled occurrence.");
+              }
+              yield* sql`UPDATE scheduled_tasks SET next_run_at = ${nextRunAtAfterConcurrentCompletion},
+                last_run_status = 'failed', last_run_error = 'Provider failed'
+                WHERE task_id = 'scheduled-task:busy-thread'`;
+            }
+            return (yield* Ref.get(thread)) as never;
+          }).pipe(Effect.orDie),
         getThreadShell: () =>
           Effect.succeed({
             projectId: "project-busy-thread",
@@ -296,6 +314,37 @@ it.effect("keeps one queued occurrence of a recurring task while its bound threa
         Date.parse("2026-07-01T09:03:03.000Z"),
       );
 
+      yield* Ref.update(thread, (current) => ({
+        ...current,
+        runs: current.runs.map((run) =>
+          run.status === "queued" ? { ...run, queueHeld: true } : run,
+        ),
+      }));
+      yield* TestClock.adjust("61 seconds");
+      yield* Effect.flatten(Ref.get(runDueWork));
+      const [blocked] = (yield* service.list()).tasks;
+      expect(blocked?.lastRunStatus).toBe("failed");
+      expect(blocked?.lastRunError).toBe(
+        "A previous occurrence is held in the thread queue. Resume or remove it to run this task again.",
+      );
+      expect(yield* queuedOccurrences).toBe(1);
+
+      // The prior run can finish while the poll is looking up its held occurrence.
+      yield* sql`UPDATE scheduled_tasks SET last_run_status = 'succeeded', last_run_error = NULL
+        WHERE task_id = ${task.id}`;
+      nextRunAtAfterConcurrentCompletion = DateTime.formatIso(
+        DateTime.makeUnsafe(Date.parse(blocked?.nextRunAt ?? "") + 61_000),
+      );
+      yield* Ref.set(outcomeDuringLookup, true);
+      yield* TestClock.adjust("61 seconds");
+      yield* Effect.flatten(Ref.get(runDueWork));
+      const [raced] = (yield* service.list()).tasks;
+      expect(raced?.lastRunStatus).toBe("failed");
+      expect(raced?.lastRunError).toBe("Provider failed");
+      expect(Date.parse(raced?.nextRunAt ?? "")).toBeGreaterThan(
+        Date.parse(blocked?.nextRunAt ?? ""),
+      );
+
       // Run now is an explicit request, so it still queues behind the held one.
       yield* service.runNow({ id: task.id });
       expect(yield* queuedOccurrences).toBe(2);
@@ -310,6 +359,9 @@ it.effect("keeps one queued occurrence of a recurring task while its bound threa
       yield* TestClock.adjust("61 seconds");
       yield* Effect.flatten(Ref.get(runDueWork));
       expect(yield* queuedOccurrences).toBe(1);
+      const [resumed] = (yield* service.list()).tasks;
+      expect(resumed?.lastRunStatus).toBe("failed");
+      expect(resumed?.lastRunError).toBe("Provider failed");
 
       // A one-time task's only scheduled occurrence still sends behind a queued Run now.
       const { task: once } = yield* service.upsert(
@@ -318,7 +370,7 @@ it.effect("keeps one queued occurrence of a recurring task while its bound threa
           title: "Check once",
           prompt: "Check once",
           enabled: true,
-          schedule: { type: "once", runAt: "2026-07-01T09:05:00.000Z" },
+          schedule: { type: "once", runAt: "2026-07-01T09:07:00.000Z" },
           projectId: "project-busy-thread",
           threadId: "thread:busy",
           workspaceStrategy: { type: "root" },

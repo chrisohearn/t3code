@@ -122,7 +122,7 @@ function compactText(text: string, maxLength = 240): string {
 }
 
 /** A fresh-session schedule run starts a side conversation; the thread's own one continues past it. */
-export function isScheduledFreshRun(
+function isScheduledFreshRun(
   run: Pick<OrchestrationV2Run, "freshContext" | "userMessageId">,
   turnItems: OrchestrationV2ThreadProjection["turnItems"],
 ): boolean {
@@ -139,7 +139,7 @@ export function isScheduledFreshRun(
 }
 
 /** Ordinal of the latest started fresh-context run. Runs before it never reach a provider again. */
-export function contextBoundaryOrdinal(
+function contextBoundaryOrdinal(
   runs: ReadonlyArray<OrchestrationV2Run>,
   turnItems: OrchestrationV2ThreadProjection["turnItems"],
 ): number {

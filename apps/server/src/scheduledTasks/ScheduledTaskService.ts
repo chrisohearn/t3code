@@ -1,7 +1,7 @@
 import {
   CommandId,
   MessageId,
-  type OrchestrationV2Run,
+  type OrchestrationV2ConversationMessage,
   type RunId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   type ProjectId,
@@ -330,13 +330,19 @@ function iso(value: DateTime.DateTime): string {
 }
 
 const RUN_OUTCOME_WAIT_MS = 24 * 60 * 60 * 1_000;
+const HELD_OCCURRENCE_ERROR =
+  "A previous occurrence is held in the thread queue. Resume or remove it to run this task again.";
 const UNSUCCESSFUL_RUN_ERRORS = {
   failed: "The run failed.",
   interrupted: "The run was stopped.",
   cancelled: "The run was cancelled.",
   rolled_back: "The run was rolled back.",
 } as const;
-type RunOutcome = { readonly status: "succeeded" | "failed"; readonly error: string | null };
+type RunOutcome = {
+  readonly status: "succeeded" | "failed";
+  readonly error: string | null;
+  readonly completedAt?: string;
+};
 const THREAD_DELETED_OUTCOME: RunOutcome = {
   status: "failed",
   error: "The run's thread was deleted before the run finished.",
@@ -905,20 +911,28 @@ export const layer = Layer.effect(
 
     // Reads every run row but only the queued runs' messages, so the cost per
     // due interval tracks the thread's run count, not its transcript.
-    const hasQueuedOccurrence = Effect.fn("ScheduledTaskService.hasQueuedOccurrence")(function* (
+    const queuedOccurrence = Effect.fn("ScheduledTaskService.queuedOccurrence")(function* (
       taskId: ScheduledTaskId,
       threadId: ThreadId,
     ) {
       const { runs } = yield* threadManagement.getThreadRecords(threadId, ["runs"]);
       const queued = runs.filter((run) => run.status === "queued");
-      if (queued.length === 0) return false;
+      if (queued.length === 0) return null;
       const queuedMessageIds = new Set(queued.map((run) => run.userMessageId));
       const { messages } = yield* threadManagement.getThreadRecords(threadId, ["messages"], {
         messageIds: [...queuedMessageIds],
       });
-      return messages.some(
-        (message) => queuedMessageIds.has(message.id) && message.scheduledTaskId === taskId,
+      const taskMessageIds = new Set(
+        messages
+          .filter((message) => message.scheduledTaskId === taskId)
+          .map((message) => message.id),
       );
+      const occurrences = queued.filter((run) => taskMessageIds.has(run.userMessageId));
+      return occurrences.some((run) => run.queueHeld === true)
+        ? "held"
+        : occurrences.length > 0
+          ? "queued"
+          : null;
     });
 
     // The run already started the thread, so a failed write only costs the binding.
@@ -957,18 +971,33 @@ export const layer = Layer.effect(
         return [true, next] as const;
       });
 
-    // Only while the run is still the pending one, so a missed-run failure recorded meanwhile stands.
+    // Only while this run remains current, so a later dispatch or missed-run failure wins.
     const recordRunOutcome = Effect.fn("ScheduledTaskService.recordRunOutcome")(function* (
       taskId: ScheduledTaskId,
       startedAtIso: string,
       outcome: RunOutcome,
     ) {
       if ((yield* Ref.get(pendingRuns)).get(taskId) !== startedAtIso) return;
-      yield* sql`
+      const updated = yield* sql`
         UPDATE scheduled_tasks
         SET last_run_status = ${outcome.status}, last_run_error = ${outcome.error}
         WHERE task_id = ${taskId} AND last_run_at = ${startedAtIso}
           AND last_run_status <> 'running'
+        RETURNING task_id
+      `;
+      if (
+        updated.length === 0 ||
+        outcome.status !== "succeeded" ||
+        outcome.completedAt === undefined
+      )
+        return;
+      yield* sql`
+        DELETE FROM scheduled_tasks
+        WHERE task_id = ${taskId} AND last_run_at = ${startedAtIso}
+          AND last_run_status = 'succeeded' AND last_run_error IS NULL AND next_run_at IS NULL
+          AND json_extract(schedule_json, '$.type') = 'once'
+          AND julianday(${outcome.completedAt}) >= julianday(json_extract(schedule_json, '$.runAt'))
+        RETURNING task_id
       `;
     });
 
@@ -978,30 +1007,54 @@ export const layer = Layer.effect(
         const shell = yield* threadManagement.getThreadShell(threadId);
         if (shell === null || shell.deletedAt != null) return THREAD_DELETED_OUTCOME;
         const thread = { projectId: shell.projectId, threadId };
-        const { runs, messages } = yield* threadManagement.getProjectThreadRecords(thread, [
-          "runs",
-          "messages",
-        ]);
-        let runId: RunId | null =
-          runs.find((run) => run.userMessageId === messageId)?.id ??
-          messages.find((message) => message.id === messageId)?.runId ??
-          null;
+        const { runs } = yield* threadManagement.getProjectThreadRecords(thread, ["runs"]);
+        let runId: RunId | null = runs.find((run) => run.userMessageId === messageId)?.id ?? null;
+        if (runId === null) {
+          const { messages } = yield* threadManagement.getProjectThreadRecords(
+            thread,
+            ["messages"],
+            {
+              messageIds: [messageId],
+            },
+          );
+          runId = messages.find((message) => message.id === messageId)?.runId ?? null;
+        }
         if (runId === null) return { status: "failed", error: "The run never started." } as const;
         // A queued message promoted to a steer cancels its run and joins the active one.
         for (let hops = 0; hops < 3; hops++) {
-          const { run }: { readonly run: OrchestrationV2Run | null } =
-            yield* threadManagement.waitForThread({
-              ...thread,
-              runId,
-              timeoutMs: RUN_OUTCOME_WAIT_MS,
-            });
+          const waitingRunId: RunId | null = runId;
+          if (waitingRunId === null)
+            return { status: "failed", error: "The run was not found." } as const;
+          const waitInput: ThreadManagementService.ThreadManagementWaitInput = {
+            ...thread,
+            runId: waitingRunId,
+            timeoutMs: RUN_OUTCOME_WAIT_MS,
+          };
+          const waited: ThreadManagementService.ThreadManagementWaitResult =
+            yield* threadManagement.waitForThread(waitInput);
+          const run = waited.run;
           if (run === null || !ThreadManagementService.isTerminalRunStatus(run.status)) return null;
-          if (run.status === "completed") return { status: "succeeded", error: null } as const;
-          const { turnItems, messages: current } = yield* threadManagement.getProjectThreadRecords(
+          if (run.status === "completed")
+            return {
+              status: "succeeded",
+              error: null,
+              ...(run.completedAt === null
+                ? {}
+                : { completedAt: DateTime.formatIso(run.completedAt) }),
+            } as const;
+          const { turnItems, messages } = yield* threadManagement.getProjectThreadRecords(
             thread,
             ["turnItems", "messages"],
+            {
+              messageIds: [messageId],
+              turnItemRunId: run.id,
+              turnItemTypes: ["error"],
+              turnItemStatuses: ["failed"],
+            },
           );
-          const joined = current.find((message) => message.id === messageId)?.runId ?? null;
+          const current: ReadonlyArray<OrchestrationV2ConversationMessage> = messages;
+          const joined: RunId | null =
+            current.find((message) => message.id === messageId)?.runId ?? null;
           // waitForThread answers with a restart's continuation, so compare against both ids.
           if (
             run.status !== "cancelled" ||
@@ -1072,13 +1125,17 @@ export const layer = Layer.effect(
         LIMIT 1
       `.pipe(NodeSqliteClient.readOnly);
       if (found === undefined) return;
-      // A failure's error text needs the run's turn items, so only a clean success is skipped.
       if (
         found.run_status === "completed" &&
         row.last_run_status === "succeeded" &&
         row.last_run_error === null
-      )
-        return;
+      ) {
+        const [scheduled] = yield* sql<{ readonly schedule_type: string | null }>`
+          SELECT json_extract(schedule_json, '$.type') AS schedule_type
+          FROM scheduled_tasks WHERE task_id = ${row.task_id} AND last_run_at = ${row.last_run_at}
+        `.pipe(NodeSqliteClient.readOnly);
+        if (scheduled?.schedule_type !== "once") return;
+      }
       const taskId = ScheduledTaskId.make(row.task_id);
       yield* setPendingRun(taskId, row.last_run_at);
       yield* followRunOutcome(
@@ -1164,13 +1221,21 @@ export const layer = Layer.effect(
         if (
           trigger === "scheduled" &&
           active.schedule.type !== "once" &&
-          active.threadId !== null &&
-          (yield* hasQueuedOccurrence(active.id, ThreadId.make(active.threadId)).pipe(
-            Effect.orElseSucceed(() => false),
-          ))
+          active.threadId !== null
         ) {
-          yield* rescheduleMissedRun(active, startedAt, "previous occurrence still queued");
-          return { task: active, threadId: null, dispatchFailed: false };
+          const occurrence = yield* queuedOccurrence(
+            active.id,
+            ThreadId.make(active.threadId),
+          ).pipe(Effect.orElseSucceed(() => null));
+          if (occurrence !== null) {
+            yield* rescheduleMissedRun(
+              active,
+              startedAt,
+              "previous occurrence still queued",
+              occurrence === "held" ? HELD_OCCURRENCE_ERROR : undefined,
+            );
+            return { task: active, threadId: null, dispatchFailed: false };
+          }
         }
         // Reject queued deliveries after pause, same-id recreation or trigger changes.
         if (webhook !== undefined) {
@@ -1434,14 +1499,14 @@ export const layer = Layer.effect(
             ${
               runError === undefined
                 ? sql``
-                : // A new last_run_at makes the miss the latest run, so no earlier run's follower,
-                  // now or after a restart, can record its outcome over it.
-                  sql`, last_run_status = 'failed', last_run_error = ${runError},
+                : sql`, last_run_status = 'failed', last_run_error = ${runError},
                     last_run_at = ${iso(now)}, last_run_webhook_delivery_id = NULL`
             }
         WHERE task_id = ${task.id}
           AND next_run_at IS ${task.nextRunAt}
           AND last_run_at IS ${task.lastRunAt}
+          AND last_run_status IS ${task.lastRunStatus}
+          AND last_run_error IS ${task.lastRunError}
         RETURNING task_id
       `.pipe(
         Effect.mapError((cause) =>

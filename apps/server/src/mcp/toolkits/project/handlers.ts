@@ -1,6 +1,9 @@
 import * as ThreadLaunchMcp from "../../ThreadLaunchMcpService.ts";
-import { OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
-
+import {
+  OrchestratorMcpFailure,
+  ProjectId,
+  type Project as ProjectRecord,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
 import * as Option from "effect/Option";
@@ -8,10 +11,11 @@ import * as Option from "effect/Option";
 import * as Project from "../../../project/ProjectService.ts";
 import * as ProjectCloneTracker from "../../../project/ProjectCloneTracker.ts";
 import { mutateProjectWithClone } from "../../../project/ProjectMutation.ts";
+import { temporaryFolderWarning } from "../../../project/temporaryFolder.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as Repositories from "../../../sourceControl/SourceControlRepositoryService.ts";
-
-import { temporaryFolderWarning } from "../../../project/temporaryFolder.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
+import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { newCommandId, readCaller, unavailable } from "../../threadAccess.ts";
 import { ProjectToolkit } from "./tools.ts";
@@ -33,6 +37,25 @@ const access = Effect.gen(function* () {
   yield* readCaller();
   return yield* Project.ProjectService;
 });
+
+/** Settings, not the project record, hold the project default model that new threads use. */
+const withSavedDefaultModel = Effect.gen(function* () {
+  const settings = yield* ServerSettings.ServerSettingsService.pipe(
+    Effect.flatMap((service) => service.getSettings),
+    Effect.mapError(unavailable),
+  );
+  return (project: ProjectRecord) => {
+    const resolved = resolveProjectSettings(settings, project.id, project);
+    return {
+      ...project,
+      defaultModelSelection:
+        resolved.sources.defaultModelSelection === "project"
+          ? resolved.settings.defaultModelSelection
+          : null,
+    };
+  };
+});
+
 export const layer = McpToolAccess.toLayer(ProjectToolkit, {
   t3_thread_launch: McpToolAccess.startsThreads(
     (input) => input,
@@ -48,9 +71,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
     Effect.gen(function* () {
       const projects = yield* access;
       // Identities are resolved: linked environments find this side's project by repository.
-      return yield* projects
+      const page = yield* projects
         .listPage({ cursor: input.cursor ?? 0, limit: input.limit ?? 20 })
         .pipe(Effect.mapError(unavailable));
+      return { ...page, projects: page.projects.map(yield* withSavedDefaultModel) };
     }),
   ),
   t3_project_read: McpToolAccess.reads((input) =>
@@ -62,7 +86,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           code: "invalid_request",
           message: "The project was not found.",
         });
-      return result.value;
+      return (yield* withSavedDefaultModel)(result.value);
     }),
   ),
   t3_project_create: McpToolAccess.writesEnvironment(
@@ -104,6 +128,12 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             ...(created.commitError === undefined ? {} : { commitError: created.commitError }),
           };
         }
+        if (input.defaultModelSelection !== undefined && input.defaultModelSelection !== null)
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message:
+              "Creating a project does not set its default model; set defaultModelSelection afterwards with t3_project_update.",
+          });
         const commandId = yield* newCommandId();
         const created = yield* projects
           .create({ ...input, workspaceRoot, commandId, projectId: ProjectId.make(commandId) })
@@ -118,9 +148,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
   t3_project_update: McpToolAccess.writesEnvironment((input) =>
     Effect.gen(function* () {
       const projects = yield* Project.ProjectService;
-      return yield* projects
+      const updated = yield* projects
         .update({ ...input, commandId: yield* newCommandId() })
         .pipe(Effect.mapError(projectFailure));
+      return (yield* withSavedDefaultModel)(updated);
     }),
   ),
   t3_project_delete: McpToolAccess.writesEnvironment((input) =>

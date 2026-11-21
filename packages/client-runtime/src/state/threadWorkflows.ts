@@ -6,6 +6,8 @@ import {
   type ThreadFreeze,
 } from "@t3tools/contracts";
 import { copySorted } from "@t3tools/shared/Array";
+import { mFallback, msg } from "gt-i18n";
+import type { MFunctionType } from "gt-i18n/types";
 
 import type { ThreadStructure } from "./models.ts";
 
@@ -33,10 +35,17 @@ export interface QueuedThreadRun {
 }
 
 /** One line for the frozen indicator, shared by web and mobile. */
-export function describeThreadFreeze(freeze: ThreadFreeze): string {
-  return `Frozen by ${freeze.by.label}${
-    freeze.by.sessionId === undefined ? "" : ` (${freeze.by.sessionId})`
-  }: ${freeze.reason}`;
+export function describeThreadFreeze(
+  freeze: ThreadFreeze,
+  resolve: MFunctionType = mFallback,
+): string {
+  return resolve(
+    msg("Frozen by {label}{session}: {reason}", {
+      label: freeze.by.label,
+      session: freeze.by.sessionId === undefined ? "" : ` (${freeze.by.sessionId})`,
+      reason: freeze.reason,
+    }),
+  );
 }
 
 export interface ThreadQueueWorkflowState {
@@ -133,6 +142,8 @@ export function threadSupportsProviderHandoff(projection: Projection | null | un
 export function getUserQueuedThreadRuns(
   projection: Pick<Projection, "runs" | "messages">,
 ): ReadonlyArray<Run> {
+  if (!projection.runs.some((run) => run.status === "queued")) return [];
+
   const automaticCompletionMessageIds = new Set(
     projection.messages
       .filter(
@@ -146,7 +157,10 @@ export function getUserQueuedThreadRuns(
   );
 }
 
-export function deriveThreadQueueWorkflowState(projection: Projection): ThreadQueueWorkflowState {
+export function deriveThreadQueueWorkflowState(
+  projection: Projection,
+  resolve: MFunctionType = mFallback,
+): ThreadQueueWorkflowState {
   const activeRun = resolveActiveThreadRun(projection);
   const session = resolveThreadProviderSession(projection);
   const capabilities = session?.capabilities.turns;
@@ -171,7 +185,7 @@ export function deriveThreadQueueWorkflowState(projection: Projection): ThreadQu
     return {
       run,
       // A queued guest message shows the guest's words; the agent still gets the attributed text.
-      text: message?.context?.guest?.text ?? message?.text ?? "Queued message",
+      text: message?.context?.guest?.text ?? message?.text ?? resolve(msg("Queued message")),
       attachments: message?.attachments ?? [],
       messageId: run.userMessageId,
       ...(message?.context ? { context: message.context } : {}),

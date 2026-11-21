@@ -73,6 +73,28 @@ set +e; out=$(bash "$tmp/copy/block.sh" 2>&1); rc=$?; set -e
 check "neither source: exit 2" "$rc" 2
 check "neither source: logs why" "${out:0:29}" "cannot load upstream-stable-t"
 
+# Conflict handling must update the issue with this exact title, not an unrelated
+# issue that happens to share the upstream-sync label.
+issue_block=$(sed -n '/matching-issue begin/,/matching-issue end/p' "$here/upstream-sync.sh")
+[[ -n "$issue_block" ]] || { echo "FAIL matching-issue block not found"; exit 1; }
+cat >"$tmp/issues.json" <<'JSON'
+[
+  {"number":149,"title":"Upstream sync conflict: v0.1.10"},
+  {"number":150,"title":"Upstream sync conflict: v0.1.11"}
+]
+JSON
+find_issue() {
+  ( FORK=chrisohearn/t3code GH_ISSUES=$1
+    gh() { cat "$GH_ISSUES"; }
+    eval "$issue_block"
+    find_open_conflict_issue "Upstream sync conflict: v0.1.11" )
+}
+check "conflict issue lookup matches the exact title" "$(find_issue "$tmp/issues.json")" 150
+cat >"$tmp/issues.json" <<'JSON'
+[{"number":149,"title":"Upstream sync conflict: v0.1.10"}]
+JSON
+check "conflict issue lookup ignores unrelated labeled issues" "$(find_issue "$tmp/issues.json")" ""
+
 # Release-only runs never attempt an upstream merge, whatever upstream_sha holds (empty, older, contained).
 mblock=$(sed -n '/^# merge-step begin/,/^# merge-step end/p' "$here/upstream-sync.sh")
 [[ -n "$mblock" ]] || { echo "FAIL merge-step block not found"; exit 1; }
