@@ -1,6 +1,20 @@
 import { OrchestratorMcpFailure, type ServerProvider } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+/** A folder's own provider config can add models that only its workspace snapshot lists. */
+export const withWorkspaceModels = (
+  providers: ReadonlyArray<ServerProvider>,
+  cwd: string | undefined,
+): ReadonlyArray<ServerProvider> =>
+  cwd === undefined
+    ? providers
+    : providers.map((provider) => {
+        const models = provider.workspaceSnapshots?.find(
+          (snapshot) => snapshot.cwd === cwd,
+        )?.models;
+        return models === undefined ? provider : { ...provider, models };
+      });
+
 export const advertisedModel = (provider: ServerProvider, model: string) =>
   provider.models.find((candidate) => candidate.slug === model) ??
   provider.models.find((candidate) =>

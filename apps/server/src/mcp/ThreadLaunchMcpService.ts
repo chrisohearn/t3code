@@ -27,10 +27,14 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as DateTime from "effect/DateTime";
 import { resolveNewThreadModelSelection } from "@t3tools/shared/usageLimits";
-import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import {
+  resolveProjectFileBackedSetting,
+  resolveProjectSettings,
+} from "@t3tools/shared/projectSettings";
+import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import { resolveRuntimeMode } from "./delegatedTaskModes.ts";
-import { requireAdvertisedModel } from "./providerModels.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import { requireAdvertisedModel, withWorkspaceModels } from "./providerModels.ts";
 
 import { newCommandId, readCaller, resolveProjectId, unavailable } from "./threadAccess.ts";
 
@@ -49,11 +53,13 @@ import {
   ProviderInteractionMode,
   OrchestrationV2ThreadLaunchWorkspaceStrategy,
   OrchestrationV2DelegatedFrom,
+  T3_PROJECT_FILE_NAME,
   LaunchPresetName,
   StandingRole,
   composeStandingRole,
   RunId,
   OrchestrationV2RunStatus,
+  type ServerProvider,
   type OrchestrationV2LinkOrigin,
 } from "@t3tools/contracts";
 
@@ -105,12 +111,15 @@ export const launchResult = Schema.Struct({
 function worktreeCheckHint(
   error:
     | ThreadLaunch.ThreadLaunchBaseRefError
+    | ThreadLaunch.ThreadLaunchBranchExistsError
     | ThreadLaunch.ThreadLaunchBranchConflictError
     | ThreadLaunch.ThreadLaunchNotRepositoryError,
   strategy: { readonly startFromOrigin?: boolean | undefined },
 ) {
   if (error._tag === "ThreadLaunchNotRepositoryError")
     return `Use workspaceStrategy: {type: "root"}, or pass the projectId of a Git repository.`;
+  if (error._tag === "ThreadLaunchBranchExistsError")
+    return "Pass a branch name that does not exist yet, or omit branch to get a generated name.";
   if (error._tag === "ThreadLaunchBranchConflictError") {
     const sibling = error.branch.replaceAll("/", "-");
     return `Use a name that does not nest under or contain an existing branch${
@@ -142,6 +151,66 @@ const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
       message:
         "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
     });
+});
+
+/** The composer falls back to the project's t3.json when no setting picks the mode. */
+const projectFileThreadEnvMode = Effect.fn("mcp.projectFileThreadEnvMode")(function* (
+  workspaceRoot: string,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const contents = yield* fileSystem
+    .readFileString(`${workspaceRoot}/${T3_PROJECT_FILE_NAME}`)
+    .pipe(Effect.orElseSucceed(() => null));
+  return resolveProjectFileBackedSetting(
+    "defaultThreadEnvMode",
+    null,
+    contents === null ? null : parseT3ProjectFile(contents),
+  ).value;
+});
+
+// Anchored to the fatal line: other diagnostics, such as a dubious-ownership refusal, quote the path.
+const NON_REPOSITORY_FATAL =
+  /^fatal: (?:not a git repository|gitfile does not point to a valid repository)/im;
+
+/** Branches from the checkout's current branch, as the composer does; a checkout with no commit or a detached HEAD stays shared. */
+const defaultWorktreeStrategy = Effect.fn("mcp.defaultWorktreeStrategy")(function* (
+  workspaceRoot: string,
+): Effect.fn.Return<
+  OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined,
+  OrchestratorMcpFailure,
+  GitVcsDriver.GitVcsDriver
+> {
+  const git = yield* GitVcsDriver.GitVcsDriver;
+  const unreadable = new OrchestratorMcpFailure({
+    code: "orchestration_error",
+    message:
+      "Could not read the project's current branch for the new worktree. No thread was created. Retry, or pass workspaceStrategy.",
+  });
+  const commit = yield* git
+    .execute({
+      operation: "mcp.defaultWorktreeStrategy",
+      cwd: workspaceRoot,
+      args: ["rev-parse", "--verify", "--quiet", "HEAD"],
+      allowNonZeroExit: true,
+      timeoutMs: 5_000,
+    })
+    .pipe(Effect.orElseSucceed(() => null));
+  if (commit?.exitCode === 1 || (commit !== null && NON_REPOSITORY_FATAL.test(commit.stderr)))
+    return undefined;
+  if (commit?.exitCode !== 0) return yield* unreadable;
+  const head = yield* git
+    .execute({
+      operation: "mcp.defaultWorktreeStrategy",
+      cwd: workspaceRoot,
+      args: ["symbolic-ref", "--quiet", "--short", "HEAD"],
+      allowNonZeroExit: true,
+      timeoutMs: 5_000,
+    })
+    .pipe(Effect.orElseSucceed(() => null));
+  if (head?.exitCode === 1) return undefined;
+  const branch = head?.exitCode === 0 ? head.stdout.trim() : "";
+  if (branch.length === 0) return yield* unreadable;
+  return { type: "worktree" as const, baseRef: branch };
 });
 
 /** A fixed-length id, so a long key fits in the scratch folder name derived from it. */
@@ -220,6 +289,11 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       const launchedModel =
         launched === null || launched.deletedAt !== null ? undefined : launched.modelSelection;
       const replaying = launchedModel !== undefined;
+      if (launched !== null && replaying && launched.projectId !== projectId)
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "A launch retry must use the original project.",
+        });
       const preset =
         input.preset === undefined || replaying
           ? undefined
@@ -229,31 +303,58 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         input.workspaceStrategy ?? (input.scratch === true ? undefined : preset?.workspaceStrategy);
       const requestedModel = input.modelSelection ?? preset?.modelSelection;
       const presetMode = input.runtimeMode === undefined ? preset?.runtimeMode : undefined;
-      const project = replaying
-        ? undefined
-        : yield* Project.ProjectService.pipe(
-            Effect.flatMap((projects) => projects.getById(projectId)),
-            Effect.mapError(unavailable),
-            Effect.flatMap(
-              Option.match({
-                onNone: () =>
-                  Effect.fail(
-                    new OrchestratorMcpFailure({
-                      code: "invalid_request",
-                      message: "The project was not found.",
-                    }),
-                  ),
-                onSome: Effect.succeed,
-              }),
-            ),
-          );
+      const project =
+        replaying && workspaceStrategy?.type !== "existing_worktree"
+          ? undefined
+          : yield* Project.ProjectService.pipe(
+              Effect.flatMap((projects) => projects.getById(projectId)),
+              Effect.mapError(unavailable),
+              Effect.flatMap(
+                Option.match({
+                  onNone: () =>
+                    Effect.fail(
+                      new OrchestratorMcpFailure({
+                        code: "invalid_request",
+                        message: "The project was not found.",
+                      }),
+                    ),
+                  onSome: Effect.succeed,
+                }),
+              ),
+            );
       if (project !== undefined && workspaceStrategy?.type === "existing_worktree")
         yield* assertProjectWorktree(project.workspaceRoot, workspaceStrategy.worktreePath);
       if (!replaying && requestedModel !== undefined) {
         const { instanceId, model } = requestedModel;
-        const providers = yield* (yield* ProviderRegistry.ProviderRegistry).getProviders;
-        const provider = providers.find((candidate) => candidate.instanceId === instanceId);
-        if (provider !== undefined) yield* requireAdvertisedModel(provider, model);
+        const registry = yield* ProviderRegistry.ProviderRegistry;
+        const cwd =
+          workspaceStrategy?.type === "existing_worktree"
+            ? workspaceStrategy.worktreePath
+            : project?.workspaceRoot;
+        const requireModel = (
+          providers: ReadonlyArray<ServerProvider>,
+        ): Effect.Effect<void, OrchestratorMcpFailure> => {
+          const provider = withWorkspaceModels(providers, cwd).find(
+            (candidate) => candidate.instanceId === instanceId,
+          );
+          return provider === undefined ? Effect.void : requireAdvertisedModel(provider, model);
+        };
+        const checked = requireModel(yield* registry.getProviders);
+        yield* cwd === undefined
+          ? checked
+          : checked.pipe(
+              Effect.catchIf(
+                (error) => error.code === "model_unavailable",
+                () =>
+                  Project.ProjectService.pipe(
+                    Effect.flatMap((projects) => projects.workspaceScanDirectory(cwd)),
+                    Effect.flatMap((scanCwd) =>
+                      registry.refreshWorkspaceSnapshot({ instanceId, cwd, scanCwd }),
+                    ),
+                    Effect.flatMap(requireModel),
+                  ),
+              ),
+            );
       }
       const projectSettings =
         project === undefined
@@ -267,15 +368,24 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
             );
       // An omitted startFromOrigin follows the new-worktree setting, as the composer and
       // t3_worktree_handoff do. Otherwise a stale local branch silently becomes the base.
+      const requestedStrategy =
+        workspaceStrategy === undefined &&
+        caller === undefined &&
+        project !== undefined &&
+        projectSettings !== undefined &&
+        (projectSettings.defaultThreadEnvMode ??
+          (yield* projectFileThreadEnvMode(project.workspaceRoot))) === "worktree"
+          ? yield* defaultWorktreeStrategy(project.workspaceRoot)
+          : workspaceStrategy;
       const strategy =
         projectSettings !== undefined &&
-        workspaceStrategy?.type === "worktree" &&
-        workspaceStrategy.startFromOrigin === undefined
+        requestedStrategy?.type === "worktree" &&
+        requestedStrategy.startFromOrigin === undefined
           ? {
-              ...workspaceStrategy,
+              ...requestedStrategy,
               startFromOrigin: projectSettings.newWorktreesStartFromOrigin,
             }
-          : workspaceStrategy;
+          : requestedStrategy;
       // Reject unresolved base refs and blocked branch names before accepting a launch; worktree provisioning happens later.
       if (!replaying && strategy?.type === "worktree")
         yield* ThreadLaunch.ThreadLaunchService.pipe(

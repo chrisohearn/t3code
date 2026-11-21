@@ -1,5 +1,6 @@
 import { createMemoryHistory } from "@tanstack/react-router";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { getProjectOrderKey } from "@t3tools/client-runtime/state/project-grouping";
 import { ProjectId } from "@t3tools/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
 import type * as Context from "effect/Context";
@@ -12,6 +13,7 @@ import "~/components/ChatView";
 import { DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { __setClientSettingsForTests } from "~/hooks/useSettings";
 import { getRouter } from "~/router";
+import { readProjects } from "~/state/entities";
 import { useUiStateStore } from "~/uiStateStore";
 import {
   ENVIRONMENT_ID,
@@ -25,11 +27,13 @@ import { render } from "../../../test/render";
 vi.mock(
   "../../../../../packages/client-runtime/src/connection/driver.ts",
   async (importOriginal) => {
-    const [actual, { fakeDriver }, Layer] = await Promise.all([
+    const [actual, { fakeDriver, installFakeEnvironment }, Layer] = await Promise.all([
       importOriginal<{ readonly ConnectionDriver: Context.Key<unknown, FakeDriver> }>(),
       import("../../../test/fakeEnvironment"),
       import("effect/Layer"),
     ]);
+    // Discovery can start before the test body installs its project fixtures.
+    installFakeEnvironment([]);
     return { ...actual, layer: Layer.succeed(actual.ConnectionDriver, fakeDriver) };
   },
 );
@@ -51,15 +55,9 @@ it("the new-thread project picker follows the manual sidebar project order", asy
     onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
     sidebarProjectSortOrder: "manual",
   });
-  useUiStateStore.setState({
-    projectOrder: [
-      `${ENVIRONMENT_ID}:/workspace/beta`,
-      `${ENVIRONMENT_ID}:/workspace/render`,
-      `${ENVIRONMENT_ID}:/workspace/alpha`,
-    ],
-  });
-  using _order = { [Symbol.dispose]: () => useUiStateStore.setState({ projectOrder: [] }) };
   const draftId = DraftId.make("draft-manual-order");
+  // Seed the route before mount; the test runtime replaces the fixture environment id
+  // with its own id, so the project binding is corrected after the shell loads below.
   useComposerDraftStore
     .getState()
     .setProjectDraftThreadId(scopeProjectRef(ENVIRONMENT_ID, PROJECT_ID), draftId);
@@ -70,8 +68,34 @@ it("the new-thread project picker follows the manual sidebar project order", asy
     // AppRoot brings its own router.
     router: false,
   });
-  // The shell snapshot has arrived once the sidebar lists the project.
-  await expect.element(page.getByText("render", { exact: true }).first()).toBeVisible();
+  // Empty project folders are not always visible in the sidebar. Wait on the shell data
+  // instead, then exercise the picker that this test covers.
+  await vi.waitFor(() => {
+    expect(readProjects().map((project) => project.id)).toEqual([
+      PROJECT_ID,
+      ProjectId.make("project-alpha"),
+      ProjectId.make("project-beta"),
+    ]);
+  });
+  const loadedProjects = readProjects();
+  const renderProject = loadedProjects.find((project) => project.id === PROJECT_ID);
+  if (!renderProject) throw new Error("The render project did not load.");
+  useComposerDraftStore
+    .getState()
+    .setProjectDraftThreadId(
+      scopeProjectRef(renderProject.environmentId, renderProject.id),
+      draftId,
+    );
+  const projectsByTitle = new Map(loadedProjects.map((project) => [project.title, project]));
+  useUiStateStore.setState({
+    projectOrder: ["beta", "render", "alpha"].map((title) =>
+      getProjectOrderKey(projectsByTitle.get(title)!),
+    ),
+  });
+  using _order = { [Symbol.dispose]: () => useUiStateStore.setState({ projectOrder: [] }) };
+  await vi.waitFor(() =>
+    expect(document.querySelector("[data-draft-project-trigger]")).not.toBeNull(),
+  );
   const trigger = document.querySelector<HTMLElement>("[data-draft-project-trigger]");
   if (!trigger) throw new Error("The draft project picker did not render.");
   await userEvent.click(page.elementLocator(trigger));

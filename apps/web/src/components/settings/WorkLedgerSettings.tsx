@@ -5,11 +5,13 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
+import { T, Var, useGT } from "gt-react";
 import { Button } from "../ui/button";
 import { SettingsPageContainer, SettingsSection } from "./settingsLayout";
 import { useSettingsScope } from "./SettingsScopeContext";
 
 function LedgerList({ environmentId }: { readonly environmentId: EnvironmentId }) {
+  const gt = useGT();
   const [cursors, setCursors] = useState<string[]>([]);
   const cursor = cursors.at(-1);
   const query = useEnvironmentQuery(
@@ -21,16 +23,16 @@ function LedgerList({ environmentId }: { readonly environmentId: EnvironmentId }
   return (
     <SettingsSection
       id="work-ledger"
-      title="Work ledger"
+      title={gt("Work ledger")}
       variant="plain"
       headerAction={
         <Button variant="outline" size="sm" onClick={query.refresh} disabled={query.isPending}>
-          Refresh
+          <T>Refresh</T>
         </Button>
       }
     >
       <p className="text-sm text-muted-foreground">
-        Read-only view of shared work and its next action.
+        <T>Read-only view of shared work and its next action.</T>
       </p>
       {query.error && (
         <p role="alert" className="text-sm text-destructive">
@@ -39,13 +41,15 @@ function LedgerList({ environmentId }: { readonly environmentId: EnvironmentId }
       )}
       {query.isPending && (
         <p role="status" className="text-sm text-muted-foreground">
-          Loading work…
+          <T>Loading work…</T>
         </p>
       )}
       {query.data && (
         <>
           {query.data.items.length === 0 && (
-            <p className="text-sm text-muted-foreground">No work items.</p>
+            <p className="text-sm text-muted-foreground">
+              <T>No work items.</T>
+            </p>
           )}
           <ul className="divide-y divide-border">
             {query.data.items.map((item) => (
@@ -58,14 +62,23 @@ function LedgerList({ environmentId }: { readonly environmentId: EnvironmentId }
                 </div>
                 <p className="text-sm text-muted-foreground">
                   {item.ownerName} · {item.ownerKind}
-                  {item.waitReason ? ` · Waiting: ${item.waitReason}` : ""}
+                  {item.waitReason ? (
+                    <>
+                      {" · "}
+                      <T>
+                        Waiting: <Var>{item.waitReason}</Var>
+                      </T>
+                    </>
+                  ) : null}
                 </p>
                 <p className="whitespace-pre-wrap break-words text-sm">
-                  {item.nextAction || "No next action recorded."}
+                  {item.nextAction || <T>No next action recorded.</T>}
                 </p>
                 {item.approval && (
                   <p className="line-clamp-3 whitespace-pre-wrap break-words text-sm text-muted-foreground">
-                    Your approval: “{item.approval.quotedAnswer}”
+                    <T>
+                      Your approval: “<Var>{item.approval.quotedAnswer}</Var>”
+                    </T>
                   </p>
                 )}
                 {item.ownerThreadId && (
@@ -76,7 +89,7 @@ function LedgerList({ environmentId }: { readonly environmentId: EnvironmentId }
                     )}
                     className="text-sm underline underline-offset-2"
                   >
-                    Open owner thread
+                    <T>Open owner thread</T>
                   </Link>
                 )}
               </li>
@@ -89,7 +102,7 @@ function LedgerList({ environmentId }: { readonly environmentId: EnvironmentId }
               disabled={cursors.length === 0}
               onClick={() => setCursors(cursors.slice(0, -1))}
             >
-              Previous
+              <T>Previous</T>
             </Button>
             <Button
               variant="outline"
@@ -99,7 +112,7 @@ function LedgerList({ environmentId }: { readonly environmentId: EnvironmentId }
                 if (query.data?.nextCursor) setCursors([...cursors, query.data.nextCursor]);
               }}
             >
-              Next
+              <T>Next</T>
             </Button>
           </div>
         </>
@@ -117,7 +130,7 @@ export function WorkLedgerSettings() {
         <LedgerList key={selected.environmentId} environmentId={selected.environmentId} />
       ) : (
         <p className="text-sm text-muted-foreground">
-          Connect to an environment to read its work ledger.
+          <T>Connect to an environment to read its work ledger.</T>
         </p>
       )}
     </SettingsPageContainer>

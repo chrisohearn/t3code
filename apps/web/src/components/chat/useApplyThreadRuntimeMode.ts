@@ -6,11 +6,13 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import type { RuntimeMode, ScopedThreadRef } from "@t3tools/contracts";
 import { useContext, useEffect, useRef } from "react";
+import { msg } from "gt-react";
 
 import { environmentThreadShells, threadEnvironment } from "../../state/threads";
 import { useOrchestrationCommand } from "../../state/use-orchestration-command";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { useRuntimeModePickStore } from "./runtimeModePickStore";
+import { m } from "~/i18n/messages";
 
 // Bounds a pick the shell never shows, such as one another client changed again first.
 const SHELL_CONFIRMATION_TIMEOUT_MS = 10_000;
@@ -65,8 +67,8 @@ export function useApplyThreadRuntimeMode() {
       toastManager.add(
         stackedThreadToast({
           type: "error",
-          title: "Could not change permissions",
-          description: error instanceof Error ? error.message : "Try again.",
+          title: m(msg("Could not change permissions")),
+          description: error instanceof Error ? error.message : m(msg("Try again.")),
         }),
       );
     }

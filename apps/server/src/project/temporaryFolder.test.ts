@@ -1,9 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off - builds a symlink fixture with node:fs.
 import * as NodeFS from "node:fs";
-import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { assert, expect, it } from "@effect/vitest";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
@@ -14,6 +14,8 @@ import {
   isTemporaryPath,
   temporaryFolderWarning,
 } from "./temporaryFolder.ts";
+
+const TEMPORARY_TEST_ROOT = HostProcess.Platform.defaultValue() === "linux" ? "/dev/shm" : "/tmp";
 
 it.effect.each([
   ["/tmp/review", true],
@@ -62,9 +64,10 @@ it.effect("falls back to the name when the filesystem does not answer in time", 
   }),
 );
 
-it.effect("resolves symlinks, and ignores a persistent TMPDIR", () =>
+it.effect("resolves symlinks under a known temporary directory", () =>
   Effect.gen(function* () {
-    const sandbox = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "temporary-folder-"));
+    // TMPDIR may point to persistent storage. Use a system-cleared tmpfs on Linux.
+    const sandbox = NodeFS.mkdtempSync(NodePath.join(TEMPORARY_TEST_ROOT, "temporary-folder-"));
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => NodeFS.rmSync(sandbox, { recursive: true, force: true })),
     );

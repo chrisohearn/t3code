@@ -47,6 +47,20 @@ fi
 source "$helper" || { log "cannot load $helper"; exit 2; }
 [[ -z "$helper_tmp" ]] || rm -f "$helper_tmp"
 # helper-load end
+# matching-issue begin (exact title; the label also covers unrelated sync work)
+find_open_conflict_issue() {
+  local title=$1 issues
+  issues=$(gh issue list -R "$FORK" --label upstream-sync --state open --json number,title)
+  python3 -c '
+import json, sys
+title = sys.argv[1]
+for issue in json.load(sys.stdin):
+    if issue.get("title") == title:
+        print(issue["number"])
+        break
+' "$title" <<<"$issues"
+}
+# matching-issue end
 git -C "$SOURCE" fetch -q --no-tags upstream main
 # upstream_sha is the commit the sync targets; upstream_name labels it in logs and PRs.
 upstream_sha=$(git -C "$SOURCE" rev-parse upstream/main)
@@ -169,7 +183,7 @@ elif ! git -c merge.conflictstyle=zdiff3 merge -q --no-edit \
     body=$(printf 'The upstream sync could not merge `pingdotgg/t3code` %s (%s, %s commits) into `%s`.\n\nConflicting files:\n%s\n\nResolve it in a worktree from fresh `origin/%s`, following FORK.md (fork migrations stay in `ForkMigrations/`), then open a PR into `%s` from a `sync/upstream-*` branch. The next sync run checks, merges and releases it.\n' \
       "$upstream_name" "$upstream_sha" "$behind" "$BRANCH" "$(printf -- '- `%s`\n' $conflicts)" "$BRANCH" "$BRANCH")
     gh label create upstream-sync -R "$FORK" --color FBCA04 --description "Daily upstream sync" 2>/dev/null || true
-    existing=$(gh issue list -R "$FORK" --label upstream-sync --state open --json number --jq '.[0].number // empty')
+    existing=$(find_open_conflict_issue "$title")
     if [[ -n "$dry_run" ]]; then
       log "dry run: would open or update an issue: $title"
     elif [[ -n "$pr_number" ]]; then

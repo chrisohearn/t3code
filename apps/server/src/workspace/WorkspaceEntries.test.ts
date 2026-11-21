@@ -7,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
@@ -618,7 +619,7 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
         }
       }),
     );
-    it.effect("lets the nearest .ignore rule decide a symlink, and git's rules still hide it", () =>
+    it.effect("lets the nearest .ignore rule decide a symlink, ahead of git's rules", () =>
       Effect.gen(function* () {
         if ((yield* HostProcess.Platform) === "win32") return;
         const cwd = yield* makeTempDir({ prefix: "t3code-workspace-symlinks-", git: true });
@@ -639,12 +640,12 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
         for (const entries of [searched.entries, listed.entries]) {
           const paths = entries.map((entry) => entry.path);
           expect(paths).toContain("sub/hide-link.ts");
-          expect(paths).not.toContain("keep-link.ts");
+          expect(paths).toContain("keep-link.ts");
         }
         // The real files are shown or hidden by the same rules.
         const listedPaths = listed.entries.map((entry) => entry.path);
         expect(listedPaths).toContain("sub/hide-real.ts");
-        expect(listedPaths).not.toContain("keep-real.ts");
+        expect(listedPaths).toContain("keep-real.ts");
       }),
     );
     it.effect("matches .ignore rules against whole names and treats folder links as links", () =>
@@ -711,6 +712,44 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
           expect(partial.entries.map((entry) => entry.path)).not.toContain(path);
         }
       }),
+    );
+
+    it.effect("releases an index nobody searched within the idle timeout on refresh", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-idle-refresh-" });
+        yield* writeTextFile(cwd, "src/index.ts");
+        let rescans = 0;
+        let destroyed = 0;
+        const openFinder = yield* WorkspaceFinderOpener;
+        const countingOpener: typeof openFinder = async (options) => {
+          const opened = await openFinder(options);
+          if (!opened.ok) return opened;
+          const call: typeof opened.value.call = (method, ...args) => {
+            if (method === "scanFilesAsync") rescans += 1;
+            if (method === "destroy") destroyed += 1;
+            return opened.value.call(method, ...args);
+          };
+          return { ok: true, value: { ...opened.value, call } };
+        };
+        yield* Effect.gen(function* () {
+          const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+          yield* TestClock.adjust("1 hour");
+          yield* workspaceEntries.search({ cwd, query: "index", limit: 10, kind: "file" });
+
+          for (let run = 0; run < 3; run++) {
+            yield* TestClock.adjust("6 minutes");
+            yield* workspaceEntries.refresh(cwd);
+          }
+
+          expect({ rescans, destroyed }).toEqual({ rescans: 2, destroyed: 1 });
+        }).pipe(
+          Effect.provide(
+            Layer.fresh(WorkspaceEntries.layer).pipe(
+              Layer.provide(Layer.succeed(WorkspaceFinderOpener, countingOpener)),
+            ),
+          ),
+        );
+      }).pipe(Effect.provide(TestClock.layer())),
     );
   });
 

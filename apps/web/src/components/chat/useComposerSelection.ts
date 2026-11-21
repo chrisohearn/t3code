@@ -1,5 +1,6 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import type { UnifiedSettings } from "@t3tools/contracts";
+import { msg, useMessages } from "gt-react";
 import type { Dispatch } from "react";
 import type { ComposerThreadTarget, DraftSessionState } from "../../composerDraftStore";
 import { useStableCallback } from "../../hooks/useStableCallback";
@@ -97,6 +98,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     setPendingServerThreadStartFromOriginByThreadId,
     scheduleComposerFocus,
   } = input;
+  const messages = useMessages();
   const navigate = useNavigate();
   const setStickyComposerModelSelection = useComposerDraftStore(
     (store) => store.setStickyModelSelection,
@@ -130,8 +132,10 @@ export function useComposerSelection(input: ComposerSelectionInput) {
       toastManager.add(
         stackedThreadToast({
           type: "warning",
-          title: "Permissions not changed",
-          description: "Wait for the current run to finish, or stop it, then change permissions.",
+          title: messages(msg("Permissions not changed")),
+          description: messages(
+            msg("Wait for the current run to finish, or stop it, then change permissions."),
+          ),
         }),
       );
     } else {
@@ -163,6 +167,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
           currentProviderInstanceId: runtimeProviderInstanceId,
         }
       : null,
+    messages,
   );
 
   const onProviderModelSelect = (
