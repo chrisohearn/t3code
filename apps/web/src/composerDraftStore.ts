@@ -46,8 +46,10 @@ import { DeepMutable } from "effect/Types";
 import {
   createModelSelection,
   draftModelPickMatchesThread,
+  modelSelectionWithoutUltracode,
   normalizeCustomModelSlug,
   normalizeModelSlug,
+  withoutUltracode,
 } from "@t3tools/shared/model";
 import { AsyncResult, Atom, type AtomRegistry } from "effect/reactivity";
 import * as Option from "effect/Option";
@@ -816,7 +818,8 @@ function compactStickyOptionsByModel(
 ): NonNullable<PersistedComposerDraftStoreState["stickyOptionsByModelByProvider"]> {
   const result: Record<string, Record<string, ReadonlyArray<ProviderOptionSelection>>> = {};
   for (const [instanceId, optionsByModel] of Object.entries(optionsByModelByProvider)) {
-    for (const [modelSlug, options] of Object.entries(optionsByModel ?? {})) {
+    for (const [modelSlug, remembered] of Object.entries(optionsByModel ?? {})) {
+      const options = withoutUltracode(remembered);
       if (options === undefined || options.length === 0) continue;
       result[instanceId] ??= {};
       result[instanceId][modelSlug] = options;
@@ -837,7 +840,8 @@ function seedStickyOptionsByModel(
     ) {
       continue;
     }
-    result[instanceId] = { [selection.model]: selection.options };
+    const options = withoutUltracode(selection.options);
+    if (options.length > 0) result[instanceId] = { [selection.model]: options };
   }
   return result as NonNullable<PersistedComposerDraftStoreState["stickyOptionsByModelByProvider"]>;
 }
@@ -2554,7 +2558,14 @@ function normalizeCurrentPersistedComposerDraftStoreState(
     ),
     draftThreadsByThreadKey,
     logicalProjectDraftThreadKeyByLogicalProjectKey,
-    stickyModelSelectionByProvider: compactModelSelectionByProvider(stickyModelSelectionByProvider),
+    stickyModelSelectionByProvider: compactModelSelectionByProvider(
+      Object.fromEntries(
+        Object.entries(stickyModelSelectionByProvider).map(([instanceId, selection]) => [
+          instanceId,
+          selection && modelSelectionWithoutUltracode(selection),
+        ]),
+      ),
+    ),
     stickyOptionsByModelByProvider:
       normalizedPersistedState.stickyOptionsByModelByProvider === undefined
         ? seedStickyOptionsByModel(stickyModelSelectionByProvider)
@@ -3200,7 +3211,8 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           });
         },
         setStickyModelSelection: (modelSelection) => {
-          const normalized = normalizeModelSelection(modelSelection);
+          const picked = normalizeModelSelection(modelSelection);
+          const normalized = picked && modelSelectionWithoutUltracode(picked);
           set((state) => {
             if (!normalized) {
               return state;
@@ -3419,6 +3431,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             let nextOptionsByModel = state.stickyOptionsByModelByProvider;
             let nextStickyActiveProvider = state.stickyActiveProvider;
             if (options?.persistSticky === true) {
+              const stickyOpts = providerOpts && withoutUltracode(providerOpts);
               nextStickyMap = { ...state.stickyModelSelectionByProvider };
               const stickyBase =
                 nextStickyMap[instanceKey] ??
@@ -3428,19 +3441,19 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               // Traits for another shown model belong in per-model memory only;
               // the sticky selection keeps its own model's traits.
               const appliesToSticky = rememberedModel === stickyBase.model;
-              if (providerOpts) {
+              if (stickyOpts && stickyOpts.length > 0) {
                 if (appliesToSticky) {
                   nextStickyMap[instanceKey] = createModelSelection(
                     instanceKey,
                     stickyBase.model,
-                    providerOpts,
+                    stickyOpts,
                   );
                 }
                 nextOptionsByModel = {
                   ...state.stickyOptionsByModelByProvider,
                   [instanceKey]: {
                     ...state.stickyOptionsByModelByProvider[instanceKey],
-                    [rememberedModel]: providerOpts,
+                    [rememberedModel]: stickyOpts,
                   },
                 };
               } else {
