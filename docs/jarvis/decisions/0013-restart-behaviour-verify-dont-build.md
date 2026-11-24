@@ -16,7 +16,7 @@ Exit zero; serving 07:37:22; Connect HTTP 200 07:37:57.
 `continueThreadsAfterServerUpdate` was unset (default true). No pending approval,
 secret or auth requests. Baseline: eight running, 59 queued, all with native references.
 
-Continued once: Claude 2/2, Codex Revotech 4/4, Codex Pro 1/2.
+Continued once: Claude 2/2, Codex (work account) 4/4, Codex Pro 1/2.
 Seven retained provider, model/options, provider thread and restart notices.
 Codex used native empty input; Claude used shared prompts, one with lost-work notes.
 
