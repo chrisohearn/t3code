@@ -992,7 +992,7 @@ it.effect("a run Stop reached cannot delegate or start a watch, even after it en
     });
     yield* send(threadId, "queued", "queue_after_active");
     const queued = (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)!;
-    const caller = { sessionId: "ab3aa7f5", threadId: ThreadId.make("thread:other-agent") };
+    const caller = { sessionId: "9c8d7e6f", threadId: ThreadId.make("thread:other-agent") };
     yield* orchestrator
       .dispatch({
         type: "queued-run.cancel",

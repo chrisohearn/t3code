@@ -203,12 +203,12 @@ it("labels a restart cancel with the run that continued it", () => {
         startedAt: null,
         stop: {
           reason: "queue_cancelled",
-          actor: { kind: "agent", sessionId: "ab3aa7f5", threadId: ThreadId.make("mcp:8270") },
+          actor: { kind: "agent", sessionId: "9c8d7e6f", threadId: ThreadId.make("mcp:1122") },
         },
       }),
       [],
     )?.label,
-    "removed from the queue before it started by an agent (session ab3aa7f5) from thread mcp:8270",
+    "removed from the queue before it started by an agent (session 9c8d7e6f) from thread mcp:1122",
   );
   assert.isUndefined(runStopDetail(run(77, { status: "completed" }), []));
 

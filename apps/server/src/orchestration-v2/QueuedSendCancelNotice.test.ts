@@ -17,8 +17,8 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as QueuedSendCancelNotice from "./QueuedSendCancelNotice.ts";
 
-const recipient = ThreadId.make("mcp:82704295");
-const sender = ThreadId.make("4e3f096d");
+const recipient = ThreadId.make("mcp:11223344");
+const sender = ThreadId.make("5a6b7c8d");
 const now = DateTime.makeUnsafe("2026-11-13T01:13:10.000Z");
 const instanceId = ProviderInstanceId.make("codex");
 
@@ -105,7 +105,7 @@ it.effect("tells the sender once when another thread's agent drops its queued me
     assert.equal(notice.commandId, "server:queued-send-cancelled:run:78");
     assert.equal(
       notice.text,
-      "Your message to thread mcp:82704295 (run 78, request policy-6fd-review) was not delivered: it was removed from the queue before it started by an agent from thread mcp:82704295. Send it again if it is still needed.",
+      "Your message to thread mcp:11223344 (run 78, request policy-6fd-review) was not delivered: it was removed from the queue before it started by an agent from thread mcp:11223344. Send it again if it is still needed.",
     );
 
     // The sender withdrew it, it was delivered as a steer, or it was a server wake.
