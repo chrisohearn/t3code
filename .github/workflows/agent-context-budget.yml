@@ -26,6 +26,7 @@ jobs:
         with:
           sparse-checkout: apps/server/src/provider/agentContextBudget.json
           sparse-checkout-cone-mode: false
+          fetch-depth: 2
 
       - name: Compare with PR base
         run: |

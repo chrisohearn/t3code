@@ -9,6 +9,7 @@ import {
   type OrchestrationV2ThreadShell,
   type SourceControlCloneRepositoryInput,
   ProjectId,
+  OrchestratorMcpFailure,
   ProviderInstanceId,
   RunId,
   RuntimeRequestId,
@@ -30,6 +31,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { McpSchema, McpServer } from "effect/ai";
 
 import * as ServerConfig from "../config.ts";
+import type { ProjectionTimelinePageOptions } from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
@@ -69,6 +71,7 @@ interface Seen {
   readonly approvalAnswers: ReadonlyArray<unknown>;
   readonly sends: ReadonlyArray<ThreadManagement.ThreadManagementSendInput>;
   readonly waits: ReadonlyArray<ThreadManagement.ThreadManagementWaitInput>;
+  readonly reads: ReadonlyArray<ProjectionTimelinePageOptions>;
   readonly launches: ReadonlyArray<ThreadLaunch.ThreadLaunchInput>;
   readonly projects: ReadonlyArray<ProjectService.ProjectCreateInput>;
   readonly clones: ReadonlyArray<SourceControlCloneRepositoryInput>;
@@ -79,6 +82,7 @@ const nothingSeen: Seen = {
   approvalAnswers: [],
   sends: [],
   waits: [],
+  reads: [],
   launches: [],
   projects: [],
   clones: [],
@@ -101,16 +105,25 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
   );
   const users = { ...liveThreadShell(usersThread, { runtimeMode: "auto" }), projectId: boxProject };
   const run = (status: OrchestrationV2Run["status"]) =>
-    ({ id: boxRun, status }) as unknown as OrchestrationV2Run;
+    ({
+      id: boxRun,
+      ordinal: 1,
+      status,
+      modelSelection: base.modelSelection,
+      requestedAt: base.createdAt,
+      startedAt: null,
+      completedAt: null,
+    }) as unknown as OrchestrationV2Run;
   const shellOf = (threadId: ThreadId): Effect.Effect<OrchestrationV2ThreadShell | null> =>
     threadId === boxThread ? linked : Effect.succeed(threadId === usersThread ? users : null);
   const projectionOf = (threadId: ThreadId) =>
     shellOf(threadId).pipe(
       Effect.map(
-        (thread) =>
+        (thread: OrchestrationV2ThreadShell | null) =>
           ({
             thread,
             runs: [run("running")],
+            providerTurns: [],
             runtimeRequests: [
               {
                 id: approvalRequest,
@@ -152,8 +165,14 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
   return Layer.mock(ThreadManagement.ThreadManagementService)({
     acknowledgeOnly: () => Effect.succeed(false),
     getThreadShell: shellOf,
+    getThreadEventSequence: () => Effect.succeed(0),
     getProjectThreadRecords: (input) => projectionOf(input.threadId),
     getThreadRecords: (threadId) => projectionOf(threadId),
+    getRunCount: () => Effect.succeed(1),
+    getTimelinePage: (_threadId, options) =>
+      Ref.update(seen, (current) => ({ ...current, reads: [...current.reads, options] })).pipe(
+        Effect.as({ items: [], totalItems: 0, hasMore: false, hasEarlier: false }),
+      ),
     listProjectThreads: () => linked.pipe(Effect.map((shell) => [shell] as never)),
     getPendingRuntimeRequestCounts: () => Effect.succeed({}),
     getShellSnapshot: () => linked.pipe(Effect.map((shell) => ({ threads: [shell] }) as never)),
@@ -457,7 +476,17 @@ const makeLaptop = Effect.gen(function* () {
       }),
       Effect.provideService(McpSchema.McpServerClient, mcpClient),
     );
-  return { links: Context.get(linking, PeerLinks.PeerLinks), call, callOutside };
+  const callAsClient = (name: string, args: Record<string, unknown>) =>
+    server.callTool({ name, arguments: args }).pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, {
+        ...scopeOf("outside-client"),
+        requestNamespace: "client:session-1",
+        thread: undefined,
+        client: { sessionId: "session-1", label: "claude.ai", access: "read-only" },
+      }),
+      Effect.provideService(McpSchema.McpServerClient, mcpClient),
+    );
+  return { links: Context.get(linking, PeerLinks.PeerLinks), call, callOutside, callAsClient };
 });
 
 const failureOf = (result: McpSchema.CallToolResult) => {
@@ -762,6 +791,21 @@ it.effect("runs any tool that takes a linked environment there", () =>
       });
       expect(archived.isError).toBe(false);
       expect((yield* Ref.get(seen)).stops).toEqual([`thread.archive ${boxThread}`]);
+      // A cursorless read from here gets the newest page there, as it does locally.
+      const read = yield* a.call("thread:laptop-full", "t3_thread_read", {
+        environmentId: box.environmentId,
+        threadId: boxThread,
+      });
+      expect(read.isError).toBe(false);
+      const clientRead = yield* a.callAsClient("t3_thread_read", {
+        environmentId: box.environmentId,
+        threadId: boxThread,
+      });
+      expect(clientRead.isError).toBe(false);
+      expect((yield* Ref.get(seen)).reads).toEqual([
+        { beforePosition: Number.MAX_SAFE_INTEGER, limit: 10, view: "messages" },
+        { beforePosition: Number.MAX_SAFE_INTEGER, limit: 10, view: "messages" },
+      ]);
 
       // This environment's own id keeps the call here.
       const own = yield* a.call("thread:laptop-full", "t3_thread_configure", {
@@ -927,4 +971,53 @@ it.effect("refuses a launch there above the link's access, naming the link", () 
       expect(failureOf(yield* launchAboveLink).message).toContain("expired");
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+const refusedRead = (message: string) =>
+  new OrchestratorMcpFailure({ code: "invalid_request", message });
+const beforePositionRefusal = refusedRead(
+  `Invalid parameters for tool 't3_thread_read': Unknown argument "beforePosition". Accepted arguments: limit, view.`,
+);
+
+it("recognizes only a validation refusal of beforePosition", () => {
+  const cases: Array<[OrchestratorMcpFailure, boolean]> = [
+    [beforePositionRefusal, true],
+    [
+      refusedRead(
+        `Invalid parameters for tool 't3_thread_read': Unknown arguments "runLimit", "beforePosition". Accepted arguments: limit.`,
+      ),
+      true,
+    ],
+    [refusedRead(`Invalid parameters for tool 't3_thread_read': Unknown argument "limit".`), false],
+    // A thread id can carry the same words; only the refusal's code and prefix count.
+    [
+      new OrchestratorMcpFailure({
+        code: "thread_not_found",
+        message: `Thread Unknown argument "beforePosition". Accepted arguments: x. is no longer available.`,
+      }),
+      false,
+    ],
+  ];
+  for (const [failure, expected] of cases) {
+    expect(PeerForwarding.refusesBeforePosition(failure)).toBe(expected);
+  }
+});
+
+it.effect("retries a newest-page read without its cursor when the peer refuses the cursor", () =>
+  Effect.gen(function* () {
+    const sent: Array<unknown> = [];
+    const olderPeer = (args: unknown): Effect.Effect<string, OrchestratorMcpFailure> => {
+      sent.push(args);
+      return "beforePosition" in (args as object)
+        ? Effect.fail(beforePositionRefusal)
+        : Effect.succeed("forward page");
+    };
+    const params = { threadId: "thread:box-auto", limit: 35 };
+    const newest = { ...params, beforePosition: Number.MAX_SAFE_INTEGER };
+
+    const page = yield* PeerForwarding.readNewestOrRetry(olderPeer, newest, params);
+
+    expect(page).toBe("forward page");
+    expect(sent).toEqual([newest, params]);
+  }),
 );

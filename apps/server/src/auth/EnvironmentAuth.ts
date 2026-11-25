@@ -36,6 +36,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as HttpServerRequest from "effect/http/HttpServerRequest";
@@ -106,6 +107,12 @@ export interface McpClientSession {
   /** When a peer link's session ends unless it is used again; the linking side keeps this. */
   readonly linkExpiresAt?: DateTime.Utc;
 }
+
+/** What Connections calls a client session: its label, or its browser and system. */
+export const clientSessionLabel = (client: AuthClientMetadata | undefined): string =>
+  client?.label ??
+  ([client?.browser, client?.os].filter((part) => part !== undefined).join(" on ") ||
+    "T3 Code client");
 
 export interface AuthenticatedSession {
   readonly sessionId: AuthSessionId;
@@ -639,6 +646,12 @@ export class EnvironmentAuth extends Context.Service<
     readonly authenticateMcpClient: (
       request: HttpServerRequest.HttpServerRequest,
     ) => Effect.Effect<McpClientSession, ServerAuthCredentialError | ServerAuthInternalError>;
+    /** Ends the MCP client session `token` belongs to. False when it is no live MCP client token. */
+    readonly revokeMcpClientToken: (
+      token: string,
+    ) => Effect.Effect<boolean, ServerAuthInternalError>;
+    /** How many times "revoke all others" has run since this server started. */
+    readonly otherSessionRevocationCount: Effect.Effect<number>;
     readonly issueMcpClientSession: (input: {
       readonly label: string;
       readonly access: AuthMcpClientAccess;
@@ -649,6 +662,11 @@ export class EnvironmentAuth extends Context.Service<
         readonly resource: string;
         readonly offlineAccess?: boolean;
       };
+      /**
+       * `otherSessionRevocationCount` read before the sign-in was approved. The session is
+       * refused when "revoke all others" has run since.
+       */
+      readonly approvedAtRevocationCount?: number;
     }) => Effect.Effect<
       {
         readonly sessionId: AuthSessionId;
@@ -656,7 +674,7 @@ export class EnvironmentAuth extends Context.Service<
         readonly refreshToken?: string;
         readonly expiresAt: DateTime.DateTime;
       },
-      ServerAuthInternalError
+      ServerAuthInvalidCredentialError | ServerAuthInternalError
     >;
     readonly refreshMcpClientSession: (input: {
       readonly clientId: string;
@@ -952,6 +970,7 @@ export const make = Effect.gen(function* () {
             auth: descriptor,
             ...authScopeResponse(session.scopes),
             sessionMethod: session.method,
+            sessionId: session.sessionId,
             ...(session.expiresAt ? { expiresAt: DateTime.toUtc(session.expiresAt) } : {}),
           }) satisfies AuthSessionState,
       ),
@@ -962,6 +981,28 @@ export const make = Effect.gen(function* () {
         } satisfies AuthSessionState),
       ),
       Effect.withSpan("EnvironmentAuth.getSessionState"),
+    );
+
+  // T3 Connect credential issuance, DPoP exchanges and device revocation take turns. Two mints
+  // at once would open two requests with one code, and a revoke landing between an exchange
+  // spending its credential and trusting the key would be undone by that exchange.
+  const connectTrustLock = yield* Semaphore.make(1);
+
+  // Counts "revoke all others" runs. An exchange or sign-in approval that began before a run
+  // issues its session here, under the lock the run holds, so it cannot leave a session behind.
+  const otherSessionRevocations = yield* Ref.make(0);
+  const issueUnlessOthersRevokedSince = <A, E>(since: number, issue: Effect.Effect<A, E>) =>
+    Ref.get(otherSessionRevocations).pipe(
+      Effect.flatMap((count): Effect.Effect<A, E | ServerAuthInvalidCredentialError> =>
+        count === since
+          ? issue
+          : Effect.fail(
+              new ServerAuthInvalidCredentialError({
+                diagnostic: "All other sessions were revoked before this one was issued.",
+              }),
+            ),
+      ),
+      connectTrustLock.withPermits(1),
     );
 
   const createBrowserSession: EnvironmentAuth["Service"]["createBrowserSession"] = Effect.fn(
@@ -991,6 +1032,7 @@ export const make = Effect.gen(function* () {
         Effect.withSpan("EnvironmentAuth.createBrowserSession"),
       );
     }
+    const revocationsAtStart = yield* Ref.get(otherSessionRevocations);
     const previousSession =
       previousSessionToken === undefined
         ? undefined
@@ -1001,20 +1043,23 @@ export const make = Effect.gen(function* () {
     const grant = yield* bootstrapCredentials
       .consume(credential)
       .pipe(Effect.mapError(toBootstrapExchangeError));
-    const session = yield* sessions
-      .issue({
-        method: "browser-session-cookie",
-        subject: grant.subject,
-        scopes: grant.scopes,
-        ...(previousSession?.method === "browser-session-cookie"
-          ? { replaceSessionId: previousSession.sessionId }
-          : {}),
-        client: {
-          ...requestMetadata,
-          ...(grant.label ? { label: grant.label } : {}),
-        },
-      })
-      .pipe(Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })));
+    const session = yield* issueUnlessOthersRevokedSince(
+      revocationsAtStart,
+      sessions
+        .issue({
+          method: "browser-session-cookie",
+          subject: grant.subject,
+          scopes: grant.scopes,
+          ...(previousSession?.method === "browser-session-cookie"
+            ? { replaceSessionId: previousSession.sessionId }
+            : {}),
+          client: {
+            ...requestMetadata,
+            ...(grant.label ? { label: grant.label } : {}),
+          },
+        })
+        .pipe(Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause }))),
+    );
     return {
       response: {
         authenticated: true,
@@ -1086,11 +1131,6 @@ export const make = Effect.gen(function* () {
     );
   };
 
-  // T3 Connect credential issuance, DPoP exchanges and device revocation take turns. Two mints
-  // at once would open two requests with one code, and a revoke landing between an exchange
-  // spending its credential and trusting the key would be undone by that exchange.
-  const connectTrustLock = yield* Semaphore.make(1);
-
   const toAccessTokenResult = (session: SessionStore.IssuedSession) =>
     DateTime.now.pipe(
       Effect.map(
@@ -1130,63 +1170,71 @@ export const make = Effect.gen(function* () {
 
   const exchangeBootstrapCredentialForAccessToken: EnvironmentAuth["Service"]["exchangeBootstrapCredentialForAccessToken"] =
     (credential, requestedScopes, requestMetadata, input) => {
-      return resolveBootstrapGrant(credential, {
-        ...input,
-        requestMetadata,
-        ...(requestedScopes !== undefined ? { requestedScopes } : {}),
-      }).pipe(
-        // Every T3 Connect key that gets in is remembered, so turning approval on later
-        // keeps the devices already in use and lists them for review.
-        Effect.tap((grant) =>
-          grant.subject === CLOUD_CONNECT_SUBJECT && input?.proofKeyThumbprint
-            ? bootstrapCredentials
-                .trustConnectDevice(input.proofKeyThumbprint, requestMetadata)
-                .pipe(Effect.mapError((cause) => new ServerAuthConnectDevicesError({ cause })))
-            : Effect.void,
-        ),
-        Effect.flatMap((grant) =>
-          Effect.gen(function* () {
-            const grantedScopes =
-              requestedScopes === undefined
-                ? grant.scopes
-                : [...new Set(requestedScopes)].filter((scope) => grant.scopes.includes(scope));
-            if (grantedScopes.length === 0) {
-              return yield* new ServerAuthScopeNotGrantedError({});
-            }
-            // Only plain pairing links renew. T3 Connect, CLI, desktop and peer sessions keep
-            // their own lifetimes, so unlinking Connect or rotating a credential still cuts off.
-            const renewable =
-              input?.proofKeyThumbprint !== undefined &&
-              grant.method === "one-time-token" &&
-              grant.subject === PAIRING_LINK_SUBJECT;
-            return yield* sessions
-              .issue({
-                method: input?.proofKeyThumbprint ? "dpop-access-token" : "bearer-access-token",
-                subject: grant.subject,
-                scopes: grantedScopes,
-                ...(input?.proofKeyThumbprint
-                  ? {
-                      proofKeyThumbprint: input.proofKeyThumbprint,
-                      ttl: renewable ? RENEWABLE_ACCESS_TOKEN_TTL : Duration.hours(1),
-                    }
-                  : {}),
-                ...(renewable ? { renewalWindow: RENEWABLE_SESSION_WINDOW } : {}),
-                replaceActiveForSubjectAndMethod: grant.method === "desktop-bootstrap",
-                client: {
-                  ...requestMetadata,
-                  ...(grant.label ? { label: grant.label } : {}),
-                },
-              })
-              .pipe(
-                Effect.mapError(
-                  (cause) => new ServerAuthAuthenticatedAccessTokenIssueError({ cause }),
-                ),
-              );
-          }),
-        ),
-        Effect.flatMap(toAccessTokenResult),
-        (exchange) =>
-          input?.proofKeyThumbprint ? connectTrustLock.withPermits(1)(exchange) : exchange,
+      const exchangeSince = (revocationsAtStart: number) =>
+        resolveBootstrapGrant(credential, {
+          ...input,
+          requestMetadata,
+          ...(requestedScopes !== undefined ? { requestedScopes } : {}),
+        }).pipe(
+          // Every T3 Connect key that gets in is remembered, so turning approval on later
+          // keeps the devices already in use and lists them for review.
+          Effect.tap((grant) =>
+            grant.subject === CLOUD_CONNECT_SUBJECT && input?.proofKeyThumbprint
+              ? bootstrapCredentials
+                  .trustConnectDevice(input.proofKeyThumbprint, requestMetadata)
+                  .pipe(Effect.mapError((cause) => new ServerAuthConnectDevicesError({ cause })))
+              : Effect.void,
+          ),
+          Effect.flatMap((grant) =>
+            Effect.gen(function* () {
+              const grantedScopes =
+                requestedScopes === undefined
+                  ? grant.scopes
+                  : [...new Set(requestedScopes)].filter((scope) => grant.scopes.includes(scope));
+              if (grantedScopes.length === 0) {
+                return yield* new ServerAuthScopeNotGrantedError({});
+              }
+              // Only plain pairing links renew. T3 Connect, CLI, desktop and peer sessions keep
+              // their own lifetimes, so unlinking Connect or rotating a credential still cuts off.
+              const renewable =
+                input?.proofKeyThumbprint !== undefined &&
+                grant.method === "one-time-token" &&
+                grant.subject === PAIRING_LINK_SUBJECT;
+              const issue = sessions
+                .issue({
+                  method: input?.proofKeyThumbprint ? "dpop-access-token" : "bearer-access-token",
+                  subject: grant.subject,
+                  scopes: grantedScopes,
+                  ...(input?.proofKeyThumbprint
+                    ? {
+                        proofKeyThumbprint: input.proofKeyThumbprint,
+                        ttl: renewable ? RENEWABLE_ACCESS_TOKEN_TTL : Duration.hours(1),
+                      }
+                    : {}),
+                  ...(renewable ? { renewalWindow: RENEWABLE_SESSION_WINDOW } : {}),
+                  replaceActiveForSubjectAndMethod: grant.method === "desktop-bootstrap",
+                  client: {
+                    ...requestMetadata,
+                    ...(grant.label ? { label: grant.label } : {}),
+                  },
+                })
+                .pipe(
+                  Effect.mapError(
+                    (cause) => new ServerAuthAuthenticatedAccessTokenIssueError({ cause }),
+                  ),
+                );
+              // A proof-key exchange holds the lock from before it spends its credential.
+              return yield* input?.proofKeyThumbprint
+                ? issue
+                : issueUnlessOthersRevokedSince(revocationsAtStart, issue);
+            }),
+          ),
+          Effect.flatMap(toAccessTokenResult),
+          (exchange) =>
+            input?.proofKeyThumbprint ? connectTrustLock.withPermits(1)(exchange) : exchange,
+        );
+      return Ref.get(otherSessionRevocations).pipe(
+        Effect.flatMap(exchangeSince),
         Effect.withSpan("EnvironmentAuth.exchangeBootstrapCredentialForAccessToken"),
       );
     };
@@ -1510,7 +1558,12 @@ export const make = Effect.gen(function* () {
           .revokeConnectDevicesExcept(Option.getOrNull(currentProofKey))
           .pipe(Effect.mapError((cause) => new ServerAuthConnectDevicesError({ cause })));
         return yield* revokeOtherSessionsExcept(currentSessionId);
-      }).pipe(connectTrustLock.withPermits(1));
+      }).pipe(
+        // Counted last, after unspent links and session rows are gone, so whatever reads the
+        // new count can no longer use either.
+        Effect.ensuring(Ref.update(otherSessionRevocations, (count) => count + 1)),
+        connectTrustLock.withPermits(1),
+      );
     });
 
   const issueStartupPairingUrl: EnvironmentAuth["Service"]["issueStartupPairingUrl"] = (baseUrl) =>
@@ -1688,30 +1741,36 @@ export const make = Effect.gen(function* () {
     );
   };
 
-  const issueMcpClientSession: EnvironmentAuth["Service"]["issueMcpClientSession"] = (input) =>
-    input.oauth !== undefined
-      ? oauthSessions
-          .issue({ ...input, ...input.oauth })
-          .pipe(Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })))
-      : sessions
-          .issue({
-            subject: MCP_CLIENT_SUBJECT,
-            method: "bearer-access-token",
-            scopes: mcpClientScopes(input.access),
-            ttl: MCP_CLIENT_SESSION_TTL,
-            ...(input.access === "read-only" ? {} : { runtimeModeCeiling: input.access }),
-            peerLink: input.peerLink,
-            client: { ...input.client, label: input.label, deviceType: "bot" },
-          })
-          .pipe(
-            Effect.map((issued) => ({
-              sessionId: issued.sessionId,
-              token: issued.token,
-              expiresAt: issued.expiresAt,
-            })),
-            Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
-            Effect.withSpan("EnvironmentAuth.issueMcpClientSession"),
-          );
+  const issueMcpClientSession: EnvironmentAuth["Service"]["issueMcpClientSession"] = (input) => {
+    const issue =
+      input.oauth !== undefined
+        ? oauthSessions
+            .issue({ ...input, ...input.oauth })
+            .pipe(Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })))
+        : sessions
+            .issue({
+              subject: MCP_CLIENT_SUBJECT,
+              method: "bearer-access-token",
+              scopes: mcpClientScopes(input.access),
+              ttl: MCP_CLIENT_SESSION_TTL,
+              ...(input.access === "read-only" ? {} : { runtimeModeCeiling: input.access }),
+              peerLink: input.peerLink,
+              client: { ...input.client, label: input.label, deviceType: "bot" },
+            })
+            .pipe(
+              Effect.map((issued) => ({
+                sessionId: issued.sessionId,
+                token: issued.token,
+                expiresAt: issued.expiresAt,
+              })),
+              Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
+            );
+    return (
+      input.approvedAtRevocationCount === undefined
+        ? issue
+        : issueUnlessOthersRevokedSince(input.approvedAtRevocationCount, issue)
+    ).pipe(Effect.withSpan("EnvironmentAuth.issueMcpClientSession"));
+  };
 
   const refreshMcpClientSession: EnvironmentAuth["Service"]["refreshMcpClientSession"] = (input) =>
     oauthSessions.refresh(input).pipe(
@@ -1720,6 +1779,28 @@ export const make = Effect.gen(function* () {
           Effect.fail(new ServerAuthSessionTokenIssueError({ cause })),
       }),
     );
+  const revokeMcpClientToken: EnvironmentAuth["Service"]["revokeMcpClientToken"] = Effect.fn(
+    "EnvironmentAuth.revokeMcpClientToken",
+  )(function* (token) {
+    if (McpOAuthSessions.isRollingToken(token)) {
+      return yield* oauthSessions
+        .revoke(token)
+        .pipe(Effect.mapError((cause) => new ServerAuthSessionRevocationError({ cause })));
+    }
+    const session = yield* sessions.verify(token).pipe(
+      Effect.asSome,
+      Effect.catchIf(SessionStore.isSessionCredentialInvalidError, () => Effect.succeedNone),
+      Effect.mapError((cause) => new ServerAuthSessionCredentialValidationError({ cause })),
+    );
+    if (
+      Option.isNone(session) ||
+      session.value.subject !== MCP_CLIENT_SUBJECT ||
+      session.value.method !== "bearer-access-token"
+    ) {
+      return false;
+    }
+    return yield* revokeSession(session.value.sessionId);
+  });
 
   const consumeMcpApprovalCode: EnvironmentAuth["Service"]["consumeMcpApprovalCode"] = (
     code,
@@ -1782,6 +1863,8 @@ export const make = Effect.gen(function* () {
     issueWebSocketTicket,
     issueStartupPairingUrl,
     authenticateMcpClient,
+    revokeMcpClientToken,
+    otherSessionRevocationCount: Ref.get(otherSessionRevocations),
     issueMcpClientSession,
     refreshMcpClientSession,
     consumeMcpApprovalCode,

@@ -13,12 +13,14 @@ import {
   scheduledTaskRunDisplayStatus,
   type ThreadId,
 } from "@t3tools/contracts";
+import type { TimestampFormat } from "@t3tools/contracts/settings";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
+import { useClientSettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { ScheduledRelativeLabel } from "../settings/ScheduledTasksSettings";
 import { scheduleLabel } from "../settings/scheduledTasksSettings.logic";
@@ -44,12 +46,13 @@ const STATUS_DOT_CLASS: Record<ScheduledTask["lastRunStatus"], string> = {
 
 function taskScheduleLine(
   task: ScheduledTask,
+  timestampFormat: TimestampFormat,
   timeZone: string | undefined,
   resolve: MessageResolver,
 ) {
   return (
     <>
-      {scheduleLabel(task.schedule, timeZone, task.nextRunAt, resolve)}
+      {scheduleLabel(task.schedule, timestampFormat, timeZone, task.nextRunAt, resolve)}
       {task.blockedByPolicy !== undefined ? (
         ` · ${task.blockedByPolicy}`
       ) : task.enabled && task.nextRunAt !== null ? (
@@ -88,6 +91,7 @@ export function ThreadAutomationsPanel(props: {
   const runTaskNow = useAtomCommand(serverEnvironment.runScheduledTaskNow, {
     label: "thread automation run now",
   });
+  const timestampFormat = useClientSettings((settings) => settings.timestampFormat);
   const navigate = useNavigate();
   const gt = useGT();
   const m = useMessages();
@@ -199,13 +203,13 @@ export function ThreadAutomationsPanel(props: {
                   {task.title}
                 </span>
                 <p className="truncate text-2xs text-muted-foreground">
-                  {taskScheduleLine(task, tasksQuery.data?.timeZone, m)}
+                  {taskScheduleLine(task, timestampFormat, tasksQuery.data?.timeZone, m)}
                 </p>
               </TooltipTrigger>
               <TooltipPopup side="left">
                 <p className="font-medium">{task.title}</p>
                 <p className="text-muted-foreground">
-                  {taskScheduleLine(task, tasksQuery.data?.timeZone, m)}
+                  {taskScheduleLine(task, timestampFormat, tasksQuery.data?.timeZone, m)}
                 </p>
               </TooltipPopup>
             </Tooltip>

@@ -1778,6 +1778,7 @@ it.effect.each(["reachable", "deadline"] as const)(
         const sub = yield* f.call(f.service.subscribe(input));
         yield* f.append([input.arguments.threadId]);
         const drain = yield* Effect.forkChild(f.service.drain());
+        yield* TestClock.adjust("1 millis");
         yield* TestClock.adjust("1 second");
         expect(f.sent).toHaveLength(0);
         const pending = yield* f.deliveries.due(yield* Clock.currentTimeMillis);
@@ -1823,6 +1824,7 @@ it.effect.each([
       yield* f.call(f.service.subscribe(input));
       yield* f.append([input.arguments.threadId]);
       const drain = yield* Effect.forkChild(f.service.drain());
+      yield* TestClock.adjust("1 millis");
       yield* TestClock.adjust("1 second");
       expect(f.sent).toHaveLength(held ? 0 : 1);
       f.setTunnel({
