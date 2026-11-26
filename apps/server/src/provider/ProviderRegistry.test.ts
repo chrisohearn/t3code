@@ -445,6 +445,17 @@ function makeMutableServerSettingsService(
           yield* PubSub.publish(changes, next);
           return next;
         }),
+      updateSettingsFromSnapshot: (update) =>
+        Effect.gen(function* () {
+          const current = yield* Ref.get(settingsRef);
+          const patch = update(current, current);
+          if (patch === undefined) return current;
+          const next = applyServerSettingsPatch(current, patch);
+          encodeServerSettings(next);
+          yield* Ref.set(settingsRef, next);
+          yield* PubSub.publish(changes, next);
+          return next;
+        }),
       updateProviderInstance: (mutation, patch = {}) =>
         Effect.gen(function* () {
           const current = yield* Ref.get(settingsRef);

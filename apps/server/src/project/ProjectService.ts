@@ -6,6 +6,7 @@ import {
   type Project,
   type ProjectCreatePayload,
   type ProjectTrackedFolder,
+  type ProjectSettingsOverrides,
   type ProjectUpdatePayload,
   type ProjectSnapshot,
   type ThreadId,
@@ -27,6 +28,10 @@ import * as Schema from "effect/Schema";
 
 import { withCommandMetrics } from "../observability/Metrics.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
+import type {
+  ProjectSettingsSync,
+  ProjectSettingsSyncChange,
+} from "../orchestration-v2/CommandReceiptStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
@@ -387,6 +392,10 @@ export const make = Effect.gen(function* () {
     });
   });
 
+  type ProjectSettingsSyncInput = Pick<
+    ProjectUpdateInput,
+    "scripts" | "defaultModelSelection" | "defaultThreadEnvMode" | "autoPull"
+  >;
   const commit = Effect.fn("ProjectService.commit")(function* (
     initial: ProjectCommand,
     // Decides the command from the row as it is under the project's lock; null commits nothing.
@@ -394,9 +403,8 @@ export const make = Effect.gen(function* () {
     refine?: (
       current: ProjectStore.ProjectRow | undefined,
     ) => Effect.Effect<ProjectCommand | null, ProjectServiceError>,
-    // Runs under the same lock only when this call commits, so retries skip it and writes keep
-    // the commit order.
-    onCommitted?: Effect.Effect<void, ProjectOperationError>,
+    // Settings-backed fields are included in the durable project event for safe replay.
+    settingsSyncInput?: ProjectSettingsSyncInput,
   ) {
     const { projectId } = initial;
     const dispatchError = (cause: unknown) =>
@@ -430,14 +438,32 @@ export const make = Effect.gen(function* () {
         now,
       });
       if (Result.isSuccess(planned)) {
-        const { receipt, committed } = yield* eventSink.commitProjectCommand({
+        const settingsSync =
+          settingsSyncInput === undefined
+            ? undefined
+            : yield* captureProjectSettingsSync(projectId, settingsSyncInput).pipe(
+                Effect.mapError(dispatchError),
+              );
+        const { receipt } = yield* eventSink.commitProjectCommand({
           commandId: command.commandId,
           projectId,
           commandType: command.type,
           acceptedAt: now,
           event: planned.success,
+          ...(settingsSync === undefined ? {} : { projectSettingsSync: settingsSync }),
         });
-        if (committed && onCommitted !== undefined) yield* onCommitted;
+        if (
+          receipt.status === "accepted" &&
+          receipt.projectId === projectId &&
+          receipt.commandType === initial.type &&
+          receipt.projectSettingsSync !== undefined
+        ) {
+          yield* applyProjectSettingsSync(
+            projectId,
+            receipt.commandId,
+            receipt.projectSettingsSync,
+          ).pipe(Effect.mapError(dispatchError));
+        }
         return { receipt };
       }
       const receipt = yield* eventSink.commitRejectedProjectCommand({
@@ -447,6 +473,18 @@ export const make = Effect.gen(function* () {
         rejectedAt: now,
         error: encodeProjectCommandRejection(planned.failure),
       });
+      if (
+        receipt.status === "accepted" &&
+        receipt.projectId === projectId &&
+        receipt.commandType === initial.type &&
+        receipt.projectSettingsSync !== undefined
+      ) {
+        yield* applyProjectSettingsSync(
+          projectId,
+          receipt.commandId,
+          receipt.projectSettingsSync,
+        ).pipe(Effect.mapError(dispatchError));
+      }
       return { receipt };
     });
     // Deletion holds the project lock across its child cascade and this commit.
@@ -545,49 +583,80 @@ export const make = Effect.gen(function* () {
   });
 
   // Once project settings are folded, project defaults resolve from Settings only, where the app's editor saves them.
-  const saveProjectSettings = (
+  const captureProjectSettingsSync = (projectId: ProjectId, input: ProjectSettingsSyncInput) =>
+    serverSettings.getSettings.pipe(
+      Effect.map(({ projectSettingsOverrides }) => {
+        const entry = projectSettingsOverrides[projectId] as
+          | (ProjectSettingsOverrides & Record<string, unknown>)
+          | undefined;
+        const changes: Array<ProjectSettingsSyncChange> = [];
+        const addChange = (key: ProjectSettingsSyncChange["key"], after: unknown) => {
+          const before =
+            entry !== undefined && Object.hasOwn(entry, key)
+              ? { present: true as const, value: entry[key] }
+              : { present: false as const };
+          const next =
+            after === undefined
+              ? { present: false as const }
+              : { present: true as const, value: after };
+          changes.push({ key, before, after: next } as ProjectSettingsSyncChange);
+        };
+        if (input.scripts !== undefined) addChange("defaultProjectScripts", input.scripts);
+        if (input.defaultModelSelection !== undefined)
+          addChange(
+            "defaultModelSelection",
+            input.defaultModelSelection === null ? undefined : input.defaultModelSelection,
+          );
+        if (input.defaultThreadEnvMode !== undefined)
+          addChange(
+            "defaultThreadEnvMode",
+            input.defaultThreadEnvMode === null ? undefined : input.defaultThreadEnvMode,
+          );
+        if (input.autoPull !== undefined) addChange("defaultAutoPull", input.autoPull);
+        return changes.length === 0 ? undefined : { changes };
+      }),
+    );
+
+  const applyProjectSettingsSync = Effect.fn("ProjectService.applyProjectSettingsSync")(function* (
     projectId: ProjectId,
-    input: Pick<
-      ProjectUpdateInput,
-      "scripts" | "defaultModelSelection" | "defaultThreadEnvMode" | "autoPull"
-    >,
-  ) =>
-    input.scripts === undefined &&
-    input.defaultModelSelection === undefined &&
-    input.defaultThreadEnvMode === undefined &&
-    input.autoPull === undefined
-      ? Effect.void
-      : serverSettings.getSettings.pipe(
-          // A patch replaces the project's whole entry, so its other overrides are carried over.
-          Effect.flatMap(({ projectSettingsOverrides }) => {
-            const entry = {
-              ...projectSettingsOverrides[projectId],
-              ...(input.scripts === undefined ? {} : { defaultProjectScripts: input.scripts }),
-              ...(input.defaultModelSelection == null
-                ? {}
-                : { defaultModelSelection: input.defaultModelSelection }),
-              ...(input.defaultThreadEnvMode == null
-                ? {}
-                : { defaultThreadEnvMode: input.defaultThreadEnvMode }),
-              ...(input.autoPull === undefined ? {} : { defaultAutoPull: input.autoPull }),
-            };
-            // A cleared project default inherits the machine's setting again.
-            if (input.defaultModelSelection === null) delete entry.defaultModelSelection;
-            if (input.defaultThreadEnvMode === null) delete entry.defaultThreadEnvMode;
-            return serverSettings.updateSettings({
-              projectSettingsOverrides: { [projectId]: entry },
-            });
-          }),
-          Effect.asVoid,
-          Effect.mapError(
-            (cause) =>
-              new ProjectOperationError({
-                operation: "dispatch-project-command",
-                projectId,
-                cause,
-              }),
-          ),
-        );
+    commandId: CommandId,
+    sync: ProjectSettingsSync,
+  ) {
+    yield* serverSettings
+      .updateSettingsFromSnapshot((persisted, effective) => {
+        const raw = persisted.projectSettingsOverrides[projectId] as
+          | (ProjectSettingsOverrides & Record<string, unknown>)
+          | undefined;
+        const current = effective.projectSettingsOverrides[projectId] as
+          | (ProjectSettingsOverrides & Record<string, unknown>)
+          | undefined;
+        const entry = { ...raw } as Record<string, unknown>;
+        let changed = false;
+        const sameSnapshot = (
+          left: { readonly present: boolean; readonly value?: unknown },
+          right: { readonly present: boolean; readonly value?: unknown },
+        ) =>
+          left.present === right.present &&
+          (!left.present || JSON.stringify(left.value) === JSON.stringify(right.value));
+        for (const change of sync.changes) {
+          if (sameSnapshot(change.before, change.after)) continue;
+          const snapshot =
+            current !== undefined && Object.hasOwn(current, change.key)
+              ? { present: true, value: current[change.key] }
+              : { present: false };
+          if (!sameSnapshot(snapshot, change.before)) continue;
+          if (change.after.present) entry[change.key] = change.after.value;
+          else delete entry[change.key];
+          changed = true;
+        }
+        if (!changed) return undefined;
+        return {
+          projectSettingsOverrides: { [projectId]: entry as ProjectSettingsOverrides },
+        };
+      })
+      .pipe(Effect.asVoid);
+    yield* eventSink.acknowledgeProjectSettingsSync({ commandId });
+  });
 
   const create: ProjectService["Service"]["create"] = Effect.fn("ProjectService.create")(
     function* (input) {
@@ -614,7 +683,7 @@ export const make = Effect.gen(function* () {
           trackedFolders,
         },
         undefined,
-        saveProjectSettings(input.projectId, { scripts: input.scripts }),
+        input,
       );
       yield* projectEnrichment.invalidate([workspaceRoot]);
       return yield* readCommitted(input.projectId);
@@ -698,7 +767,7 @@ export const make = Effect.gen(function* () {
           );
           return { ...command, trackedFolders };
         }),
-        saveProjectSettings(input.projectId, input),
+        input,
       );
       if (workspaceRoot !== previousRoot || input.faviconPath !== undefined) {
         yield* projectEnrichment.invalidate([previousRoot, workspaceRoot]);

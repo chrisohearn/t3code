@@ -1,4 +1,12 @@
-import { CommandId, NonNegativeInt, ProjectId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  ModelSelection,
+  NonNegativeInt,
+  ProjectId,
+  ProjectScript,
+  ThreadEnvMode,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -40,6 +48,52 @@ export type CommandReceiptStoreV2Error = typeof CommandReceiptStoreV2Error.Type;
 export const CommandReceiptV2Status = Schema.Literals(["accepted", "rejected"]);
 export type CommandReceiptV2Status = typeof CommandReceiptV2Status.Type;
 
+const projectScriptSyncSnapshot = Schema.Struct({
+  present: Schema.Boolean,
+  value: Schema.optional(Schema.Array(ProjectScript)),
+});
+const modelSelectionSyncSnapshot = Schema.Struct({
+  present: Schema.Boolean,
+  value: Schema.optional(Schema.NullOr(ModelSelection)),
+});
+const threadEnvModeSyncSnapshot = Schema.Struct({
+  present: Schema.Boolean,
+  value: Schema.optional(Schema.NullOr(ThreadEnvMode)),
+});
+const autoPullSyncSnapshot = Schema.Struct({
+  present: Schema.Boolean,
+  value: Schema.optional(Schema.Boolean),
+});
+
+export const ProjectSettingsSyncChange = Schema.Union([
+  Schema.Struct({
+    key: Schema.Literal("defaultProjectScripts"),
+    before: projectScriptSyncSnapshot,
+    after: projectScriptSyncSnapshot,
+  }),
+  Schema.Struct({
+    key: Schema.Literal("defaultModelSelection"),
+    before: modelSelectionSyncSnapshot,
+    after: modelSelectionSyncSnapshot,
+  }),
+  Schema.Struct({
+    key: Schema.Literal("defaultThreadEnvMode"),
+    before: threadEnvModeSyncSnapshot,
+    after: threadEnvModeSyncSnapshot,
+  }),
+  Schema.Struct({
+    key: Schema.Literal("defaultAutoPull"),
+    before: autoPullSyncSnapshot,
+    after: autoPullSyncSnapshot,
+  }),
+]);
+export type ProjectSettingsSyncChange = typeof ProjectSettingsSyncChange.Type;
+
+export const ProjectSettingsSync = Schema.Struct({
+  changes: Schema.Array(ProjectSettingsSyncChange),
+});
+export type ProjectSettingsSync = typeof ProjectSettingsSync.Type;
+
 export const CommandReceiptV2 = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
@@ -59,6 +113,7 @@ export const ProjectCommandReceiptV2 = Schema.Struct({
   resultSequence: NonNegativeInt,
   status: CommandReceiptV2Status,
   error: Schema.NullOr(Schema.String),
+  projectSettingsSync: Schema.optional(ProjectSettingsSync),
 });
 export type ProjectCommandReceiptV2 = typeof ProjectCommandReceiptV2.Type;
 
@@ -92,12 +147,32 @@ const decodeReceipt = Schema.decodeUnknownEffect(
     acceptedAt: Schema.DateTimeUtcFromString,
   })),
 );
-const decodeProjectReceipt = Schema.decodeUnknownEffect(
+const ProjectSettingsSyncJson = Schema.fromJsonString(ProjectSettingsSync);
+const decodeProjectSettingsSyncJson = Schema.decodeUnknownEffect(ProjectSettingsSyncJson);
+const decodeProjectCommandReceipt = Schema.decodeUnknownEffect(
   ProjectCommandReceiptV2.mapFields((fields) => ({
     ...fields,
     acceptedAt: Schema.DateTimeUtcFromString,
   })),
 );
+const decodeProjectReceipt = Effect.fn("CommandReceiptStore.decodeProjectReceipt")(function* (
+  receipt: OrchestrationCommandReceipts.OrchestrationCommandReceipt,
+) {
+  const projectSettingsSync =
+    receipt.projectSettingsSyncJson == null
+      ? undefined
+      : yield* decodeProjectSettingsSyncJson(receipt.projectSettingsSyncJson);
+  return yield* decodeProjectCommandReceipt({
+    commandId: receipt.commandId,
+    projectId: receipt.aggregateId as ProjectId,
+    commandType: receipt.commandType,
+    acceptedAt: receipt.acceptedAt,
+    resultSequence: receipt.resultSequence,
+    status: receipt.status,
+    error: receipt.error,
+    ...(projectSettingsSync === undefined ? {} : { projectSettingsSync }),
+  });
+});
 
 function fromApplicationReceipt(receipt: OrchestrationCommandReceipts.OrchestrationCommandReceipt) {
   return decodeReceipt({
@@ -124,6 +199,10 @@ function toApplicationReceipt(
     resultSequence: receipt.resultSequence,
     status: receipt.status,
     error: receipt.error,
+    projectSettingsSyncJson:
+      "projectSettingsSync" in receipt && receipt.projectSettingsSync !== undefined
+        ? JSON.stringify(receipt.projectSettingsSync)
+        : null,
   };
 }
 
@@ -181,15 +260,7 @@ const layerBase: Layer.Layer<
           Effect.flatMap((receipt) =>
             Option.isNone(receipt) || receipt.value.aggregateKind !== "project"
               ? Effect.succeedNone
-              : decodeProjectReceipt({
-                  commandId: receipt.value.commandId,
-                  projectId: receipt.value.aggregateId,
-                  commandType: receipt.value.commandType,
-                  acceptedAt: receipt.value.acceptedAt,
-                  resultSequence: receipt.value.resultSequence,
-                  status: receipt.value.status,
-                  error: receipt.value.error,
-                }).pipe(Effect.asSome),
+              : decodeProjectReceipt(receipt.value).pipe(Effect.asSome),
           ),
           Effect.mapError((cause) => new CommandReceiptStoreReadError({ commandId, cause })),
         ),

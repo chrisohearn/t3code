@@ -141,6 +141,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
         }),
       );
     } else {
+      cancelHeldComposerSend(composerTargetKey(composerDraftTarget));
       void applyThreadRuntimeMode(threadRef, mode);
     }
     scheduleComposerFocus();

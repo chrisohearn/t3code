@@ -460,6 +460,38 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings"
     }).pipe(Effect.provide(layerServerSettings())),
   );
 
+  it.effect("updates Settings from the latest persisted snapshot under its write lock", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const projectId = ProjectId.make("project:settings-snapshot-update");
+      yield* serverSettings.updateSettings({
+        projectSettingsOverrides: {
+          [projectId]: {
+            defaultAutoPull: false,
+            defaultProjectScripts: [],
+            enableAgentBrowserAccess: true,
+          },
+        },
+      });
+
+      const next = yield* serverSettings.updateSettingsFromSnapshot((persisted, effective) => {
+        assert.equal(effective.projectSettingsOverrides[projectId]?.defaultAutoPull, false);
+        return {
+          projectSettingsOverrides: {
+            [projectId]: {
+              ...persisted.projectSettingsOverrides[projectId],
+              defaultAutoPull: true,
+            },
+          },
+        };
+      });
+
+      assert.equal(next.projectSettingsOverrides[projectId]?.defaultAutoPull, true);
+      assert.deepEqual(next.projectSettingsOverrides[projectId]?.defaultProjectScripts, []);
+      assert.equal(next.projectSettingsOverrides[projectId]?.enableAgentBrowserAccess, true);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
   it.effect("keeps an external settings edit that the watcher has not reloaded yet", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;

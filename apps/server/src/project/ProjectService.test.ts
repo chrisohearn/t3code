@@ -11,6 +11,7 @@ import {
   ProjectId,
   type ProjectTrackedFolder,
   ProviderInstanceId,
+  ServerSettingsError,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
@@ -203,22 +204,25 @@ it.effect("resolves only the requested active project page in creation order", (
   }),
 );
 
-const layerProjectServiceDependencies = Layer.mergeAll(
-  RuntimeLayer.layerEventSink,
-  ProjectStore.layer,
-  ProjectionStore.layer,
-  IdAllocator.layer,
-  ThreadCommandExecutor.layer,
-).pipe(
-  Layer.provideMerge(LegacyV1ThreadImporter.layer.pipe(Layer.provide(RuntimeLayer.layerEventSink))),
-  Layer.provideMerge(ProjectEnrichmentService.layer),
-  Layer.provideMerge(layerWorkspacePaths),
-  Layer.provideMerge(layerMetadata),
-  Layer.provideMerge(SqlitePersistence.layerMemory),
-  Layer.provideMerge(ServerSettings.layerTest()),
-  Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "project-service-race-" })),
-  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-);
+const layerProjectServiceDependencies = (serverSettingsLayer = ServerSettings.layerTest()) =>
+  Layer.mergeAll(
+    RuntimeLayer.layerEventSink,
+    ProjectStore.layer,
+    ProjectionStore.layer,
+    IdAllocator.layer,
+    ThreadCommandExecutor.layer,
+  ).pipe(
+    Layer.provideMerge(
+      LegacyV1ThreadImporter.layer.pipe(Layer.provide(RuntimeLayer.layerEventSink)),
+    ),
+    Layer.provideMerge(ProjectEnrichmentService.layer),
+    Layer.provideMerge(layerWorkspacePaths),
+    Layer.provideMerge(layerMetadata),
+    Layer.provideMerge(SqlitePersistence.layerMemory),
+    Layer.provideMerge(serverSettingsLayer),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "project-service-race-" })),
+    Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+  );
 
 const waitForProject = Effect.fn("ProjectServiceTest.waitForProject")(function* (
   service: ProjectService.ProjectService["Service"],
@@ -578,6 +582,91 @@ it.layer(layerTest)("ProjectService", (it) => {
       `;
       assert.deepEqual(events, []);
       assert.deepEqual(Option.getOrThrow(yield* service.getById(projectId)).scripts, []);
+    }),
+  );
+
+  it.effect("retries a failed post-commit Settings write with the same project command", () =>
+    Effect.gen(function* () {
+      const settings = yield* ServerSettings.ServerSettingsService;
+      let failNextUpdate = true;
+      const flakySettings = {
+        ...settings,
+        updateSettingsFromSnapshot: (
+          update: Parameters<typeof settings.updateSettingsFromSnapshot>[0],
+        ) =>
+          Effect.suspend(() => {
+            if (!failNextUpdate) return settings.updateSettingsFromSnapshot(update);
+            failNextUpdate = false;
+            return Effect.fail(
+              new ServerSettingsError({
+                settingsPath: "/tmp/project-settings-retry.json",
+                operation: "write-file",
+                cause: new Error("temporary write failure"),
+              }),
+            );
+          }),
+      };
+      const dependencies = layerProjectServiceDependencies(
+        Layer.succeed(ServerSettings.ServerSettingsService, flakySettings),
+      );
+      const projectId = ProjectId.make("project:settings-retry");
+      const script = {
+        id: "saved-script",
+        name: "Saved script",
+        command: "npm run start",
+        icon: "play" as const,
+        runOnWorktreeCreate: false,
+      };
+      const input = {
+        commandId: CommandId.make("command:settings-retry:create"),
+        projectId,
+        title: "Settings retry",
+        workspaceRoot: "/work/settings-retry",
+        scripts: [script],
+      };
+
+      yield* Effect.gen(function* () {
+        const service = yield* ProjectService.make;
+        const firstError = yield* service.create(input).pipe(Effect.flip);
+        assert.equal(firstError._tag, "ProjectOperationError");
+        assert.isUndefined(
+          (yield* settings.getSettings).projectSettingsOverrides[projectId]?.defaultProjectScripts,
+        );
+
+        // A fresh service instance simulates a restart: recovery state must come from the event.
+        const restartedService = yield* ProjectService.make;
+        yield* restartedService.create(input);
+        assert.deepStrictEqual(
+          (yield* settings.getSettings).projectSettingsOverrides[projectId]?.defaultProjectScripts,
+          [script],
+        );
+
+        const supersededProjectId = ProjectId.make("project:settings-retry-superseded");
+        const originalScript = { ...script, id: "original-script", name: "Original script" };
+        const newerScript = { ...script, id: "newer-script", name: "Newer script" };
+        const supersededInput = {
+          ...input,
+          commandId: CommandId.make("command:settings-retry:superseded"),
+          projectId: supersededProjectId,
+          title: "Settings retry superseded",
+          workspaceRoot: "/work/settings-retry-superseded",
+          scripts: [originalScript],
+        };
+        failNextUpdate = true;
+        const secondError = yield* restartedService.create(supersededInput).pipe(Effect.flip);
+        assert.equal(secondError._tag, "ProjectOperationError");
+        yield* settings.updateSettings({
+          projectSettingsOverrides: {
+            [supersededProjectId]: { defaultProjectScripts: [newerScript] },
+          },
+        });
+        yield* restartedService.create(supersededInput);
+        assert.deepStrictEqual(
+          (yield* settings.getSettings).projectSettingsOverrides[supersededProjectId]
+            ?.defaultProjectScripts,
+          [newerScript],
+        );
+      }).pipe(Effect.provide(dependencies));
     }),
   );
 
@@ -1117,7 +1206,7 @@ it.effect("serializes two projects claiming the same workspace root", () =>
     yield* Deferred.succeed(releaseFirst, undefined);
     assert.equal((yield* Fiber.join(first)).id, "project:race:first");
     assert.equal((yield* Fiber.join(second))._tag, "ProjectConflictError");
-  }).pipe(Effect.provide(layerProjectServiceDependencies)),
+  }).pipe(Effect.provide(layerProjectServiceDependencies())),
 );
 
 it.effect("keeps a folder added while a scan of the project folder waited to commit", () =>
@@ -1177,7 +1266,7 @@ it.effect("keeps a folder added while a scan of the project folder waited to com
       { path: path.join(root, "api"), name: "api", discovered: true },
       added,
     ]);
-  }).pipe(Effect.provide(layerProjectServiceDependencies)),
+  }).pipe(Effect.provide(layerProjectServiceDependencies())),
 );
 
 it.effect("rejects an update that waited on the lock while its project was deleted", () =>
@@ -1234,5 +1323,5 @@ it.effect("rejects an update that waited on the lock while its project was delet
       Option.getOrThrow(yield* service.getById(projectId, { includeDeleted: true })).title,
       "Update race",
     );
-  }).pipe(Effect.provide(layerProjectServiceDependencies)),
+  }).pipe(Effect.provide(layerProjectServiceDependencies())),
 );

@@ -10,8 +10,14 @@ import { AppRoot } from "~/AppRoot";
 // The route loads ChatView lazily, and its first transform (React Compiler over ~4k lines)
 // takes 6-11s; importing it here keeps that out of the test's timeout.
 import "~/components/ChatView";
+import {
+  addPreparingComposerImages,
+  cancelPreparingComposerImages,
+  holdComposerSend,
+  useComposerSendHeld,
+} from "~/components/chat/preparingComposerImages";
 import { useRuntimeModePickStore } from "~/components/chat/runtimeModePickStore";
-import { useComposerDraftStore } from "~/composerDraftStore";
+import { composerTargetKey, useComposerDraftStore } from "~/composerDraftStore";
 import { __setClientSettingsForTests } from "~/hooks/useSettings";
 import { getRouter } from "~/router";
 import {
@@ -25,7 +31,7 @@ import {
   type FakeDriver,
   type FakeThread,
 } from "../../test/fakeEnvironment";
-import { render } from "../../test/render";
+import { act, render } from "../../test/render";
 
 // The socket is the only fake layer; see test/appScenarios.renders.tsx.
 vi.mock("../../../../packages/client-runtime/src/connection/driver.ts", async (importOriginal) => {
@@ -45,6 +51,7 @@ vi.mock(import("~/rpc/requestLatencyState"), async (original) => ({
 }));
 
 const idleThread = threadWithHistory("thread-mode-pick", 1);
+const heldSendThread = threadWithHistory("thread-mode-held-send", 1);
 const refusedThread = threadWithHistory("thread-mode-refused", 1);
 const revertedThread = threadWithHistory("thread-mode-reverted", 1);
 const sendingThread = threadWithHistory("thread-mode-sending", 1);
@@ -58,6 +65,7 @@ const activeThreads = ACTIVE_STATUSES.map((status) => {
 // The app's shell subscription outlives a test, so every test lists every thread.
 const allThreads = [
   idleThread,
+  heldSendThread,
   refusedThread,
   revertedThread,
   sendingThread,
@@ -67,11 +75,15 @@ const allThreads = [
 
 async function openThread(
   thread: FakeThread,
-  options: { readonly holdCommand?: (command: OrchestrationV2Command) => boolean } = {},
+  options: {
+    readonly holdCommand?: (command: OrchestrationV2Command) => boolean;
+    readonly observeHeldSend?: boolean;
+  } = {},
 ) {
   const stack = new AsyncDisposableStack();
   try {
-    stack.use(installFakeEnvironment(allThreads, { acceptCommands: true, ...options }));
+    const { observeHeldSend = false, ...environmentOptions } = options;
+    stack.use(installFakeEnvironment(allThreads, { acceptCommands: true, ...environmentOptions }));
     __setClientSettingsForTests({
       ...DEFAULT_CLIENT_SETTINGS,
       onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
@@ -81,7 +93,19 @@ async function openThread(
     );
     await router.load();
     // AppRoot brings its own router.
-    stack.use(await render(<AppRoot router={router} />, { router: false }));
+    stack.use(
+      await render(
+        observeHeldSend ? (
+          <>
+            <AppRoot router={router} />
+            <HeldComposerSendStatus targetKey={composerTargetKey(threadRef(thread))} />
+          </>
+        ) : (
+          <AppRoot router={router} />
+        ),
+        { router: false },
+      ),
+    );
     await expect.element(page.getByText(`Answer 0 for ${thread.id}.`)).toBeVisible();
     return stack.move();
   } catch (error) {
@@ -107,6 +131,14 @@ const pendingPick = (thread: FakeThread) =>
 
 const holdRuntimeModeCommands = (command: OrchestrationV2Command) =>
   command.type === "thread.runtime-mode.set";
+
+function HeldComposerSendStatus({ targetKey }: { readonly targetKey: string }) {
+  return (
+    <span data-testid="held-composer-send">
+      {useComposerSendHeld(targetKey) ? "held" : "ready"}
+    </span>
+  );
+}
 
 async function typeAndSend(text: string) {
   await userEvent.click(page.getByTestId("composer-editor"));
@@ -193,6 +225,40 @@ it("a send while a pick is pending does not set the mode again", async () => {
   await rejectPendingCommand("Refused.");
   await messageSent();
   expect(runtimeModeCommands()).toHaveLength(1);
+});
+
+it("cancels an image-held send before changing an idle thread's permissions", async () => {
+  const thread = heldSendThread;
+  const targetKey = composerTargetKey(threadRef(thread));
+  using _preparing = {
+    [Symbol.dispose]: () => cancelPreparingComposerImages(targetKey),
+  };
+  await using _app = await openThread(thread, { observeHeldSend: true });
+
+  addPreparingComposerImages(targetKey, [
+    {
+      id: "permissions-held-image",
+      name: "pending.png",
+      file: new File(["pending"], "pending.png", { type: "image/png" }),
+      hidden: false,
+    },
+  ]);
+  await page.getByRole("button", { name: "GPT-5.4", exact: true }).click();
+  await expect
+    .element(page.getByRole("button", { name: "Permissions: Full access" }))
+    .toBeVisible();
+  await page.getByRole("button", { name: "Permissions: Full access" }).click();
+  let heldSend: ReturnType<typeof holdComposerSend> = null;
+  await act(() => {
+    heldSend = holdComposerSend(threadRef(thread));
+  });
+  if (heldSend === null) throw new Error("the pending image should hold this send");
+  await expect.element(page.getByTestId("held-composer-send")).toHaveTextContent("held");
+
+  await page.getByRole("menuitemradio", { name: "Supervised" }).click();
+  await vi.waitFor(() => expect(runtimeModeCommands()).toHaveLength(1));
+  await expect.element(page.getByTestId("held-composer-send")).toHaveTextContent("ready");
+  await expect(heldSend).resolves.toEqual({ status: "cancelled" });
 });
 
 it("a mode saved in an older draft neither shows nor reaches the server", async () => {

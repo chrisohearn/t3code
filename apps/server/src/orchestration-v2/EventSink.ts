@@ -248,6 +248,7 @@ export interface EventSinkV2Shape {
     readonly commandType: string;
     readonly acceptedAt: DateTime.Utc;
     readonly event: UnsequencedProjectEvent;
+    readonly projectSettingsSync?: CommandReceiptStore.ProjectSettingsSync;
   }) => Effect.Effect<
     { readonly receipt: CommandReceiptStore.ProjectCommandReceiptV2; readonly committed: boolean },
     EventSinkV2Error
@@ -259,6 +260,10 @@ export interface EventSinkV2Shape {
     readonly rejectedAt: DateTime.Utc;
     readonly error: string;
   }) => Effect.Effect<CommandReceiptStore.ProjectCommandReceiptV2, EventSinkV2Error>;
+  /** Clears the durable Settings replay payload after its side effect has succeeded or been superseded. */
+  readonly acknowledgeProjectSettingsSync: (input: {
+    readonly commandId: CommandId;
+  }) => Effect.Effect<void, EventSinkV2Error>;
   readonly stream: (input?: {
     readonly threadId?: ThreadId;
     readonly afterSequence?: number;
@@ -1087,6 +1092,9 @@ const layerBase: Layer.Layer<
               resultSequence: 0,
               status: "accepted",
               error: null,
+              ...(input.projectSettingsSync === undefined
+                ? {}
+                : { projectSettingsSync: input.projectSettingsSync }),
             };
             if (!(yield* commandReceipts.insertIfAbsent(reserved))) {
               return { receipt: yield* existingProjectReceipt(input.commandId), event: undefined };
@@ -1133,6 +1141,14 @@ const layerBase: Layer.Layer<
             : yield* existingProjectReceipt(input.commandId);
         }),
       );
+    });
+
+    const acknowledgeProjectSettingsSyncEffect = Effect.fn(
+      "orchestrationV2.EventSink.acknowledgeProjectSettingsSync",
+    )(function* (input: Parameters<EventSinkV2Shape["acknowledgeProjectSettingsSync"]>[0]) {
+      const receipt = yield* existingProjectReceipt(input.commandId);
+      if (receipt.projectSettingsSync === undefined) return;
+      yield* commandReceipts.upsert({ ...receipt, projectSettingsSync: undefined });
     });
 
     const catchUp = (input: {
@@ -1429,6 +1445,13 @@ const layerBase: Layer.Layer<
         ),
       commitRejectedProjectCommand: (input) =>
         commitRejectedProjectCommandEffect(input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new EventSinkWriteError({ commandId: input.commandId, eventCount: 0, cause }),
+          ),
+        ),
+      acknowledgeProjectSettingsSync: (input) =>
+        acknowledgeProjectSettingsSyncEffect(input).pipe(
           Effect.mapError(
             (cause) =>
               new EventSinkWriteError({ commandId: input.commandId, eventCount: 0, cause }),

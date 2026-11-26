@@ -118,6 +118,9 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // Effect's helpers must share the runner's suite context; externalizing their re-export of
+    // vite-plus/test loads a separate Vitest API outside the collector.
+    server: { deps: { inline: ["@effect/vitest", "vite-plus"] } },
     // Fixture subprocesses must not inherit the outer task runner’s cache policy.
     env: { VP_REMOTE_CACHE: "off", VP_REMOTE_CACHE_URL: "" },
     exclude: TEST_EXCLUDE,

@@ -409,6 +409,7 @@ const fixture = Effect.fn("fixture")(function* (
         start: Effect.void,
         ready: Effect.void,
         getSettings: Ref.get(settings),
+        updateSettingsFromSnapshot: () => Effect.die("Unexpected settings snapshot update"),
         updateSettings: (patch) =>
           Ref.updateAndGet(settings, (current) => ({
             ...current,

@@ -703,6 +703,7 @@ it.effect.each([
       Effect.provide(dependencies),
     );
     expect(result).toMatchObject(warns ? { warning: expect.stringContaining(workspaceRoot) } : {});
+    expect(ThreadLaunchMcp.launchResult.fields).toHaveProperty("warning");
     expect(warns || (result as { warning?: string }).warning === undefined).toBe(true);
   }),
 );
@@ -1380,6 +1381,57 @@ it.effect("creating a project through MCP refuses a model default instead of dro
     expect(refused.at(-1)?.result).toMatchObject({
       code: "invalid_request",
       message: expect.stringContaining("t3_project_update"),
+    });
+  }),
+);
+
+it.effect("returns saved project settings with a temporary-folder warning", () =>
+  Effect.gen(function* () {
+    const script: ProjectScript = {
+      id: "saved-script",
+      name: "Saved script",
+      command: "npm run start",
+      icon: "play",
+      runOnWorktreeCreate: false,
+    };
+    const harness = clientLaunchHarness({
+      runtimeModeCeiling: "full-access",
+      overrideModel: {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-opus",
+      },
+      overrideScripts: [script],
+      launched: [],
+      workspaceRoot: "/tmp/review",
+    });
+    const created = {
+      id: harness.projectId,
+      title: "Saved settings",
+      workspaceRoot: "/tmp/review",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      deletedAt: null,
+    } as unknown as ProjectRecord;
+    const dependencies = Layer.merge(
+      harness.dependencies,
+      Layer.mock(Project.ProjectService)({
+        create: () => Effect.succeed(created),
+      }),
+    );
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const result = yield* toolkit
+      .handle("t3_project_create", { title: "Saved settings", workspaceRoot: "/tmp/review" })
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+
+    expect(result.at(-1)?.result).toMatchObject({
+      warning: expect.stringContaining("/tmp/review"),
+      scripts: [script],
     });
   }),
 );
