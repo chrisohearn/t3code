@@ -47,10 +47,17 @@ it.layer(NodeServices.layer)("agent-skill-tree-layout", (it) => {
       const repoRoot = path.resolve(path.dirname(testPath), "..");
       const roots = skillTrees.map((tree) => path.join(repoRoot, tree));
 
-      for (const root of roots) {
+      for (const [index, root] of roots.entries()) {
         const stat = yield* fileSystem.lstat(root);
         assert.equal(stat.type, "Directory", `${root} must be a real directory`);
-        assert.deepStrictEqual(yield* listFiles(fileSystem, path, root), skillFiles);
+        const files = yield* listFiles(fileSystem, path, root);
+        for (const required of skillFiles) {
+          assert.isTrue(files.includes(required), `${skillTrees[index]} is missing ${required}`);
+        }
+        // .claude is the seven-path alias tree; .agents may also contain fork-only skills.
+        if (skillTrees[index] === ".claude/skills") {
+          assert.deepStrictEqual(files, skillFiles);
+        }
       }
 
       for (const relative of skillFiles) {

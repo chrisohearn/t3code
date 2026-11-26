@@ -22,6 +22,7 @@ export const OrchestrationCommandReceipt = Schema.Struct({
   resultSequence: NonNegativeInt,
   status: Schema.Literals(["accepted", "rejected"]),
   error: Schema.NullOr(Schema.String),
+  projectSettingsSyncJson: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type OrchestrationCommandReceipt = typeof OrchestrationCommandReceipt.Type;
 
@@ -65,7 +66,8 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
           accepted_at,
           result_sequence,
           status,
-          error
+          error,
+          project_settings_sync_json
         )
         VALUES (
           ${receipt.commandId},
@@ -75,7 +77,8 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
           ${receipt.acceptedAt},
           ${receipt.resultSequence},
           ${receipt.status},
-          ${receipt.error}
+          ${receipt.error},
+          ${receipt.projectSettingsSyncJson}
         )
         ON CONFLICT (command_id)
         DO UPDATE SET
@@ -85,7 +88,8 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
           accepted_at = excluded.accepted_at,
           result_sequence = excluded.result_sequence,
           status = excluded.status,
-          error = excluded.error
+          error = excluded.error,
+          project_settings_sync_json = excluded.project_settings_sync_json
       `,
   });
 
@@ -102,7 +106,8 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
           accepted_at AS "acceptedAt",
           result_sequence AS "resultSequence",
           status,
-          error
+          error,
+          project_settings_sync_json AS "projectSettingsSyncJson"
         FROM orchestration_command_receipts
         WHERE command_id = ${commandId}
       `,
@@ -125,7 +130,8 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
         accepted_at,
         result_sequence,
         status,
-        error
+        error,
+        project_settings_sync_json
       )
       VALUES (
         ${receipt.commandId},
@@ -135,7 +141,8 @@ const makeOrchestrationCommandReceiptRepository = Effect.gen(function* () {
         ${receipt.acceptedAt},
         ${receipt.resultSequence},
         ${receipt.status},
-        ${receipt.error}
+        ${receipt.error},
+        ${receipt.projectSettingsSyncJson}
       )
       ON CONFLICT(command_id) DO NOTHING
       RETURNING command_id

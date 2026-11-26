@@ -2,6 +2,8 @@ import * as McpClientThreads from "../../../persistence/McpClientThreads.ts";
 import * as ThreadLaunchMcp from "../../ThreadLaunchMcpService.ts";
 import * as ThreadRoles from "../../../persistence/ThreadRoles.ts";
 import * as LaunchPresets from "../../../persistence/LaunchPresets.ts";
+// @effect-diagnostics nodeBuiltinImport:off - a directory junction needs no privilege on Windows.
+import * as NodeFSP from "node:fs/promises";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import { expect, it } from "@effect/vitest";
 import {
@@ -15,6 +17,7 @@ import {
   type ServerProvider,
   type Project as ProjectRecord,
   type ModelSelection,
+  type ProjectScript,
   type RuntimeMode,
   type OrchestrationV2ThreadShell,
   ThreadId,
@@ -62,6 +65,7 @@ const clientLaunchHarness = (input: {
   readonly providers?: readonly ServerProvider[];
   /** Where Settings saves a project's model; the legacy project field stays null. */
   readonly overrideModel?: ModelSelection;
+  readonly overrideScripts?: readonly ProjectScript[];
   readonly launched: Array<ThreadLaunch.ThreadLaunchInput>;
   readonly workspaceRoot?: string;
   readonly checkWorktreeBase?: ThreadLaunch.ThreadLaunchService["Service"]["checkWorktreeBase"];
@@ -114,7 +118,12 @@ const clientLaunchHarness = (input: {
         : {
             projectSettingsFolded: true,
             projectSettingsOverrides: {
-              [projectId]: { defaultModelSelection: input.overrideModel },
+              [projectId]: {
+                defaultModelSelection: input.overrideModel,
+                ...(input.overrideScripts === undefined
+                  ? {}
+                  : { defaultProjectScripts: input.overrideScripts }),
+              },
             },
           }),
     }),
@@ -277,6 +286,7 @@ it.effect(
         defaultRuntimeMode: RuntimeMode,
         params: {
           readonly title: string;
+          readonly generateTitle?: boolean;
           readonly message?: string;
           readonly runtimeMode?: RuntimeMode;
           readonly targeted?: false;
@@ -319,6 +329,26 @@ it.effect(
       });
       expect(belowCeiling.launched[0]?.runtimeMode).toBe("approval-required");
       expect(belowCeiling.launched[0]?.initialMessage?.senderThreadId).toBeUndefined();
+      expect(belowCeiling.launched[0]?.generateTitle).toBeUndefined();
+      expect(belowCeiling.launched[0]?.titleRenamed).toBe(true);
+
+      const titled = yield* launchWith("full-access", "full-access", {
+        title: "Fix",
+        generateTitle: true,
+        message: "Fix the bug",
+      });
+      expect(titled.launched[0]).toMatchObject({ title: "Fix", generateTitle: true });
+      expect(titled.launched[0]?.titleRenamed).toBeUndefined();
+
+      for (const message of [undefined, "", " \n "]) {
+        const idleTitled = yield* launchWith("full-access", "full-access", {
+          title: "Fix",
+          generateTitle: true,
+          ...(message === undefined ? {} : { message }),
+        });
+        expect(idleTitled.result).toMatchObject({ code: "invalid_request" });
+        expect(idleTitled.launched).toHaveLength(0);
+      }
 
       const aboveCeiling = yield* launchWith("auto-accept-edits", "full-access", {
         title: "Fix",
@@ -673,8 +703,95 @@ it.effect.each([
       Effect.provide(dependencies),
     );
     expect(result).toMatchObject(warns ? { warning: expect.stringContaining(workspaceRoot) } : {});
+    expect(ThreadLaunchMcp.launchResult.fields).toHaveProperty("warning");
     expect(warns || (result as { warning?: string }).warning === undefined).toBe(true);
   }),
+);
+it.effect(
+  "a launch rejects options its model does not declare and normalizes legacy ultracode effort",
+  () =>
+    Effect.gen(function* () {
+      const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+      const providers: ServerProvider[] = [
+        {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+          installed: true,
+          status: "ready",
+          version: null,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-01-01T00:00:00Z",
+          models: [
+            {
+              slug: "claude-opus-5-5",
+              name: "Claude Opus 5.5",
+              isCustom: false,
+              capabilities: {
+                optionDescriptors: [
+                  {
+                    id: "effort",
+                    role: "reasoning",
+                    label: "Effort",
+                    type: "select",
+                    options: [
+                      { id: "high", label: "High" },
+                      { id: "xhigh", label: "Extra High" },
+                    ],
+                  },
+                  { id: "ultracode", label: "Ultracode", type: "boolean" },
+                ],
+              },
+            },
+          ],
+          slashCommands: [],
+          skills: [],
+        },
+      ];
+      const { projectId, dependencies } = clientLaunchHarness({
+        runtimeModeCeiling: "auto",
+        launched,
+        providers,
+      });
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
+            Layer.provide(dependencies),
+          ),
+        ),
+      );
+      const launchWith = (options: NonNullable<ModelSelection["options"]>) =>
+        toolkit
+          .handle("t3_thread_launch", {
+            title: "Options check",
+            projectId,
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claudeAgent"),
+              model: "claude-opus-5-5",
+              options,
+            },
+          })
+          .pipe(
+            Stream.unwrap,
+            Stream.runCollect,
+            Effect.map((result) => result.at(-1)?.result),
+            Effect.provide(dependencies),
+          );
+
+      expect(yield* launchWith([{ id: "thought_level", value: "high" }])).toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining("Unknown option thought_level"),
+      });
+      expect(launched).toHaveLength(0);
+
+      yield* launchWith([{ id: "effort", value: "ultracode" }]);
+      expect(launched.map((launch) => launch.modelSelection.options)).toEqual([
+        [
+          { id: "effort", value: "xhigh" },
+          { id: "ultracode", value: true },
+        ],
+      ]);
+    }),
 );
 
 it.effect("a launch retried with the same clientRequestId replays the first one", () =>
@@ -783,10 +900,14 @@ it.effect("a launch binds only an existing checkout that is one of the project's
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-launch-worktree-" });
+    // Git registers resolved paths, and a launch keeps the registered one.
+    const root = yield* fileSystem.realPath(
+      yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-launch-worktree-" }),
+    );
     const repo = path.join(root, "repo");
     const worktree = path.join(root, "feature");
     const outside = path.join(root, "outside");
+    const alias = path.join(root, "alias");
     yield* fileSystem.makeDirectory(repo);
     yield* fileSystem.makeDirectory(outside);
 
@@ -831,9 +952,13 @@ it.effect("a launch binds only an existing checkout that is one of the project's
         code: "invalid_request",
       });
     }
+    // The thread keeps the registered worktree path when launched through a link to it.
+    yield* Effect.promise(() => NodeFSP.symlink(worktree, alias, "junction"));
+    expect((yield* launchInto(alias)).at(-1)?.result).toMatchObject({ projectId });
     expect(launched.map((launch) => launch.workspaceStrategy)).toEqual([
       { type: "existing_worktree", worktreePath: worktree },
       { type: "existing_worktree", worktreePath: repo },
+      { type: "existing_worktree", worktreePath: worktree },
     ]);
 
     yield* fileSystem.remove(worktree, { recursive: true });
@@ -1260,6 +1385,57 @@ it.effect("creating a project through MCP refuses a model default instead of dro
   }),
 );
 
+it.effect("returns saved project settings with a temporary-folder warning", () =>
+  Effect.gen(function* () {
+    const script: ProjectScript = {
+      id: "saved-script",
+      name: "Saved script",
+      command: "npm run start",
+      icon: "play",
+      runOnWorktreeCreate: false,
+    };
+    const harness = clientLaunchHarness({
+      runtimeModeCeiling: "full-access",
+      overrideModel: {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-opus",
+      },
+      overrideScripts: [script],
+      launched: [],
+      workspaceRoot: "/tmp/review",
+    });
+    const created = {
+      id: harness.projectId,
+      title: "Saved settings",
+      workspaceRoot: "/tmp/review",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      deletedAt: null,
+    } as unknown as ProjectRecord;
+    const dependencies = Layer.merge(
+      harness.dependencies,
+      Layer.mock(Project.ProjectService)({
+        create: () => Effect.succeed(created),
+      }),
+    );
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const result = yield* toolkit
+      .handle("t3_project_create", { title: "Saved settings", workspaceRoot: "/tmp/review" })
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+
+    expect(result.at(-1)?.result).toMatchObject({
+      warning: expect.stringContaining("/tmp/review"),
+      scripts: [script],
+    });
+  }),
+);
+
 it.effect("an agent's clone is not cut off while git is still transferring", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -1411,15 +1587,19 @@ it.effect("an agent cannot delete the built-in scratch project, even with force"
   }),
 );
 
-it.effect("reading a project shows the default model saved in Settings", () =>
+it.effect("reading a project shows the default model and actions saved in Settings", () =>
   Effect.gen(function* () {
     const overrideModel = {
       instanceId: ProviderInstanceId.make("claudeAgent"),
       model: "claude-sonnet",
     };
+    const overrideScripts = [
+      { id: "test", name: "Test", command: "pnpm test", icon: "test", runOnWorktreeCreate: false },
+    ] satisfies ProjectScript[];
     const harness = clientLaunchHarness({
       runtimeModeCeiling: "full-access",
       overrideModel,
+      overrideScripts,
       launched: [],
     });
     const dependencies = Layer.merge(
@@ -1431,7 +1611,15 @@ it.effect("reading a project shows the default model saved in Settings", () =>
             title: "Client target",
             workspaceRoot: "/projects/client-target",
             defaultModelSelection: null,
-            scripts: [],
+            scripts: [
+              {
+                id: "stale",
+                name: "Stale",
+                command: "true",
+                icon: "play",
+                runOnWorktreeCreate: false,
+              },
+            ],
             createdAt: "2026-01-01T00:00:00.000Z",
             updatedAt: "2026-01-01T00:00:00.000Z",
             deletedAt: null,
@@ -1448,11 +1636,14 @@ it.effect("reading a project shows the default model saved in Settings", () =>
       .handle("t3_project_read", { projectId: harness.projectId })
       .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
 
-    expect(read.at(-1)?.result).toMatchObject({ defaultModelSelection: overrideModel });
+    expect(read.at(-1)?.result).toMatchObject({
+      defaultModelSelection: overrideModel,
+      scripts: overrideScripts,
+    });
   }),
 );
 
-it.effect("an update the project refuses tells the agent why", () =>
+it.effect("a project update or create that is refused tells the agent why", () =>
   Effect.gen(function* () {
     const harness = clientLaunchHarness({ runtimeModeCeiling: "full-access", launched: [] });
     const detail = "Project monograms must contain at most two characters.";
@@ -1477,5 +1668,14 @@ it.effect("an update the project refuses tells the agent why", () =>
       .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
 
     expect(refused.at(-1)?.result).toMatchObject({ code: "invalid_request", message: detail });
+
+    // A project started from its title has no folder yet for tracked folders to be checked against.
+    const dropped = yield* toolkit
+      .handle("t3_project_create", {
+        title: "Wrapper",
+        trackedFolders: [{ path: "/repos/api", name: "api" }],
+      })
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+    expect(dropped.at(-1)?.result).toMatchObject({ code: "invalid_request" });
   }),
 );

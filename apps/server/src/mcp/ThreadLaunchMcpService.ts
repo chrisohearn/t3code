@@ -16,6 +16,8 @@ import * as Schema from "effect/Schema";
 import { OrchestratorRuntimeModeAboveCeilingError } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "../orchestration-v2/ThreadMessageIntake.ts";
+import { outputRequestProblem } from "../orchestration-v2/runOutput.ts";
+import { validateModelOptions } from "./OrchestratorMcpService.ts";
 import * as Claims from "../orchestration-v2/AttachmentClaims.ts";
 import { temporaryFolderWarning } from "../project/temporaryFolder.ts";
 import * as Project from "../project/ProjectService.ts";
@@ -54,6 +56,8 @@ import {
   ProviderInteractionMode,
   OrchestrationV2ThreadLaunchWorkspaceStrategy,
   OrchestrationV2DelegatedFrom,
+  OrchestrationV2WorkflowOrigin,
+  type TaskFolderError,
   T3_PROJECT_FILE_NAME,
   LaunchPresetName,
   StandingRole,
@@ -76,6 +80,7 @@ export const launchInput = Schema.Struct({
     }),
   ),
   title: TrimmedNonEmptyString,
+  generateTitle: Schema.optional(Schema.Boolean),
   modelSelection: Schema.optional(ModelSelection),
   runtimeMode: Schema.optional(RuntimeMode),
   interactionMode: Schema.optional(ProviderInteractionMode),
@@ -90,6 +95,7 @@ export const launchInput = Schema.Struct({
       description: "First prompt. Omit it and `attachments` for idle.",
     }),
   ),
+  outputSchema: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
   attachments: Schema.optional(Schema.Array(McpAttachmentInput).check(Schema.isMaxLength(8))),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
   preset: Schema.optional(
@@ -98,6 +104,8 @@ export const launchInput = Schema.Struct({
   standingRole: Schema.optional(StandingRole),
   /** Set by a linked environment launching its agent's delegated task here; ignored otherwise. */
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
+  /** Set by a linked environment whose workflow run this thread is a step of; ignored otherwise. */
+  workflowRun: Schema.optional(OrchestrationV2WorkflowOrigin),
 });
 export const launchResult = Schema.Struct({
   notify: Schema.optional(McpThreadNotifyResult),
@@ -114,9 +122,12 @@ function worktreeCheckHint(
     | ThreadLaunch.ThreadLaunchBaseRefError
     | ThreadLaunch.ThreadLaunchBranchExistsError
     | ThreadLaunch.ThreadLaunchBranchConflictError
-    | ThreadLaunch.ThreadLaunchNotRepositoryError,
+    | ThreadLaunch.ThreadLaunchNotRepositoryError
+    | TaskFolderError,
   strategy: { readonly startFromOrigin?: boolean | undefined },
 ) {
+  if (error._tag === "TaskFolderError")
+    return "Pass `repositories` paths from the project's tracked Git folders.";
   if (error._tag === "ThreadLaunchNotRepositoryError")
     return `Use workspaceStrategy: {type: "root"}, or pass the projectId of a Git repository.`;
   if (error._tag === "ThreadLaunchBranchExistsError")
@@ -134,7 +145,7 @@ function worktreeCheckHint(
   }`;
 }
 
-/** Require project worktrees so launches cannot target arbitrary host directories. */
+/** Require project worktrees and keep the path Git registered on the created thread. */
 const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
   workspaceRoot: string,
   worktreePath: string,
@@ -142,16 +153,18 @@ const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
   const git = yield* GitVcsDriver.GitVcsDriver;
   const fileSystem = yield* FileSystem.FileSystem;
   const real = (path: string) => fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
-  const worktrees = yield* git.listWorktreePaths(workspaceRoot).pipe(
-    Effect.flatMap((paths) => Effect.forEach(paths, real)),
-    Effect.orElseSucceed((): ReadonlyArray<string> => []),
-  );
-  if (!worktrees.includes(yield* real(worktreePath)))
-    return yield* new OrchestratorMcpFailure({
-      code: "invalid_request",
-      message:
-        "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
-    });
+  const worktrees = yield* git
+    .listWorktreePaths(workspaceRoot)
+    .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+  const requested = yield* real(worktreePath);
+  for (const registered of worktrees) {
+    if ((yield* real(registered)) === requested) return registered;
+  }
+  return yield* new OrchestratorMcpFailure({
+    code: "invalid_request",
+    message:
+      "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
+  });
 });
 
 /** The composer falls back to the project's t3.json when no setting picks the mode. */
@@ -253,6 +266,23 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       const threadId = ThreadId.make(commandId);
       const messageId = MessageId.make(commandId);
       const attachments = input.attachments ?? [];
+      if (input.generateTitle === true && !input.message?.trim() && attachments.length === 0)
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "Title generation requires a message or attachments. No thread was created.",
+        });
+      const schemaProblem =
+        input.outputSchema === undefined
+          ? null
+          : outputRequestProblem(input.outputSchema, {
+              text: input.message ?? "",
+              attachments: input.attachments,
+            });
+      if (schemaProblem !== null || (input.outputSchema !== undefined && !input.message))
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: schemaProblem ?? "outputSchema needs a message that asks for the result.",
+        });
       if (attachments.some((attachment) => !Claims.attachmentIsPendingUpload(attachment)))
         return yield* new OrchestratorMcpFailure({
           code: "invalid_request",
@@ -300,9 +330,10 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           ? undefined
           : yield* (yield* LaunchPresets.LaunchPresets).get(input.preset);
       // Explicit fields win. A scratch launch has no checkout to choose.
-      const workspaceStrategy =
+      let workspaceStrategy =
         input.workspaceStrategy ?? (input.scratch === true ? undefined : preset?.workspaceStrategy);
       const requestedModel = input.modelSelection ?? preset?.modelSelection;
+      let validatedModelSelection = requestedModel;
       const presetMode = input.runtimeMode === undefined ? preset?.runtimeMode : undefined;
       const project =
         replaying && workspaceStrategy?.type !== "existing_worktree"
@@ -323,8 +354,13 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
                 }),
               ),
             );
-      if (project !== undefined && workspaceStrategy?.type === "existing_worktree")
-        yield* assertProjectWorktree(project.workspaceRoot, workspaceStrategy.worktreePath);
+      if (project !== undefined && workspaceStrategy?.type === "existing_worktree") {
+        const worktreePath = yield* assertProjectWorktree(
+          project.workspaceRoot,
+          workspaceStrategy.worktreePath,
+        );
+        workspaceStrategy = { ...workspaceStrategy, worktreePath };
+      }
       if (!replaying && requestedModel !== undefined) {
         const { instanceId, model } = requestedModel;
         const registry = yield* ProviderRegistry.ProviderRegistry;
@@ -332,16 +368,21 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
           workspaceStrategy?.type === "existing_worktree"
             ? workspaceStrategy.worktreePath
             : project?.workspaceRoot;
-        const requireModel = (
-          providers: ReadonlyArray<ServerProvider>,
-        ): Effect.Effect<void, OrchestratorMcpFailure> => {
-          const provider = withWorkspaceModels(providers, cwd).find(
-            (candidate) => candidate.instanceId === instanceId,
-          );
-          return provider === undefined ? Effect.void : requireAdvertisedModel(provider, model);
-        };
-        const checked = requireModel(yield* registry.getProviders);
-        yield* cwd === undefined
+        const validateSelection = Effect.fn("ThreadLaunchMcpService.validateModelSelection")(
+          function* (providers: ReadonlyArray<ServerProvider>) {
+            const provider = withWorkspaceModels(providers, cwd).find(
+              (candidate) => candidate.instanceId === instanceId,
+            );
+            if (provider === undefined) return requestedModel;
+            yield* requireAdvertisedModel(provider, model);
+            const options = yield* validateModelOptions(provider, model, requestedModel.options);
+            return options === undefined || options === requestedModel.options
+              ? requestedModel
+              : { ...requestedModel, options };
+          },
+        );
+        const checked = validateSelection(yield* registry.getProviders);
+        validatedModelSelection = yield* cwd === undefined
           ? checked
           : checked.pipe(
               Effect.catchIf(
@@ -352,7 +393,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
                     Effect.flatMap((scanCwd) =>
                       registry.refreshWorkspaceSnapshot({ instanceId, cwd, scanCwd }),
                     ),
-                    Effect.flatMap(requireModel),
+                    Effect.flatMap(validateSelection),
                   ),
               ),
             );
@@ -406,7 +447,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
       // within the ceiling it was approved with.
       const projectDefaults = caller === undefined ? projectSettings : undefined;
       const modelSelection =
-        requestedModel ??
+        validatedModelSelection ??
         launchedModel ??
         (caller && modelSelectionWithoutUltracode(caller.modelSelection)) ??
         (projectDefaults
@@ -462,6 +503,8 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         threadId,
         projectId,
         title: input.title,
+        ...(input.generateTitle === undefined ? {} : { generateTitle: input.generateTitle }),
+        ...(input.generateTitle === true ? {} : { titleRenamed: true }),
         modelSelection,
         runtimeMode: startedRuntimeMode,
         interactionMode,
@@ -478,6 +521,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
                 ...McpInvocationContext.messageSenderFor(scope),
                 text: input.message ?? "",
                 attachments,
+                ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),
               },
             }),
         createdBy: "agent",
@@ -485,6 +529,7 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
         ...(linkOrigin === undefined ? {} : { linkOrigin }),
         // Kept only alongside linkOrigin: thread.create drops it otherwise.
         ...(input.delegatedFrom === undefined ? {} : { delegatedFrom: input.delegatedFrom }),
+        ...(input.workflowRun === undefined ? {} : { workflowRun: input.workflowRun }),
       }).pipe(
         // A failure after the thread committed leaves its role; only a launch that never
         // created the thread loses the one stored for it.

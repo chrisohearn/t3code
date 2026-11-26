@@ -21,6 +21,7 @@ import * as PayloadSigner from "./PayloadSigner.ts";
 
 const IDLE_MS = 30 * 86400_000;
 const ACCESS_PREFIX = "t3mcp_a_";
+const REFRESH_PREFIX = "t3mcp_r_";
 // Covers a retry across the observed roughly 80-second restart gap without extending on retry.
 const REFRESH_RETRY_MS = 90_000;
 
@@ -67,6 +68,7 @@ export class McpOAuthSessions extends Context.Service<
       | undefined,
       McpOAuthSessionStorageError
     >;
+    readonly revoke: (token: string) => Effect.Effect<boolean, McpOAuthSessionStorageError>;
   }
 >()("t3/auth/McpOAuthSessions") {}
 
@@ -77,6 +79,8 @@ const invalidGrant = () =>
   });
 
 export const isRollingAccessToken = (token: string) => token.startsWith(ACCESS_PREFIX);
+export const isRollingToken = (token: string) =>
+  token.startsWith(ACCESS_PREFIX) || token.startsWith(REFRESH_PREFIX);
 
 export const layer = Layer.effect(
   McpOAuthSessions,
@@ -117,7 +121,7 @@ export const layer = Layer.effect(
       return {
         sessionId,
         token: ACCESS_PREFIX + (yield* credential("access")),
-        refreshToken: "t3mcp_r_" + (yield* credential("refresh")),
+        refreshToken: REFRESH_PREFIX + (yield* credential("refresh")),
         expiresAt: DateTime.add(now, { milliseconds: IDLE_MS }),
         access,
         offlineAccess,
@@ -296,6 +300,14 @@ export const layer = Layer.effect(
           }),
         );
       }, Effect.mapError(storageError)),
+      revoke: Effect.fn("McpOAuthSessions.revoke")(function* (token) {
+        const rows = yield* sql<{ readonly sessionId: AuthSessionId }>`
+          SELECT session_id AS "sessionId" FROM mcp_oauth_tokens
+          WHERE token_hash = ${yield* hash(token)} AND kind IN ('access', 'refresh')
+        `.pipe(Effect.mapError(storageError));
+        if (rows.length === 0) return false;
+        return yield* sessions.revoke(rows[0]!.sessionId).pipe(Effect.mapError(storageError));
+      }),
     });
   }),
 );

@@ -97,6 +97,7 @@ export const authorizationServerMetadata = (
   authorization_endpoint: `${urls.issuer}/oauth/mcp/authorize`,
   token_endpoint: `${urls.issuer}/oauth/mcp/token`,
   registration_endpoint: `${urls.issuer}/oauth/mcp/register`,
+  revocation_endpoint: `${urls.issuer}/oauth/mcp/revoke`,
   response_types_supported: ["code"],
   grant_types_supported: ["authorization_code", "refresh_token"],
   code_challenge_methods_supported: ["S256"],
@@ -197,6 +198,7 @@ interface PendingCode {
   readonly codeChallenge: string;
   readonly resource: string;
   readonly access: AuthMcpClientAccess;
+  readonly approvedAtRevocationCount: number;
   readonly expiresAtMs: number;
   readonly offlineAccess: boolean;
 }
@@ -353,7 +355,7 @@ const make = Effect.gen(function* () {
         return yield* new AuthMcpRegistrationError({
           error: "invalid_client_metadata",
           error_description:
-            "Linked environments is off on that machine. Turn it on in its Settings → Labs.",
+            'Linked environments is off on that machine. Turn it on in its Settings → Labs, or without a desktop, set "linkedEnvironmentsEnabled": true in userdata/settings.json in its T3 home (~/.t3 by default).',
         });
       }
       const clientId = yield* signClientId(name, redirectUris, peerLink);
@@ -447,6 +449,7 @@ const make = Effect.gen(function* () {
   const mintCode = Effect.fn("McpOAuth.mintCode")(function* (
     authorization: AuthorizationRequest,
     access: AuthMcpClientAccess,
+    approvedAtRevocationCount: number,
   ) {
     const now = yield* Clock.currentTimeMillis;
     const code = Buffer.from(yield* random.randomBytes(32)).toString("base64url");
@@ -460,6 +463,7 @@ const make = Effect.gen(function* () {
         codeChallenge: authorization.codeChallenge,
         resource: authorization.resource,
         access,
+        approvedAtRevocationCount,
         expiresAtMs: now + AUTHORIZATION_CODE_TTL_MS,
         offlineAccess: authorization.offlineAccess,
       });
@@ -470,6 +474,9 @@ const make = Effect.gen(function* () {
 
   const approve: McpOAuth["Service"]["approve"] = Effect.fn("McpOAuth.approve")(function* (input) {
     const { decision } = input;
+    // Read before the approver is checked: "revoke all others" then ends this sign-in whether
+    // it lands before the check or after the code is handed out.
+    const approvedAtRevocationCount = yield* environmentAuth.otherSessionRevocationCount;
     let access = decision.access;
     if (decision._tag === "pairing-code") {
       // An approval code is for one app's sign-in, never for linking another environment.
@@ -505,7 +512,7 @@ const make = Effect.gen(function* () {
         });
       }
     }
-    const code = yield* mintCode(input.authorization, access);
+    const code = yield* mintCode(input.authorization, access, approvedAtRevocationCount);
     yield* Effect.logInfo("Approved an MCP client sign-in.", {
       client: input.authorization.client.name,
       access,
@@ -613,14 +620,17 @@ const make = Effect.gen(function* () {
           peerLink: pending.peerLink,
           client: deriveAuthClientMetadata({ request }),
           oauth: { clientId, resource: pending.resource, offlineAccess: pending.offlineAccess },
+          approvedAtRevocationCount: pending.approvedAtRevocationCount,
         })
         .pipe(
           Effect.catch((cause) =>
-            Effect.logError("Could not issue an MCP client session.", { cause }).pipe(
-              Effect.andThen(
-                Effect.fail(fail("invalid_grant", "The session could not be issued.")),
-              ),
-            ),
+            cause._tag === "ServerAuthInvalidCredentialError"
+              ? Effect.fail(fail("invalid_grant", "The authorization code is invalid or expired."))
+              : Effect.logError("Could not issue an MCP client session.", { cause }).pipe(
+                  Effect.andThen(
+                    Effect.fail(fail("invalid_grant", "The session could not be issued.")),
+                  ),
+                ),
           ),
         );
       return {

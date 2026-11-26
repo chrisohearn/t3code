@@ -248,6 +248,7 @@ export interface EventSinkV2Shape {
     readonly commandType: string;
     readonly acceptedAt: DateTime.Utc;
     readonly event: UnsequencedProjectEvent;
+    readonly projectSettingsSync?: CommandReceiptStore.ProjectSettingsSync;
   }) => Effect.Effect<
     { readonly receipt: CommandReceiptStore.ProjectCommandReceiptV2; readonly committed: boolean },
     EventSinkV2Error
@@ -259,6 +260,10 @@ export interface EventSinkV2Shape {
     readonly rejectedAt: DateTime.Utc;
     readonly error: string;
   }) => Effect.Effect<CommandReceiptStore.ProjectCommandReceiptV2, EventSinkV2Error>;
+  /** Clears the durable Settings replay payload after its side effect has succeeded or been superseded. */
+  readonly acknowledgeProjectSettingsSync: (input: {
+    readonly commandId: CommandId;
+  }) => Effect.Effect<void, EventSinkV2Error>;
   readonly stream: (input?: {
     readonly threadId?: ThreadId;
     readonly afterSequence?: number;
@@ -487,25 +492,27 @@ const layerBase: Layer.Layer<
             latestInBatch.set(candidate.payload.id, candidate.payload);
           }
         }
-        const stored = yield* projectionStore
-          .getThreadRecords(run.threadId, ["turnItems"], {
-            turnItemRunId: run.id,
-            turnItemTypes: [...RUN_BOUND_ITEM_TYPES],
-            turnItemStatuses: ["pending", "running", "waiting"],
-          })
-          // The thread's creation can share this batch. An old item that cannot be read must not
-          // fail the write that ends the run; its items then close on read instead.
-          .pipe(
-            Effect.catchTags({
-              ProjectionStoreThreadNotFoundError: () => Effect.succeed({ turnItems: [] }),
-            }),
-            Effect.catch((cause) =>
-              Effect.logWarning("Could not read run items to close", {
-                runId: run.id,
-                cause,
-              }).pipe(Effect.as({ turnItems: [] })),
-            ),
-          );
+        const stored = yield* (
+          projectionStore
+            .getThreadRecords(run.threadId, ["turnItems"], {
+              turnItemRunId: run.id,
+              turnItemTypes: [...RUN_BOUND_ITEM_TYPES],
+              turnItemStatuses: ["pending", "running", "waiting"],
+            })
+            // The thread's creation can share this batch. An old item that cannot be read must not
+            // fail the write that ends the run; its items then close on read instead.
+            .pipe(
+              Effect.catchTags({
+                ProjectionStoreThreadNotFoundError: () => Effect.succeed({ turnItems: [] }),
+              }),
+              Effect.catch((cause) =>
+                Effect.logWarning("Could not read run items to close", {
+                  runId: run.id,
+                  cause,
+                }).pipe(Effect.as({ turnItems: [] })),
+              ),
+            )
+        );
         for (const item of stored.turnItems) {
           if (!latestInBatch.has(item.id)) latestInBatch.set(item.id, item);
         }
@@ -1085,6 +1092,9 @@ const layerBase: Layer.Layer<
               resultSequence: 0,
               status: "accepted",
               error: null,
+              ...(input.projectSettingsSync === undefined
+                ? {}
+                : { projectSettingsSync: input.projectSettingsSync }),
             };
             if (!(yield* commandReceipts.insertIfAbsent(reserved))) {
               return { receipt: yield* existingProjectReceipt(input.commandId), event: undefined };
@@ -1131,6 +1141,14 @@ const layerBase: Layer.Layer<
             : yield* existingProjectReceipt(input.commandId);
         }),
       );
+    });
+
+    const acknowledgeProjectSettingsSyncEffect = Effect.fn(
+      "orchestrationV2.EventSink.acknowledgeProjectSettingsSync",
+    )(function* (input: Parameters<EventSinkV2Shape["acknowledgeProjectSettingsSync"]>[0]) {
+      const receipt = yield* existingProjectReceipt(input.commandId);
+      if (receipt.projectSettingsSync === undefined) return;
+      yield* commandReceipts.upsert({ ...receipt, projectSettingsSync: undefined });
     });
 
     const catchUp = (input: {
@@ -1427,6 +1445,13 @@ const layerBase: Layer.Layer<
         ),
       commitRejectedProjectCommand: (input) =>
         commitRejectedProjectCommandEffect(input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new EventSinkWriteError({ commandId: input.commandId, eventCount: 0, cause }),
+          ),
+        ),
+      acknowledgeProjectSettingsSync: (input) =>
+        acknowledgeProjectSettingsSyncEffect(input).pipe(
           Effect.mapError(
             (cause) =>
               new EventSinkWriteError({ commandId: input.commandId, eventCount: 0, cause }),
