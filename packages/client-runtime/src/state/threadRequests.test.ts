@@ -942,7 +942,8 @@ it("splits a megabyte of approval text the same way as a short one", () => {
   expect(count(fill("\u200D"))).toEqual([1, 1]);
   expect(count(fill("\uFE0F"))).toEqual([1, 1]);
   expect(count(fill("\r"))).toEqual([1, 1]);
-  // Every other character named: one run each.
-  expect(count(fill("a\r"))).toEqual([size, size / 2]);
+  // Many alternating named runs exercise the untruncated path without a million output parts.
+  const runs = 1 << 15;
+  expect(count("a\r".repeat(runs))).toEqual([2 * runs, runs]);
   expect(count(fill("a"))).toEqual([1, 0]);
 });
