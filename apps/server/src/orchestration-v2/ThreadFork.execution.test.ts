@@ -444,6 +444,7 @@ it.effect.each([
   "a $execution fork's first /compact is rejected only when no history reaches it: $rejected",
   ({ execution, rejected }) => {
     const opened: Array<ProviderInstanceId> = [];
+    const openedSession = Deferred.makeUnsafe<void>();
     const adapter = (driverName: "claudeAgent" | "codex") => {
       const driver = ProviderDriverKind.make(driverName);
       const instanceId = ProviderInstanceId.make(driverName);
@@ -457,6 +458,7 @@ it.effect.each([
         planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
         openSession: (input) =>
           Effect.sync(() => opened.push(instanceId)).pipe(
+            Effect.tap(() => Deferred.succeed(openedSession, undefined)),
             Effect.andThen(
               new ProviderAdapter.ProviderAdapterOpenSessionError({
                 driver,
@@ -623,6 +625,10 @@ it.effect.each([
         creationSource: "web",
       });
       yield* worker.drain();
+      if (!rejected) {
+        yield* Deferred.await(openedSession);
+        yield* worker.drain();
+      }
 
       const projection = yield* orchestrator.getThreadProjection(targetThreadId);
       if (execution === "portable_context") {

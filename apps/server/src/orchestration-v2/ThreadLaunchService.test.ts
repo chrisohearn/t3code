@@ -3,6 +3,10 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The test inspects the guard-compatible admission token directory.
+import * as NodeFS from "node:fs";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The test locates the guard-compatible admission token directory.
+import * as NodePath from "node:path";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as FileSystem from "effect/FileSystem";
@@ -165,10 +169,18 @@ interface HarnessOptions {
 function makeHarness(options: HarnessOptions = {}) {
   const layerDatabase = SqlitePersistence.layerMemory;
   const layerRegistry = ProviderAdapterRegistry.layerFromAdapters(options.adapters ?? [adapter]);
+  const layerServerConfig = Layer.effect(
+    ServerConfig.ServerConfig,
+    ProviderReplayHarness.makeReplayServerConfig("thread-launch").pipe(Effect.orDie),
+  ).pipe(Layer.provide(NodeServices.layer));
   const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
     { name: "thread-launch" },
     layerRegistry,
-    { databaseLayer: layerDatabase, runEffectWorker: false },
+    {
+      databaseLayer: layerDatabase,
+      runEffectWorker: false,
+      serverConfigLayer: layerServerConfig,
+    },
   );
   const layerServerSettings = ServerSettings.layerTest(options.serverSettings);
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
@@ -293,6 +305,7 @@ function makeHarness(options: HarnessOptions = {}) {
         layerLaunchThreads,
         layerReceipts,
         layerOrchestrator,
+        layerServerConfig,
         ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
         NodeServices.layer,
         IdAllocator.layer,
@@ -342,6 +355,7 @@ function makeHarness(options: HarnessOptions = {}) {
   return {
     layer: Layer.mergeAll(
       layerLaunch,
+      layerServerConfig,
       layerRegistry,
       layerThreadManagement,
       layerTitleRegeneration,
@@ -479,6 +493,48 @@ it.effect.each(
     }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerScheduledTasks)));
   },
 );
+
+it.effect("keeps admission active through a runless workspace preparation", () => {
+  const worktreeStarted = Deferred.makeUnsafe<void>();
+  const releaseWorktree = Deferred.makeUnsafe<void>();
+  const harness = makeHarness({
+    createWorktree: (input) =>
+      Deferred.succeed(worktreeStarted, undefined).pipe(
+        Effect.andThen(Deferred.await(releaseWorktree)),
+        Effect.as({
+          worktree: {
+            path: "/repo-worktrees/runless-admission",
+            refName: input.newRefName,
+            headSha: "abc",
+          },
+        } as never),
+      ),
+  });
+
+  return Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const setups = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:runless-admission",
+        thread: "thread:runless-admission",
+        workspace: worktreeStrategy,
+      }),
+    );
+    yield* Deferred.await(worktreeStarted);
+
+    const active = NodePath.join(config.baseDir, "runtime", "service-change-admission", "active");
+    assert.lengthOf(NodeFS.readdirSync(active), 1);
+
+    yield* Deferred.succeed(releaseWorktree, undefined);
+    yield* setups.stream(launched.threadId).pipe(
+      Stream.filter((snapshot) => snapshot?.phase === "done"),
+      Stream.runHead,
+    );
+    assert.isEmpty(NodeFS.readdirSync(active));
+  }).pipe(Effect.provide(harness.layer));
+});
 
 it.effect(
   "returns no dispatched thread when sending an automation to a missing thread fails",
@@ -3521,11 +3577,30 @@ it.live.each(concurrentTaskFolderUses)("cancels task folder setup with %s", (con
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-launch-folders-" })),
     Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
-  const layerTaskFolders = layerTaskFoldersWithGit(state).pipe(
-    Layer.provide(layerGit),
-    Layer.orDie,
-  );
   return Effect.gen(function* () {
+    const taskFolderRemovalStarted = yield* Deferred.make<void>();
+    const allowTaskFolderRemoval = yield* Deferred.make<void>();
+    const baseTaskFolders = layerTaskFoldersWithGit(state).pipe(
+      Layer.provide(layerGit),
+      Layer.orDie,
+    );
+    const layerTaskFolders =
+      concurrent === "side chat without a run"
+        ? Layer.effect(
+            TaskFolders.TaskFolders,
+            Effect.gen(function* () {
+              const folders = yield* TaskFolders.TaskFolders;
+              return {
+                ...folders,
+                remove: (input) =>
+                  Deferred.succeed(taskFolderRemovalStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(allowTaskFolderRemoval)),
+                    Effect.andThen(folders.remove(input)),
+                  ),
+              };
+            }),
+          ).pipe(Layer.provide(baseTaskFolders))
+        : baseTaskFolders;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const git = yield* GitVcsDriver.GitVcsDriver;
@@ -3639,7 +3714,14 @@ it.live.each(concurrentTaskFolderUses)("cancels task folder setup with %s", (con
         Effect.flip,
       );
       assert.equal(refused._tag, "OrchestratorDispatchError");
-      assert.isTrue(yield* tracker.cancel(launched.threadId));
+      if (concurrent === "side chat without a run") {
+        const cancellation = yield* tracker.cancel(launched.threadId).pipe(Effect.forkChild);
+        yield* Deferred.await(taskFolderRemovalStarted);
+        yield* Deferred.succeed(allowTaskFolderRemoval, undefined);
+        assert.isTrue(yield* Fiber.join(cancellation));
+      } else {
+        assert.isTrue(yield* tracker.cancel(launched.threadId));
+      }
 
       assert.isNull((yield* threads.getThreadProjection(launched.threadId)).thread.worktreePath);
       assert.isNull(yield* taskFolders.find(taskFolder!.root));

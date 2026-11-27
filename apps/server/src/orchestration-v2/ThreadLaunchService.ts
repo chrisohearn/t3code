@@ -1,5 +1,7 @@
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
+import * as ServerConfig from "../config.ts";
+import * as ServiceChangeAdmission from "../serviceChangeAdmission.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -290,6 +292,7 @@ function failureDetail(error: unknown): string {
 }
 
 const make = Effect.gen(function* () {
+  const config = yield* ServerConfig.ServerConfig;
   const projects = yield* ProjectService.ProjectService;
   const setupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
   const cloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
@@ -1285,7 +1288,7 @@ const make = Effect.gen(function* () {
                         ),
                       ),
             );
-            yield* Effect.gen(function* () {
+            const cleanupWorkspace = Effect.gen(function* () {
               // An explicit launch can bind a repository inside a task folder during setup.
               if (yield* worktreeIsShared(removedTaskFolder ?? removedPath, threadId)) return;
               // Keep the binding if removal fails so a retry can find the checkout.
@@ -1309,6 +1312,16 @@ const make = Effect.gen(function* () {
                   cause: removeCause,
                 }),
               ),
+            );
+            yield* removedTaskFolder === null
+              ? cleanupWorkspace
+              : Effect.uninterruptible(cleanupWorkspace);
+          }
+          if (cancelled && runId !== null) {
+            // The tracked setup fiber can be interrupted before its race parent observes the
+            // exit, so persist the run failure here before cancellation is acknowledged.
+            yield* Effect.uninterruptible(
+              failPreparedRun(input, threadId, runId, "Worktree setup cancelled."),
             );
           }
         }),
@@ -1446,19 +1459,22 @@ const make = Effect.gen(function* () {
         );
       yield* Effect.raceFirst(prepare, interruption);
     });
-    yield* preparation.pipe(
-      Effect.onError((cause) =>
-        failPreparedRun(
-          input,
-          threadId,
-          runId,
-          Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
+    yield* ServiceChangeAdmission.forkInWithAdmissionAt(
+      config.baseDir,
+      preparation.pipe(
+        Effect.onError((cause) =>
+          failPreparedRun(
+            input,
+            threadId,
+            runId,
+            Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
+          ),
         ),
+        Effect.ignoreCause,
+        Effect.ensuring(releasePreparation(input.commandId)),
       ),
-      Effect.ignoreCause,
-      Effect.ensuring(releasePreparation(input.commandId)),
-      Effect.forkIn(preparationScope),
-    );
+      preparationScope,
+    ).pipe(Effect.mapError(mapError(input, "update-thread", threadId)));
   });
 
   const launch: ThreadLaunchService["Service"]["launch"] = Effect.fn("ThreadLaunchService.launch")(

@@ -30,6 +30,7 @@ import * as Schema from "effect/Schema";
 
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as ServerConfig from "./config.ts";
+import * as ServiceChangeAdmission from "./serviceChangeAdmission.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import { flushCompileCache } from "./compileCache.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -452,6 +453,17 @@ const runOrderedV2StartupPhases = Effect.fn("serverRuntimeStartup.runOrderedV2St
 
 const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: StartupOptions) {
   const serverConfig = yield* ServerConfig.ServerConfig;
+  yield* ServiceChangeAdmission.initialize(serverConfig.baseDir).pipe(
+    Effect.tapError((cause) =>
+      Effect.logWarning(
+        "Snapshot admission capability could not be published; guarded snapshots will fail closed.",
+        {
+          cause,
+        },
+      ),
+    ),
+    Effect.ignore,
+  );
   const keybindings = yield* Keybindings.Keybindings;
   const legacyV1ThreadImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
   const providerRuntimeRecovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;

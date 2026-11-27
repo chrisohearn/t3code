@@ -21,6 +21,7 @@
 #             tool calls, never stops the service while the kernel shows the exit hang, and
 #             reports afterwards which interrupted threads continued. Verifies the new build
 #             serves, and rolls back if not.
+#   snapshot  Strict-idle, same-version stop/copy/restart with an owner-only idempotent receipt.
 #   status    Show what is active, trusted, healthy and blocked.
 #   trust V   Verify version V against its release and record it as trusted.
 #
@@ -39,6 +40,17 @@ GUARD_STATE="${T3_GUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/t3-upda
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/t3-update-guard/config"
 LOCK="$T3HOME/runtime/service-change.lock"
 DB="$T3HOME/userdata/statev2.sqlite"
+SNAPSHOT_ADMISSION_ROOT="$T3HOME/runtime/service-change-admission"
+SNAPSHOT_ADMISSION_MUTEX="$SNAPSHOT_ADMISSION_ROOT/mutex"
+SNAPSHOT_ADMISSION_ACTIVE="$SNAPSHOT_ADMISSION_ROOT/active"
+SNAPSHOT_ADMISSION_FENCE="$SNAPSHOT_ADMISSION_ROOT/snapshot-fence.json"
+SNAPSHOT_ADMISSION_CLOSED=0
+SNAPSHOT_ADMISSION_OPERATION=""
+SNAPSHOT_ADMISSION_CLOSED_AT=""
+SNAPSHOT_ADMISSION_DRAINED_AT=""
+SNAPSHOT_ADMISSION_CAPABILITY_PID=0
+SNAPSHOT_STOP_REQUESTED=0
+SNAPSHOT_COPY_COMPLETE=0
 PORT="${T3CODE_PORT:-3773}"
 SELF="$(readlink -f "$0")"
 
@@ -663,8 +675,18 @@ PRE_RESTART="$GUARD_STATE/pre-restart"
 CANARY_SECONDS="${CANARY_SECONDS:-300}"
 CANARY_FAILURES="${CANARY_FAILURES:-2}"
 quiet_seconds() {
-  timeout 10 sqlite3 -readonly "$DB" \
-    "select cast((julianday('now') - julianday(max(max(coalesce(completed_at,'')), max(requested_at)))) * 86400 as int) from orchestration_v2_projection_runs;" 2>/dev/null
+  local history count quiet
+  history=$(timeout 10 sqlite3 -readonly -separator '|' "$DB" \
+    "select count(*), coalesce(cast((julianday('now') - julianday(max(max(coalesce(completed_at,'')), max(requested_at)))) * 86400 as int), -1) from orchestration_v2_projection_runs;" 2>/dev/null) || return 1
+  IFS='|' read -r count quiet <<<"$history"
+  [[ "$count" =~ ^[0-9]+$ && "$quiet" =~ ^-?[0-9]+$ ]] || return 1
+  # An empty run table has no activity timestamp. Use the current server generation's
+  # uptime as the quiet period, so a fresh install still waits the full configured window.
+  if (( count == 0 )); then
+    service_uptime
+  else
+    echo "$quiet"
+  fi
 }
 
 # What a restart now would break in a way restart recovery cannot undo (checked 2026-11-13):
@@ -891,15 +913,50 @@ SNAPSHOTS="$T3HOME/runtime/guard-db-snapshots"
 # Copy-on-write snapshot of the databases (btrfs reflink: instant, shares blocks). The service
 # must be stopped so the copy is consistent. Prints the snapshot directory.
 snapshot_db() {
-  local label="$1" dir f
-  dir="$SNAPSHOTS/$(date +%Y%m%dT%H%M%S)-$label"
-  mkdir -p "$dir" || return 1
+  local label="$1" retain_all="${2:-}" requested_dir="${3:-}" skip_compare="${4:-}" dir f copied=0
+  local created_dir=0
+  [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  [[ -f "$DB" && ! -L "$DB" ]] || return 1
+  mkdir -p "$SNAPSHOTS" || return 1
+  chmod 700 "$SNAPSHOTS" || return 1
+  if [[ -n "$requested_dir" ]]; then
+    dir="$requested_dir"
+    [[ "$dir" == "$SNAPSHOTS/"* && -d "$dir" && ! -L "$dir" && \
+      "$(stat -c %a "$dir" 2>/dev/null)" == 700 ]] || return 1
+    # A previous attempt may have ended during its copy. Replace only SQLite files in this
+    # operation's private directory while the service is confirmed down.
+    for f in "$dir"/*; do
+      [[ -e "$f" ]] || continue
+      [[ -f "$f" && ! -L "$f" && "$(basename "$f")" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.sqlite(-wal|-shm)?$ ]] || return 1
+      rm -f -- "$f" || return 1
+    done
+  else
+    dir="$SNAPSHOTS/$(date +%Y%m%dT%H%M%S)-$label"
+    mkdir "$dir" || return 1
+    created_dir=1
+    chmod 700 "$dir" || { rmdir "$dir" 2>/dev/null; return 1; }
+  fi
   for f in "$T3HOME"/userdata/*.sqlite "$T3HOME"/userdata/*.sqlite-wal "$T3HOME"/userdata/*.sqlite-shm; do
     [[ -e "$f" ]] || continue
-    cp --reflink=always -p "$f" "$dir/" || { rm -rf "$dir"; return 1; }
+    [[ -f "$f" && ! -L "$f" ]] || { [[ "$created_dir" == 0 ]] || rm -rf "$dir"; return 1; }
+    cp --reflink=always -p "$f" "$dir/" && \
+      { [[ "$skip_compare" == skip-compare ]] || cmp -s "$f" "$dir/$(basename "$f")"; } || {
+      [[ "$created_dir" == 0 ]] || rm -rf "$dir"
+      return 1
+    }
+    copied=$((copied + 1))
   done
+  (( copied > 0 )) || { [[ "$created_dir" == 0 ]] || rm -rf "$dir"; return 1; }
+  if [[ "$skip_compare" == skip-compare ]]; then
+    local files=()
+    for f in "$dir"/*; do [[ -f "$f" && ! -L "$f" ]] && files+=("$f"); done
+    snapshot_fsync "${files[@]}" "$dir" "$SNAPSHOTS" || return 1
+  fi
   # Keep the newest three.
-  ls -1d "$SNAPSHOTS"/2* 2>/dev/null | sort | head -n -3 | xargs -r rm -rf
+  if [[ "$retain_all" != retain-all ]]; then
+    find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d -name '2*' \
+      ! -name '*-snapshot-*' -print | sort | head -n -3 | xargs -r rm -rf --
+  fi
   printf '%s' "$dir"
 }
 
@@ -955,6 +1012,832 @@ wait_inactive() {
   return 1
 }
 
+unit_property() { systemctl --user show -p "$1" --value "$UNIT" 2>/dev/null; }
+
+# The service launcher is MainPID; its listener is a child. Bind the listener to that launcher
+# and to the exact systemd unit cgroup, so a stale or unrelated loopback process cannot pass.
+service_listener_pid() {
+  local output pids
+  [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$PORT <= 65535 )) || return 1
+  output=$(timeout --kill-after=1 5 ss -H -ltnp "sport = :$PORT" 2>/dev/null) || return 1
+  pids=$(sed -nE 's/.*pid=([0-9]+).*/\1/p' <<<"$output" | sort -u)
+  [[ "$pids" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$pids"
+}
+
+process_is_descendant_of() {
+  local child="$1" ancestor="$2" current="$1" ppid depth=0
+  [[ "$child" =~ ^[1-9][0-9]*$ && "$ancestor" =~ ^[1-9][0-9]*$ ]] || return 1
+  while [[ "$current" =~ ^[1-9][0-9]*$ ]] && (( depth < 64 )); do
+    [[ "$current" == "$ancestor" ]] && return 0
+    [[ -r "/proc/$current/status" ]] || return 1
+    ppid=$(awk '/^PPid:/ { print $2; exit }' "/proc/$current/status") || return 1
+    [[ "$ppid" =~ ^[0-9]+$ && "$ppid" != "$current" ]] || return 1
+    current="$ppid"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+process_in_unit_cgroup() {
+  local pid="$1" unit_group="$2" process_group
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$unit_group" == /* && "$unit_group" != *$'\n'* ]] || return 1
+  process_group=$(awk -F: '$1 == "0" { print $3; exit }' "/proc/$pid/cgroup") || return 1
+  [[ "$unit_group" == "/" && "$process_group" == /* ]] || \
+    [[ "$process_group" == "$unit_group" || "$process_group" == "$unit_group/"* ]]
+}
+
+snapshot_admission_capability() {
+  local listener="$1" protocol pid capability="$SNAPSHOT_ADMISSION_ROOT/capability.json"
+  [[ -d "$SNAPSHOT_ADMISSION_ROOT" && ! -L "$SNAPSHOT_ADMISSION_ROOT" && \
+    "$(stat -c %a "$SNAPSHOT_ADMISSION_ROOT" 2>/dev/null)" == 700 && \
+    -d "$SNAPSHOT_ADMISSION_ACTIVE" && ! -L "$SNAPSHOT_ADMISSION_ACTIVE" && \
+    "$(stat -c %a "$SNAPSHOT_ADMISSION_ACTIVE" 2>/dev/null)" == 700 ]] || return 1
+  [[ -f "$capability" && ! -L "$capability" && "$(stat -c %a "$capability" 2>/dev/null)" == 600 ]] || return 1
+  protocol=$(jq -er '.protocolVersion | select(type == "number")' "$capability" 2>/dev/null) || return 1
+  pid=$(jq -er '.pid | select(type == "number")' "$capability" 2>/dev/null) || return 1
+  [[ "$protocol" == 1 && "$pid" == "$listener" ]]
+}
+
+snapshot_admission_lock() {
+  local deadline=$((SECONDS + 5)) owner_path owner_pid age
+  mkdir -p "$SNAPSHOT_ADMISSION_ROOT" "$SNAPSHOT_ADMISSION_ACTIVE" || return 1
+  chmod 700 "$SNAPSHOT_ADMISSION_ROOT" "$SNAPSHOT_ADMISSION_ACTIVE" || return 1
+  while ! mkdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null; do
+    [[ -d "$SNAPSHOT_ADMISSION_MUTEX" && ! -L "$SNAPSHOT_ADMISSION_MUTEX" ]] || return 1
+    owner_path="$SNAPSHOT_ADMISSION_MUTEX/owner"
+    if [[ -e "$owner_path" ]]; then
+      [[ -f "$owner_path" && ! -L "$owner_path" ]] || return 1
+      owner_pid=$(cat "$owner_path" 2>/dev/null) || return 1
+      [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+      if ! kill -0 "$owner_pid" 2>/dev/null; then
+        rm -f -- "$owner_path" || return 1
+        rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
+        continue
+      fi
+    else
+      age=$(( $(date +%s) - $(stat -c %Y "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || echo 0) ))
+      if (( age > 5 )); then
+        rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
+        continue
+      fi
+    fi
+    (( SECONDS < deadline )) || return 1
+    sleep 0.01
+  done
+  if ! printf '%s\n' "$$" >"$SNAPSHOT_ADMISSION_MUTEX/owner" || \
+    ! chmod 600 "$SNAPSHOT_ADMISSION_MUTEX/owner" || \
+    ! snapshot_fsync "$SNAPSHOT_ADMISSION_MUTEX/owner" "$SNAPSHOT_ADMISSION_ROOT"; then
+    rm -f -- "$SNAPSHOT_ADMISSION_MUTEX/owner"
+    rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
+    return 1
+  fi
+}
+
+snapshot_admission_unlock() {
+  rm -f -- "$SNAPSHOT_ADMISSION_MUTEX/owner"
+  rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
+}
+
+snapshot_process_start_ticks() {
+  local pid="$1" stat rest
+  local -a fields=()
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  stat=$(<"/proc/$pid/stat") || return 1
+  [[ "$stat" == *") "* ]] || return 1
+  rest="${stat##*) }"
+  read -r -a fields <<<"$rest"
+  [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${fields[19]}"
+}
+
+snapshot_admission_clear_stale_fence() {
+  local protocol_version owner_pid owner_boot_id owner_start_ticks current_boot_id current_start_ticks self_pid
+  [[ -e "$SNAPSHOT_ADMISSION_FENCE" ]] || return 0
+  [[ -f "$SNAPSHOT_ADMISSION_FENCE" && ! -L "$SNAPSHOT_ADMISSION_FENCE" ]] || return 1
+  protocol_version=$(jq -er '.protocolVersion | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
+  [[ "$protocol_version" == 2 ]] || return 1
+  owner_pid=$(jq -er '.ownerPid | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  owner_boot_id=$(jq -er '.ownerBootId | select(type == "string" and test("^[a-fA-F0-9-]{36}$"))' \
+    "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
+  owner_start_ticks=$(jq -er '.ownerStartTicks | select(type == "string" and test("^[0-9]+$"))' \
+    "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
+  [[ -r /proc/sys/kernel/random/boot_id ]] || return 1
+  IFS= read -r current_boot_id </proc/sys/kernel/random/boot_id || return 1
+  [[ "$current_boot_id" =~ ^[a-fA-F0-9-]{36}$ ]] || return 1
+  if [[ "$owner_boot_id" == "$current_boot_id" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+    current_start_ticks=$(snapshot_process_start_ticks "$owner_pid") || return 1
+    if [[ "$current_start_ticks" == "$owner_start_ticks" ]]; then
+      self_pid="${BASHPID:-$$}"
+      [[ "$owner_pid" == "$self_pid" ]] && return 0
+      return 1
+    fi
+  fi
+  rm -f -- "$SNAPSHOT_ADMISSION_FENCE" || return 1
+  snapshot_fsync "$SNAPSHOT_ADMISSION_ROOT"
+}
+
+snapshot_admission_active_count() {
+  local token pid count=0
+  local -a tokens=("$SNAPSHOT_ADMISSION_ACTIVE"/*.json)
+  for token in "${tokens[@]}"; do
+    [[ -e "$token" ]] || continue
+    [[ -f "$token" && ! -L "$token" ]] || return 1
+    pid=$(jq -er '.pid | select(type == "number")' "$token" 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if kill -0 "$pid" 2>/dev/null; then
+      count=$((count + 1))
+    else
+      rm -f -- "$token" || return 1
+    fi
+  done
+  printf '%s' "$count"
+}
+
+snapshot_admission_close() {
+  local operation="$1" point="$2" listener="$3" tmp count deadline owner_pid owner_boot_id owner_start_ticks
+  snapshot_admission_lock || { echo "snapshot: admission coordination lock is unavailable" >&2; return 1; }
+  if ! snapshot_admission_clear_stale_fence; then
+    snapshot_admission_unlock
+    echo "snapshot: another guarded operation owns the admission fence" >&2
+    return 1
+  fi
+  SNAPSHOT_ADMISSION_CLOSED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  owner_pid="${BASHPID:-$$}"
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || {
+    snapshot_admission_unlock
+    return 1
+  }
+  IFS= read -r owner_boot_id </proc/sys/kernel/random/boot_id || {
+    snapshot_admission_unlock
+    return 1
+  }
+  [[ "$owner_boot_id" =~ ^[a-fA-F0-9-]{36}$ ]] || {
+    snapshot_admission_unlock
+    return 1
+  }
+  owner_start_ticks=$(snapshot_process_start_ticks "$owner_pid") || {
+    snapshot_admission_unlock
+    return 1
+  }
+  tmp=$(mktemp "$SNAPSHOT_ADMISSION_ROOT/.snapshot-fence.XXXXXX") || {
+    snapshot_admission_unlock
+    return 1
+  }
+  if ! jq -cn --arg operation "$operation" --arg point "$point" --arg closedAt "$SNAPSHOT_ADMISSION_CLOSED_AT" \
+      --arg pid "$owner_pid" --arg bootId "$owner_boot_id" --arg startTicks "$owner_start_ticks" \
+      '{protocolVersion:2,ownerPid:($pid|tonumber),ownerBootId:$bootId,ownerStartTicks:$startTicks,operationId:$operation,snapshotPoint:$point,closedAt:$closedAt}' >"$tmp" || \
+    ! chmod 600 "$tmp" || ! snapshot_fsync "$tmp" || \
+    ! mv -f -- "$tmp" "$SNAPSHOT_ADMISSION_FENCE"; then
+    rm -f -- "$tmp"
+    snapshot_admission_unlock
+    echo "snapshot: admission fence could not be durably closed" >&2
+    return 1
+  fi
+  SNAPSHOT_ADMISSION_CLOSED=1
+  if ! snapshot_fsync "$SNAPSHOT_ADMISSION_ROOT"; then
+    snapshot_admission_unlock
+    echo "snapshot: admission fence directory could not be durably synced" >&2
+    return 1
+  fi
+  snapshot_admission_unlock
+
+  deadline=$((SECONDS + 120))
+  while true; do
+    count=$(snapshot_admission_active_count) || {
+      echo "snapshot: admitted command tokens could not be verified" >&2
+      return 1
+    }
+    if [[ "$count" == 0 ]]; then
+      SNAPSHOT_ADMISSION_DRAINED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+      SNAPSHOT_ADMISSION_CAPABILITY_PID="$listener"
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "snapshot: $count admitted command(s) did not drain within 120 seconds" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+snapshot_admission_open() {
+  local version identity receipt expected_version
+  version=$(active_version) || return 1
+  [[ -n "$version" ]] && is_trusted "$version" && is_healthy "$version" || {
+    echo "snapshot: admission remains fenced until the trusted service is healthy" >&2
+    return 1
+  }
+  receipt="$GUARD_STATE/snapshot-receipts/${SNAPSHOT_ADMISSION_OPERATION}.json"
+  if [[ -n "$SNAPSHOT_ADMISSION_OPERATION" && -f "$receipt" ]]; then
+    expected_version=$(jq -r '.stoppedGeneration.version // empty' "$receipt" 2>/dev/null) || return 1
+    [[ -n "$expected_version" && "$version" == "$expected_version" ]] || {
+      echo "snapshot: admission remains fenced because the selected service is not the recorded fork version" >&2
+      return 1
+    }
+  fi
+  identity=$(snapshot_service_identity "$version") || {
+    echo "snapshot: admission remains fenced until the trusted listener identity is verified" >&2
+    return 1
+  }
+  snapshot_admission_lock || { echo "snapshot: admission coordination lock is unavailable while reopening" >&2; return 1; }
+  if [[ -e "$SNAPSHOT_ADMISSION_FENCE" ]]; then
+    local protocol_version owner_pid operation_id owner_boot_id owner_start_ticks current_boot_id current_start_ticks self_pid
+    protocol_version=$(jq -er '.protocolVersion | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    [[ "$protocol_version" == 2 ]] || {
+      snapshot_admission_unlock
+      return 1
+    }
+    owner_pid=$(jq -er '.ownerPid | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || {
+      snapshot_admission_unlock
+      return 1
+    }
+    operation_id=$(jq -r '.operationId // empty' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    owner_boot_id=$(jq -er '.ownerBootId | select(type == "string" and test("^[a-fA-F0-9-]{36}$"))' \
+      "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    owner_start_ticks=$(jq -er '.ownerStartTicks | select(type == "string" and test("^[0-9]+$"))' \
+      "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    IFS= read -r current_boot_id </proc/sys/kernel/random/boot_id || {
+      snapshot_admission_unlock
+      return 1
+    }
+    [[ "$current_boot_id" =~ ^[a-fA-F0-9-]{36}$ ]] || {
+      snapshot_admission_unlock
+      return 1
+    }
+    self_pid="${BASHPID:-$$}"
+    if [[ "$owner_boot_id" == "$current_boot_id" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+      current_start_ticks=$(snapshot_process_start_ticks "$owner_pid") || {
+        snapshot_admission_unlock
+        return 1
+      }
+      if [[ "$current_start_ticks" == "$owner_start_ticks" ]]; then
+        if [[ "$owner_pid" == "$self_pid" ]]; then
+          [[ "$operation_id" == "$SNAPSHOT_ADMISSION_OPERATION" ]] || {
+            snapshot_admission_unlock
+            return 1
+          }
+        else
+          snapshot_admission_unlock
+          return 1
+        fi
+      fi
+    fi
+    rm -f -- "$SNAPSHOT_ADMISSION_FENCE" || {
+      snapshot_admission_unlock
+      return 1
+    }
+    snapshot_fsync "$SNAPSHOT_ADMISSION_ROOT" || {
+      snapshot_admission_unlock
+      return 1
+    }
+  fi
+  snapshot_admission_unlock
+  SNAPSHOT_ADMISSION_CLOSED=0
+}
+
+snapshot_service_identity() {
+  local expected="$1" state invocation pid listener version uptime control_group
+  state=$(unit_property ActiveState) || return 1
+  [[ "$state" == active ]] || return 1
+  invocation=$(unit_property InvocationID) || return 1
+  [[ "$invocation" =~ ^[[:xdigit:]]{32}$ ]] || return 1
+  pid=$(unit_property MainPID) || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  listener=$(service_listener_pid) || return 1
+  [[ "$listener" =~ ^[1-9][0-9]*$ && "$listener" != "$pid" ]] || return 1
+  snapshot_admission_capability "$listener" || return 1
+  control_group=$(unit_property ControlGroup) || return 1
+  process_is_descendant_of "$listener" "$pid" || return 1
+  process_in_unit_cgroup "$pid" "$control_group" || return 1
+  process_in_unit_cgroup "$listener" "$control_group" || return 1
+  version=$(service_version) || return 1
+  [[ "$version" == "$expected" ]] || return 1
+  uptime=$(service_uptime) || return 1
+  [[ "$uptime" =~ ^[0-9]+$ ]] && (( uptime >= 60 )) || return 1
+  printf '%s|%s|%s|%s|%s' "$invocation" "$pid" "$version" "$uptime" "$listener"
+}
+
+# A one-off snapshot has a stricter idle gate than the long-running update timer: queued runs,
+# any pending request, and every active tool item hold it. The DB read is deliberately repeated
+# immediately before the stop; unreadable or incomplete evidence fails closed.
+snapshot_idle_evidence() {
+  local counts runs requests tools subagents deliveries background effects quiet checked_at
+  counts=$(timeout 10 sqlite3 -readonly -separator '|' "$DB" \
+    "select
+       (select count(*) from orchestration_v2_projection_runs where status in ('preparing','queued','starting','running','waiting')),
+       (select count(*) from orchestration_v2_projection_runtime_requests where status = 'pending'),
+       (select count(*) from orchestration_v2_projection_turn_items i
+         where i.status in ('pending','running','waiting')
+           and i.type in ('command_execution','dynamic_tool','file_change','subagent','link_request')
+           and not exists (select 1 from orchestration_v2_projection_runs r
+             where r.run_id = i.run_id and r.status = 'rolled_back')),
+       (select count(*) from orchestration_v2_projection_subagents
+         where status not in ('idle','completed','failed','cancelled','interrupted')),
+       (select count(*) from orchestration_v2_projection_subagents
+         where status in ('completed','failed','cancelled','interrupted')
+           and completion_delivery_state in ('pending','claimed')),
+       (select count(*) from orchestration_v2_projection_provider_threads
+         where not json_valid(payload_json)
+            or (json_type(payload_json,'$.pendingBackgroundTasks') is not null
+                and (json_type(payload_json,'$.pendingBackgroundTasks') != 'array'
+                     or json_array_length(payload_json,'$.pendingBackgroundTasks') > 0))),
+       (select count(*) from orchestration_v2_effect_outbox where status in ('pending','running'));" ) || {
+    echo "snapshot: activity database is unreadable" >&2
+    return 1
+  }
+  IFS='|' read -r runs requests tools subagents deliveries background effects <<<"$counts"
+  [[ "$runs" =~ ^[0-9]+$ && "$requests" =~ ^[0-9]+$ && "$tools" =~ ^[0-9]+$ && "$subagents" =~ ^[0-9]+$ && "$deliveries" =~ ^[0-9]+$ && "$background" =~ ^[0-9]+$ && "$effects" =~ ^[0-9]+$ ]] || {
+    echo "snapshot: activity census is incomplete" >&2
+    return 1
+  }
+  (( runs == 0 && requests == 0 && tools == 0 && subagents == 0 && deliveries == 0 && background == 0 && effects == 0 )) || {
+    echo "snapshot: activity remains (runs=$runs pendingRequests=$requests activeItems=$tools activeSubagents=$subagents pendingSubagentDeliveries=$deliveries providerBackgroundTasks=$background activeEffects=$effects)" >&2
+    return 1
+  }
+  quiet=$(quiet_seconds) || quiet=""
+  [[ "$quiet" =~ ^[0-9]+$ ]] && (( quiet >= IDLE_QUIET_SECONDS )) || {
+    echo "snapshot: idle quiet window is not verified (quietSeconds=${quiet:-unknown}, required=$IDLE_QUIET_SECONDS)" >&2
+    return 1
+  }
+  checked_at=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  jq -cn --arg checkedAt "$checked_at" --argjson runs "$runs" \
+    --argjson requests "$requests" --argjson tools "$tools" --argjson subagents "$subagents" \
+    --argjson deliveries "$deliveries" --argjson background "$background" \
+    --argjson effects "$effects" --argjson quiet "$quiet" \
+    '{checkedAt:$checkedAt,runs:$runs,pendingRequests:$requests,activeItems:$tools,activeSubagents:$subagents,pendingSubagentDeliveries:$deliveries,providerBackgroundTasks:$background,activeEffects:$effects,quietSeconds:$quiet}'
+}
+
+snapshot_manifest() {
+  local dir="$1" file name sha size files='[]' count=0
+  [[ -f "$dir/$(basename "$DB")" && ! -L "$dir/$(basename "$DB")" ]] || return 1
+  for file in "$dir"/*; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    name=$(basename "$file")
+    sha=$(sha256sum "$file" 6>&- 7>&- | cut -d' ' -f1) || return 1
+    [[ "$sha" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    size=$(stat -c %s "$file") || return 1
+    files=$(jq -cn --argjson old "$files" --arg name "$name" --arg sha "$sha" \
+      --argjson size "$size" '$old + [{name:$name,sha256:$sha,sizeBytes:$size}]') || return 1
+    count=$((count + 1))
+  done
+  (( count > 0 )) || return 1
+  printf '%s' "$files"
+}
+
+snapshot_fsync() {
+  python3 -c 'import os, sys
+for path in sys.argv[1:]:
+    flags = os.O_RDONLY
+    if os.path.isdir(path):
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)' "$@"
+}
+
+write_snapshot_receipt() {
+  local receipt="$1" json="$2" dir="${1%/*}"
+  (
+    umask 077
+    local tmp
+    tmp=$(mktemp "$dir/.snapshot-receipt.XXXXXX") || exit 1
+    if ! printf '%s\n' "$json" >"$tmp" || ! chmod 600 "$tmp" || \
+      ! snapshot_fsync "$tmp" || ! mv -f -- "$tmp" "$receipt" || ! snapshot_fsync "$dir"; then
+      rm -f -- "$tmp"
+      exit 1
+    fi
+  )
+}
+
+snapshot_receipt_matches() {
+  local receipt="$1" operation="$2" point="$3" status path name sha actual version invocation pid listener
+  [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+  [[ "$(stat -c %a "$receipt" 2>/dev/null)" == 600 ]] || return 1
+  [[ "$(stat -c %a "${receipt%/*}" 2>/dev/null)" == 700 ]] || return 1
+  [[ "$(jq -r '.operationId // empty' "$receipt" 2>/dev/null)" == "$operation" ]] || return 1
+  [[ "$(jq -r '.snapshotPoint // empty' "$receipt" 2>/dev/null)" == "$point" ]] || return 1
+  [[ "$(jq -r '.schemaVersion // empty' "$receipt" 2>/dev/null)" == 1 ]] || return 1
+  [[ "$(jq -r '.unit // empty' "$receipt" 2>/dev/null)" == "$UNIT" ]] || return 1
+  status=$(jq -r '.status // empty' "$receipt" 2>/dev/null)
+  [[ "$status" == prepared || "$status" == stop_requested || "$status" == copied || \
+    "$status" == captured || "$status" == restart_failed || "$status" == complete ]] || return 1
+  version=$(jq -r '.stoppedGeneration.version // empty' "$receipt" 2>/dev/null)
+  invocation=$(jq -r '.stoppedGeneration.invocationId // empty' "$receipt" 2>/dev/null)
+  pid=$(jq -r '.stoppedGeneration.mainPid // empty' "$receipt" 2>/dev/null)
+  listener=$(jq -r '.stoppedGeneration.listenerPid // empty' "$receipt" 2>/dev/null)
+  [[ -n "$version" && "$invocation" =~ ^[[:xdigit:]]{32}$ && "$pid" =~ ^[1-9][0-9]*$ && \
+    "$listener" =~ ^[1-9][0-9]*$ ]] || return 1
+  if [[ "$status" == complete ]]; then
+    invocation=$(jq -r '.restart.invocationId // empty' "$receipt" 2>/dev/null)
+    pid=$(jq -r '.restart.mainPid // empty' "$receipt" 2>/dev/null)
+    [[ "$invocation" =~ ^[[:xdigit:]]{32}$ && "$pid" =~ ^[1-9][0-9]*$ && \
+      "$(jq -r '.restart.servingVersion // empty' "$receipt" 2>/dev/null)" == "$version" && \
+      "$(jq -r '.restart.listenerPid // empty' "$receipt" 2>/dev/null)" =~ ^[1-9][0-9]*$ && \
+      -n "$(jq -r '.restart.verifiedAt // empty' "$receipt" 2>/dev/null)" ]] || return 1
+  fi
+  path=$(jq -r '.snapshotPath // empty' "$receipt" 2>/dev/null)
+  [[ "$path" == "$SNAPSHOTS/"* && ! -L "$path" ]] || return 1
+  if [[ "$status" == prepared || "$status" == stop_requested ]]; then
+    [[ -d "$path" && "$(stat -c %a "$path" 2>/dev/null)" == 700 ]] || return 1
+    [[ "$(jq -e '.files | type == "array" and length == 0' "$receipt" 2>/dev/null)" == true ]]
+    return
+  fi
+  [[ -d "$path" && "$(stat -c %a "$path" 2>/dev/null)" == 700 && \
+    -f "$path/$(basename "$DB")" && ! -L "$path/$(basename "$DB")" ]] || return 1
+  if [[ "$status" == copied ]]; then
+    [[ "$(jq -e '.files | type == "array" and length == 0' "$receipt" 2>/dev/null)" == true ]]
+    return
+  fi
+  [[ "$(jq -e '.files | type == "array" and length > 0' "$receipt" 2>/dev/null)" == true ]] || return 1
+  while IFS=$'\t' read -r name sha; do
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$sha" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    [[ -f "$path/$name" && ! -L "$path/$name" ]] || return 1
+    actual=$(sha256sum "$path/$name" 6>&- 7>&- | cut -d' ' -f1) || return 1
+    [[ "$actual" == "$sha" ]] || return 1
+  done < <(jq -r '.files[]? | [.name,.sha256] | @tsv' "$receipt" 2>/dev/null)
+  [[ "$(jq -r '.files | length' "$receipt" 2>/dev/null)" =~ ^[1-9][0-9]*$ ]]
+}
+
+snapshot_wait_serving() {
+  local expected="$1" stopped_invocation="$2" deadline=$((SECONDS + HEALTH_WAIT_SECONDS)) identity invocation pid version uptime listener
+  while (( SECONDS <= deadline )); do
+    if [[ "$(active_version)" == "$expected" ]] && identity=$(snapshot_service_identity "$expected"); then
+      IFS='|' read -r invocation pid version uptime listener <<<"$identity"
+      if [[ "$invocation" != "$stopped_invocation" ]]; then
+        printf '%s|%s|%s|%s|%s' "$invocation" "$pid" "$version" "$uptime" "$listener"
+        return 0
+      fi
+    fi
+    (( SECONDS >= deadline )) || sleep 2
+  done
+  return 1
+}
+
+snapshot_start_and_verify() {
+  local expected="$1" stopped_invocation="$2" identity state
+  if ! svc start --no-block "$UNIT"; then
+    state=$(unit_property ActiveState) || state="unknown"
+    [[ "$state" == active || "$state" == activating ]] || return 1
+  fi
+  identity=$(snapshot_wait_serving "$expected" "$stopped_invocation") || return 1
+  printf '%s' "$identity"
+}
+
+snapshot_receipt_finalize() {
+  local receipt="$1" identity="$2" status="$3" why="${4:-}" invocation pid version uptime listener verified_at updated
+  IFS='|' read -r invocation pid version uptime listener <<<"$identity"
+  verified_at=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  updated=$(jq -c --arg status "$status" --arg invocation "$invocation" --arg pid "$pid" --arg listener "$listener" \
+    --arg version "$version" --arg verifiedAt "$verified_at" --arg why "$why" \
+    '.status=$status | .restart={invocationId:$invocation,mainPid:($pid|tonumber),listenerPid:($listener|tonumber),servingVersion:$version,verifiedAt:$verifiedAt} | if $why == "" then del(.restartFailure) else .restartFailure=$why end' \
+    "$receipt") || return 1
+  write_snapshot_receipt "$receipt" "$updated"
+}
+
+snapshot_receipt_set_status() {
+  local receipt="$1" status="$2" updated
+  updated=$(jq -c --arg status "$status" '.status=$status' "$receipt") || return 1
+  write_snapshot_receipt "$receipt" "$updated"
+}
+
+snapshot_receipt_set_idle_evidence() {
+  local receipt="$1" first="$2" second="$3" identity="$4" updated invocation pid version uptime listener
+  IFS='|' read -r invocation pid version uptime listener <<<"$identity"
+  updated=$(jq -c --arg invocation "$invocation" --arg pid "$pid" --arg listener "$listener" --arg version "$version" \
+    --argjson first "$first" --argjson second "$second" \
+    --arg closedAt "$SNAPSHOT_ADMISSION_CLOSED_AT" --arg drainedAt "$SNAPSHOT_ADMISSION_DRAINED_AT" \
+    --arg capabilityPid "$SNAPSHOT_ADMISSION_CAPABILITY_PID" \
+    '.idleVerification={first:$first,second:$second} | .admissionBarrier={protocolVersion:1,closedAt:$closedAt,drainedAt:$drainedAt,drainedAdmissions:0,capabilityListenerPid:($capabilityPid|tonumber)} | .stoppedGeneration={invocationId:$invocation,mainPid:($pid|tonumber),listenerPid:($listener|tonumber),version:$version}' \
+    "$receipt") || return 1
+  write_snapshot_receipt "$receipt" "$updated"
+}
+
+snapshot_receipt_set_copied() {
+  local receipt="$1" updated copied_at
+  copied_at=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  updated=$(jq -c --arg copiedAt "$copied_at" '.status="copied" | .files=[] | .copiedAt=$copiedAt' "$receipt") || return 1
+  write_snapshot_receipt "$receipt" "$updated"
+}
+
+snapshot_receipt_set_manifest() {
+  local receipt="$1" files="$2" updated captured_at
+  captured_at=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  updated=$(jq -c --argjson files "$files" --arg capturedAt "$captured_at" \
+    '.status="captured" | .files=$files | .capturedAt=$capturedAt' "$receipt") || return 1
+  write_snapshot_receipt "$receipt" "$updated"
+}
+
+cmd_snapshot_impl() {
+  local operation="" point="" label label_length receipt_dir receipt status version identity
+  local stopped_invocation stopped_pid stopped_listener_pid listener_pid identity_listener_pid
+  local first_activity second_activity snapshot identity_after
+  local files generation hang state restart_invocation json
+
+  if [[ $# != 2 ]]; then
+    echo "usage: t3-service-update snapshot <operation-id> <snapshot-point>" >&2
+    return 2
+  fi
+  operation=$1
+  point=$2
+  [[ "$operation" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ && \
+    "$point" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] || {
+    echo "usage: t3-service-update snapshot <operation-id> <snapshot-point>" >&2
+    return 2
+  }
+  label="snapshot-$operation-$point"
+  label_length=$(printf '%s' "$label" | wc -c)
+  (( label_length <= 128 )) || {
+    echo "snapshot: combined operation and point label exceeds the snapshot filename limit" >&2
+    return 2
+  }
+  manager_ready || { echo "snapshot: user service manager unavailable" >&2; return 1; }
+  exec 9>>"$LOCK"
+  flock -n 9 || { echo "Another service change holds $LOCK." >&2; return 1; }
+  receipt_dir="$GUARD_STATE/snapshot-receipts"
+  mkdir -p "$receipt_dir" && chmod 700 "$receipt_dir" || return 1
+  snapshot_fsync "$receipt_dir" "$GUARD_STATE" || return 1
+  receipt="$receipt_dir/$operation.json"
+
+  if [[ -e "$receipt" ]]; then
+    snapshot_receipt_matches "$receipt" "$operation" "$point" || {
+      echo "snapshot: existing receipt does not match this operation or its retained files" >&2
+      return 1
+    }
+    status=$(jq -r '.status' "$receipt")
+    if [[ "$status" == complete ]]; then
+      version=$(jq -r '.stoppedGeneration.version' "$receipt")
+      restart_invocation=$(jq -r '.restart.invocationId' "$receipt")
+      state=$(unit_property ActiveState) || state="unknown"
+      if [[ "$state" == active && "$(active_version)" == "$version" ]] && \
+        identity=$(snapshot_service_identity "$version"); then
+        IFS='|' read -r generation _ _ _ <<<"$identity"
+        [[ "$generation" != "$restart_invocation" ]] || outage_end "$version"
+      fi
+      cat "$receipt"
+      return
+    fi
+    [[ "$status" == stop_requested ]] && SNAPSHOT_STOP_REQUESTED=1
+    [[ "$status" == copied || "$status" == captured || "$status" == restart_failed ]] && SNAPSHOT_COPY_COMPLETE=1
+    version=$(jq -r '.stoppedGeneration.version' "$receipt")
+    stopped_invocation=$(jq -r '.stoppedGeneration.invocationId' "$receipt")
+    stopped_pid=$(jq -r '.stoppedGeneration.mainPid' "$receipt")
+    stopped_listener_pid=$(jq -r '.stoppedGeneration.listenerPid' "$receipt")
+    snapshot=$(jq -r '.snapshotPath' "$receipt")
+    [[ "$(active_version)" == "$version" ]] && is_trusted "$version" && is_healthy "$version" || {
+      echo "snapshot: receipt exists, but its original trusted service version is not selected" >&2
+      return 1
+    }
+  else
+    version=$(active_version)
+    [[ -n "$version" ]] && is_trusted "$version" && is_healthy "$version" || {
+      echo "snapshot: active version is not both trusted and recorded healthy" >&2
+      return 1
+    }
+    [[ -f "$DB" && ! -L "$DB" ]] || { echo "snapshot: primary database is missing or not a regular file" >&2; return 1; }
+    identity=$(snapshot_service_identity "$version") || {
+      echo "snapshot: managed unit, listener descendant, cgroup, health version, or generation is not verified" >&2
+      return 1
+    }
+    IFS='|' read -r stopped_invocation stopped_pid _ _ stopped_listener_pid <<<"$identity"
+    first_activity=$(snapshot_idle_evidence) || return 1
+    second_activity=$(snapshot_idle_evidence) || return 1
+    identity_after=$(snapshot_service_identity "$version") || {
+      echo "snapshot: service identity changed before stop" >&2
+      return 1
+    }
+    IFS='|' read -r generation identity_pid _ _ identity_listener_pid <<<"$identity_after"
+    [[ "$generation" == "$stopped_invocation" && "$identity_pid" == "$stopped_pid" && \
+      "$identity_listener_pid" == "$stopped_listener_pid" ]] || {
+      echo "snapshot: service generation or listener changed before stop" >&2
+      return 1
+    }
+    if hang=$(kernel_hang_signs); then
+      echo "snapshot: refusing stop while the kernel exit-hang guard is active: $hang" >&2
+      return 1
+    fi
+    mkdir -p "$SNAPSHOTS" && chmod 700 "$SNAPSHOTS" || return 1
+    snapshot="$SNAPSHOTS/$(date +%Y%m%dT%H%M%S)-$label"
+    mkdir "$snapshot" && chmod 700 "$snapshot" || {
+      rmdir "$snapshot" 2>/dev/null || true
+      return 1
+    }
+    snapshot_fsync "$snapshot" "$SNAPSHOTS" || {
+      rmdir "$snapshot" 2>/dev/null || true
+      return 1
+    }
+    json=$(jq -cn --arg operation "$operation" --arg point "$point" --arg unit "$UNIT" \
+      --arg invocation "$stopped_invocation" --arg pid "$stopped_pid" \
+      --arg listener "$stopped_listener_pid" --arg version "$version" \
+      --arg path "$snapshot" --argjson first "$first_activity" --argjson second "$second_activity" \
+      '{schemaVersion:1,operationId:$operation,snapshotPoint:$point,unit:$unit,status:"prepared",snapshotPath:$path,files:[],idleVerification:{first:$first,second:$second},stoppedGeneration:{invocationId:$invocation,mainPid:($pid|tonumber),listenerPid:($listener|tonumber),version:$version}}') || {
+      rmdir "$snapshot" 2>/dev/null || true
+      return 1
+    }
+    if ! write_snapshot_receipt "$receipt" "$json"; then
+      rmdir "$snapshot" 2>/dev/null || true
+      echo "snapshot: could not durably record the prepared operation; service was not stopped" >&2
+      return 1
+    fi
+    status=prepared
+  fi
+
+  if [[ "$status" == prepared ]]; then
+    [[ "$(active_version)" == "$version" ]] && is_trusted "$version" && is_healthy "$version" || {
+      echo "snapshot: prepared operation no longer selects its original trusted service version" >&2
+      return 1
+    }
+    identity=$(snapshot_service_identity "$version") || {
+      echo "snapshot: prepared service identity is no longer verified" >&2
+      return 1
+    }
+    IFS='|' read -r generation _ _ _ listener_pid <<<"$identity"
+    [[ "$generation" == "$stopped_invocation" && "$listener_pid" == "$stopped_listener_pid" ]] || {
+      echo "snapshot: prepared listener identity changed; no stop requested" >&2
+      return 1
+    }
+    SNAPSHOT_ADMISSION_OPERATION="$operation"
+    snapshot_admission_close "$operation" "$point" "$listener_pid" || return 1
+    IFS='|' read -r generation _ _ _ identity_listener_pid <<<"$identity"
+    [[ "$generation" == "$stopped_invocation" ]] || {
+      echo "snapshot: prepared service generation changed; no stop requested" >&2
+      return 1
+    }
+    first_activity=$(snapshot_idle_evidence) || return 1
+    second_activity=$(snapshot_idle_evidence) || return 1
+    identity_after=$(snapshot_service_identity "$version") || {
+      echo "snapshot: service identity changed immediately before the stop request" >&2
+      return 1
+    }
+    IFS='|' read -r generation identity_pid _ _ identity_listener_pid <<<"$identity_after"
+    [[ "$generation" == "$stopped_invocation" && "$identity_pid" == "$stopped_pid" && \
+      "$identity_listener_pid" == "$listener_pid" && "$listener_pid" == "$stopped_listener_pid" ]] || {
+      echo "snapshot: service generation or listener changed immediately before the stop request" >&2
+      return 1
+    }
+    if hang=$(kernel_hang_signs); then
+      echo "snapshot: refusing stop while the kernel exit-hang guard is active: $hang" >&2
+      return 1
+    fi
+    snapshot_receipt_set_idle_evidence "$receipt" "$first_activity" "$second_activity" "$identity_after" || {
+      echo "snapshot: could not durably update the idle proof; service was not stopped" >&2
+      return 1
+    }
+    # This write-ahead state is fsynced before systemd receives the stop request. A retry can
+    # recover from an inactive unit, but it will never send a second stop for this operation ID.
+    snapshot_receipt_set_status "$receipt" stop_requested || {
+      echo "snapshot: could not durably record stop intent; service was not stopped" >&2
+      return 1
+    }
+    status=stop_requested
+    SNAPSHOT_STOP_REQUESTED=1
+    log "snapshot: operation=$operation point=$point stopping $UNIT on $version after fresh idle census"
+    if ! svc stop --no-block "$UNIT"; then
+      state=$(unit_property ActiveState) || state="unknown"
+      if [[ "$state" == inactive || "$state" == failed ]]; then
+        outage_begin "snapshot operation $operation"
+      else
+        hold_updates "snapshot operation $operation recorded stop intent but the unit is not confirmed stopped; retry will not issue another stop"
+        echo "snapshot: stop request failed or remained ambiguous; retry will not stop $UNIT again" >&2
+        return 1
+      fi
+    else
+      outage_begin "snapshot operation $operation"
+      if ! wait_inactive; then
+        hold_updates "snapshot operation $operation recorded stop intent but $UNIT did not become inactive; retry will not issue another stop"
+        echo "snapshot: $UNIT did not become inactive within 120 seconds; retry will not issue another stop" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  if [[ "$status" == stop_requested ]]; then
+    SNAPSHOT_ADMISSION_OPERATION="$operation"
+    snapshot_admission_close "$operation" "$point" "0" || return 1
+    state=$(unit_property ActiveState) || state="unknown"
+    if [[ "$state" == deactivating ]]; then
+      wait_inactive || {
+        hold_updates "snapshot operation $operation is still waiting for its already-requested stop"
+        echo "snapshot: existing stop request is still in progress; no second stop was sent" >&2
+        return 1
+      }
+      state=$(unit_property ActiveState) || state="unknown"
+    fi
+    if [[ "$state" != inactive && "$state" != failed ]]; then
+      echo "snapshot: stop intent already exists while the original service invocation is active; refusing a second stop" >&2
+      return 1
+    fi
+    outage_begin "snapshot operation $operation"
+    snapshot=$(snapshot_db "$label" retain-all "$snapshot" skip-compare) || {
+      if identity=$(snapshot_start_and_verify "$version" "$stopped_invocation"); then
+        outage_end "$version"
+      else
+        hold_updates "snapshot operation $operation stopped the service, could not copy its database, and same-version restart failed"
+      fi
+      echo "snapshot: stopped database copy failed; no second stop will be issued for this operation" >&2
+      return 1
+    }
+    snapshot_receipt_set_copied "$receipt" || {
+      if identity=$(snapshot_start_and_verify "$version" "$stopped_invocation"); then
+        outage_end "$version"
+      else
+        hold_updates "snapshot operation $operation copied its database but could not durably record the copy or verify restart"
+      fi
+      echo "snapshot: copied files exist but the copied state could not be durably recorded" >&2
+      return 1
+    }
+    status=copied
+    SNAPSHOT_COPY_COMPLETE=1
+  fi
+
+  if [[ "$status" == copied || "$status" == captured || "$status" == restart_failed ]]; then
+    SNAPSHOT_COPY_COMPLETE=1
+    [[ "$(active_version)" == "$version" ]] && is_trusted "$version" && is_healthy "$version" || {
+      echo "snapshot: refusing to start anything except the original trusted service version $version" >&2
+      return 1
+    }
+    SNAPSHOT_ADMISSION_OPERATION="$operation"
+    state=$(unit_property ActiveState) || state="unknown"
+    if [[ "$state" == active || "$state" == activating || "$state" == deactivating ]]; then
+      identity=$(snapshot_wait_serving "$version" "$stopped_invocation") || {
+        hold_updates "snapshot operation $operation retained its copy but the same-version listener is not healthy"
+        echo "snapshot: copied database retained; same-version service health is not verified" >&2
+        return 1
+      }
+    else
+      identity=$(snapshot_start_and_verify "$version" "$stopped_invocation") || {
+        hold_updates "snapshot operation $operation copied the database but could not verify the same-version service restart"
+        echo "snapshot: copied database retained; same-version service health is not verified" >&2
+        return 1
+      }
+    fi
+    snapshot_admission_open || {
+      echo "snapshot: same-version service is healthy, but its admission fence could not be reopened" >&2
+      return 1
+    }
+    if [[ "$status" == copied ]]; then
+      files=$(snapshot_manifest "$snapshot") || {
+        hold_updates "snapshot operation $operation restarted the service but could not verify the copied files"
+        echo "snapshot: service restarted; copied files did not produce a valid manifest" >&2
+        return 1
+      }
+      snapshot_receipt_set_manifest "$receipt" "$files" || {
+        hold_updates "snapshot operation $operation restarted the service but could not durably record its file manifest"
+        echo "snapshot: service restarted; file manifest could not be durably recorded" >&2
+        return 1
+      }
+      status=captured
+      log "snapshot: operation=$operation hashed $(jq 'length' <<<"$files") copied files after same-version restart"
+    fi
+    snapshot_receipt_finalize "$receipt" "$identity" complete || {
+      hold_updates "snapshot operation $operation restarted the service but could not durably complete its receipt"
+      return 1
+    }
+  fi
+
+  outage_end "$version"
+  log "snapshot: operation=$operation restarted and verified $version"
+  cat "$receipt"
+}
+
+cmd_snapshot() {
+  local status=0
+  SNAPSHOT_ADMISSION_CLOSED=0
+  SNAPSHOT_ADMISSION_OPERATION="${1:-}"
+  SNAPSHOT_ADMISSION_CLOSED_AT=""
+  SNAPSHOT_ADMISSION_DRAINED_AT=""
+  SNAPSHOT_ADMISSION_CAPABILITY_PID=0
+  SNAPSHOT_STOP_REQUESTED=0
+  SNAPSHOT_COPY_COMPLETE=0
+  cmd_snapshot_impl "$@" || status=$?
+  if [[ "$SNAPSHOT_ADMISSION_CLOSED" == 1 && \
+    ( "$SNAPSHOT_STOP_REQUESTED" == 0 || "$SNAPSHOT_COPY_COMPLETE" == 1 ) ]]; then
+    snapshot_admission_open || {
+      echo "snapshot: service-change admission fence remains closed" >&2
+      [[ "$status" != 0 ]] || status=1
+    }
+  fi
+  return "$status"
+}
 # Install the newest trusted release (or $1), verify it serves, roll back if not.
 cmd_update() {
   local now_flag="" target="" cur latest runs sha blockers="" forced="" hang deferred_epoch=""
@@ -1307,7 +2190,8 @@ case "${1:-}" in
   update) shift; cmd_update "$@"; rc=$?; exec 9>&-; report_deferred; flush_reports; exit $rc ;;
   flush) flush_reports ;;
   status) cmd_status ;;
+  snapshot) shift; cmd_snapshot "$@"; rc=$?; exec 9>&-; report_deferred; flush_reports; exit $rc ;;
   resume) cmd_resume ;;
   trust) trust "${2:?version}" ;;
-  *) echo "usage: guard {launch|prove|prove-later|rollback|update [--now] [version]|status|resume|trust <version>|flush}" >&2; exit 2 ;;
+  *) echo "usage: guard {launch|prove|prove-later|rollback|update [--now] [version]|snapshot <operation-id> <snapshot-point>|status|resume|trust <version>|flush}" >&2; exit 2 ;;
 esac

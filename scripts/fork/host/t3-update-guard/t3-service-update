@@ -5,8 +5,28 @@
 #   t3-service-update [--now] [version]
 #   t3-service-update status
 #   t3-service-update resume     lift an automatic-updates hold once its cause is fixed
+#   t3-service-update snapshot <operation-id> <snapshot-point>
+GUARD="$HOME/.local/libexec/t3-update-guard/guard"
 case "${1:-}" in
-  status) exec "$HOME/.local/libexec/t3-update-guard/guard" status ;;
-  resume) exec "$HOME/.local/libexec/t3-update-guard/guard" resume ;;
+  status) exec "$GUARD" status ;;
+  resume) exec "$GUARD" resume ;;
+  snapshot)
+    shift
+    if [ "$#" -ne 2 ]; then
+      echo "usage: t3-service-update snapshot <operation-id> <snapshot-point>" >&2
+      exit 2
+    fi
+    operation="$1"
+    point="$2"
+    unit="t3-update-guard-snapshot-$(date +%s%N)-$$"
+    set -- --user --collect --pipe --wait "--setenv=HOME=$HOME"
+    [ -n "${PATH:-}" ] && set -- "$@" "--setenv=PATH=$PATH"
+    [ -n "${T3CODE_HOME:-}" ] && set -- "$@" "--setenv=T3CODE_HOME=$T3CODE_HOME"
+    [ -n "${T3_GUARD_STATE_DIR:-}" ] && set -- "$@" "--setenv=T3_GUARD_STATE_DIR=$T3_GUARD_STATE_DIR"
+    [ -n "${XDG_CONFIG_HOME:-}" ] && set -- "$@" "--setenv=XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+    [ -n "${XDG_STATE_HOME:-}" ] && set -- "$@" "--setenv=XDG_STATE_HOME=$XDG_STATE_HOME"
+    [ -n "${T3CODE_PORT:-}" ] && set -- "$@" "--setenv=T3CODE_PORT=$T3CODE_PORT"
+    exec systemd-run "$@" --unit="$unit" "$GUARD" snapshot "$operation" "$point"
+    ;;
 esac
-exec "$HOME/.local/libexec/t3-update-guard/guard" update "$@"
+exec "$GUARD" update "$@"
