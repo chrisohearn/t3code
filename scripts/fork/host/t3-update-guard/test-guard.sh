@@ -2,7 +2,7 @@
 set -eu
 original="$(cd "$(dirname "$0")" && pwd)/guard"
 root=$(mktemp -d)
-trap 'rm -rf "$root"' EXIT
+trap 'rm -r -- "$root" </dev/null' EXIT
 export HOME="$root/home" T3CODE_HOME="$root/t3" T3_GUARD_STATE_DIR="$root/state"
 mkdir -p "$HOME" "$T3CODE_HOME/runtime"
 sed '/^case "${1:-}" in/,$d' "$original" > "$root/functions"
@@ -679,6 +679,11 @@ EOF
     sleep 0.05
   done
   service_listener_pid >/dev/null 2>&1 || fail 'could not start the isolated launcher-child listener'
+  mkdir -p "$SNAPSHOT_ADMISSION_ACTIVE"
+  chmod 700 "$SNAPSHOT_ADMISSION_ROOT" "$SNAPSHOT_ADMISSION_ACTIVE"
+  printf '{"protocolVersion":1,"pid":%s,"startedAt":"2026-11-27T00:00:00.000Z"}\n' \
+    "$(service_listener_pid)" >"$SNAPSHOT_ADMISSION_ROOT/capability.json"
+  chmod 600 "$SNAPSHOT_ADMISSION_ROOT/capability.json"
   manager_ready() { return 0; }
   active_version() { echo "$sim_version"; }
   is_trusted() { return 0; }
@@ -696,6 +701,16 @@ EOF
   }
   kernel_hang_signs() { return 1; }
   wait_inactive() { [[ "$(cat "$sim_state_file")" == inactive ]]; }
+  real_snapshot_admission_open=$(declare -f snapshot_admission_open)
+  eval "${real_snapshot_admission_open/snapshot_admission_open/snapshot_admission_open_inner}"
+  snapshot_admission_open() {
+    local version identity
+    version=$(active_version) || fail 'admission fence reopened without an active version'
+    is_trusted "$version" && is_healthy "$version" || fail 'admission fence reopened before trusted health verification'
+    identity=$(snapshot_service_identity "$version") || fail 'admission fence reopened before listener identity verification'
+    printf 'admission-open-after-verified-restart\n' >>"$root/snapshot-admission-order"
+    snapshot_admission_open_inner
+  }
   cp() { if [[ "$1" == --reflink=always ]]; then shift; fi; command cp "$@"; }
   snapshot_fsync() {
     local path
@@ -744,7 +759,8 @@ for path in sys.argv[1:]:
         ;;
       start)
         [[ "$(jq -r '.status' "$GUARD_STATE/snapshot-receipts/snapshot-op.json")" == copied ]] || fail 'restart ran before the copied receipt was durable'
-        [[ "$(tail -n 1 "$root/snapshot-fsync")" == "fsync:$GUARD_STATE/snapshot-receipts" ]] || fail 'restart ran before the copied receipt directory was fsynced'
+        grep -Fqx "fsync:$GUARD_STATE/snapshot-receipts" "$root/snapshot-fsync" || fail 'restart ran before the copied receipt directory was fsynced'
+        [[ -f "$SNAPSHOT_ADMISSION_FENCE" ]] || fail 'admission fence opened before the restarted listener was verified'
         printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$sim_generation_file"
         printf 'start\n' >"$sim_command_fifo"
         local i
@@ -753,6 +769,9 @@ for path in sys.argv[1:]:
           sleep 0.05
         done
         service_listener_pid >/dev/null 2>&1 || fail 'same-version child listener did not restart'
+        printf '{"protocolVersion":1,"pid":%s,"startedAt":"2026-11-27T00:00:01.000Z"}\n' \
+          "$(service_listener_pid)" >"$SNAPSHOT_ADMISSION_ROOT/capability.json"
+        chmod 600 "$SNAPSHOT_ADMISSION_ROOT/capability.json"
         printf 'active\n' >"$sim_state_file"
         ;;
       *) return 1 ;;
@@ -822,6 +841,13 @@ for path in sys.argv[1:]:
   sim_identity=$(snapshot_service_identity "$sim_version") || fail 'real child listener did not bind to its launcher'
   sim_listener=$(service_listener_pid)
   [[ "$sim_listener" == "$(cat "$sim_listener_file")" && "$sim_listener" != "$sim_pid" ]] || fail 'fixture did not prove a child listener distinct from MainPID'
+  cp "$SNAPSHOT_ADMISSION_ROOT/capability.json" "$root/capability.json"
+  printf '{"protocolVersion":1,"pid":%s}\n' "$sim_pid" >"$SNAPSHOT_ADMISSION_ROOT/capability.json"
+  chmod 600 "$SNAPSHOT_ADMISSION_ROOT/capability.json"
+  if snapshot_service_identity "$sim_version" >/dev/null 2>&1; then fail 'launcher MainPID was accepted as the listener capability PID'; fi
+  cp "$root/capability.json" "$SNAPSHOT_ADMISSION_ROOT/capability.json"
+  chmod 600 "$SNAPSHOT_ADMISSION_ROOT/capability.json"
+  sim_identity=$(snapshot_service_identity "$sim_version") || fail 'valid listener capability marker was not restored'
   sleep 100 &
   sibling_pid=$!
   sim_pid=$sibling_pid
@@ -840,6 +866,35 @@ for path in sys.argv[1:]:
   exec 9>&-
   [[ -z "$(grep '^stop ' "$root/snapshot-svc" 2>/dev/null || true)" ]] || fail 'snapshot stopped before its prepared receipt was durable'
   [[ ! -e "$GUARD_STATE/snapshot-receipts/snapshot-op.json" ]] || fail 'failed prepared receipt was published'
+
+  # An admitted command owns a token until its commit finishes. The guard closes the fence,
+  # waits for that token, then takes the final census and catches the committed preparing run.
+  admission_release="$root/admission-release"
+  rm -f "$admission_release"
+  (
+    while [[ ! -e "$admission_release" ]]; do sleep 0.01; done
+  ) &
+  admission_pid=$!
+  admission_token="$SNAPSHOT_ADMISSION_ACTIVE/$admission_pid-regression.json"
+  printf '{"pid":%s}\n' "$admission_pid" >"$admission_token"
+  chmod 600 "$admission_token"
+  (cmd_snapshot snapshot-op before-stock-switch >"$root/snapshot-fenced-census.out" 2>&1) &
+  snapshot_guard_pid=$!
+  for ((i=0; i<100; i++)); do
+    [[ -f "$SNAPSHOT_ADMISSION_FENCE" ]] && break
+    sleep 0.02
+  done
+  [[ -f "$SNAPSHOT_ADMISSION_FENCE" ]] || fail 'snapshot did not close the admission fence before its final census'
+  [[ -z "$(grep '^stop ' "$root/snapshot-svc" 2>/dev/null || true)" ]] || fail 'snapshot stopped while an admitted command was draining'
+  sqlite3 "$DB" "insert into orchestration_v2_projection_runs values ('fenced','thread','preparing','2026-11-27T00:00:00.000Z',null,'{}');"
+  touch "$admission_release"
+  if wait "$snapshot_guard_pid"; then fail 'snapshot stopped after a command committed during admission drain'; fi
+  wait "$admission_pid" 2>/dev/null || true
+  [[ ! -e "$SNAPSHOT_ADMISSION_FENCE" ]] || fail 'pre-stop refusal left the admission fence closed'
+  [[ -z "$(grep '^stop ' "$root/snapshot-svc" 2>/dev/null || true)" ]] || fail 'snapshot stopped before the final post-drain census passed'
+  grep -q 'runs=1' "$root/snapshot-fenced-census.out" || fail 'post-drain census omitted the admitted preparing run'
+  sqlite3 "$DB" "delete from orchestration_v2_projection_runs;"
+
   cmd_snapshot snapshot-op before-stock-switch >"$root/snapshot-out" || fail 'snapshot-only command failed in the isolated service fixture'
   out=$(cat "$root/snapshot-out")
   receipt="$GUARD_STATE/snapshot-receipts/snapshot-op.json"
@@ -851,10 +906,14 @@ for path in sys.argv[1:]:
   [[ "$(sha256sum "$(jq -r '.snapshotPath' "$receipt")/statev2.sqlite" | cut -d' ' -f1)" == "$(sha256sum "$DB" | cut -d' ' -f1)" ]] || fail 'snapshot main database differs from the stopped source'
   [[ "$(stat -c %a "$receipt")" == 600 && "$(stat -c %a "$(jq -r '.snapshotPath' "$receipt")")" == 700 ]] || fail 'snapshot receipt or files are not under owner-only directories'
   [[ "$(jq -r '.idleVerification.first.runs' "$receipt")" == 0 && "$(jq -r '.idleVerification.second.runs' "$receipt")" == 0 ]] || fail 'receipt did not retain both clean idle censuses'
+  [[ "$(jq -r '.admissionBarrier.protocolVersion' "$receipt")" == 1 && \
+    "$(jq -r '.admissionBarrier.drainedAdmissions' "$receipt")" == 0 && \
+    "$(jq -r '.admissionBarrier.capabilityListenerPid' "$receipt")" =~ ^[1-9][0-9]*$ ]] || fail 'receipt did not retain the drained admission-fence proof'
   [[ -d "$SNAPSHOTS/20200101T000000-before" && -d "$SNAPSHOTS/20200104T000000-before" ]] || fail 'one-off snapshot rotated away an earlier copy'
   [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'snapshot did not stop exactly once'
   [[ "$(grep -c '^start --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'snapshot did not restart exactly once'
   [[ -s "$root/snapshot-hash-order" ]] || fail 'copied files were not hashed after restart'
+  [[ -s "$root/snapshot-admission-order" && ! -e "$SNAPSHOT_ADMISSION_FENCE" ]] || fail 'admission fence did not stay closed through restart verification'
   cmd_snapshot snapshot-op before-stock-switch >"$root/snapshot-out" || fail 'idempotent snapshot retry did not return its receipt'
   [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'idempotent retry stopped the service twice'
   if cmd_snapshot snapshot-op different-point >/dev/null 2>&1; then fail 'snapshot reused an operation ID with a different point'; fi
@@ -862,3 +921,41 @@ for path in sys.argv[1:]:
   [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'mismatched receipt retry stopped the service again'
 ) || fail 'snapshot-only path violated its isolated activity, identity, durability, or restart contract'
 pass 'snapshot-only path verifies full idle state and durable receipts, restarts before hashing, and is idempotent'
+
+# The public wrapper runs the guard in a transient user service outside t3code.service so the
+# executor itself survives the same-version stop/restart and can return the durable receipt.
+wrapper_root="$root/snapshot-wrapper"
+mkdir -p "$wrapper_root/home/.local/libexec/t3-update-guard" "$wrapper_root/bin"
+cat >"$wrapper_root/home/.local/libexec/t3-update-guard/guard" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$SNAPSHOT_GUARD_ARGS"
+printf '{"status":"complete"}\n'
+EOF
+cat >"$wrapper_root/bin/systemd-run" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$SNAPSHOT_SYSTEMD_RUN_ARGS"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --*) shift ;;
+    *) exec "$@" ;;
+  esac
+done
+exit 2
+EOF
+chmod +x "$wrapper_root/home/.local/libexec/t3-update-guard/guard" "$wrapper_root/bin/systemd-run"
+SNAPSHOT_GUARD_ARGS="$wrapper_root/guard-args" \
+SNAPSHOT_SYSTEMD_RUN_ARGS="$wrapper_root/systemd-run-args" \
+HOME="$wrapper_root/home" PATH="$wrapper_root/bin:$PATH" \
+  "$(dirname "$original")/t3-service-update" snapshot snapshot-op before-stock-switch >"$wrapper_root/output" ||
+  fail 'snapshot wrapper did not return the transient unit receipt'
+grep -Fxq -- '--user' "$wrapper_root/systemd-run-args" || fail 'snapshot wrapper did not use the user systemd manager'
+grep -Fxq -- '--collect' "$wrapper_root/systemd-run-args" || fail 'snapshot wrapper did not collect the transient unit'
+grep -Fxq -- '--pipe' "$wrapper_root/systemd-run-args" || fail 'snapshot wrapper did not return the receipt through its pipe'
+grep -Fxq -- '--wait' "$wrapper_root/systemd-run-args" || fail 'snapshot wrapper returned before its transient executor finished'
+grep -Eq '^--unit=t3-update-guard-snapshot-[0-9]+-[0-9]+$' "$wrapper_root/systemd-run-args" ||
+  fail 'snapshot executor was not assigned a separate transient unit'
+[[ "$(cat "$wrapper_root/guard-args")" == $'snapshot\nsnapshot-op\nbefore-stock-switch' ]] ||
+  fail 'transient executor did not receive the snapshot-only arguments'
+[[ "$(cat "$wrapper_root/output")" == '{"status":"complete"}' ]] ||
+  fail 'snapshot wrapper did not relay the durable guard receipt'
+pass 'snapshot wrapper runs the guard in a separate transient service and returns its receipt'

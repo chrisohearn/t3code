@@ -40,6 +40,17 @@ GUARD_STATE="${T3_GUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/t3-upda
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/t3-update-guard/config"
 LOCK="$T3HOME/runtime/service-change.lock"
 DB="$T3HOME/userdata/statev2.sqlite"
+SNAPSHOT_ADMISSION_ROOT="$T3HOME/runtime/service-change-admission"
+SNAPSHOT_ADMISSION_MUTEX="$SNAPSHOT_ADMISSION_ROOT/mutex"
+SNAPSHOT_ADMISSION_ACTIVE="$SNAPSHOT_ADMISSION_ROOT/active"
+SNAPSHOT_ADMISSION_FENCE="$SNAPSHOT_ADMISSION_ROOT/snapshot-fence.json"
+SNAPSHOT_ADMISSION_CLOSED=0
+SNAPSHOT_ADMISSION_OPERATION=""
+SNAPSHOT_ADMISSION_CLOSED_AT=""
+SNAPSHOT_ADMISSION_DRAINED_AT=""
+SNAPSHOT_ADMISSION_CAPABILITY_PID=0
+SNAPSHOT_STOP_REQUESTED=0
+SNAPSHOT_COPY_COMPLETE=0
 PORT="${T3CODE_PORT:-3773}"
 SELF="$(readlink -f "$0")"
 
@@ -1025,6 +1036,190 @@ process_in_unit_cgroup() {
     [[ "$process_group" == "$unit_group" || "$process_group" == "$unit_group/"* ]]
 }
 
+snapshot_admission_capability() {
+  local listener="$1" protocol pid capability="$SNAPSHOT_ADMISSION_ROOT/capability.json"
+  [[ -d "$SNAPSHOT_ADMISSION_ROOT" && ! -L "$SNAPSHOT_ADMISSION_ROOT" && \
+    "$(stat -c %a "$SNAPSHOT_ADMISSION_ROOT" 2>/dev/null)" == 700 && \
+    -d "$SNAPSHOT_ADMISSION_ACTIVE" && ! -L "$SNAPSHOT_ADMISSION_ACTIVE" && \
+    "$(stat -c %a "$SNAPSHOT_ADMISSION_ACTIVE" 2>/dev/null)" == 700 ]] || return 1
+  [[ -f "$capability" && ! -L "$capability" && "$(stat -c %a "$capability" 2>/dev/null)" == 600 ]] || return 1
+  protocol=$(jq -er '.protocolVersion | select(type == "number")' "$capability" 2>/dev/null) || return 1
+  pid=$(jq -er '.pid | select(type == "number")' "$capability" 2>/dev/null) || return 1
+  [[ "$protocol" == 1 && "$pid" == "$listener" ]]
+}
+
+snapshot_admission_lock() {
+  local deadline=$((SECONDS + 5)) owner_path owner_pid age
+  mkdir -p "$SNAPSHOT_ADMISSION_ROOT" "$SNAPSHOT_ADMISSION_ACTIVE" || return 1
+  chmod 700 "$SNAPSHOT_ADMISSION_ROOT" "$SNAPSHOT_ADMISSION_ACTIVE" || return 1
+  while ! mkdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null; do
+    [[ -d "$SNAPSHOT_ADMISSION_MUTEX" && ! -L "$SNAPSHOT_ADMISSION_MUTEX" ]] || return 1
+    owner_path="$SNAPSHOT_ADMISSION_MUTEX/owner"
+    if [[ -e "$owner_path" ]]; then
+      [[ -f "$owner_path" && ! -L "$owner_path" ]] || return 1
+      owner_pid=$(cat "$owner_path" 2>/dev/null) || return 1
+      [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+      if ! kill -0 "$owner_pid" 2>/dev/null; then
+        rm -f -- "$owner_path" || return 1
+        rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
+        continue
+      fi
+    else
+      age=$(( $(date +%s) - $(stat -c %Y "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || echo 0) ))
+      if (( age > 5 )); then
+        rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
+        continue
+      fi
+    fi
+    (( SECONDS < deadline )) || return 1
+    sleep 0.01
+  done
+  if ! printf '%s\n' "$$" >"$SNAPSHOT_ADMISSION_MUTEX/owner" || \
+    ! chmod 600 "$SNAPSHOT_ADMISSION_MUTEX/owner" || \
+    ! snapshot_fsync "$SNAPSHOT_ADMISSION_MUTEX/owner" "$SNAPSHOT_ADMISSION_ROOT"; then
+    rm -f -- "$SNAPSHOT_ADMISSION_MUTEX/owner"
+    rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
+    return 1
+  fi
+}
+
+snapshot_admission_unlock() {
+  rm -f -- "$SNAPSHOT_ADMISSION_MUTEX/owner"
+  rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
+}
+
+snapshot_admission_clear_stale_fence() {
+  local owner_pid
+  [[ -e "$SNAPSHOT_ADMISSION_FENCE" ]] || return 0
+  [[ -f "$SNAPSHOT_ADMISSION_FENCE" && ! -L "$SNAPSHOT_ADMISSION_FENCE" ]] || return 1
+  owner_pid=$(jq -er '.ownerPid | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  if kill -0 "$owner_pid" 2>/dev/null; then
+    [[ "$owner_pid" == "$$" ]] && return 0
+    return 1
+  fi
+  rm -f -- "$SNAPSHOT_ADMISSION_FENCE" || return 1
+  snapshot_fsync "$SNAPSHOT_ADMISSION_ROOT"
+}
+
+snapshot_admission_active_count() {
+  local token pid count=0
+  local -a tokens=("$SNAPSHOT_ADMISSION_ACTIVE"/*.json)
+  for token in "${tokens[@]}"; do
+    [[ -e "$token" ]] || continue
+    [[ -f "$token" && ! -L "$token" ]] || return 1
+    pid=$(jq -er '.pid | select(type == "number")' "$token" 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if kill -0 "$pid" 2>/dev/null; then
+      count=$((count + 1))
+    else
+      rm -f -- "$token" || return 1
+    fi
+  done
+  printf '%s' "$count"
+}
+
+snapshot_admission_close() {
+  local operation="$1" point="$2" listener="$3" tmp count deadline
+  snapshot_admission_lock || { echo "snapshot: admission coordination lock is unavailable" >&2; return 1; }
+  if ! snapshot_admission_clear_stale_fence; then
+    snapshot_admission_unlock
+    echo "snapshot: another guarded operation owns the admission fence" >&2
+    return 1
+  fi
+  SNAPSHOT_ADMISSION_CLOSED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  tmp=$(mktemp "$SNAPSHOT_ADMISSION_ROOT/.snapshot-fence.XXXXXX") || {
+    snapshot_admission_unlock
+    return 1
+  }
+  if ! jq -cn --arg operation "$operation" --arg point "$point" --arg closedAt "$SNAPSHOT_ADMISSION_CLOSED_AT" \
+      --arg pid "$$" '{protocolVersion:1,ownerPid:($pid|tonumber),operationId:$operation,snapshotPoint:$point,closedAt:$closedAt}' >"$tmp" || \
+    ! chmod 600 "$tmp" || ! snapshot_fsync "$tmp" || \
+    ! mv -f -- "$tmp" "$SNAPSHOT_ADMISSION_FENCE"; then
+    rm -f -- "$tmp"
+    snapshot_admission_unlock
+    echo "snapshot: admission fence could not be durably closed" >&2
+    return 1
+  fi
+  SNAPSHOT_ADMISSION_CLOSED=1
+  if ! snapshot_fsync "$SNAPSHOT_ADMISSION_ROOT"; then
+    snapshot_admission_unlock
+    echo "snapshot: admission fence directory could not be durably synced" >&2
+    return 1
+  fi
+  snapshot_admission_unlock
+
+  deadline=$((SECONDS + 120))
+  while true; do
+    count=$(snapshot_admission_active_count) || {
+      echo "snapshot: admitted command tokens could not be verified" >&2
+      return 1
+    }
+    if [[ "$count" == 0 ]]; then
+      SNAPSHOT_ADMISSION_DRAINED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+      SNAPSHOT_ADMISSION_CAPABILITY_PID="$listener"
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "snapshot: $count admitted command(s) did not drain within 120 seconds" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+snapshot_admission_open() {
+  local version identity receipt expected_version
+  version=$(active_version) || return 1
+  [[ -n "$version" ]] && is_trusted "$version" && is_healthy "$version" || {
+    echo "snapshot: admission remains fenced until the trusted service is healthy" >&2
+    return 1
+  }
+  receipt="$GUARD_STATE/snapshot-receipts/${SNAPSHOT_ADMISSION_OPERATION}.json"
+  if [[ -n "$SNAPSHOT_ADMISSION_OPERATION" && -f "$receipt" ]]; then
+    expected_version=$(jq -r '.stoppedGeneration.version // empty' "$receipt" 2>/dev/null) || return 1
+    [[ -n "$expected_version" && "$version" == "$expected_version" ]] || {
+      echo "snapshot: admission remains fenced because the selected service is not the recorded fork version" >&2
+      return 1
+    }
+  fi
+  identity=$(snapshot_service_identity "$version") || {
+    echo "snapshot: admission remains fenced until the trusted listener identity is verified" >&2
+    return 1
+  }
+  snapshot_admission_lock || { echo "snapshot: admission coordination lock is unavailable while reopening" >&2; return 1; }
+  if [[ -e "$SNAPSHOT_ADMISSION_FENCE" ]]; then
+    local owner_pid operation_id
+    owner_pid=$(jq -er '.ownerPid | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    operation_id=$(jq -r '.operationId // empty' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    if [[ "$owner_pid" == "$$" ]]; then
+      [[ "$operation_id" == "$SNAPSHOT_ADMISSION_OPERATION" ]] || {
+        snapshot_admission_unlock
+        return 1
+      }
+    elif kill -0 "$owner_pid" 2>/dev/null; then
+      snapshot_admission_unlock
+      return 1
+    fi
+    rm -f -- "$SNAPSHOT_ADMISSION_FENCE" || {
+      snapshot_admission_unlock
+      return 1
+    }
+    snapshot_fsync "$SNAPSHOT_ADMISSION_ROOT" || {
+      snapshot_admission_unlock
+      return 1
+    }
+  fi
+  snapshot_admission_unlock
+  SNAPSHOT_ADMISSION_CLOSED=0
+}
+
 snapshot_service_identity() {
   local expected="$1" state invocation pid listener version uptime control_group
   state=$(unit_property ActiveState) || return 1
@@ -1035,6 +1230,7 @@ snapshot_service_identity() {
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   listener=$(service_listener_pid) || return 1
   [[ "$listener" =~ ^[1-9][0-9]*$ && "$listener" != "$pid" ]] || return 1
+  snapshot_admission_capability "$listener" || return 1
   control_group=$(unit_property ControlGroup) || return 1
   process_is_descendant_of "$listener" "$pid" || return 1
   process_in_unit_cgroup "$pid" "$control_group" || return 1
@@ -1229,7 +1425,9 @@ snapshot_receipt_set_idle_evidence() {
   IFS='|' read -r invocation pid version uptime <<<"$identity"
   updated=$(jq -c --arg invocation "$invocation" --arg pid "$pid" --arg version "$version" \
     --argjson first "$first" --argjson second "$second" \
-    '.idleVerification={first:$first,second:$second} | .stoppedGeneration={invocationId:$invocation,mainPid:($pid|tonumber),version:$version}' \
+    --arg closedAt "$SNAPSHOT_ADMISSION_CLOSED_AT" --arg drainedAt "$SNAPSHOT_ADMISSION_DRAINED_AT" \
+    --arg capabilityPid "$SNAPSHOT_ADMISSION_CAPABILITY_PID" \
+    '.idleVerification={first:$first,second:$second} | .admissionBarrier={protocolVersion:1,closedAt:$closedAt,drainedAt:$drainedAt,drainedAdmissions:0,capabilityListenerPid:($capabilityPid|tonumber)} | .stoppedGeneration={invocationId:$invocation,mainPid:($pid|tonumber),version:$version}' \
     "$receipt") || return 1
   write_snapshot_receipt "$receipt" "$updated"
 }
@@ -1249,7 +1447,7 @@ snapshot_receipt_set_manifest() {
   write_snapshot_receipt "$receipt" "$updated"
 }
 
-cmd_snapshot() {
+cmd_snapshot_impl() {
   local operation="" point="" label label_length receipt_dir receipt status version identity
   local stopped_invocation stopped_pid first_activity second_activity snapshot identity_after
   local files generation hang state restart_invocation json
@@ -1297,6 +1495,8 @@ cmd_snapshot() {
       cat "$receipt"
       return
     fi
+    [[ "$status" == stop_requested ]] && SNAPSHOT_STOP_REQUESTED=1
+    [[ "$status" == copied || "$status" == captured || "$status" == restart_failed ]] && SNAPSHOT_COPY_COMPLETE=1
     version=$(jq -r '.stoppedGeneration.version' "$receipt")
     stopped_invocation=$(jq -r '.stoppedGeneration.invocationId' "$receipt")
     stopped_pid=$(jq -r '.stoppedGeneration.mainPid' "$receipt")
@@ -1366,6 +1566,13 @@ cmd_snapshot() {
       echo "snapshot: prepared service identity is no longer verified" >&2
       return 1
     }
+    local listener_pid
+    listener_pid=$(service_listener_pid) || {
+      echo "snapshot: prepared listener PID is no longer verified" >&2
+      return 1
+    }
+    SNAPSHOT_ADMISSION_OPERATION="$operation"
+    snapshot_admission_close "$operation" "$point" "$listener_pid" || return 1
     IFS='|' read -r generation _ _ _ <<<"$identity"
     [[ "$generation" == "$stopped_invocation" ]] || {
       echo "snapshot: prepared service generation changed; no stop requested" >&2
@@ -1397,6 +1604,7 @@ cmd_snapshot() {
       return 1
     }
     status=stop_requested
+    SNAPSHOT_STOP_REQUESTED=1
     log "snapshot: operation=$operation point=$point stopping $UNIT on $version after fresh idle census"
     if ! svc stop --no-block "$UNIT"; then
       state=$(unit_property ActiveState) || state="unknown"
@@ -1418,6 +1626,8 @@ cmd_snapshot() {
   fi
 
   if [[ "$status" == stop_requested ]]; then
+    SNAPSHOT_ADMISSION_OPERATION="$operation"
+    snapshot_admission_close "$operation" "$point" "0" || return 1
     state=$(unit_property ActiveState) || state="unknown"
     if [[ "$state" == deactivating ]]; then
       wait_inactive || {
@@ -1451,13 +1661,16 @@ cmd_snapshot() {
       return 1
     }
     status=copied
+    SNAPSHOT_COPY_COMPLETE=1
   fi
 
   if [[ "$status" == copied || "$status" == captured || "$status" == restart_failed ]]; then
+    SNAPSHOT_COPY_COMPLETE=1
     [[ "$(active_version)" == "$version" ]] && is_trusted "$version" && is_healthy "$version" || {
       echo "snapshot: refusing to start anything except the original trusted service version $version" >&2
       return 1
     }
+    SNAPSHOT_ADMISSION_OPERATION="$operation"
     state=$(unit_property ActiveState) || state="unknown"
     if [[ "$state" == active || "$state" == activating || "$state" == deactivating ]]; then
       identity=$(snapshot_wait_serving "$version" "$stopped_invocation") || {
@@ -1472,6 +1685,10 @@ cmd_snapshot() {
         return 1
       }
     fi
+    snapshot_admission_open || {
+      echo "snapshot: same-version service is healthy, but its admission fence could not be reopened" >&2
+      return 1
+    }
     if [[ "$status" == copied ]]; then
       files=$(snapshot_manifest "$snapshot") || {
         hold_updates "snapshot operation $operation restarted the service but could not verify the copied files"
@@ -1495,6 +1712,26 @@ cmd_snapshot() {
   outage_end "$version"
   log "snapshot: operation=$operation restarted and verified $version"
   cat "$receipt"
+}
+
+cmd_snapshot() {
+  local status=0
+  SNAPSHOT_ADMISSION_CLOSED=0
+  SNAPSHOT_ADMISSION_OPERATION="${1:-}"
+  SNAPSHOT_ADMISSION_CLOSED_AT=""
+  SNAPSHOT_ADMISSION_DRAINED_AT=""
+  SNAPSHOT_ADMISSION_CAPABILITY_PID=0
+  SNAPSHOT_STOP_REQUESTED=0
+  SNAPSHOT_COPY_COMPLETE=0
+  cmd_snapshot_impl "$@" || status=$?
+  if [[ "$SNAPSHOT_ADMISSION_CLOSED" == 1 && \
+    ( "$SNAPSHOT_STOP_REQUESTED" == 0 || "$SNAPSHOT_COPY_COMPLETE" == 1 ) ]]; then
+    snapshot_admission_open || {
+      echo "snapshot: service-change admission fence remains closed" >&2
+      [[ "$status" != 0 ]] || status=1
+    }
+  fi
+  return "$status"
 }
 # Install the newest trusted release (or $1), verify it serves, roll back if not.
 cmd_update() {

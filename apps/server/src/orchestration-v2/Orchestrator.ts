@@ -250,6 +250,7 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ServiceChangeAdmission from "../serviceChangeAdmission.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -3980,7 +3981,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         left.afterRunOrdinal - right.afterRunOrdinal || left.item.ordinal - right.item.ordinal,
     );
     for (const { run, message, steer, afterRunOrdinal } of placed) {
-      yield* dispatchWithReceiptEffect({
+      yield* dispatchWithAdmission({
         type: "message.dispatch",
         commandId: CommandId.make(`command:unread-steer:${run.id}:${message.id}`),
         threadId,
@@ -16444,7 +16445,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               session.capabilities.sessions.supportsMultipleProviderThreadsPerSession
             )
               continue;
-            yield* dispatchWithReceiptEffect({
+            yield* dispatchWithAdmission({
               type: "provider-session.detach",
               commandId: CommandId.make(
                 `command:system:delegated-task-release:${resultRunId}:${session.id}`,
@@ -16947,7 +16948,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             node.id === request.nodeId && node.runId !== null && resultRunIds.has(node.runId),
         )
       ) {
-        yield* dispatchWithReceipt({
+        yield* dispatchWithReceiptWithAdmission({
           type: "thread.user-input.dismiss",
           commandId: CommandId.make(`command:system:delegated-task-question:${request.id}`),
           threadId: childThreadId,
@@ -18031,6 +18032,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     } satisfies OrchestratorV2DispatchResult;
   }, withCommandMetrics);
 
+  const dispatchWithAdmission = Effect.fnUntraced(function* (
+    command: OrchestrationV2ServerCommand,
+    sideChatIds: ReadonlyArray<ThreadId> = [],
+    cancelledTask?: OrchestrationV2Subagent,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    return yield* ServiceChangeAdmission.withAdmissionAt(
+      config.baseDir,
+      dispatchWithReceiptEffect(command, sideChatIds, cancelledTask),
+    ).pipe(
+      Effect.mapError((cause) =>
+        ServiceChangeAdmission.isServiceChangeAdmissionError(cause)
+          ? new OrchestratorCommandRejectedError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            })
+          : cause,
+      ),
+    );
+  });
+
   // Follow-up intake and Stop serialize on the parent before taking the child lock.
   const withSubagentParentLock = <A, E, R>(threadId: ThreadId, dispatch: Effect.Effect<A, E, R>) =>
     appOwnedSubagentParentThreadId(threadId).pipe(
@@ -18100,6 +18122,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return yield* command.type === "runtime-request.respond"
       ? withSubagentParentLock(command.threadId, dispatch)
       : dispatch;
+  });
+
+  const dispatchWithReceiptWithAdmission = Effect.fnUntraced(function* (
+    command: OrchestrationV2ServerCommand,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    return yield* ServiceChangeAdmission.withAdmissionAt(
+      config.baseDir,
+      dispatchWithReceipt(command),
+    ).pipe(
+      Effect.mapError((cause) =>
+        ServiceChangeAdmission.isServiceChangeAdmissionError(cause)
+          ? new OrchestratorCommandRejectedError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            })
+          : cause,
+      ),
+    );
   });
 
   const parentTaskSyncRetries = yield* FiberSet.make();
@@ -18296,7 +18337,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   (left.queuePosition ?? left.ordinal) - (right.queuePosition ?? right.ordinal),
               );
             for (const queued of pending) {
-              yield* dispatchWithReceiptEffect({
+              yield* dispatchWithAdmission({
                 type: "queued-message.promote-to-steer",
                 commandId: CommandId.make(
                   `command:deferred-steer:${queued.id}:${run.id}:${turn.runAttemptId}`,
@@ -18611,8 +18652,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             // Hold intake closed until descendants stop and this thread's Stop commits.
             yield* input.stopDescendants((command) =>
               commandThreadId(command) === input.command.threadId
-                ? dispatchWithReceiptEffect(command)
-                : dispatchWithReceipt(command),
+                ? dispatchWithAdmission(command)
+                : dispatchWithReceiptWithAdmission(command),
             );
             const child = yield* projectionStore
               .getThreadRecords(
@@ -18639,7 +18680,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 ? { ...task, cancelledRunId: cancelledRun.id, updatedAt: now }
                 : undefined;
             // The marker, Stop receipt and interrupt outbox commit together under both locks.
-            yield* dispatchWithReceiptEffect(command, [], cancelledTask);
+            yield* dispatchWithAdmission(command, [], cancelledTask);
           }),
         );
         yield* finalizeAppOwnedSubagent(command.threadId).pipe(mapDispatchError(command));
@@ -18664,7 +18705,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {
       return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
     }),
-    dispatch: dispatchWithReceipt,
+    dispatch: dispatchWithReceiptWithAdmission,
     skipProviderFailover: Effect.fn("OrchestratorV2.skipProviderFailover")(function (input) {
       return threadDispatch.withLock(
         input.threadId,
@@ -18702,7 +18743,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           const command = { type: "thread.metadata.update", ...input } as const;
           // A Stop that reached the run before its limit failure landed had nothing to disarm.
           const stopped = yield* stopReachedRun(command, input.threadId, input.limitRecovery.runId);
-          yield* dispatchWithReceiptEffect(
+          yield* dispatchWithAdmission(
             stopped
               ? {
                   ...command,

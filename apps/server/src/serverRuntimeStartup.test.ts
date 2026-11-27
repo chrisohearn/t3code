@@ -1,5 +1,10 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The test cleans its isolated startup base directory.
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The test builds and removes an isolated startup base directory.
+import * as NodePath from "node:path";
 import {
   DEFAULT_SERVER_SETTINGS,
   ProjectId,
@@ -54,8 +59,9 @@ it.effect.each([
   "launch-failure",
   "project-failure",
   "project-refused",
-] as const)("keeps bootstrap launch failures separate from project failures: %s", (scenario) =>
-  Effect.gen(function* () {
+] as const)("keeps bootstrap launch failures separate from project failures: %s", (scenario) => {
+  const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-startup-"));
+  return Effect.gen(function* () {
     const projectId = ProjectId.make("bootstrap-project");
     const instanceId = ProviderInstanceId.make(
       scenario === "disabled-default" ? "custom" : "codex",
@@ -73,10 +79,10 @@ it.effect.each([
       NodeCrypto.layer,
       Path.layer,
       Layer.mock(ServerConfig.ServerConfig)({
-        ...(yield* ServerConfig.deriveServerPaths("/bootstrap-project", undefined).pipe(
+        ...(yield* ServerConfig.deriveServerPaths(baseDir, undefined).pipe(
           Effect.provide(Path.layer),
         )),
-        baseDir: "/bootstrap-project",
+        baseDir,
         logLevel: "Error",
         traceMinLevel: "Info",
         traceTimingEnabled: false,
@@ -97,7 +103,7 @@ it.effect.each([
         tailscaleServeEnabled: false,
         tailscaleServePort: 443,
         mode: "web",
-        cwd: "/bootstrap-project",
+        cwd: baseDir,
         host: "localhost",
         port: 3773,
         devUrl: undefined,
@@ -167,7 +173,7 @@ it.effect.each([
                   project: {
                     id: projectId,
                     title: "Project",
-                    workspaceRoot: "/bootstrap-project",
+                    workspaceRoot: baseDir,
                     repositoryIdentity: null,
                     faviconPath: null,
                     scripts: [],
@@ -242,9 +248,10 @@ it.effect.each([
     }).pipe(
       Effect.provide(ServerRuntimeStartup.layerWithOptions().pipe(Layer.provide(dependencies))),
       Effect.provideService(ServerActivation, Effect.never),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(baseDir, { recursive: true, force: true }))),
     );
-  }),
-);
+  });
+});
 
 it.effect("interrupts the effect worker when awareness relay startup fails", () =>
   Effect.gen(function* () {
