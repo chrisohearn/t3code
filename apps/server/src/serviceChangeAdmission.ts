@@ -8,9 +8,11 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Scope from "effect/Scope";
 import * as ServerConfig from "./config.ts";
 
 const PROTOCOL_VERSION = 1;
@@ -18,6 +20,7 @@ const MUTEX_WAIT_MS = 5_000;
 
 interface AdmissionLease {
   readonly tokenPath: string;
+  references: number;
 }
 
 interface AdmissionPaths {
@@ -30,6 +33,7 @@ interface AdmissionPaths {
 
 const admissionPathsByBaseDir = new Map<string, AdmissionPaths>();
 const admissionMutexesByBaseDir = new Map<string, Semaphore.Semaphore>();
+const pendingAdmissionTokenCleanup = new Set<string>();
 
 const admissionMutex = (baseDir: string) => {
   const cached = admissionMutexesByBaseDir.get(baseDir);
@@ -98,6 +102,37 @@ const pidIsAlive = (pid: number) => {
   }
 };
 
+const errorHasCode = (cause: unknown, code: string) =>
+  typeof cause === "object" && cause !== null && "code" in cause && cause.code === code;
+
+const unlinkWithRetry = async (filePath: string) => {
+  let lastCause: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await NodeFS.promises.unlink(filePath);
+      return;
+    } catch (cause) {
+      if (errorHasCode(cause, "ENOENT")) return;
+      lastCause = cause;
+    }
+  }
+  throw lastCause;
+};
+
+const rmdirWithRetry = async (directory: string) => {
+  let lastCause: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await NodeFS.promises.rmdir(directory);
+      return;
+    } catch (cause) {
+      if (errorHasCode(cause, "ENOENT")) return;
+      lastCause = cause;
+    }
+  }
+  throw lastCause;
+};
+
 const ensureDirectories = async (paths: AdmissionPaths) => {
   await NodeFS.promises.mkdir(paths.root, { recursive: true, mode: 0o700 });
   await NodeFS.promises.mkdir(paths.active, { recursive: true, mode: 0o700 });
@@ -111,26 +146,18 @@ const ensureDirectories = async (paths: AdmissionPaths) => {
 };
 
 const releaseMutex = async (paths: AdmissionPaths) => {
-  try {
-    await NodeFS.promises.unlink(NodePath.join(paths.mutex, "owner"));
-  } catch {
-    // A missing owner file means an interrupted or already completed cleanup.
-  }
-  try {
-    await NodeFS.promises.rmdir(paths.mutex);
-  } catch {
-    // Leave unexpected contents in place; the next caller fails closed.
-  }
+  await unlinkWithRetry(NodePath.join(paths.mutex, "owner"));
+  await rmdirWithRetry(paths.mutex);
 };
 
-const removeStaleMutex = async (paths: AdmissionPaths, now: number) => {
+const removeStaleMutex = async (paths: AdmissionPaths, now: number): Promise<boolean> => {
   const ownerPath = NodePath.join(paths.mutex, "owner");
   let stat: Awaited<ReturnType<typeof NodeFS.promises.lstat>>;
   try {
     stat = await NodeFS.promises.lstat(paths.mutex);
   } catch (cause) {
     if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT") {
-      return;
+      return true;
     }
     throw cause;
   }
@@ -147,15 +174,18 @@ const removeStaleMutex = async (paths: AdmissionPaths, now: number) => {
     ownerPid = Number(ownerText);
     if (!Number.isSafeInteger(ownerPid)) throw new Error("Admission mutex owner PID is invalid.");
   } catch (cause) {
-    if (
-      !(typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT")
-    ) {
-      throw cause;
-    }
-    if (now - stat.mtimeMs <= 5_000) return;
+    if (!errorHasCode(cause, "ENOENT")) throw cause;
+    if (now - stat.mtimeMs <= 5_000) return false;
   }
-  if (ownerPid !== undefined && pidIsAlive(ownerPid)) return;
+  // This caller holds the process-local semaphore, so no other local operation
+  // can still own a same-process mutex left behind by a failed finalizer.
+  if (ownerPid === process.pid) {
+    await releaseMutex(paths);
+    return true;
+  }
+  if (ownerPid !== undefined && pidIsAlive(ownerPid)) return false;
   await releaseMutex(paths);
+  return true;
 };
 
 type MutexAttempt =
@@ -205,14 +235,14 @@ const acquireMutex = Effect.fn("ServiceChangeAdmission.acquireMutex")(function* 
     }
 
     const now = yield* Clock.currentTimeMillis;
-    yield* Effect.tryPromise({
+    const staleMutexRemoved = yield* Effect.tryPromise({
       try: () => removeStaleMutex(paths, now),
       catch: (cause) => new ServiceChangeAdmissionError({ stage: "mutex", cause }),
     });
     if ((yield* Clock.currentTimeMillis) >= deadline) {
       return yield* new ServiceChangeAdmissionError({ stage: "mutex" });
     }
-    yield* Effect.sleep("10 millis");
+    if (!staleMutexRemoved) yield* Effect.sleep("10 millis");
   }
 });
 
@@ -272,13 +302,19 @@ const removeStaleFence = async (paths: AdmissionPaths) => {
 
 const createAdmission = (baseDir: string) => {
   const paths = admissionPaths(baseDir);
-  return Semaphore.withPermit(admissionMutex(baseDir))(
+  let createdLease: AdmissionLease | undefined;
+  const acquired = Semaphore.withPermit(admissionMutex(baseDir))(
     Effect.tryPromise({
       try: () => ensureDirectories(paths),
       catch: (cause) => new ServiceChangeAdmissionError({ stage: "storage", cause }),
     }).pipe(
       Effect.andThen(
         withMutex(paths, async () => {
+          for (const tokenPath of pendingAdmissionTokenCleanup) {
+            if (NodePath.dirname(tokenPath) !== paths.active) continue;
+            await unlinkWithRetry(tokenPath);
+            pendingAdmissionTokenCleanup.delete(tokenPath);
+          }
           await removeStaleFence(paths);
           const tokenPath = NodePath.join(
             paths.active,
@@ -288,12 +324,34 @@ const createAdmission = (baseDir: string) => {
             mode: 0o600,
             flag: "wx",
           });
-          return { tokenPath } satisfies AdmissionLease;
+          createdLease = { tokenPath, references: 1 } satisfies AdmissionLease;
+          return createdLease;
         }),
       ),
     ),
   );
+  return acquired.pipe(
+    Effect.onExit((exit) =>
+      Exit.isFailure(exit) && createdLease !== undefined
+        ? releaseAdmission(createdLease)
+        : Effect.void,
+    ),
+  );
 };
+
+const releaseAdmission = (lease: AdmissionLease) =>
+  Effect.promise(async () => {
+    if (lease.references <= 0) throw new Error("Admission lease released more than once.");
+    lease.references -= 1;
+    if (lease.references > 0) return;
+    try {
+      await unlinkWithRetry(lease.tokenPath);
+      pendingAdmissionTokenCleanup.delete(lease.tokenPath);
+    } catch (cause) {
+      pendingAdmissionTokenCleanup.add(lease.tokenPath);
+      throw cause;
+    }
+  });
 
 export const initialize = Effect.fn("ServiceChangeAdmission.initialize")(function* (
   baseDir: string,
@@ -330,9 +388,6 @@ export const initialize = Effect.fn("ServiceChangeAdmission.initialize")(functio
   );
 });
 
-const releaseAdmission = (lease: AdmissionLease) =>
-  Effect.promise(() => NodeFS.promises.unlink(lease.tokenPath).catch(() => undefined));
-
 const leaseIsActive = (lease: AdmissionLease) =>
   Effect.promise(() =>
     NodeFS.promises.access(lease.tokenPath).then(
@@ -350,7 +405,14 @@ export const withAdmissionAt = Effect.fn("ServiceChangeAdmission.withAdmissionAt
   effect: Effect.Effect<A, E, R>,
 ): Effect.fn.Return<A, E | ServiceChangeAdmissionError, R> {
   const activeLease = yield* Effect.serviceOption(AdmissionLeaseContext);
-  if (Option.isSome(activeLease) && (yield* leaseIsActive(activeLease.value))) return yield* effect;
+  if (
+    Option.isSome(activeLease) &&
+    NodePath.dirname(activeLease.value.tokenPath) === admissionPaths(baseDir).active &&
+    activeLease.value.references > 0 &&
+    (yield* leaseIsActive(activeLease.value))
+  ) {
+    return yield* effect;
+  }
 
   return yield* Effect.scoped(
     Effect.gen(function* () {
@@ -359,6 +421,39 @@ export const withAdmissionAt = Effect.fn("ServiceChangeAdmission.withAdmissionAt
     }),
   );
 });
+
+/**
+ * Fork background work while retaining the command's admission lease until that
+ * work exits. The child receives the same lease context, so nested dispatches
+ * reuse it and a snapshot census cannot pass between acceptance and preparation.
+ */
+export const forkInWithAdmissionAt = Effect.fn("ServiceChangeAdmission.forkInWithAdmissionAt")(
+  function* <A, E, R>(baseDir: string, effect: Effect.Effect<A, E, R>, scope: Scope.Scope) {
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const inheritedLease = yield* Effect.serviceOption(AdmissionLeaseContext);
+        const leaseIsReusable =
+          Option.isSome(inheritedLease) &&
+          NodePath.dirname(inheritedLease.value.tokenPath) === admissionPaths(baseDir).active &&
+          inheritedLease.value.references > 0 &&
+          (yield* leaseIsActive(inheritedLease.value));
+        const lease = leaseIsReusable
+          ? inheritedLease.value
+          : yield* restore(createAdmission(baseDir));
+        if (leaseIsReusable) lease.references += 1;
+
+        const child = Effect.provideService(
+          effect.pipe(Effect.ensuring(releaseAdmission(lease))),
+          AdmissionLeaseContext,
+          lease,
+        ).pipe(Effect.forkIn(scope));
+        return yield* restore(child).pipe(
+          Effect.onExit((exit) => (Exit.isFailure(exit) ? releaseAdmission(lease) : Effect.void)),
+        );
+      }),
+    );
+  },
+);
 
 export const withAdmission = Effect.fn("ServiceChangeAdmission.withAdmission")(function* <A, E, R>(
   effect: Effect.Effect<A, E, R>,

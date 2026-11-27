@@ -305,6 +305,8 @@ export function layerWithRegistry<Error>(
     readonly settings?: Parameters<typeof ServerSettings.layerTest>[0];
     /** Replaces `settings` with a layer the test also provides, so it can change settings live. */
     readonly settingsLayer?: Layer.Layer<ServerSettings.ServerSettingsService>;
+    /** Shares the server's runtime paths with services layered around the replay harness. */
+    readonly serverConfigLayer?: Layer.Layer<ServerConfig.ServerConfig>;
     /** The instances the ingestor reads snapshots from, such as an endpoint behind a hub. */
     readonly providerInstances?: Partial<
       ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]
@@ -320,10 +322,12 @@ export function layerWithRegistry<Error>(
   | ThreadCommandExecutor.ThreadCommandExecutor,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
-  const layerServerConfig = Layer.effect(
-    ServerConfig.ServerConfig,
-    makeReplayServerConfig(scenario.name).pipe(Effect.orDie),
-  ).pipe(Layer.provide(NodeServices.layer));
+  const layerServerConfig =
+    options.serverConfigLayer ??
+    Layer.effect(
+      ServerConfig.ServerConfig,
+      makeReplayServerConfig(scenario.name).pipe(Effect.orDie),
+    ).pipe(Layer.provide(NodeServices.layer));
   // A thread without a worktree would otherwise fall back to process.cwd(), so checkpoints
   // would run git against the checkout running the tests and race its other users.
   const layerScenarioWorkspacePolicy = Layer.effect(

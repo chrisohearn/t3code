@@ -1,4 +1,4 @@
-import { assert, it } from "@effect/vitest";
+import { assert, it, vi } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- The test verifies the guard-compatible host file protocol.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Scope from "effect/Scope";
 import * as ServerConfig from "./config.ts";
 import * as ServiceChangeAdmission from "./serviceChangeAdmission.ts";
 
@@ -98,5 +99,102 @@ it.effect("serializes concurrent local admission file creation", () => {
     assert.isEmpty(NodeFS.readdirSync(active));
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(baseDir, { recursive: true, force: true }))),
+  );
+});
+
+it.effect("keeps admission active until forked preparation exits", () => {
+  const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-snapshot-admission-"));
+  const active = NodePath.join(baseDir, "runtime", "service-change-admission", "active");
+
+  return Effect.gen(function* () {
+    yield* ServiceChangeAdmission.initialize(baseDir);
+    const scope = yield* Scope.make("sequential");
+    yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const child = yield* ServiceChangeAdmission.withAdmissionAt(
+      baseDir,
+      ServiceChangeAdmission.forkInWithAdmissionAt(
+        baseDir,
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+        }),
+        scope,
+      ),
+    );
+
+    yield* Deferred.await(entered);
+    assert.lengthOf(NodeFS.readdirSync(active), 1);
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(child);
+    assert.isEmpty(NodeFS.readdirSync(active));
+  }).pipe(
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(baseDir, { recursive: true, force: true }))),
+  );
+});
+
+it.effect("retries pending admission-token cleanup on the next admission", () => {
+  const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-snapshot-admission-"));
+  const active = NodePath.join(baseDir, "runtime", "service-change-admission", "active");
+  const originalUnlink = NodeFS.promises.unlink.bind(NodeFS.promises);
+  let tokenUnlinksToFail = 2;
+  vi.spyOn(NodeFS.promises, "unlink").mockImplementation((filePath) => {
+    if (NodePath.dirname(String(filePath)) === active && tokenUnlinksToFail > 0) {
+      tokenUnlinksToFail -= 1;
+      return Promise.reject(Object.assign(new Error("transient unlink failure"), { code: "EIO" }));
+    }
+    return originalUnlink(filePath);
+  });
+
+  return Effect.gen(function* () {
+    yield* ServiceChangeAdmission.initialize(baseDir);
+    const first = yield* Effect.exit(ServiceChangeAdmission.withAdmissionAt(baseDir, Effect.void));
+    assert.isTrue(Exit.isFailure(first));
+    assert.lengthOf(NodeFS.readdirSync(active), 1);
+
+    yield* ServiceChangeAdmission.withAdmissionAt(baseDir, Effect.void);
+    assert.isEmpty(NodeFS.readdirSync(active));
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        vi.restoreAllMocks();
+        NodeFS.rmSync(baseDir, { recursive: true, force: true });
+      }),
+    ),
+  );
+});
+
+it.effect("reports mutex cleanup failure and reclaims the stale local mutex", () => {
+  const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-snapshot-admission-"));
+  const mutex = NodePath.join(baseDir, "runtime", "service-change-admission", "mutex");
+  const mutexOwner = NodePath.join(mutex, "owner");
+  const originalUnlink = NodeFS.promises.unlink.bind(NodeFS.promises);
+  let ownerUnlinksToFail = 2;
+  vi.spyOn(NodeFS.promises, "unlink").mockImplementation((filePath) => {
+    if (String(filePath) === mutexOwner && ownerUnlinksToFail > 0) {
+      ownerUnlinksToFail -= 1;
+      return Promise.reject(
+        Object.assign(new Error("transient mutex cleanup failure"), { code: "EIO" }),
+      );
+    }
+    return originalUnlink(filePath);
+  });
+
+  return Effect.gen(function* () {
+    yield* ServiceChangeAdmission.initialize(baseDir);
+    const first = yield* Effect.exit(ServiceChangeAdmission.withAdmissionAt(baseDir, Effect.void));
+    assert.isTrue(Exit.isFailure(first));
+    assert.isTrue(NodeFS.existsSync(mutexOwner));
+
+    yield* ServiceChangeAdmission.withAdmissionAt(baseDir, Effect.void);
+    assert.isFalse(NodeFS.existsSync(mutex));
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        vi.restoreAllMocks();
+        NodeFS.rmSync(baseDir, { recursive: true, force: true });
+      }),
+    ),
   );
 });

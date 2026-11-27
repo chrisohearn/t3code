@@ -14,6 +14,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
@@ -52,6 +53,7 @@ const runDelegation = (input: {
   Effect.gen(function* () {
     const cwd = yield* checkpointWorkspace(input.name);
     let armed = false;
+    const failedRead = Deferred.makeUnsafe<void>();
     const turns: Array<{
       readonly turn: ProviderAdapter.ProviderAdapterV2TurnInput;
       readonly events: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event>;
@@ -153,6 +155,7 @@ const runDelegation = (input: {
                 (yield* input.failRead({ store, threadId, fields, filter }))
               ) {
                 armed = false;
+                yield* Deferred.succeed(failedRead, undefined);
                 return yield* new ProjectionStore.ProjectionStoreReadError({ threadId });
               }
               return yield* store.getThreadRecords(threadId, fields, filter);
@@ -265,6 +268,11 @@ const runDelegation = (input: {
       }
 
       armed = true;
+      const parentWake = input.parentEndsFirst
+        ? yield* watch(
+            (event) => event.type === "message.updated" && event.threadId === parentThreadId,
+          )
+        : undefined;
       const childFailed = yield* watch(
         (event) =>
           event.type === "run.updated" &&
@@ -276,11 +284,18 @@ const runDelegation = (input: {
         yield* TestClock.adjust("1 second");
       }
       yield* Fiber.join(childFailed);
+      if (input.parentEndsFirst && input.failRead !== undefined) {
+        yield* Deferred.await(failedRead);
+      }
 
       if (!input.parentEndsFirst) yield* endParentTurn;
       for (let attempt = 0; attempt < 5; attempt++) {
         yield* worker.drain();
         yield* TestClock.adjust("30 seconds");
+      }
+      if (parentWake !== undefined) {
+        yield* Fiber.join(parentWake);
+        yield* worker.drain();
       }
 
       assert.isFalse(armed, "the injected read failed once");

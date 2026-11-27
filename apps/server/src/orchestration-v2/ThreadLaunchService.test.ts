@@ -3,6 +3,10 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The test inspects the guard-compatible admission token directory.
+import * as NodeFS from "node:fs";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The test locates the guard-compatible admission token directory.
+import * as NodePath from "node:path";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as FileSystem from "effect/FileSystem";
@@ -165,10 +169,18 @@ interface HarnessOptions {
 function makeHarness(options: HarnessOptions = {}) {
   const layerDatabase = SqlitePersistence.layerMemory;
   const layerRegistry = ProviderAdapterRegistry.layerFromAdapters(options.adapters ?? [adapter]);
+  const layerServerConfig = Layer.effect(
+    ServerConfig.ServerConfig,
+    ProviderReplayHarness.makeReplayServerConfig("thread-launch").pipe(Effect.orDie),
+  ).pipe(Layer.provide(NodeServices.layer));
   const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
     { name: "thread-launch" },
     layerRegistry,
-    { databaseLayer: layerDatabase, runEffectWorker: false },
+    {
+      databaseLayer: layerDatabase,
+      runEffectWorker: false,
+      serverConfigLayer: layerServerConfig,
+    },
   );
   const layerServerSettings = ServerSettings.layerTest(options.serverSettings);
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
@@ -293,6 +305,7 @@ function makeHarness(options: HarnessOptions = {}) {
         layerLaunchThreads,
         layerReceipts,
         layerOrchestrator,
+        layerServerConfig,
         ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
         NodeServices.layer,
         IdAllocator.layer,
@@ -342,6 +355,7 @@ function makeHarness(options: HarnessOptions = {}) {
   return {
     layer: Layer.mergeAll(
       layerLaunch,
+      layerServerConfig,
       layerRegistry,
       layerThreadManagement,
       layerTitleRegeneration,
@@ -479,6 +493,48 @@ it.effect.each(
     }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerScheduledTasks)));
   },
 );
+
+it.effect("keeps admission active through a runless workspace preparation", () => {
+  const worktreeStarted = Deferred.makeUnsafe<void>();
+  const releaseWorktree = Deferred.makeUnsafe<void>();
+  const harness = makeHarness({
+    createWorktree: (input) =>
+      Deferred.succeed(worktreeStarted, undefined).pipe(
+        Effect.andThen(Deferred.await(releaseWorktree)),
+        Effect.as({
+          worktree: {
+            path: "/repo-worktrees/runless-admission",
+            refName: input.newRefName,
+            headSha: "abc",
+          },
+        } as never),
+      ),
+  });
+
+  return Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const setups = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:runless-admission",
+        thread: "thread:runless-admission",
+        workspace: worktreeStrategy,
+      }),
+    );
+    yield* Deferred.await(worktreeStarted);
+
+    const active = NodePath.join(config.baseDir, "runtime", "service-change-admission", "active");
+    assert.lengthOf(NodeFS.readdirSync(active), 1);
+
+    yield* Deferred.succeed(releaseWorktree, undefined);
+    yield* setups.stream(launched.threadId).pipe(
+      Stream.filter((snapshot) => snapshot?.phase === "done"),
+      Stream.runHead,
+    );
+    assert.isEmpty(NodeFS.readdirSync(active));
+  }).pipe(Effect.provide(harness.layer));
+});
 
 it.effect(
   "returns no dispatched thread when sending an automation to a missing thread fails",
