@@ -35,7 +35,11 @@ import {
   resolveProjectSettings,
 } from "@t3tools/shared/projectSettings";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
-import { resolveRuntimeMode } from "./delegatedTaskModes.ts";
+import {
+  providerOptionDescriptors,
+  refuseAgentModePick,
+  resolveRuntimeMode,
+} from "./delegatedTaskModes.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { requireAdvertisedModel, withWorkspaceModels } from "./providerModels.ts";
 
@@ -373,6 +377,15 @@ const launch = Effect.fn("ThreadLaunchMcpService.launch")(
             const provider = withWorkspaceModels(providers, cwd).find(
               (candidate) => candidate.instanceId === instanceId,
             );
+            yield* refuseAgentModePick({
+              callerRuntimeMode: context.limits.runtimeMode,
+              picked: requestedModel.options,
+              descriptors: providerOptionDescriptors(provider),
+              held:
+                caller?.modelSelection.instanceId === instanceId
+                  ? caller.modelSelection.options
+                  : undefined,
+            });
             if (provider === undefined) return requestedModel;
             yield* requireAdvertisedModel(provider, model);
             const options = yield* validateModelOptions(provider, model, requestedModel.options);

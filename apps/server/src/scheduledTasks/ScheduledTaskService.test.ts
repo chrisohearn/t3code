@@ -4,6 +4,7 @@ import * as NodeOS from "node:os";
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, it, vi } from "@effect/vitest";
 import {
   CommandId,
@@ -37,6 +38,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import { OrchestratorDispatchError } from "../orchestration-v2/Orchestrator.ts";
+import { findGitEntry } from "../mcp/gitEntryProbe.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -972,8 +974,22 @@ it.effect.each([
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const sql = yield* SqlClient.SqlClient;
+    const candidates =
+      (yield* HostProcess.Platform) === "win32"
+        ? [NodeOS.tmpdir()]
+        : [NodeOS.tmpdir(), "/var/tmp", "/dev/shm", "/tmp"];
+    let tempDirectory: string | undefined;
+    for (const candidate of new Set(candidates)) {
+      if ((yield* findGitEntry(candidate)) === null) {
+        tempDirectory = candidate;
+        break;
+      }
+    }
+    if (tempDirectory === undefined) {
+      throw new Error("Could not find a temporary directory outside a Git repository.");
+    }
     const parent = yield* fileSystem.makeTempDirectoryScoped({
-      directory: NodeOS.homedir(),
+      directory: tempDirectory,
       prefix: "scheduled-root-",
     });
     const root = path.join(parent, "project");
@@ -1036,7 +1052,11 @@ it.effect.each([
         assert.equal(edited.task.creationSource, "mcp");
       }
       const result = yield* service.runNow({ id: task.id });
-      assert.equal(yield* Ref.get(dispatched), "dispatch" in row ? row.dispatch : "launched");
+      assert.equal(
+        yield* Ref.get(dispatched),
+        "dispatch" in row ? row.dispatch : "launched",
+        result.task.lastRunError ?? JSON.stringify(result.task),
+      );
       if ("dispatch" in row && row.dispatch === "refused") {
         assert.equal(result.task.lastRunStatus, "failed");
         assert.equal(result.task.runCount, 1);
@@ -1050,7 +1070,15 @@ it.effect.each([
         assert.equal(result.task.runInProgressSince, result.task.lastRunAt);
       }
     }).pipe(Effect.provide(layer));
-  }).pipe(Effect.provide(Layer.merge(SqlitePersistence.layerMemory, NodeServices.layer))),
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        SqlitePersistence.layerMemory,
+        NodeServices.layer,
+        Layer.succeed(HostProcess.Platform, HostProcess.Platform.defaultValue()),
+      ),
+    ),
+  ),
 );
 
 it.effect("a one-time task is removed once its turn completes", () =>

@@ -229,6 +229,15 @@ function run(
   } satisfies OrchestrationV2Run;
 }
 
+/** A run fixture that remains active in the thread shell. */
+export function runningRun(threadId: ThreadId, id: string, ordinal: number, userMessageId: string) {
+  return {
+    ...run(threadId, RunId.make(id), ordinal, userMessageId),
+    status: "running" as const,
+    completedAt: null,
+  };
+}
+
 export interface FakeThread {
   /** Makes this a side chat of that thread. */
   readonly sideChatOf?: ThreadId;
@@ -495,8 +504,8 @@ const handlers: Record<string, (input: never) => unknown> = {
         if (terminalMetadataSubscriber === queue) terminalMetadataSubscriber = null;
       };
     }),
-  [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: () => {
-    return subscribe<OrchestrationV2ShellStreamItem>(
+  [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: () =>
+    subscribe<OrchestrationV2ShellStreamItem>(
       [
         {
           kind: "snapshot",
@@ -516,8 +525,7 @@ const handlers: Record<string, (input: never) => unknown> = {
           if (shellSubscriber === queue) shellSubscriber = null;
         };
       },
-    );
-  },
+    ),
   [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input: { readonly threadId: ThreadId }) => {
     const thread = threads.find((candidate) => candidate.id === input.threadId);
     if (!thread) return Stream.never;
@@ -649,16 +657,7 @@ export function installFakeEnvironment(
         expiresAt: "2099-01-01T00:00:00.000Z",
       });
     }
-    if (url.pathname === "/api/orchestration/shell") {
-      return json({
-        schemaVersion: 1,
-        snapshotSequence: sequence,
-        projects,
-        threads: threads.filter((thread) => !thread.olderSettled).map(shellOf),
-        archivedThreads: [],
-      });
-    }
-    // Other snapshot endpoints fall back to the socket, which serves the same fixtures.
+    // Snapshot endpoints fall back to the socket, which serves the same fixtures.
     if (/^\/(api|oauth|\.well-known)\//.test(url.pathname)) return json({}, 404);
     return realFetch(input, init);
   };
@@ -727,16 +726,6 @@ export function answerRpc(method: string, handler: (input: never) => unknown): D
   };
 }
 
-export async function emitTerminalMetadata(event: TerminalMetadataStreamEvent): Promise<void> {
-  if (terminalMetadataSubscriber === null) throw new Error("No terminal metadata subscription");
-  await Effect.runPromise(Queue.offer(terminalMetadataSubscriber, event));
-}
-
-/** Whether the app holds a live subscription to the thread, so events reach it. */
-export function isThreadSubscribed(threadId: ThreadId): boolean {
-  return threadSubscribers.has(threadId);
-}
-
 /** Delivers one domain event, such as a run or turn-item update, to the thread's subscription. */
 export async function emitThreadEvent(
   threadId: ThreadId,
@@ -771,19 +760,4 @@ export async function emitThreadShellUpdate(
       thread: { ...shellOf(thread), ...changes },
     }),
   );
-}
-
-export function runningRun(threadId: ThreadId, id: string, ordinal: number, userMessageId: string) {
-  return {
-    ...run(threadId, RunId.make(id), ordinal, userMessageId),
-    status: "running" as const,
-    completedAt: null,
-  };
-}
-
-export { userItem };
-
-export async function emitVcsStatus(event: VcsStatusStreamEvent): Promise<void> {
-  if (vcsStatusSubscriber === null) throw new Error("No VCS status subscription");
-  await Effect.runPromise(Queue.offer(vcsStatusSubscriber, event));
 }
