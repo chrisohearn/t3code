@@ -142,42 +142,48 @@ describe("terminatePosixOwnedProcessTree", () => {
       const scratchRoot = NodePath.join(process.cwd(), "tmp");
       NodeFS.mkdirSync(scratchRoot, { recursive: true });
       const scratch = NodeFS.mkdtempSync(NodePath.join(scratchRoot, "acp-cgroup-wrapper-"));
+      // Keep the negative PATH fixture unique so host-installed CLIs cannot collide with it.
+      const fixtureCommand = `t3-${NodePath.basename(scratch)}`;
       const linkedNode = NodePath.join(scratch, "T3 Code AppImage 'quoted'");
-      const bareGrok = NodePath.join(scratch, "grok");
+      const bareFixture = NodePath.join(scratch, fixtureCommand);
       const relativeBin = NodePath.join(scratch, "relative-bin");
       const directoryBin = NodePath.join(scratch, "directory-bin");
       const validBin = NodePath.join(scratch, "valid-bin");
       const outputPath = NodePath.join(scratch, "argv.json");
       NodeFS.mkdirSync(relativeBin);
-      NodeFS.mkdirSync(NodePath.join(directoryBin, "grok"), { recursive: true });
+      NodeFS.mkdirSync(NodePath.join(directoryBin, fixtureCommand), { recursive: true });
       NodeFS.mkdirSync(validBin);
       NodeFS.symlinkSync(process.execPath, linkedNode);
-      NodeFS.symlinkSync(process.execPath, bareGrok);
-      NodeFS.symlinkSync(process.execPath, NodePath.join(relativeBin, "grok"));
-      NodeFS.symlinkSync(process.execPath, NodePath.join(validBin, "grok"));
+      NodeFS.symlinkSync(process.execPath, bareFixture);
+      NodeFS.symlinkSync(process.execPath, NodePath.join(relativeBin, fixtureCommand));
+      NodeFS.symlinkSync(process.execPath, NodePath.join(validBin, fixtureCommand));
       expect(
-        AcpSessionRuntime.resolveLinuxCgroupTargetCommand("grok", scratch, { PATH: scratch }),
-      ).toBe(bareGrok);
-      expect(AcpSessionRuntime.resolveLinuxCgroupTargetCommand("grok", scratch, { PATH: "" })).toBe(
-        bareGrok,
-      );
-      // Undefined PATH searches /usr/bin:/bin; the bareGrok fixture lives only in cwd.
+        AcpSessionRuntime.resolveLinuxCgroupTargetCommand(fixtureCommand, scratch, {
+          PATH: scratch,
+        }),
+      ).toBe(bareFixture);
       expect(
-        AcpSessionRuntime.resolveLinuxCgroupTargetCommand("grok", scratch, { PATH: undefined }),
+        AcpSessionRuntime.resolveLinuxCgroupTargetCommand(fixtureCommand, scratch, { PATH: "" }),
+      ).toBe(bareFixture);
+      // Undefined PATH searches /usr/bin:/bin; the fixture lives only in cwd.
+      expect(
+        AcpSessionRuntime.resolveLinuxCgroupTargetCommand(fixtureCommand, scratch, {
+          PATH: undefined,
+        }),
       ).toBeUndefined();
       expect(
         AcpSessionRuntime.resolveLinuxCgroupTargetCommand("sh", scratch, { PATH: undefined }),
       ).toBeDefined();
       expect(
-        AcpSessionRuntime.resolveLinuxCgroupTargetCommand("grok", scratch, {
+        AcpSessionRuntime.resolveLinuxCgroupTargetCommand(fixtureCommand, scratch, {
           PATH: "relative-bin",
         }),
-      ).toBe(NodePath.join(relativeBin, "grok"));
+      ).toBe(NodePath.join(relativeBin, fixtureCommand));
       expect(
-        AcpSessionRuntime.resolveLinuxCgroupTargetCommand("grok", scratch, {
+        AcpSessionRuntime.resolveLinuxCgroupTargetCommand(fixtureCommand, scratch, {
           PATH: `directory-bin${NodePath.delimiter}valid-bin`,
         }),
-      ).toBe(NodePath.join(validBin, "grok"));
+      ).toBe(NodePath.join(validBin, fixtureCommand));
       const target = [
         'const fs = require("node:fs");',
         "fs.writeFileSync(process.argv[1], JSON.stringify({",
