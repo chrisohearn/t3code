@@ -32,6 +32,7 @@ import { McpSchema, Tool, Toolkit } from "effect/ai";
 
 import * as ScratchThreadPromotion from "../../../project/ScratchThreadPromotion.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -234,6 +235,7 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     SqlClient.SqlClient,
     ServerSettings.ServerSettingsService,
     ThreadRoles.ThreadRoles,
+    ProviderRegistry.ProviderRegistry,
   ],
   description:
     "Read or set a thread's model and modes. Set provider, model and options with modelSelection. Omit threadId for this thread. Set runtimeMode alone to lower permissions on an idle thread; raises and active runs are refused. autoReview sets a reviewer model, null disables it, or 'inherit' uses the server default. Values from orchestrator_capabilities. Full access: `acknowledgeOnly` alone makes the server, not the agent, acknowledge each message. `standingRole` (alone; \"\" clears) is sent with every turn.",

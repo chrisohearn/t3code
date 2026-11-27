@@ -79,7 +79,7 @@ describe("runMigrations", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("upgrades through 117, then rechecks the current schema without a write lock", () =>
+  it.effect("upgrades through 119, then rechecks the current schema without a write lock", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations({ toMigrationInclusive: 54 });
@@ -122,7 +122,7 @@ describe("runMigrations", () => {
       );
       assert.isNull(yield* Ref.get(current));
       assert.deepStrictEqual(yield* history, migrationManifest);
-      assert.equal(migrationManifest.at(-1)?.[0], 117);
+      assert.equal(migrationManifest.at(-1)?.[0], 119);
       assert.isAbove(yield* v2TableCount, 0);
 
       // query_only rejects BEGIN IMMEDIATE, which CLI startup would otherwise take on the live database.
