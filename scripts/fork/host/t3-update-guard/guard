@@ -675,8 +675,18 @@ PRE_RESTART="$GUARD_STATE/pre-restart"
 CANARY_SECONDS="${CANARY_SECONDS:-300}"
 CANARY_FAILURES="${CANARY_FAILURES:-2}"
 quiet_seconds() {
-  timeout 10 sqlite3 -readonly "$DB" \
-    "select cast((julianday('now') - julianday(max(max(coalesce(completed_at,'')), max(requested_at)))) * 86400 as int) from orchestration_v2_projection_runs;" 2>/dev/null
+  local history count quiet
+  history=$(timeout 10 sqlite3 -readonly -separator '|' "$DB" \
+    "select count(*), coalesce(cast((julianday('now') - julianday(max(max(coalesce(completed_at,'')), max(requested_at)))) * 86400 as int), -1) from orchestration_v2_projection_runs;" 2>/dev/null) || return 1
+  IFS='|' read -r count quiet <<<"$history"
+  [[ "$count" =~ ^[0-9]+$ && "$quiet" =~ ^-?[0-9]+$ ]] || return 1
+  # An empty run table has no activity timestamp. Use the current server generation's
+  # uptime as the quiet period, so a fresh install still waits the full configured window.
+  if (( count == 0 )); then
+    service_uptime
+  else
+    echo "$quiet"
+  fi
 }
 
 # What a restart now would break in a way restart recovery cannot undo (checked 2026-11-13):

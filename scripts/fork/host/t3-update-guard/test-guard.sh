@@ -690,6 +690,18 @@ EOF
   is_healthy() { return 0; }
   service_version() { echo "$sim_version"; }
   service_uptime() { echo 120; }
+  service_uptime() { echo 899; }
+  [[ "$(quiet_seconds)" == 899 ]] || fail 'empty run history did not use server uptime for its quiet window'
+  service_uptime() { echo 900; }
+  [[ "$(quiet_seconds)" == 900 ]] || fail 'empty run history did not qualify after a full server-uptime quiet window'
+  service_uptime() { return 1; }
+  if quiet_seconds >/dev/null 2>&1; then fail 'empty run history accepted an unverified service uptime'; fi
+  service_uptime() { echo 1; }
+  sqlite3 "$DB" "insert into orchestration_v2_projection_runs values ('quiet-history','thread','completed',strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 hour'),strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 hour'),'{}');"
+  quiet=$(quiet_seconds)
+  [[ "$quiet" =~ ^[0-9]+$ ]] && (( quiet >= 900 )) || fail 'existing run history stopped using its last activity timestamp'
+  sqlite3 "$DB" "delete from orchestration_v2_projection_runs;"
+  service_uptime() { echo 120; }
   unit_property() {
     case "$1" in
       ActiveState) cat "$sim_state_file" ;;
