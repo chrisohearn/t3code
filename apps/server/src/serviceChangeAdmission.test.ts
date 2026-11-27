@@ -4,8 +4,8 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- The test creates and removes its isolated runtime directory.
 import * as NodePath from "node:path";
-import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Deferred from "effect/Deferred";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -78,6 +78,25 @@ it.effect("drains admitted commands before refusing work behind the snapshot fen
     assert.isFalse(NodeFS.existsSync(fence));
   }).pipe(
     Effect.provide(testLayer),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(baseDir, { recursive: true, force: true }))),
+  );
+});
+
+it.effect("serializes concurrent local admission file creation", () => {
+  const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-snapshot-admission-"));
+  const active = NodePath.join(baseDir, "runtime", "service-change-admission", "active");
+
+  return Effect.gen(function* () {
+    yield* ServiceChangeAdmission.initialize(baseDir);
+    const admissions = yield* Effect.all(
+      Array.from({ length: 16 }, () =>
+        ServiceChangeAdmission.withAdmissionAt(baseDir, Effect.void),
+      ),
+      { concurrency: "unbounded" },
+    );
+    assert.lengthOf(admissions, 16);
+    assert.isEmpty(NodeFS.readdirSync(active));
+  }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(baseDir, { recursive: true, force: true }))),
   );
 });

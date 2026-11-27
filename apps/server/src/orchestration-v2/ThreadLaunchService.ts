@@ -1285,7 +1285,7 @@ const make = Effect.gen(function* () {
                         ),
                       ),
             );
-            yield* Effect.gen(function* () {
+            const cleanupWorkspace = Effect.gen(function* () {
               // An explicit launch can bind a repository inside a task folder during setup.
               if (yield* worktreeIsShared(removedTaskFolder ?? removedPath, threadId)) return;
               // Keep the binding if removal fails so a retry can find the checkout.
@@ -1309,6 +1309,16 @@ const make = Effect.gen(function* () {
                   cause: removeCause,
                 }),
               ),
+            );
+            yield* removedTaskFolder === null
+              ? cleanupWorkspace
+              : Effect.uninterruptible(cleanupWorkspace);
+          }
+          if (cancelled && runId !== null) {
+            // The tracked setup fiber can be interrupted before its race parent observes the
+            // exit, so persist the run failure here before cancellation is acknowledged.
+            yield* Effect.uninterruptible(
+              failPreparedRun(input, threadId, runId, "Worktree setup cancelled."),
             );
           }
         }),

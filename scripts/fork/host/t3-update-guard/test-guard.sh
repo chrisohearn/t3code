@@ -617,7 +617,7 @@ pass 'all systemctl calls have a bounded timeout'
     create table orchestration_v2_projection_runs (run_id text, thread_id text, status text, requested_at text, completed_at text, payload_json text);
     create table orchestration_v2_projection_runtime_requests (runtime_request_id text, status text, resolved_at text);
     create table orchestration_v2_projection_turn_items (turn_item_id text, thread_id text, run_id text, type text, status text, updated_at text);
-    create table orchestration_v2_projection_subagents (subagent_id text, status text);
+    create table orchestration_v2_projection_subagents (subagent_id text, status text, completion_delivery_state text);
     create table orchestration_v2_projection_provider_threads (provider_thread_id text, payload_json text);
     create table orchestration_v2_effect_outbox (effect_id text, status text);"
   sim_version=0.1.13-preview.20261127.1
@@ -799,6 +799,34 @@ for path in sys.argv[1:]:
       sqlite3 "$DB" "insert into orchestration_v2_projection_runs values ('late','thread','preparing','2026-11-27T00:00:00.000Z',null,'{}');"
       touch "$root/inserted-during-census"
     fi
+    if [[ -e "$root/replace-listener-after-final-census" && -f "$SNAPSHOT_ADMISSION_FENCE" ]]; then
+      rm -f "$root/replace-listener-after-final-census"
+      local previous_listener new_listener
+      previous_listener=$(cat "$sim_listener_file")
+      printf 'stop\n' >"$sim_command_fifo"
+      for ((i=0; i<50; i++)); do
+        [[ ! -s "$sim_listener_file" ]] && break
+        sleep 0.02
+      done
+      printf 'start\n' >"$sim_command_fifo"
+      for ((i=0; i<50; i++)); do
+        new_listener=$(cat "$sim_listener_file")
+        if [[ -n "$new_listener" && "$new_listener" != "$previous_listener" ]] && \
+          [[ "$(service_listener_pid 2>/dev/null)" == "$new_listener" ]]; then
+          break
+        fi
+        sleep 0.02
+      done
+      [[ -n "$new_listener" && "$new_listener" != "$previous_listener" ]] || fail 'fixture did not replace the listener between final census and stop'
+      printf '{"protocolVersion":1,"pid":%s,"startedAt":"2026-11-27T00:00:02.000Z"}\n' \
+        "$new_listener" >"$SNAPSHOT_ADMISSION_ROOT/capability.json"
+      chmod 600 "$SNAPSHOT_ADMISSION_ROOT/capability.json"
+      for ((i=0; i<50; i++)); do
+        snapshot_service_identity "$sim_version" >/dev/null 2>&1 && break
+        sleep 0.02
+      done
+      snapshot_service_identity "$sim_version" >/dev/null || fail 'replacement child listener was not a valid same-generation identity'
+    fi
     echo "$QUIET_VALUE"
   }
   HEALTH_WAIT_SECONDS=0
@@ -835,9 +863,15 @@ for path in sys.argv[1:]:
   grep -q 'activeEffects=1' "$root/snapshot-reject.log" || fail 'snapshot ignored a pending effect outbox job'
   exec 9>&-
   sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;
-    insert into orchestration_v2_projection_subagents values ('provider-subagent','running');
-    insert into orchestration_v2_projection_subagents values ('app-owned-subagent','pending');"
+    insert into orchestration_v2_projection_subagents values ('provider-subagent','running',null);
+    insert into orchestration_v2_projection_subagents values ('app-owned-subagent','pending',null);"
   if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot stopped an active provider subagent'; fi
+  exec 9>&-
+  sqlite3 "$DB" "delete from orchestration_v2_projection_subagents;
+    insert into orchestration_v2_projection_subagents values ('pending-completion','completed','pending');
+    insert into orchestration_v2_projection_subagents values ('claimed-completion','cancelled','claimed');"
+  if cmd_snapshot snapshot-op before-stock-switch >"$root/snapshot-reject.log" 2>&1; then fail 'snapshot stopped with undelivered terminal subagent completions'; fi
+  grep -q 'pendingSubagentDeliveries=2' "$root/snapshot-reject.log" || fail 'snapshot census omitted pending or claimed subagent completions'
   exec 9>&-
   sqlite3 "$DB" "delete from orchestration_v2_projection_subagents; insert into orchestration_v2_projection_provider_threads values ('provider-thread','{\"pendingBackgroundTasks\":[{\"taskId\":\"task-1\"}]}');"
   if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot stopped a pending provider background task'; fi
@@ -879,6 +913,21 @@ for path in sys.argv[1:]:
   [[ -z "$(grep '^stop ' "$root/snapshot-svc" 2>/dev/null || true)" ]] || fail 'snapshot stopped before its prepared receipt was durable'
   [[ ! -e "$GUARD_STATE/snapshot-receipts/snapshot-op.json" ]] || fail 'failed prepared receipt was published'
 
+  touch "$root/replace-listener-after-final-census"
+  if cmd_snapshot snapshot-listener-race before-stock-switch >"$root/listener-race.out" 2>&1; then
+    fail 'snapshot stopped after the server child listener changed during the final fence'
+  fi
+  [[ ! -e "$SNAPSHOT_ADMISSION_FENCE" ]] || {
+    cat "$root/listener-race.out" >&2
+    fail 'snapshot did not reopen admission after verifying the replacement listener'
+  }
+  grep -q 'service generation or listener changed immediately before the stop request' "$root/listener-race.out" || \
+    fail 'snapshot did not identify the listener-generation change'
+  [[ -z "$(grep '^stop ' "$root/snapshot-svc" 2>/dev/null || true)" ]] || fail 'snapshot stopped after the listener changed'
+  [[ "$(jq -r '.status' "$GUARD_STATE/snapshot-receipts/snapshot-listener-race.json")" == prepared ]] || \
+    fail 'listener change did not leave the durable prepared receipt for safe retry'
+  exec 9>&-
+
   # An admitted command owns a token until its commit finishes. The guard closes the fence,
   # waits for that token, then takes the final census and catches the committed preparing run.
   admission_release="$root/admission-release"
@@ -896,7 +945,10 @@ for path in sys.argv[1:]:
     [[ -f "$SNAPSHOT_ADMISSION_FENCE" ]] && break
     sleep 0.02
   done
-  [[ -f "$SNAPSHOT_ADMISSION_FENCE" ]] || fail 'snapshot did not close the admission fence before its final census'
+  [[ -f "$SNAPSHOT_ADMISSION_FENCE" ]] || {
+    cat "$root/snapshot-fenced-census.out" >&2
+    fail 'snapshot did not close the admission fence before its final census'
+  }
   [[ -z "$(grep '^stop ' "$root/snapshot-svc" 2>/dev/null || true)" ]] || fail 'snapshot stopped while an admitted command was draining'
   sqlite3 "$DB" "insert into orchestration_v2_projection_runs values ('fenced','thread','preparing','2026-11-27T00:00:00.000Z',null,'{}');"
   touch "$admission_release"
@@ -913,7 +965,9 @@ for path in sys.argv[1:]:
   [[ "$(jq -r '.status' <<<"$out")" == complete ]] || fail 'snapshot receipt did not complete'
   [[ "$(jq -r '.stoppedGeneration.version' "$receipt")" == "$sim_version" ]] || fail 'receipt lost stopped version'
   [[ "$(jq -r '.stoppedGeneration.invocationId' "$receipt")" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] || fail 'receipt lost stopped invocation ID'
+  [[ "$(jq -r '.stoppedGeneration.listenerPid' "$receipt")" =~ ^[1-9][0-9]*$ ]] || fail 'receipt lost stopped listener PID'
   [[ "$(jq -r '.restart.invocationId' "$receipt")" == bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ]] || fail 'receipt lost restarted invocation ID'
+  [[ "$(jq -r '.restart.listenerPid' "$receipt")" =~ ^[1-9][0-9]*$ ]] || fail 'receipt lost restarted listener PID'
   [[ "$(jq -r '.files | map(.name) | sort | join(",")' "$receipt")" == 'statev2.sqlite,statev2.sqlite-shm,statev2.sqlite-wal' ]] || fail 'receipt omitted a SQLite file or sidecar'
   [[ "$(sha256sum "$(jq -r '.snapshotPath' "$receipt")/statev2.sqlite" | cut -d' ' -f1)" == "$(sha256sum "$DB" | cut -d' ' -f1)" ]] || fail 'snapshot main database differs from the stopped source'
   [[ "$(stat -c %a "$receipt")" == 600 && "$(stat -c %a "$(jq -r '.snapshotPath' "$receipt")")" == 700 ]] || fail 'snapshot receipt or files are not under owner-only directories'

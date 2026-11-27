@@ -10,6 +10,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as ServerConfig from "./config.ts";
 
 const PROTOCOL_VERSION = 1;
@@ -26,6 +27,17 @@ interface AdmissionPaths {
   readonly fence: string;
   readonly capability: string;
 }
+
+const admissionPathsByBaseDir = new Map<string, AdmissionPaths>();
+const admissionMutexesByBaseDir = new Map<string, Semaphore.Semaphore>();
+
+const admissionMutex = (baseDir: string) => {
+  const cached = admissionMutexesByBaseDir.get(baseDir);
+  if (cached !== undefined) return cached;
+  const mutex = Semaphore.makeUnsafe(1);
+  admissionMutexesByBaseDir.set(baseDir, mutex);
+  return mutex;
+};
 
 export class ServiceChangeAdmissionError extends Schema.TaggedError<
   ServiceChangeAdmissionError,
@@ -62,14 +74,18 @@ class AdmissionLeaseContext extends Context.Service<AdmissionLeaseContext, Admis
 ) {}
 
 const admissionPaths = (baseDir: string): AdmissionPaths => {
+  const cached = admissionPathsByBaseDir.get(baseDir);
+  if (cached !== undefined) return cached;
   const root = NodePath.join(baseDir, "runtime", "service-change-admission");
-  return {
+  const paths = {
     root,
     mutex: NodePath.join(root, "mutex"),
     active: NodePath.join(root, "active"),
     fence: NodePath.join(root, "snapshot-fence.json"),
     capability: NodePath.join(root, "capability.json"),
   };
+  admissionPathsByBaseDir.set(baseDir, paths);
+  return paths;
 };
 
 const pidIsAlive = (pid: number) => {
@@ -82,37 +98,36 @@ const pidIsAlive = (pid: number) => {
   }
 };
 
-const ensureDirectories = (paths: AdmissionPaths) => {
-  NodeFS.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
-  NodeFS.mkdirSync(paths.active, { recursive: true, mode: 0o700 });
-  if (
-    NodeFS.lstatSync(paths.root).isSymbolicLink() ||
-    NodeFS.lstatSync(paths.active).isSymbolicLink()
-  ) {
+const ensureDirectories = async (paths: AdmissionPaths) => {
+  await NodeFS.promises.mkdir(paths.root, { recursive: true, mode: 0o700 });
+  await NodeFS.promises.mkdir(paths.active, { recursive: true, mode: 0o700 });
+  const root = await NodeFS.promises.lstat(paths.root);
+  const active = await NodeFS.promises.lstat(paths.active);
+  if (root.isSymbolicLink() || active.isSymbolicLink()) {
     throw new Error("Snapshot admission directories must not be symbolic links.");
   }
-  NodeFS.chmodSync(paths.root, 0o700);
-  NodeFS.chmodSync(paths.active, 0o700);
+  await NodeFS.promises.chmod(paths.root, 0o700);
+  await NodeFS.promises.chmod(paths.active, 0o700);
 };
 
-const releaseMutex = (paths: AdmissionPaths) => {
+const releaseMutex = async (paths: AdmissionPaths) => {
   try {
-    NodeFS.unlinkSync(NodePath.join(paths.mutex, "owner"));
+    await NodeFS.promises.unlink(NodePath.join(paths.mutex, "owner"));
   } catch {
     // A missing owner file means an interrupted or already completed cleanup.
   }
   try {
-    NodeFS.rmdirSync(paths.mutex);
+    await NodeFS.promises.rmdir(paths.mutex);
   } catch {
     // Leave unexpected contents in place; the next caller fails closed.
   }
 };
 
-const removeStaleMutex = (paths: AdmissionPaths, now: number) => {
+const removeStaleMutex = async (paths: AdmissionPaths, now: number) => {
   const ownerPath = NodePath.join(paths.mutex, "owner");
-  let stat: NodeFS.Stats;
+  let stat: Awaited<ReturnType<typeof NodeFS.promises.lstat>>;
   try {
-    stat = NodeFS.lstatSync(paths.mutex);
+    stat = await NodeFS.promises.lstat(paths.mutex);
   } catch (cause) {
     if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT") {
       return;
@@ -123,11 +138,11 @@ const removeStaleMutex = (paths: AdmissionPaths, now: number) => {
     throw new Error("Admission mutex is not a real directory.");
   let ownerPid: number | undefined;
   try {
-    const ownerStat = NodeFS.lstatSync(ownerPath);
+    const ownerStat = await NodeFS.promises.lstat(ownerPath);
     if (!ownerStat.isFile() || ownerStat.isSymbolicLink() || (ownerStat.mode & 0o777) !== 0o600) {
       throw new Error("Admission mutex owner is not a private regular file.");
     }
-    const ownerText = NodeFS.readFileSync(ownerPath, "utf8").trim();
+    const ownerText = (await NodeFS.promises.readFile(ownerPath, "utf8")).trim();
     if (!/^[1-9][0-9]*$/.test(ownerText)) throw new Error("Admission mutex owner PID is invalid.");
     ownerPid = Number(ownerText);
     if (!Number.isSafeInteger(ownerPid)) throw new Error("Admission mutex owner PID is invalid.");
@@ -140,7 +155,7 @@ const removeStaleMutex = (paths: AdmissionPaths, now: number) => {
     if (now - stat.mtimeMs <= 5_000) return;
   }
   if (ownerPid !== undefined && pidIsAlive(ownerPid)) return;
-  releaseMutex(paths);
+  await releaseMutex(paths);
 };
 
 type MutexAttempt =
@@ -148,9 +163,9 @@ type MutexAttempt =
   | { readonly tag: "busy" }
   | { readonly tag: "failed"; readonly cause: unknown };
 
-const attemptAcquireMutex = (paths: AdmissionPaths): MutexAttempt => {
+const attemptAcquireMutex = async (paths: AdmissionPaths): Promise<MutexAttempt> => {
   try {
-    NodeFS.mkdirSync(paths.mutex, { mode: 0o700 });
+    await NodeFS.promises.mkdir(paths.mutex, { mode: 0o700 });
   } catch (cause) {
     if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "EEXIST") {
       return { tag: "busy" };
@@ -158,14 +173,14 @@ const attemptAcquireMutex = (paths: AdmissionPaths): MutexAttempt => {
     return { tag: "failed", cause };
   }
   try {
-    NodeFS.writeFileSync(NodePath.join(paths.mutex, "owner"), `${process.pid}\n`, {
+    await NodeFS.promises.writeFile(NodePath.join(paths.mutex, "owner"), `${process.pid}\n`, {
       mode: 0o600,
       flag: "wx",
     });
     return { tag: "acquired" };
   } catch (cause) {
     try {
-      NodeFS.rmdirSync(paths.mutex);
+      await NodeFS.promises.rmdir(paths.mutex);
     } catch {
       // Preserve the original failure and refuse admission.
     }
@@ -178,14 +193,19 @@ const acquireMutex = Effect.fn("ServiceChangeAdmission.acquireMutex")(function* 
 ) {
   const deadline = (yield* Clock.currentTimeMillis) + MUTEX_WAIT_MS;
   while (true) {
-    const attempt = yield* Effect.sync(() => attemptAcquireMutex(paths));
+    const attempt = yield* Effect.uninterruptible(
+      Effect.tryPromise({
+        try: () => attemptAcquireMutex(paths),
+        catch: (cause) => new ServiceChangeAdmissionError({ stage: "mutex", cause }),
+      }),
+    );
     if (attempt.tag === "acquired") return;
     if (attempt.tag === "failed") {
       return yield* new ServiceChangeAdmissionError({ stage: "mutex", cause: attempt.cause });
     }
 
     const now = yield* Clock.currentTimeMillis;
-    yield* Effect.try({
+    yield* Effect.tryPromise({
       try: () => removeStaleMutex(paths, now),
       catch: (cause) => new ServiceChangeAdmissionError({ stage: "mutex", cause }),
     });
@@ -198,27 +218,29 @@ const acquireMutex = Effect.fn("ServiceChangeAdmission.acquireMutex")(function* 
 
 const withMutex = <A>(
   paths: AdmissionPaths,
-  operation: () => A,
+  operation: () => Promise<A>,
 ): Effect.Effect<A, ServiceChangeAdmissionError> =>
   Effect.scoped(
     Effect.gen(function* () {
       yield* Effect.acquireRelease(acquireMutex(paths), () =>
-        Effect.sync(() => releaseMutex(paths)),
+        Effect.promise(() => releaseMutex(paths)),
       );
-      return yield* Effect.try({
-        try: operation,
-        catch: (cause) =>
-          isServiceChangeAdmissionError(cause)
-            ? cause
-            : new ServiceChangeAdmissionError({ stage: "fence", cause }),
-      });
+      return yield* Effect.uninterruptible(
+        Effect.tryPromise({
+          try: operation,
+          catch: (cause) =>
+            isServiceChangeAdmissionError(cause)
+              ? cause
+              : new ServiceChangeAdmissionError({ stage: "fence", cause }),
+        }),
+      );
     }),
   );
 
-const removeStaleFence = (paths: AdmissionPaths) => {
-  let stat: NodeFS.Stats;
+const removeStaleFence = async (paths: AdmissionPaths) => {
+  let stat: Awaited<ReturnType<typeof NodeFS.promises.lstat>>;
   try {
-    stat = NodeFS.lstatSync(paths.fence);
+    stat = await NodeFS.promises.lstat(paths.fence);
   } catch (cause) {
     if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT")
       return;
@@ -229,7 +251,7 @@ const removeStaleFence = (paths: AdmissionPaths) => {
   }
   let ownerPid: number;
   try {
-    const fence = JSON.parse(NodeFS.readFileSync(paths.fence, "utf8")) as {
+    const fence = JSON.parse(await NodeFS.promises.readFile(paths.fence, "utf8")) as {
       protocolVersion?: unknown;
       ownerPid?: unknown;
     };
@@ -245,28 +267,30 @@ const removeStaleFence = (paths: AdmissionPaths) => {
   if (pidIsAlive(ownerPid)) {
     throw new ServiceChangeAdmissionError({ stage: "fence" });
   }
-  NodeFS.unlinkSync(paths.fence);
+  await NodeFS.promises.unlink(paths.fence);
 };
 
 const createAdmission = (baseDir: string) => {
   const paths = admissionPaths(baseDir);
-  return Effect.try({
-    try: () => ensureDirectories(paths),
-    catch: (cause) => new ServiceChangeAdmissionError({ stage: "storage", cause }),
-  }).pipe(
-    Effect.andThen(
-      withMutex(paths, () => {
-        removeStaleFence(paths);
-        const tokenPath = NodePath.join(
-          paths.active,
-          `${process.pid}-${NodeCrypto.randomUUID()}.json`,
-        );
-        NodeFS.writeFileSync(tokenPath, JSON.stringify({ pid: process.pid }), {
-          mode: 0o600,
-          flag: "wx",
-        });
-        return { tokenPath } satisfies AdmissionLease;
-      }),
+  return Semaphore.withPermit(admissionMutex(baseDir))(
+    Effect.tryPromise({
+      try: () => ensureDirectories(paths),
+      catch: (cause) => new ServiceChangeAdmissionError({ stage: "storage", cause }),
+    }).pipe(
+      Effect.andThen(
+        withMutex(paths, async () => {
+          await removeStaleFence(paths);
+          const tokenPath = NodePath.join(
+            paths.active,
+            `${process.pid}-${NodeCrypto.randomUUID()}.json`,
+          );
+          await NodeFS.promises.writeFile(tokenPath, JSON.stringify({ pid: process.pid }), {
+            mode: 0o600,
+            flag: "wx",
+          });
+          return { tokenPath } satisfies AdmissionLease;
+        }),
+      ),
     ),
   );
 };
@@ -280,40 +304,42 @@ export const initialize = Effect.fn("ServiceChangeAdmission.initialize")(functio
     pid: process.pid,
     startedAt,
   }).pipe(Effect.mapError((cause) => new ServiceChangeAdmissionError({ stage: "storage", cause })));
-  return yield* Effect.try({
-    try: () => {
-      const paths = admissionPaths(baseDir);
-      ensureDirectories(paths);
-      const temporary = `${paths.capability}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
-      const descriptor = NodeFS.openSync(temporary, "wx", 0o600);
-      try {
-        NodeFS.writeFileSync(descriptor, `${contents}\n`, "utf8");
-        NodeFS.fsyncSync(descriptor);
-      } finally {
-        NodeFS.closeSync(descriptor);
-      }
-      NodeFS.renameSync(temporary, paths.capability);
-      const directoryDescriptor = NodeFS.openSync(paths.root, "r");
-      try {
-        NodeFS.fsyncSync(directoryDescriptor);
-      } finally {
-        NodeFS.closeSync(directoryDescriptor);
-      }
-    },
-    catch: (cause) => new ServiceChangeAdmissionError({ stage: "storage", cause }),
-  });
+  return yield* Effect.uninterruptible(
+    Effect.tryPromise({
+      try: async () => {
+        const paths = admissionPaths(baseDir);
+        await ensureDirectories(paths);
+        const temporary = `${paths.capability}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
+        const descriptor = await NodeFS.promises.open(temporary, "wx", 0o600);
+        try {
+          await descriptor.writeFile(`${contents}\n`, "utf8");
+          await descriptor.sync();
+        } finally {
+          await descriptor.close();
+        }
+        await NodeFS.promises.rename(temporary, paths.capability);
+        const directoryDescriptor = await NodeFS.promises.open(paths.root, "r");
+        try {
+          await directoryDescriptor.sync();
+        } finally {
+          await directoryDescriptor.close();
+        }
+      },
+      catch: (cause) => new ServiceChangeAdmissionError({ stage: "storage", cause }),
+    }),
+  );
 });
 
 const releaseAdmission = (lease: AdmissionLease) =>
-  Effect.sync(() => {
-    try {
-      NodeFS.unlinkSync(lease.tokenPath);
-    } catch {
-      // The guard treats a missing token as drained.
-    }
-  });
+  Effect.promise(() => NodeFS.promises.unlink(lease.tokenPath).catch(() => undefined));
 
-const leaseIsActive = (lease: AdmissionLease) => NodeFS.existsSync(lease.tokenPath);
+const leaseIsActive = (lease: AdmissionLease) =>
+  Effect.promise(() =>
+    NodeFS.promises.access(lease.tokenPath).then(
+      () => true,
+      () => false,
+    ),
+  );
 
 export const withAdmissionAt = Effect.fn("ServiceChangeAdmission.withAdmissionAt")(function* <
   A,
@@ -324,7 +350,7 @@ export const withAdmissionAt = Effect.fn("ServiceChangeAdmission.withAdmissionAt
   effect: Effect.Effect<A, E, R>,
 ): Effect.fn.Return<A, E | ServiceChangeAdmissionError, R> {
   const activeLease = yield* Effect.serviceOption(AdmissionLeaseContext);
-  if (Option.isSome(activeLease) && leaseIsActive(activeLease.value)) return yield* effect;
+  if (Option.isSome(activeLease) && (yield* leaseIsActive(activeLease.value))) return yield* effect;
 
   return yield* Effect.scoped(
     Effect.gen(function* () {

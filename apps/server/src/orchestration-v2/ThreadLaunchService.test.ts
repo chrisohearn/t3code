@@ -3521,11 +3521,30 @@ it.live.each(concurrentTaskFolderUses)("cancels task folder setup with %s", (con
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-launch-folders-" })),
     Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
-  const layerTaskFolders = layerTaskFoldersWithGit(state).pipe(
-    Layer.provide(layerGit),
-    Layer.orDie,
-  );
   return Effect.gen(function* () {
+    const taskFolderRemovalStarted = yield* Deferred.make<void>();
+    const allowTaskFolderRemoval = yield* Deferred.make<void>();
+    const baseTaskFolders = layerTaskFoldersWithGit(state).pipe(
+      Layer.provide(layerGit),
+      Layer.orDie,
+    );
+    const layerTaskFolders =
+      concurrent === "side chat without a run"
+        ? Layer.effect(
+            TaskFolders.TaskFolders,
+            Effect.gen(function* () {
+              const folders = yield* TaskFolders.TaskFolders;
+              return {
+                ...folders,
+                remove: (input) =>
+                  Deferred.succeed(taskFolderRemovalStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(allowTaskFolderRemoval)),
+                    Effect.andThen(folders.remove(input)),
+                  ),
+              };
+            }),
+          ).pipe(Layer.provide(baseTaskFolders))
+        : baseTaskFolders;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const git = yield* GitVcsDriver.GitVcsDriver;
@@ -3639,7 +3658,14 @@ it.live.each(concurrentTaskFolderUses)("cancels task folder setup with %s", (con
         Effect.flip,
       );
       assert.equal(refused._tag, "OrchestratorDispatchError");
-      assert.isTrue(yield* tracker.cancel(launched.threadId));
+      if (concurrent === "side chat without a run") {
+        const cancellation = yield* tracker.cancel(launched.threadId).pipe(Effect.forkChild);
+        yield* Deferred.await(taskFolderRemovalStarted);
+        yield* Deferred.succeed(allowTaskFolderRemoval, undefined);
+        assert.isTrue(yield* Fiber.join(cancellation));
+      } else {
+        assert.isTrue(yield* tracker.cancel(launched.threadId));
+      }
 
       assert.isNull((yield* threads.getThreadProjection(launched.threadId)).thread.worktreePath);
       assert.isNull(yield* taskFolders.find(taskFolder!.root));

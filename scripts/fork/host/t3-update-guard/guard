@@ -1249,14 +1249,14 @@ snapshot_service_identity() {
   [[ "$version" == "$expected" ]] || return 1
   uptime=$(service_uptime) || return 1
   [[ "$uptime" =~ ^[0-9]+$ ]] && (( uptime >= 60 )) || return 1
-  printf '%s|%s|%s|%s' "$invocation" "$pid" "$version" "$uptime"
+  printf '%s|%s|%s|%s|%s' "$invocation" "$pid" "$version" "$uptime" "$listener"
 }
 
 # A one-off snapshot has a stricter idle gate than the long-running update timer: queued runs,
 # any pending request, and every active tool item hold it. The DB read is deliberately repeated
 # immediately before the stop; unreadable or incomplete evidence fails closed.
 snapshot_idle_evidence() {
-  local counts runs requests tools subagents background effects quiet checked_at
+  local counts runs requests tools subagents deliveries background effects quiet checked_at
   counts=$(timeout 10 sqlite3 -readonly -separator '|' "$DB" \
     "select
        (select count(*) from orchestration_v2_projection_runs where status in ('preparing','queued','starting','running','waiting')),
@@ -1268,6 +1268,9 @@ snapshot_idle_evidence() {
              where r.run_id = i.run_id and r.status = 'rolled_back')),
        (select count(*) from orchestration_v2_projection_subagents
          where status not in ('idle','completed','failed','cancelled','interrupted')),
+       (select count(*) from orchestration_v2_projection_subagents
+         where status in ('completed','failed','cancelled','interrupted')
+           and completion_delivery_state in ('pending','claimed')),
        (select count(*) from orchestration_v2_projection_provider_threads
          where not json_valid(payload_json)
             or (json_type(payload_json,'$.pendingBackgroundTasks') is not null
@@ -1277,13 +1280,13 @@ snapshot_idle_evidence() {
     echo "snapshot: activity database is unreadable" >&2
     return 1
   }
-  IFS='|' read -r runs requests tools subagents background effects <<<"$counts"
-  [[ "$runs" =~ ^[0-9]+$ && "$requests" =~ ^[0-9]+$ && "$tools" =~ ^[0-9]+$ && "$subagents" =~ ^[0-9]+$ && "$background" =~ ^[0-9]+$ && "$effects" =~ ^[0-9]+$ ]] || {
+  IFS='|' read -r runs requests tools subagents deliveries background effects <<<"$counts"
+  [[ "$runs" =~ ^[0-9]+$ && "$requests" =~ ^[0-9]+$ && "$tools" =~ ^[0-9]+$ && "$subagents" =~ ^[0-9]+$ && "$deliveries" =~ ^[0-9]+$ && "$background" =~ ^[0-9]+$ && "$effects" =~ ^[0-9]+$ ]] || {
     echo "snapshot: activity census is incomplete" >&2
     return 1
   }
-  (( runs == 0 && requests == 0 && tools == 0 && subagents == 0 && background == 0 && effects == 0 )) || {
-    echo "snapshot: activity remains (runs=$runs pendingRequests=$requests activeItems=$tools activeSubagents=$subagents providerBackgroundTasks=$background activeEffects=$effects)" >&2
+  (( runs == 0 && requests == 0 && tools == 0 && subagents == 0 && deliveries == 0 && background == 0 && effects == 0 )) || {
+    echo "snapshot: activity remains (runs=$runs pendingRequests=$requests activeItems=$tools activeSubagents=$subagents pendingSubagentDeliveries=$deliveries providerBackgroundTasks=$background activeEffects=$effects)" >&2
     return 1
   }
   quiet=$(quiet_seconds) || quiet=""
@@ -1294,8 +1297,9 @@ snapshot_idle_evidence() {
   checked_at=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
   jq -cn --arg checkedAt "$checked_at" --argjson runs "$runs" \
     --argjson requests "$requests" --argjson tools "$tools" --argjson subagents "$subagents" \
-    --argjson background "$background" --argjson effects "$effects" --argjson quiet "$quiet" \
-    '{checkedAt:$checkedAt,runs:$runs,pendingRequests:$requests,activeItems:$tools,activeSubagents:$subagents,providerBackgroundTasks:$background,activeEffects:$effects,quietSeconds:$quiet}'
+    --argjson deliveries "$deliveries" --argjson background "$background" \
+    --argjson effects "$effects" --argjson quiet "$quiet" \
+    '{checkedAt:$checkedAt,runs:$runs,pendingRequests:$requests,activeItems:$tools,activeSubagents:$subagents,pendingSubagentDeliveries:$deliveries,providerBackgroundTasks:$background,activeEffects:$effects,quietSeconds:$quiet}'
 }
 
 snapshot_manifest() {
@@ -1343,7 +1347,7 @@ write_snapshot_receipt() {
 }
 
 snapshot_receipt_matches() {
-  local receipt="$1" operation="$2" point="$3" status path name sha actual version invocation pid
+  local receipt="$1" operation="$2" point="$3" status path name sha actual version invocation pid listener
   [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
   [[ "$(stat -c %a "$receipt" 2>/dev/null)" == 600 ]] || return 1
   [[ "$(stat -c %a "${receipt%/*}" 2>/dev/null)" == 700 ]] || return 1
@@ -1357,12 +1361,15 @@ snapshot_receipt_matches() {
   version=$(jq -r '.stoppedGeneration.version // empty' "$receipt" 2>/dev/null)
   invocation=$(jq -r '.stoppedGeneration.invocationId // empty' "$receipt" 2>/dev/null)
   pid=$(jq -r '.stoppedGeneration.mainPid // empty' "$receipt" 2>/dev/null)
-  [[ -n "$version" && "$invocation" =~ ^[[:xdigit:]]{32}$ && "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  listener=$(jq -r '.stoppedGeneration.listenerPid // empty' "$receipt" 2>/dev/null)
+  [[ -n "$version" && "$invocation" =~ ^[[:xdigit:]]{32}$ && "$pid" =~ ^[1-9][0-9]*$ && \
+    "$listener" =~ ^[1-9][0-9]*$ ]] || return 1
   if [[ "$status" == complete ]]; then
     invocation=$(jq -r '.restart.invocationId // empty' "$receipt" 2>/dev/null)
     pid=$(jq -r '.restart.mainPid // empty' "$receipt" 2>/dev/null)
     [[ "$invocation" =~ ^[[:xdigit:]]{32}$ && "$pid" =~ ^[1-9][0-9]*$ && \
       "$(jq -r '.restart.servingVersion // empty' "$receipt" 2>/dev/null)" == "$version" && \
+      "$(jq -r '.restart.listenerPid // empty' "$receipt" 2>/dev/null)" =~ ^[1-9][0-9]*$ && \
       -n "$(jq -r '.restart.verifiedAt // empty' "$receipt" 2>/dev/null)" ]] || return 1
   fi
   path=$(jq -r '.snapshotPath // empty' "$receipt" 2>/dev/null)
@@ -1389,12 +1396,12 @@ snapshot_receipt_matches() {
 }
 
 snapshot_wait_serving() {
-  local expected="$1" stopped_invocation="$2" deadline=$((SECONDS + HEALTH_WAIT_SECONDS)) identity invocation pid version uptime
+  local expected="$1" stopped_invocation="$2" deadline=$((SECONDS + HEALTH_WAIT_SECONDS)) identity invocation pid version uptime listener
   while (( SECONDS <= deadline )); do
     if [[ "$(active_version)" == "$expected" ]] && identity=$(snapshot_service_identity "$expected"); then
-      IFS='|' read -r invocation pid version uptime <<<"$identity"
+      IFS='|' read -r invocation pid version uptime listener <<<"$identity"
       if [[ "$invocation" != "$stopped_invocation" ]]; then
-        printf '%s|%s|%s|%s' "$invocation" "$pid" "$version" "$uptime"
+        printf '%s|%s|%s|%s|%s' "$invocation" "$pid" "$version" "$uptime" "$listener"
         return 0
       fi
     fi
@@ -1414,12 +1421,12 @@ snapshot_start_and_verify() {
 }
 
 snapshot_receipt_finalize() {
-  local receipt="$1" identity="$2" status="$3" why="${4:-}" invocation pid version uptime verified_at updated
-  IFS='|' read -r invocation pid version uptime <<<"$identity"
+  local receipt="$1" identity="$2" status="$3" why="${4:-}" invocation pid version uptime listener verified_at updated
+  IFS='|' read -r invocation pid version uptime listener <<<"$identity"
   verified_at=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
-  updated=$(jq -c --arg status "$status" --arg invocation "$invocation" --arg pid "$pid" \
+  updated=$(jq -c --arg status "$status" --arg invocation "$invocation" --arg pid "$pid" --arg listener "$listener" \
     --arg version "$version" --arg verifiedAt "$verified_at" --arg why "$why" \
-    '.status=$status | .restart={invocationId:$invocation,mainPid:($pid|tonumber),servingVersion:$version,verifiedAt:$verifiedAt} | if $why == "" then del(.restartFailure) else .restartFailure=$why end' \
+    '.status=$status | .restart={invocationId:$invocation,mainPid:($pid|tonumber),listenerPid:($listener|tonumber),servingVersion:$version,verifiedAt:$verifiedAt} | if $why == "" then del(.restartFailure) else .restartFailure=$why end' \
     "$receipt") || return 1
   write_snapshot_receipt "$receipt" "$updated"
 }
@@ -1431,13 +1438,13 @@ snapshot_receipt_set_status() {
 }
 
 snapshot_receipt_set_idle_evidence() {
-  local receipt="$1" first="$2" second="$3" identity="$4" updated invocation pid version uptime
-  IFS='|' read -r invocation pid version uptime <<<"$identity"
-  updated=$(jq -c --arg invocation "$invocation" --arg pid "$pid" --arg version "$version" \
+  local receipt="$1" first="$2" second="$3" identity="$4" updated invocation pid version uptime listener
+  IFS='|' read -r invocation pid version uptime listener <<<"$identity"
+  updated=$(jq -c --arg invocation "$invocation" --arg pid "$pid" --arg listener "$listener" --arg version "$version" \
     --argjson first "$first" --argjson second "$second" \
     --arg closedAt "$SNAPSHOT_ADMISSION_CLOSED_AT" --arg drainedAt "$SNAPSHOT_ADMISSION_DRAINED_AT" \
     --arg capabilityPid "$SNAPSHOT_ADMISSION_CAPABILITY_PID" \
-    '.idleVerification={first:$first,second:$second} | .admissionBarrier={protocolVersion:1,closedAt:$closedAt,drainedAt:$drainedAt,drainedAdmissions:0,capabilityListenerPid:($capabilityPid|tonumber)} | .stoppedGeneration={invocationId:$invocation,mainPid:($pid|tonumber),version:$version}' \
+    '.idleVerification={first:$first,second:$second} | .admissionBarrier={protocolVersion:1,closedAt:$closedAt,drainedAt:$drainedAt,drainedAdmissions:0,capabilityListenerPid:($capabilityPid|tonumber)} | .stoppedGeneration={invocationId:$invocation,mainPid:($pid|tonumber),listenerPid:($listener|tonumber),version:$version}' \
     "$receipt") || return 1
   write_snapshot_receipt "$receipt" "$updated"
 }
@@ -1459,7 +1466,8 @@ snapshot_receipt_set_manifest() {
 
 cmd_snapshot_impl() {
   local operation="" point="" label label_length receipt_dir receipt status version identity
-  local stopped_invocation stopped_pid first_activity second_activity snapshot identity_after
+  local stopped_invocation stopped_pid stopped_listener_pid listener_pid identity_listener_pid
+  local first_activity second_activity snapshot identity_after
   local files generation hang state restart_invocation json
 
   if [[ $# != 2 ]]; then
@@ -1510,6 +1518,7 @@ cmd_snapshot_impl() {
     version=$(jq -r '.stoppedGeneration.version' "$receipt")
     stopped_invocation=$(jq -r '.stoppedGeneration.invocationId' "$receipt")
     stopped_pid=$(jq -r '.stoppedGeneration.mainPid' "$receipt")
+    stopped_listener_pid=$(jq -r '.stoppedGeneration.listenerPid' "$receipt")
     snapshot=$(jq -r '.snapshotPath' "$receipt")
     [[ "$(active_version)" == "$version" ]] && is_trusted "$version" && is_healthy "$version" || {
       echo "snapshot: receipt exists, but its original trusted service version is not selected" >&2
@@ -1526,16 +1535,17 @@ cmd_snapshot_impl() {
       echo "snapshot: managed unit, listener descendant, cgroup, health version, or generation is not verified" >&2
       return 1
     }
-    IFS='|' read -r stopped_invocation stopped_pid _ _ <<<"$identity"
+    IFS='|' read -r stopped_invocation stopped_pid _ _ stopped_listener_pid <<<"$identity"
     first_activity=$(snapshot_idle_evidence) || return 1
     second_activity=$(snapshot_idle_evidence) || return 1
     identity_after=$(snapshot_service_identity "$version") || {
       echo "snapshot: service identity changed before stop" >&2
       return 1
     }
-    IFS='|' read -r generation stopped_pid _ _ <<<"$identity_after"
-    [[ "$generation" == "$stopped_invocation" ]] || {
-      echo "snapshot: service generation changed before stop" >&2
+    IFS='|' read -r generation identity_pid _ _ identity_listener_pid <<<"$identity_after"
+    [[ "$generation" == "$stopped_invocation" && "$identity_pid" == "$stopped_pid" && \
+      "$identity_listener_pid" == "$stopped_listener_pid" ]] || {
+      echo "snapshot: service generation or listener changed before stop" >&2
       return 1
     }
     if hang=$(kernel_hang_signs); then
@@ -1553,9 +1563,10 @@ cmd_snapshot_impl() {
       return 1
     }
     json=$(jq -cn --arg operation "$operation" --arg point "$point" --arg unit "$UNIT" \
-      --arg invocation "$stopped_invocation" --arg pid "$stopped_pid" --arg version "$version" \
+      --arg invocation "$stopped_invocation" --arg pid "$stopped_pid" \
+      --arg listener "$stopped_listener_pid" --arg version "$version" \
       --arg path "$snapshot" --argjson first "$first_activity" --argjson second "$second_activity" \
-      '{schemaVersion:1,operationId:$operation,snapshotPoint:$point,unit:$unit,status:"prepared",snapshotPath:$path,files:[],idleVerification:{first:$first,second:$second},stoppedGeneration:{invocationId:$invocation,mainPid:($pid|tonumber),version:$version}}') || {
+      '{schemaVersion:1,operationId:$operation,snapshotPoint:$point,unit:$unit,status:"prepared",snapshotPath:$path,files:[],idleVerification:{first:$first,second:$second},stoppedGeneration:{invocationId:$invocation,mainPid:($pid|tonumber),listenerPid:($listener|tonumber),version:$version}}') || {
       rmdir "$snapshot" 2>/dev/null || true
       return 1
     }
@@ -1576,14 +1587,14 @@ cmd_snapshot_impl() {
       echo "snapshot: prepared service identity is no longer verified" >&2
       return 1
     }
-    local listener_pid
-    listener_pid=$(service_listener_pid) || {
-      echo "snapshot: prepared listener PID is no longer verified" >&2
+    IFS='|' read -r generation _ _ _ listener_pid <<<"$identity"
+    [[ "$generation" == "$stopped_invocation" && "$listener_pid" == "$stopped_listener_pid" ]] || {
+      echo "snapshot: prepared listener identity changed; no stop requested" >&2
       return 1
     }
     SNAPSHOT_ADMISSION_OPERATION="$operation"
     snapshot_admission_close "$operation" "$point" "$listener_pid" || return 1
-    IFS='|' read -r generation _ _ _ <<<"$identity"
+    IFS='|' read -r generation _ _ _ identity_listener_pid <<<"$identity"
     [[ "$generation" == "$stopped_invocation" ]] || {
       echo "snapshot: prepared service generation changed; no stop requested" >&2
       return 1
@@ -1594,9 +1605,10 @@ cmd_snapshot_impl() {
       echo "snapshot: service identity changed immediately before the stop request" >&2
       return 1
     }
-    IFS='|' read -r generation stopped_pid _ _ <<<"$identity_after"
-    [[ "$generation" == "$stopped_invocation" ]] || {
-      echo "snapshot: service generation changed immediately before the stop request" >&2
+    IFS='|' read -r generation identity_pid _ _ identity_listener_pid <<<"$identity_after"
+    [[ "$generation" == "$stopped_invocation" && "$identity_pid" == "$stopped_pid" && \
+      "$identity_listener_pid" == "$listener_pid" && "$listener_pid" == "$stopped_listener_pid" ]] || {
+      echo "snapshot: service generation or listener changed immediately before the stop request" >&2
       return 1
     }
     if hang=$(kernel_hang_signs); then
