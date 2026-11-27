@@ -5,8 +5,10 @@
 #   t3-service-update [--now] [version]
 #   t3-service-update status
 #   t3-service-update resume     lift an automatic-updates hold once its cause is fixed
+#   t3-service-update snapshot <operation-id> <snapshot-point>
 case "${1:-}" in
   status) exec "$HOME/.local/libexec/t3-update-guard/guard" status ;;
   resume) exec "$HOME/.local/libexec/t3-update-guard/guard" resume ;;
+  snapshot) shift; exec "$HOME/.local/libexec/t3-update-guard/guard" snapshot "$@" ;;
 esac
 exec "$HOME/.local/libexec/t3-update-guard/guard" update "$@"

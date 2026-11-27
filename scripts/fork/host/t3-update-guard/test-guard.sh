@@ -600,3 +600,88 @@ timeout() { printf '%s\n' "$*" > "$root/timeout"; }
 systemctl --user is-active t3code.service
 [[ "$(cat "$root/timeout")" == '--kill-after=2 15 /usr/bin/systemctl --user is-active t3code.service' ]] || fail timeout
 pass 'all systemctl calls have a bounded timeout'
+
+# Snapshot-only path: strict activity refusal, copied SQLite sidecars, receipt privacy, same-build
+# restart, preservation of older snapshots, and operation-ID idempotency. All service calls are
+# simulated; no live T3 unit or database is touched.
+(
+  exec 9>&-
+  unset -f timeout
+  T3CODE_HOME="$root/snapshot-t3" T3_GUARD_STATE_DIR="$root/snapshot-state"
+  export T3CODE_HOME T3_GUARD_STATE_DIR
+  source "$root/functions"
+  DB="$T3CODE_HOME/userdata/statev2.sqlite"
+  LOCK="$root/snapshot-service-change.lock"
+  mkdir -p "$T3CODE_HOME/userdata" "$SNAPSHOTS"
+  sqlite3 "$DB" "pragma user_version=119;
+    create table orchestration_v2_projection_runs (run_id text, thread_id text, status text, requested_at text, completed_at text, payload_json text);
+    create table orchestration_v2_projection_runtime_requests (runtime_request_id text, status text, resolved_at text);
+    create table orchestration_v2_projection_turn_items (turn_item_id text, thread_id text, run_id text, type text, status text, updated_at text);"
+  sim_version=0.1.13-preview.20261127.1
+  sim_state=active sim_generation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa sim_pid=1111
+  manager_ready() { return 0; }
+  active_version() { echo "$sim_version"; }
+  is_trusted() { return 0; }
+  is_healthy() { return 0; }
+  service_version() { echo "$sim_version"; }
+  service_uptime() { echo 120; }
+  service_listener_pid() { echo "$sim_pid"; }
+  unit_property() {
+    case "$1" in
+      ActiveState) echo "$sim_state" ;;
+      InvocationID) echo "$sim_generation" ;;
+      MainPID) echo "$sim_pid" ;;
+      *) return 1 ;;
+    esac
+  }
+  kernel_hang_signs() { return 1; }
+  wait_inactive() { [[ "$sim_state" == inactive ]]; }
+  cp() { if [[ "${1:-}" == --reflink=always ]]; then shift; fi; command cp "$@"; }
+  svc() {
+    printf '%s\n' "$*" >>"$root/snapshot-svc"
+    case "$1" in
+      stop)
+        sim_state=inactive
+        printf 'wal bytes\n' >"$DB-wal"
+        printf 'shm bytes\n' >"$DB-shm"
+        ;;
+      start) sim_state=active; sim_generation=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; sim_pid=2222 ;;
+      *) return 1 ;;
+    esac
+    return 0
+  }
+  outage_begin() { :; }
+  outage_end() { :; }
+  log() { :; }
+  quiet_seconds() { echo 900; }
+  HEALTH_WAIT_SECONDS=0
+  mkdir -p "$SNAPSHOTS/20200101T000000-before" "$SNAPSHOTS/20200102T000000-before" \
+    "$SNAPSHOTS/20200103T000000-before" "$SNAPSHOTS/20200104T000000-before"
+  quiet_seconds() { echo 899; }
+  if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot accepted less than 15 minutes of quiet'; fi
+  exec 9>&-
+  quiet_seconds() { echo 900; }
+  sqlite3 "$DB" "insert into orchestration_v2_projection_runs values ('queued','thread','queued','2026-11-27T00:00:00.000Z',null,'{}');"
+  if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot stopped a queued run'; fi
+  exec 9>&-
+  ! grep -q '^stop ' "$root/snapshot-svc" 2>/dev/null || fail 'snapshot stopped a busy service'
+  sqlite3 "$DB" "delete from orchestration_v2_projection_runs;"
+  out=$(cmd_snapshot snapshot-op before-stock-switch) || fail 'snapshot-only command failed in the isolated service fixture'
+  receipt="$GUARD_STATE/snapshot-receipts/snapshot-op.json"
+  [[ "$(jq -r '.status' <<<"$out")" == complete ]] || fail 'snapshot receipt did not complete'
+  [[ "$(jq -r '.stoppedGeneration.version' "$receipt")" == "$sim_version" ]] || fail 'receipt lost stopped version'
+  [[ "$(jq -r '.stoppedGeneration.invocationId' "$receipt")" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] || fail 'receipt lost stopped invocation ID'
+  [[ "$(jq -r '.restart.invocationId' "$receipt")" == bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ]] || fail 'receipt lost restarted invocation ID'
+  [[ "$(jq -r '.files | map(.name) | sort | join(",")' "$receipt")" == 'statev2.sqlite,statev2.sqlite-shm,statev2.sqlite-wal' ]] || fail 'receipt omitted a SQLite file or sidecar'
+  [[ "$(sha256sum "$(jq -r '.snapshotPath' "$receipt")/statev2.sqlite" | cut -d' ' -f1)" == "$(sha256sum "$DB" | cut -d' ' -f1)" ]] || fail 'snapshot main database differs from the stopped source'
+  [[ "$(stat -c %a "$receipt")" == 600 && "$(stat -c %a "$(jq -r '.snapshotPath' "$receipt")")" == 700 ]] || fail 'snapshot receipt or files are not under owner-only directories'
+  [[ -d "$SNAPSHOTS/20200101T000000-before" && -d "$SNAPSHOTS/20200104T000000-before" ]] || fail 'one-off snapshot rotated away an earlier copy'
+  [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'snapshot did not stop exactly once'
+  [[ "$(grep -c '^start --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'snapshot did not restart exactly once'
+  out=$(cmd_snapshot snapshot-op before-stock-switch) || fail 'idempotent snapshot retry did not return its receipt'
+  [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'idempotent retry stopped the service twice'
+  if cmd_snapshot snapshot-op different-point >/dev/null 2>&1; then fail 'snapshot reused an operation ID with a different point'; fi
+  exec 9>&-
+  [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'mismatched receipt retry stopped the service again'
+) || fail 'snapshot-only path violated its isolated activity, receipt, or restart contract'
+pass 'snapshot-only path refuses activity, retains a private WAL/SHM receipt, restarts the same build, and is idempotent'

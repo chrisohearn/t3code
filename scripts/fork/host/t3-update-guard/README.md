@@ -20,6 +20,16 @@ These are the files that keep the T3 background service on Chris's Omarchy machi
 
 Installing the guard does not restart the T3 service.
 
+## Capture a snapshot without updating
+
+`t3-service-update snapshot <operation-id> <snapshot-point>` is the guarded stop/copy/restart entry point for a caller that needs a database snapshot without installing or selecting another release. Both identifiers must contain only letters, digits, dots, underscores, and hyphens, and start with a letter or digit. Reusing an operation ID with the same point returns its existing receipt and does not stop the service again; reusing it for a different point fails closed.
+
+The command takes the existing service-change lock, requires the selected release to be installed, trusted, healthy, and the exact version answering on the loopback listener owned by the systemd unit's main PID. It requires two clean activity reads, then rechecks the service identity and generation immediately before stopping: no running, starting, waiting, or queued runs; no pending requests; no active tool calls; and at least the configured 15 minutes of quiet. Unknown activity, health, listener, or systemd state refuses the stop.
+
+After systemd confirms the service is inactive, the guard copies the SQLite files and WAL/SHM sidecars using the existing reflink path. This one-off operation preserves earlier snapshots instead of applying the update path's three-snapshot rotation. It writes an owner-only JSON receipt under `~/.local/state/t3-update-guard/snapshot-receipts/` with the operation ID, snapshot point, stopped unit invocation and PID, quiet-window evidence, snapshot path, and each copied file's SHA-256 and size. It starts the same selected fork build and only marks the receipt complete after the new systemd invocation, listener PID, health version, and service uptime are verified. It never downloads, installs, or selects a release and never runs the T3 CLI against the live database. Once a captured receipt exists, retrying the same operation ID resumes or returns that receipt without taking another snapshot. If the process ends before that receipt is written, inspect the guard events and snapshot directory before starting another operation.
+
+The guard receipt proves which stopped-service files were copied and that the same fork build returned. A caller must still perform isolated readback against the retained copy; this command does not claim migration compatibility or publication of another release.
+
 ## When updates happen
 
 - **Launch selection:** the guard prefers a build with a positive Codex shadow readiness report. It switches away from the active build only when that build positively reports a shadow conflict and another verified build reports ready. Missing or unknown shadow status keeps the active build when it can open the database. If an update launch is redirected to a compatible build because of a positive shadow conflict, the release is marked rejected on this host, not bad globally; fix the shadow conflict and retry with `t3-service-update <version>`.
