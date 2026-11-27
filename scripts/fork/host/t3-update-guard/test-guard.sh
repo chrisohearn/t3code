@@ -601,9 +601,9 @@ systemctl --user is-active t3code.service
 [[ "$(cat "$root/timeout")" == '--kill-after=2 15 /usr/bin/systemctl --user is-active t3code.service' ]] || fail timeout
 pass 'all systemctl calls have a bounded timeout'
 
-# Snapshot-only path: strict activity refusal, copied SQLite sidecars, receipt privacy, same-build
-# restart, preservation of older snapshots, and operation-ID idempotency. All service calls are
-# simulated; no live T3 unit or database is touched.
+# Snapshot-only path: real launcher-child listener in the current cgroup, full idle refusal,
+# durable write-ahead intent, copy/restart timing, receipt privacy, and operation-ID idempotency.
+# Service state and database changes are isolated; no live T3 unit or database is touched.
 (
   exec 9>&-
   unset -f timeout
@@ -616,36 +616,145 @@ pass 'all systemctl calls have a bounded timeout'
   sqlite3 "$DB" "pragma user_version=119;
     create table orchestration_v2_projection_runs (run_id text, thread_id text, status text, requested_at text, completed_at text, payload_json text);
     create table orchestration_v2_projection_runtime_requests (runtime_request_id text, status text, resolved_at text);
-    create table orchestration_v2_projection_turn_items (turn_item_id text, thread_id text, run_id text, type text, status text, updated_at text);"
+    create table orchestration_v2_projection_turn_items (turn_item_id text, thread_id text, run_id text, type text, status text, updated_at text);
+    create table orchestration_v2_projection_subagents (subagent_id text, status text);
+    create table orchestration_v2_projection_provider_threads (provider_thread_id text, payload_json text);
+    create table orchestration_v2_effect_outbox (effect_id text, status text);"
   sim_version=0.1.13-preview.20261127.1
-  sim_state=active sim_generation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa sim_pid=1111
+  sim_control_group=""
+  PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+  export PORT
+  sim_command_fifo="$root/snapshot-command"
+  sim_listener_file="$root/snapshot-listener.pid"
+  sim_state_file="$root/snapshot-unit-state"
+  sim_generation_file="$root/snapshot-generation"
+  mkfifo "$sim_command_fifo"
+  printf 'inactive\n' >"$sim_state_file"
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' >"$sim_generation_file"
+  cat >"$root/snapshot-launcher.sh" <<'EOF'
+#!/bin/bash
+set -eu
+command_fifo=$1
+listener_file=$2
+port=$3
+listener_pid=""
+stop_listener() {
+  if [[ -n "$listener_pid" ]]; then
+    kill "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+    listener_pid=""
+  fi
+  : >"$listener_file"
+}
+trap stop_listener EXIT
+exec 3<>"$command_fifo"
+while IFS= read -r command; do
+  case "$command" in
+    start)
+      node -e 'const net=require("net"); const s=net.createServer(); s.listen(Number(process.argv[1]),"127.0.0.1"); setInterval(()=>{},1000)' "$port" >/dev/null 2>&1 &
+      listener_pid=$!
+      printf '%s\n' "$listener_pid" >"$listener_file"
+      ;;
+    stop) stop_listener ;;
+    quit) exit 0 ;;
+  esac
+done <&3
+EOF
+  chmod +x "$root/snapshot-launcher.sh"
+  bash "$root/snapshot-launcher.sh" "$sim_command_fifo" "$sim_listener_file" "$PORT" >/dev/null 2>&1 &
+  sim_launcher_pid=$!
+  sim_pid=$sim_launcher_pid
+  sim_control_group=$(awk -F: '$1 == "0" { print $3; exit }' "/proc/$sim_pid/cgroup")
+  [[ -n "$sim_control_group" ]] || fail 'fixture launcher has no unified cgroup'
+  printf 'active\n' >"$sim_state_file"
+  printf 'start\n' >"$sim_command_fifo"
+  cleanup_sim_listener() {
+    printf 'quit\n' >"$sim_command_fifo" 2>/dev/null || true
+    kill "$sim_pid" 2>/dev/null || true
+    wait "$sim_pid" 2>/dev/null || true
+  }
+  trap cleanup_sim_listener EXIT
+  for ((i=0; i<50; i++)); do
+    service_listener_pid >/dev/null 2>&1 && break
+    sleep 0.05
+  done
+  service_listener_pid >/dev/null 2>&1 || fail 'could not start the isolated launcher-child listener'
   manager_ready() { return 0; }
   active_version() { echo "$sim_version"; }
   is_trusted() { return 0; }
   is_healthy() { return 0; }
   service_version() { echo "$sim_version"; }
   service_uptime() { echo 120; }
-  service_listener_pid() { echo "$sim_pid"; }
   unit_property() {
     case "$1" in
-      ActiveState) echo "$sim_state" ;;
-      InvocationID) echo "$sim_generation" ;;
+      ActiveState) cat "$sim_state_file" ;;
+      InvocationID) cat "$sim_generation_file" ;;
       MainPID) echo "$sim_pid" ;;
+      ControlGroup) echo "$sim_control_group" ;;
       *) return 1 ;;
     esac
   }
   kernel_hang_signs() { return 1; }
-  wait_inactive() { [[ "$sim_state" == inactive ]]; }
-  cp() { if [[ "${1:-}" == --reflink=always ]]; then shift; fi; command cp "$@"; }
+  wait_inactive() { [[ "$(cat "$sim_state_file")" == inactive ]]; }
+  cp() { if [[ "$1" == --reflink=always ]]; then shift; fi; command cp "$@"; }
+  snapshot_fsync() {
+    local path
+    for path in "$@"; do
+      printf 'fsync:%s\n' "$path" >>"$root/snapshot-fsync"
+      if [[ -e "$root/fail-prepared-receipt" && "$path" == */.snapshot-receipt.* ]]; then
+        rm -f "$root/fail-prepared-receipt"
+        return 1
+      fi
+    done
+    python3 -c 'import os, sys
+for path in sys.argv[1:]:
+    flags = os.O_RDONLY
+    if os.path.isdir(path):
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)' "$@"
+  }
+  cmp() {
+    [[ "$(cat "$sim_state_file")" == active ]] || fail 'full-file comparison ran while service was stopped'
+    command cmp "$@"
+  }
+  sha256sum() {
+    [[ "$(cat "$sim_state_file")" == active ]] || fail 'manifest hashing ran while service was stopped'
+    printf 'hash-after-restart\n' >>"$root/snapshot-hash-order"
+    command sha256sum "$@"
+  }
   svc() {
     printf '%s\n' "$*" >>"$root/snapshot-svc"
     case "$1" in
       stop)
-        sim_state=inactive
+        [[ "$(jq -r '.status' "$GUARD_STATE/snapshot-receipts/snapshot-op.json")" == stop_requested ]] || fail 'stop ran without durable stop intent'
+        [[ "$(tail -n 1 "$root/snapshot-fsync")" == "fsync:$GUARD_STATE/snapshot-receipts" ]] || fail 'stop ran before the receipt directory was fsynced'
+        printf 'stop\n' >"$sim_command_fifo"
+        local i
+        for ((i=0; i<50; i++)); do
+          [[ ! -s "$sim_listener_file" ]] && break
+          sleep 0.05
+        done
+        printf 'inactive\n' >"$sim_state_file"
         printf 'wal bytes\n' >"$DB-wal"
         printf 'shm bytes\n' >"$DB-shm"
         ;;
-      start) sim_state=active; sim_generation=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; sim_pid=2222 ;;
+      start)
+        [[ "$(jq -r '.status' "$GUARD_STATE/snapshot-receipts/snapshot-op.json")" == copied ]] || fail 'restart ran before the copied receipt was durable'
+        [[ "$(tail -n 1 "$root/snapshot-fsync")" == "fsync:$GUARD_STATE/snapshot-receipts" ]] || fail 'restart ran before the copied receipt directory was fsynced'
+        printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >"$sim_generation_file"
+        printf 'start\n' >"$sim_command_fifo"
+        local i
+        for ((i=0; i<50; i++)); do
+          service_listener_pid >/dev/null 2>&1 && break
+          sleep 0.05
+        done
+        service_listener_pid >/dev/null 2>&1 || fail 'same-version child listener did not restart'
+        printf 'active\n' >"$sim_state_file"
+        ;;
       *) return 1 ;;
     esac
     return 0
@@ -653,20 +762,86 @@ pass 'all systemctl calls have a bounded timeout'
   outage_begin() { :; }
   outage_end() { :; }
   log() { :; }
-  quiet_seconds() { echo 900; }
+  QUIET_VALUE=900
+  quiet_seconds() {
+    if [[ -e "$root/insert-after-first-idle" && ! -e "$root/inserted-during-census" ]]; then
+      sqlite3 "$DB" "insert into orchestration_v2_projection_runs values ('late','thread','preparing','2026-11-27T00:00:00.000Z',null,'{}');"
+      touch "$root/inserted-during-census"
+    fi
+    echo "$QUIET_VALUE"
+  }
   HEALTH_WAIT_SECONDS=0
   mkdir -p "$SNAPSHOTS/20200101T000000-before" "$SNAPSHOTS/20200102T000000-before" \
     "$SNAPSHOTS/20200103T000000-before" "$SNAPSHOTS/20200104T000000-before"
-  quiet_seconds() { echo 899; }
+
+  QUIET_VALUE=899
   if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot accepted less than 15 minutes of quiet'; fi
   exec 9>&-
-  quiet_seconds() { echo 900; }
+  QUIET_VALUE=900
+  if cmd_snapshot "$(printf 'a%.0s' {1..60})" "$(printf 'b%.0s' {1..60})" >/dev/null 2>&1; then fail 'combined snapshot label over 128 characters was accepted'; fi
+  exec 9>&-
+  touch "$root/insert-after-first-idle"
+  if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot missed activity arriving between idle reads'; fi
+  exec 9>&-
+  rm -f "$root/insert-after-first-idle" "$root/inserted-during-census"
+  sqlite3 "$DB" "delete from orchestration_v2_projection_runs;"
   sqlite3 "$DB" "insert into orchestration_v2_projection_runs values ('queued','thread','queued','2026-11-27T00:00:00.000Z',null,'{}');"
   if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot stopped a queued run'; fi
   exec 9>&-
-  ! grep -q '^stop ' "$root/snapshot-svc" 2>/dev/null || fail 'snapshot stopped a busy service'
-  sqlite3 "$DB" "delete from orchestration_v2_projection_runs;"
-  out=$(cmd_snapshot snapshot-op before-stock-switch) || fail 'snapshot-only command failed in the isolated service fixture'
+  sqlite3 "$DB" "delete from orchestration_v2_projection_runs; insert into orchestration_v2_projection_runs values ('preparing','thread','preparing','2026-11-27T00:00:00.000Z',null,'{}');"
+  if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot stopped a preparing run'; fi
+  exec 9>&-
+  sqlite3 "$DB" "delete from orchestration_v2_projection_runs;
+    insert into orchestration_v2_projection_runs values ('active-items','thread','running','2026-11-27T00:00:00.000Z',null,'{}');
+    insert into orchestration_v2_projection_turn_items values ('item-command','thread','active-items','command_execution','pending','2026-11-27T00:00:00.000Z');
+    insert into orchestration_v2_projection_turn_items values ('item-tool','thread','active-items','dynamic_tool','running','2026-11-27T00:00:00.000Z');
+    insert into orchestration_v2_projection_turn_items values ('item-file','thread','active-items','file_change','waiting','2026-11-27T00:00:00.000Z');
+    insert into orchestration_v2_projection_turn_items values ('item-subagent','thread','active-items','subagent','running','2026-11-27T00:00:00.000Z');
+    insert into orchestration_v2_projection_turn_items values ('item-link','thread','active-items','link_request','pending','2026-11-27T00:00:00.000Z');
+    insert into orchestration_v2_effect_outbox values ('effect-1','running');"
+  if cmd_snapshot snapshot-op before-stock-switch >"$root/snapshot-reject.log" 2>&1; then fail 'snapshot ignored active command, tool, file, subagent, or link-request items'; fi
+  grep -q 'activeItems=5' "$root/snapshot-reject.log" || fail 'complete active-item census did not report all five work types'
+  grep -q 'activeEffects=1' "$root/snapshot-reject.log" || fail 'snapshot ignored a pending effect outbox job'
+  exec 9>&-
+  sqlite3 "$DB" "delete from orchestration_v2_projection_runs; delete from orchestration_v2_projection_turn_items;
+    insert into orchestration_v2_projection_subagents values ('provider-subagent','running');
+    insert into orchestration_v2_projection_subagents values ('app-owned-subagent','pending');"
+  if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot stopped an active provider subagent'; fi
+  exec 9>&-
+  sqlite3 "$DB" "delete from orchestration_v2_projection_subagents; insert into orchestration_v2_projection_provider_threads values ('provider-thread','{\"pendingBackgroundTasks\":[{\"taskId\":\"task-1\"}]}');"
+  if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot stopped a pending provider background task'; fi
+  exec 9>&-
+  sqlite3 "$DB" "delete from orchestration_v2_projection_provider_threads; insert into orchestration_v2_projection_provider_threads values ('provider-thread','invalid json');"
+  if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot accepted an unreadable provider-thread payload'; fi
+  exec 9>&-
+  sqlite3 "$DB" "delete from orchestration_v2_projection_provider_threads; delete from orchestration_v2_effect_outbox;"
+  [[ -z "$(grep '^stop ' "$root/snapshot-svc" 2>/dev/null || true)" ]] || fail 'snapshot stopped a busy or unverified service'
+
+  # The real listener is a child in the unit cgroup, not MainPID. Both ancestry and exact cgroup
+  # membership are required; an unrelated sibling in the same cgroup and a wrong cgroup fail.
+  sim_identity=$(snapshot_service_identity "$sim_version") || fail 'real child listener did not bind to its launcher'
+  sim_listener=$(service_listener_pid)
+  [[ "$sim_listener" == "$(cat "$sim_listener_file")" && "$sim_listener" != "$sim_pid" ]] || fail 'fixture did not prove a child listener distinct from MainPID'
+  sleep 100 &
+  sibling_pid=$!
+  sim_pid=$sibling_pid
+  if snapshot_service_identity "$sim_version" >/dev/null 2>&1; then fail 'unrelated same-cgroup listener was accepted'; fi
+  sim_pid=$sim_launcher_pid
+  kill "$sibling_pid" 2>/dev/null || true
+  wait "$sibling_pid" 2>/dev/null || true
+  real_control_group=$sim_control_group
+  sim_control_group=/outside-the-service-cgroup
+  if snapshot_service_identity "$sim_version" >/dev/null 2>&1; then fail 'listener outside the exact unit cgroup was accepted'; fi
+  sim_control_group=$real_control_group
+  pass 'snapshot identity accepts its real child listener and rejects unrelated or out-of-cgroup listeners'
+
+  touch "$root/fail-prepared-receipt"
+  if cmd_snapshot snapshot-op before-stock-switch >/dev/null 2>&1; then fail 'snapshot proceeded when prepared receipt fsync failed'; fi
+  exec 9>&-
+  [[ -z "$(grep '^stop ' "$root/snapshot-svc" 2>/dev/null || true)" ]] || fail 'snapshot stopped before its prepared receipt was durable'
+  [[ ! -e "$GUARD_STATE/snapshot-receipts/snapshot-op.json" ]] || fail 'failed prepared receipt was published'
+  cmd_snapshot snapshot-op before-stock-switch >"$root/snapshot-out" || fail 'snapshot-only command failed in the isolated service fixture'
+  out=$(cat "$root/snapshot-out")
   receipt="$GUARD_STATE/snapshot-receipts/snapshot-op.json"
   [[ "$(jq -r '.status' <<<"$out")" == complete ]] || fail 'snapshot receipt did not complete'
   [[ "$(jq -r '.stoppedGeneration.version' "$receipt")" == "$sim_version" ]] || fail 'receipt lost stopped version'
@@ -675,13 +850,15 @@ pass 'all systemctl calls have a bounded timeout'
   [[ "$(jq -r '.files | map(.name) | sort | join(",")' "$receipt")" == 'statev2.sqlite,statev2.sqlite-shm,statev2.sqlite-wal' ]] || fail 'receipt omitted a SQLite file or sidecar'
   [[ "$(sha256sum "$(jq -r '.snapshotPath' "$receipt")/statev2.sqlite" | cut -d' ' -f1)" == "$(sha256sum "$DB" | cut -d' ' -f1)" ]] || fail 'snapshot main database differs from the stopped source'
   [[ "$(stat -c %a "$receipt")" == 600 && "$(stat -c %a "$(jq -r '.snapshotPath' "$receipt")")" == 700 ]] || fail 'snapshot receipt or files are not under owner-only directories'
+  [[ "$(jq -r '.idleVerification.first.runs' "$receipt")" == 0 && "$(jq -r '.idleVerification.second.runs' "$receipt")" == 0 ]] || fail 'receipt did not retain both clean idle censuses'
   [[ -d "$SNAPSHOTS/20200101T000000-before" && -d "$SNAPSHOTS/20200104T000000-before" ]] || fail 'one-off snapshot rotated away an earlier copy'
   [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'snapshot did not stop exactly once'
   [[ "$(grep -c '^start --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'snapshot did not restart exactly once'
-  out=$(cmd_snapshot snapshot-op before-stock-switch) || fail 'idempotent snapshot retry did not return its receipt'
+  [[ -s "$root/snapshot-hash-order" ]] || fail 'copied files were not hashed after restart'
+  cmd_snapshot snapshot-op before-stock-switch >"$root/snapshot-out" || fail 'idempotent snapshot retry did not return its receipt'
   [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'idempotent retry stopped the service twice'
   if cmd_snapshot snapshot-op different-point >/dev/null 2>&1; then fail 'snapshot reused an operation ID with a different point'; fi
   exec 9>&-
   [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'mismatched receipt retry stopped the service again'
-) || fail 'snapshot-only path violated its isolated activity, receipt, or restart contract'
-pass 'snapshot-only path refuses activity, retains a private WAL/SHM receipt, restarts the same build, and is idempotent'
+) || fail 'snapshot-only path violated its isolated activity, identity, durability, or restart contract'
+pass 'snapshot-only path verifies full idle state and durable receipts, restarts before hashing, and is idempotent'
