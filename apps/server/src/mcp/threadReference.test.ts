@@ -11,7 +11,7 @@ const here = EnvironmentId.make("environment-here");
 const uuid = "5d0b4a3e-8c1f-4a52-9d37-2f6c7e1b9a04";
 const mcpThread = ThreadId.make(`mcp:${uuid}`);
 const launchThread = ThreadId.make(`mcp:launch:${"be52150e".repeat(8)}`);
-const nativeThread = ThreadId.make("7e56b504-8739-4f3f-80e7-298410d87ec0");
+const nativeThread = ThreadId.make("3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f");
 const deletedThread = ThreadId.make("mcp:0dd09096-12e3-4179-87d5-42fa45c77d5e");
 // A deleted mcp: thread whose bare uuid is another, live thread.
 const replacedUuid = "29b25a73-a7a7-4321-bef4-2b4eb4386aa8";

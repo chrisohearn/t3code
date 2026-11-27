@@ -25,7 +25,7 @@ import * as ServerSettings from "../serverSettings.ts";
 
 const now = DateTime.makeUnsafe("2026-11-12T17:10:00Z");
 const threadId = ThreadId.make("thread:failover");
-const limited = { instanceId: ProviderInstanceId.make("codex_e6f5e4dd"), model: "gpt-5.5" };
+const limited = { instanceId: ProviderInstanceId.make("codex_0a1b2c3d"), model: "gpt-5.5" };
 const fallback = {
   instanceId: ProviderInstanceId.make("claude"),
   model: "claude-opus-5-5",
