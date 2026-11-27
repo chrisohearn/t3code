@@ -685,6 +685,29 @@ EOF
     "$(service_listener_pid)" >"$SNAPSHOT_ADMISSION_ROOT/capability.json"
   chmod 600 "$SNAPSHOT_ADMISSION_ROOT/capability.json"
   manager_ready() { return 0; }
+  fence_owner_pid="${BASHPID:-$$}"
+  fence_owner_boot_id=$(</proc/sys/kernel/random/boot_id)
+  fence_owner_start_ticks=$(snapshot_process_start_ticks "$fence_owner_pid") || fail 'could not read current process incarnation'
+  jq -cn --arg pid "$fence_owner_pid" --arg bootId "$fence_owner_boot_id" --arg startTicks "$fence_owner_start_ticks" \
+    '{protocolVersion:2,ownerPid:($pid|tonumber),ownerBootId:$bootId,ownerStartTicks:$startTicks}' \
+    >"$SNAPSHOT_ADMISSION_FENCE"
+  chmod 600 "$SNAPSHOT_ADMISSION_FENCE"
+  snapshot_admission_clear_stale_fence || fail 'a fence owned by the current process incarnation was cleared'
+  [[ -f "$SNAPSHOT_ADMISSION_FENCE" ]] || fail 'a live process-incarnation fence was removed'
+  jq -cn --arg pid "$fence_owner_pid" --arg bootId "$fence_owner_boot_id" \
+    '{protocolVersion:2,ownerPid:($pid|tonumber),ownerBootId:$bootId,ownerStartTicks:"0"}' \
+    >"$SNAPSHOT_ADMISSION_FENCE"
+  chmod 600 "$SNAPSHOT_ADMISSION_FENCE"
+  snapshot_admission_clear_stale_fence || fail 'a PID-reused stale fence was not cleared'
+  [[ ! -e "$SNAPSHOT_ADMISSION_FENCE" ]] || fail 'PID-reused stale fence remained closed'
+  jq -cn --arg pid "$fence_owner_pid" --arg bootId "$fence_owner_boot_id" --arg startTicks "$fence_owner_start_ticks" \
+    '{protocolVersion:2,ownerPid:($pid|tonumber),ownerBootId:"00000000-0000-0000-0000-000000000000",ownerStartTicks:$startTicks}' \
+    >"$SNAPSHOT_ADMISSION_FENCE"
+  chmod 600 "$SNAPSHOT_ADMISSION_FENCE"
+  snapshot_admission_clear_stale_fence || fail 'a previous-boot fence was not cleared'
+  [[ ! -e "$SNAPSHOT_ADMISSION_FENCE" ]] || fail 'previous-boot fence remained closed'
+  pass 'admission fence recovery distinguishes a live process incarnation from PID reuse and reboot'
+
   active_version() { echo "$sim_version"; }
   is_trusted() { return 0; }
   is_healthy() { return 0; }
@@ -976,6 +999,11 @@ for path in sys.argv[1:]:
     "$(jq -r '.admissionBarrier.drainedAdmissions' "$receipt")" == 0 && \
     "$(jq -r '.admissionBarrier.capabilityListenerPid' "$receipt")" =~ ^[1-9][0-9]*$ ]] || fail 'receipt did not retain the drained admission-fence proof'
   [[ -d "$SNAPSHOTS/20200101T000000-before" && -d "$SNAPSHOTS/20200104T000000-before" ]] || fail 'one-off snapshot rotated away an earlier copy'
+  retained_snapshot=$(jq -r '.snapshotPath' "$receipt")
+  for rotation in {1..5}; do
+    snapshot_db "rotation-$rotation" >/dev/null || fail 'ordinary snapshot rotation fixture failed'
+  done
+  [[ -d "$retained_snapshot" ]] || fail 'ordinary snapshot rotation deleted the retained one-off capture'
   [[ "$(grep -c '^stop --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'snapshot did not stop exactly once'
   [[ "$(grep -c '^start --no-block t3code.service$' "$root/snapshot-svc")" == 1 ]] || fail 'snapshot did not restart exactly once'
   [[ -s "$root/snapshot-hash-order" ]] || fail 'copied files were not hashed after restart'

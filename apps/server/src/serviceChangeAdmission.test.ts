@@ -14,11 +14,27 @@ import * as Scope from "effect/Scope";
 import * as ServerConfig from "./config.ts";
 import * as ServiceChangeAdmission from "./serviceChangeAdmission.ts";
 
+const linuxProcessIncarnation = (pid: number) => {
+  if (!NodeFS.existsSync("/proc/sys/kernel/random/boot_id")) return undefined;
+  const ownerBootId = NodeFS.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
+  const commandEnd = stat.lastIndexOf(")");
+  assert.isAtLeast(commandEnd, 0);
+  const fields = stat
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/);
+  const ownerStartTicks = fields[19];
+  assert.isDefined(ownerStartTicks);
+  return { ownerBootId, ownerStartTicks };
+};
+
 it.effect("drains admitted commands before refusing work behind the snapshot fence", () => {
   const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-snapshot-admission-"));
   const root = NodePath.join(baseDir, "runtime", "service-change-admission");
   const active = NodePath.join(root, "active");
   const fence = NodePath.join(root, "snapshot-fence.json");
+  const processIncarnation = linuxProcessIncarnation(process.pid);
   const testLayer = ServerConfig.ServerConfig.layerTest(baseDir, baseDir).pipe(
     Layer.provideMerge(NodeServices.layer),
   );
@@ -46,9 +62,15 @@ it.effect("drains admitted commands before refusing work behind the snapshot fen
     yield* Deferred.await(entered);
     assert.equal(NodeFS.readdirSync(active).length, 1);
 
-    NodeFS.writeFileSync(fence, JSON.stringify({ protocolVersion: 1, ownerPid: process.pid }), {
-      mode: 0o600,
-    });
+    NodeFS.writeFileSync(
+      fence,
+      JSON.stringify(
+        processIncarnation === undefined
+          ? { protocolVersion: 1, ownerPid: process.pid }
+          : { protocolVersion: 2, ownerPid: process.pid, ...processIncarnation },
+      ),
+      { mode: 0o600 },
+    );
     let fencedEffectRan = false;
     const fenced = yield* Effect.exit(
       ServiceChangeAdmission.withAdmission(
@@ -65,18 +87,52 @@ it.effect("drains admitted commands before refusing work behind the snapshot fen
     yield* Fiber.join(fiber);
     assert.equal(NodeFS.readdirSync(active).length, 0);
 
-    NodeFS.writeFileSync(fence, JSON.stringify({ protocolVersion: 2, ownerPid: 2_000_000_000 }), {
+    NodeFS.writeFileSync(fence, JSON.stringify({ protocolVersion: 1, ownerPid: 2_000_000_000 }), {
       mode: 0o600,
     });
     const incompatible = yield* Effect.exit(ServiceChangeAdmission.withAdmission(Effect.void));
     assert.isTrue(Exit.isFailure(incompatible));
     assert.isTrue(NodeFS.existsSync(fence));
 
-    NodeFS.writeFileSync(fence, JSON.stringify({ protocolVersion: 1, ownerPid: 2_000_000_000 }), {
-      mode: 0o600,
-    });
-    yield* ServiceChangeAdmission.withAdmission(Effect.void);
-    assert.isFalse(NodeFS.existsSync(fence));
+    if (processIncarnation !== undefined) {
+      NodeFS.writeFileSync(
+        fence,
+        JSON.stringify({
+          protocolVersion: 2,
+          ownerPid: process.pid,
+          ...processIncarnation,
+          ownerStartTicks: "0",
+        }),
+        { mode: 0o600 },
+      );
+      yield* ServiceChangeAdmission.withAdmission(Effect.void);
+      assert.isFalse(NodeFS.existsSync(fence));
+
+      NodeFS.writeFileSync(
+        fence,
+        JSON.stringify({
+          protocolVersion: 2,
+          ownerPid: 2_000_000_000,
+          ...processIncarnation,
+        }),
+        { mode: 0o600 },
+      );
+      yield* ServiceChangeAdmission.withAdmission(Effect.void);
+      assert.isFalse(NodeFS.existsSync(fence));
+
+      NodeFS.writeFileSync(
+        fence,
+        JSON.stringify({
+          protocolVersion: 2,
+          ownerPid: process.pid,
+          ...processIncarnation,
+          ownerBootId: "00000000-0000-0000-0000-000000000000",
+        }),
+        { mode: 0o600 },
+      );
+      yield* ServiceChangeAdmission.withAdmission(Effect.void);
+      assert.isFalse(NodeFS.existsSync(fence));
+    }
   }).pipe(
     Effect.provide(testLayer),
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(baseDir, { recursive: true, force: true }))),

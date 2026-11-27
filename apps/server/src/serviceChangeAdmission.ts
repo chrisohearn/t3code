@@ -16,6 +16,7 @@ import * as Scope from "effect/Scope";
 import * as ServerConfig from "./config.ts";
 
 const PROTOCOL_VERSION = 1;
+const FENCE_PROTOCOL_VERSION = 2;
 const MUTEX_WAIT_MS = 5_000;
 
 interface AdmissionLease {
@@ -100,6 +101,21 @@ const pidIsAlive = (pid: number) => {
   } catch (cause) {
     return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "EPERM";
   }
+};
+
+const linuxProcessStartTicks = async (pid: number): Promise<string> => {
+  const stat = await NodeFS.promises.readFile(`/proc/${pid}/stat`, "utf8");
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd < 0) throw new Error("Snapshot fence owner process stat is invalid.");
+  const fields = stat
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/);
+  const startTicks = fields[19];
+  if (startTicks === undefined || !/^[0-9]+$/.test(startTicks)) {
+    throw new Error("Snapshot fence owner process start time is invalid.");
+  }
+  return startTicks;
 };
 
 const errorHasCode = (cause: unknown, code: string) =>
@@ -280,22 +296,59 @@ const removeStaleFence = async (paths: AdmissionPaths) => {
     throw new ServiceChangeAdmissionError({ stage: "fence" });
   }
   let ownerPid: number;
+  let ownerBootId: string;
+  let ownerStartTicks: string;
   try {
     const fence = JSON.parse(await NodeFS.promises.readFile(paths.fence, "utf8")) as {
       protocolVersion?: unknown;
       ownerPid?: unknown;
+      ownerBootId?: unknown;
+      ownerStartTicks?: unknown;
     };
-    if (fence.protocolVersion !== PROTOCOL_VERSION || typeof fence.ownerPid !== "number") {
+    if (
+      fence.protocolVersion !== FENCE_PROTOCOL_VERSION ||
+      typeof fence.ownerPid !== "number" ||
+      typeof fence.ownerBootId !== "string" ||
+      !/^[a-f0-9-]{36}$/i.test(fence.ownerBootId) ||
+      typeof fence.ownerStartTicks !== "string" ||
+      !/^[0-9]+$/.test(fence.ownerStartTicks)
+    ) {
       throw new Error("Snapshot admission fence protocol is invalid.");
     }
     ownerPid = fence.ownerPid;
     if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0)
       throw new Error("Snapshot fence owner PID is invalid.");
+    ownerBootId = fence.ownerBootId;
+    ownerStartTicks = fence.ownerStartTicks;
   } catch (cause) {
     throw new ServiceChangeAdmissionError({ stage: "fence", cause });
   }
-  if (pidIsAlive(ownerPid)) {
-    throw new ServiceChangeAdmissionError({ stage: "fence" });
+
+  let currentBootId: string;
+  try {
+    currentBootId = (
+      await NodeFS.promises.readFile("/proc/sys/kernel/random/boot_id", "utf8")
+    ).trim();
+    if (!/^[a-f0-9-]{36}$/i.test(currentBootId)) {
+      throw new Error("Current Linux boot ID is invalid.");
+    }
+  } catch (cause) {
+    throw new ServiceChangeAdmissionError({ stage: "fence", cause });
+  }
+
+  if (ownerBootId === currentBootId && pidIsAlive(ownerPid)) {
+    let currentStartTicks: string;
+    try {
+      currentStartTicks = await linuxProcessStartTicks(ownerPid);
+    } catch (cause) {
+      if (!errorHasCode(cause, "ENOENT") || pidIsAlive(ownerPid)) {
+        throw new ServiceChangeAdmissionError({ stage: "fence", cause });
+      }
+      currentStartTicks = "";
+    }
+    if (currentStartTicks === ownerStartTicks) {
+      throw new ServiceChangeAdmissionError({ stage: "fence" });
+    }
   }
   await NodeFS.promises.unlink(paths.fence);
 };

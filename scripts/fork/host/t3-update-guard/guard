@@ -954,7 +954,8 @@ snapshot_db() {
   fi
   # Keep the newest three.
   if [[ "$retain_all" != retain-all ]]; then
-    ls -1d "$SNAPSHOTS"/2* 2>/dev/null | sort | head -n -3 | xargs -r rm -rf
+    find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d -name '2*' \
+      ! -name '*-snapshot-*' -print | sort | head -n -3 | xargs -r rm -rf --
   fi
   printf '%s' "$dir"
 }
@@ -1098,15 +1099,40 @@ snapshot_admission_unlock() {
   rmdir "$SNAPSHOT_ADMISSION_MUTEX" 2>/dev/null || true
 }
 
+snapshot_process_start_ticks() {
+  local pid="$1" stat rest
+  local -a fields=()
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  stat=$(<"/proc/$pid/stat") || return 1
+  [[ "$stat" == *") "* ]] || return 1
+  rest="${stat##*) }"
+  read -r -a fields <<<"$rest"
+  [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${fields[19]}"
+}
+
 snapshot_admission_clear_stale_fence() {
-  local owner_pid
+  local protocol_version owner_pid owner_boot_id owner_start_ticks current_boot_id current_start_ticks self_pid
   [[ -e "$SNAPSHOT_ADMISSION_FENCE" ]] || return 0
   [[ -f "$SNAPSHOT_ADMISSION_FENCE" && ! -L "$SNAPSHOT_ADMISSION_FENCE" ]] || return 1
+  protocol_version=$(jq -er '.protocolVersion | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
+  [[ "$protocol_version" == 2 ]] || return 1
   owner_pid=$(jq -er '.ownerPid | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
   [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || return 1
-  if kill -0 "$owner_pid" 2>/dev/null; then
-    [[ "$owner_pid" == "$$" ]] && return 0
-    return 1
+  owner_boot_id=$(jq -er '.ownerBootId | select(type == "string" and test("^[a-fA-F0-9-]{36}$"))' \
+    "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
+  owner_start_ticks=$(jq -er '.ownerStartTicks | select(type == "string" and test("^[0-9]+$"))' \
+    "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || return 1
+  [[ -r /proc/sys/kernel/random/boot_id ]] || return 1
+  IFS= read -r current_boot_id </proc/sys/kernel/random/boot_id || return 1
+  [[ "$current_boot_id" =~ ^[a-fA-F0-9-]{36}$ ]] || return 1
+  if [[ "$owner_boot_id" == "$current_boot_id" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+    current_start_ticks=$(snapshot_process_start_ticks "$owner_pid") || return 1
+    if [[ "$current_start_ticks" == "$owner_start_ticks" ]]; then
+      self_pid="${BASHPID:-$$}"
+      [[ "$owner_pid" == "$self_pid" ]] && return 0
+      return 1
+    fi
   fi
   rm -f -- "$SNAPSHOT_ADMISSION_FENCE" || return 1
   snapshot_fsync "$SNAPSHOT_ADMISSION_ROOT"
@@ -1130,7 +1156,7 @@ snapshot_admission_active_count() {
 }
 
 snapshot_admission_close() {
-  local operation="$1" point="$2" listener="$3" tmp count deadline
+  local operation="$1" point="$2" listener="$3" tmp count deadline owner_pid owner_boot_id owner_start_ticks
   snapshot_admission_lock || { echo "snapshot: admission coordination lock is unavailable" >&2; return 1; }
   if ! snapshot_admission_clear_stale_fence; then
     snapshot_admission_unlock
@@ -1138,12 +1164,30 @@ snapshot_admission_close() {
     return 1
   fi
   SNAPSHOT_ADMISSION_CLOSED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  owner_pid="${BASHPID:-$$}"
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || {
+    snapshot_admission_unlock
+    return 1
+  }
+  IFS= read -r owner_boot_id </proc/sys/kernel/random/boot_id || {
+    snapshot_admission_unlock
+    return 1
+  }
+  [[ "$owner_boot_id" =~ ^[a-fA-F0-9-]{36}$ ]] || {
+    snapshot_admission_unlock
+    return 1
+  }
+  owner_start_ticks=$(snapshot_process_start_ticks "$owner_pid") || {
+    snapshot_admission_unlock
+    return 1
+  }
   tmp=$(mktemp "$SNAPSHOT_ADMISSION_ROOT/.snapshot-fence.XXXXXX") || {
     snapshot_admission_unlock
     return 1
   }
   if ! jq -cn --arg operation "$operation" --arg point "$point" --arg closedAt "$SNAPSHOT_ADMISSION_CLOSED_AT" \
-      --arg pid "$$" '{protocolVersion:1,ownerPid:($pid|tonumber),operationId:$operation,snapshotPoint:$point,closedAt:$closedAt}' >"$tmp" || \
+      --arg pid "$owner_pid" --arg bootId "$owner_boot_id" --arg startTicks "$owner_start_ticks" \
+      '{protocolVersion:2,ownerPid:($pid|tonumber),ownerBootId:$bootId,ownerStartTicks:$startTicks,operationId:$operation,snapshotPoint:$point,closedAt:$closedAt}' >"$tmp" || \
     ! chmod 600 "$tmp" || ! snapshot_fsync "$tmp" || \
     ! mv -f -- "$tmp" "$SNAPSHOT_ADMISSION_FENCE"; then
     rm -f -- "$tmp"
@@ -1199,8 +1243,20 @@ snapshot_admission_open() {
   }
   snapshot_admission_lock || { echo "snapshot: admission coordination lock is unavailable while reopening" >&2; return 1; }
   if [[ -e "$SNAPSHOT_ADMISSION_FENCE" ]]; then
-    local owner_pid operation_id
+    local protocol_version owner_pid operation_id owner_boot_id owner_start_ticks current_boot_id current_start_ticks self_pid
+    protocol_version=$(jq -er '.protocolVersion | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    [[ "$protocol_version" == 2 ]] || {
+      snapshot_admission_unlock
+      return 1
+    }
     owner_pid=$(jq -er '.ownerPid | select(type == "number")' "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || {
       snapshot_admission_unlock
       return 1
     }
@@ -1208,14 +1264,41 @@ snapshot_admission_open() {
       snapshot_admission_unlock
       return 1
     }
-    if [[ "$owner_pid" == "$$" ]]; then
-      [[ "$operation_id" == "$SNAPSHOT_ADMISSION_OPERATION" ]] || {
+    owner_boot_id=$(jq -er '.ownerBootId | select(type == "string" and test("^[a-fA-F0-9-]{36}$"))' \
+      "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    owner_start_ticks=$(jq -er '.ownerStartTicks | select(type == "string" and test("^[0-9]+$"))' \
+      "$SNAPSHOT_ADMISSION_FENCE" 2>/dev/null) || {
+      snapshot_admission_unlock
+      return 1
+    }
+    IFS= read -r current_boot_id </proc/sys/kernel/random/boot_id || {
+      snapshot_admission_unlock
+      return 1
+    }
+    [[ "$current_boot_id" =~ ^[a-fA-F0-9-]{36}$ ]] || {
+      snapshot_admission_unlock
+      return 1
+    }
+    self_pid="${BASHPID:-$$}"
+    if [[ "$owner_boot_id" == "$current_boot_id" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+      current_start_ticks=$(snapshot_process_start_ticks "$owner_pid") || {
         snapshot_admission_unlock
         return 1
       }
-    elif kill -0 "$owner_pid" 2>/dev/null; then
-      snapshot_admission_unlock
-      return 1
+      if [[ "$current_start_ticks" == "$owner_start_ticks" ]]; then
+        if [[ "$owner_pid" == "$self_pid" ]]; then
+          [[ "$operation_id" == "$SNAPSHOT_ADMISSION_OPERATION" ]] || {
+            snapshot_admission_unlock
+            return 1
+          }
+        else
+          snapshot_admission_unlock
+          return 1
+        fi
+      fi
     fi
     rm -f -- "$SNAPSHOT_ADMISSION_FENCE" || {
       snapshot_admission_unlock
